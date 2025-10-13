@@ -4,6 +4,9 @@ void BallrainIO::OnLoad() {
     GetLogger()->Info("Hello from BallrainIO!");
     m_BML->SendIngameMessage("\x1b[32mHello BML+!\x1b[0m");
     m_BML->AddTimer(1000ul, [](){});
+
+    m_inputSystem = std::make_unique<InputSystem>(m_BML->GetInputManager());
+    m_timeSystem = std::make_unique<TimeSystem>(m_BML->GetTimeManager());
 }
 
 void BallrainIO::OnUnload() {}
@@ -17,7 +20,13 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
 }
 void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {}
 
-void BallrainIO::OnProcess() {}
+void BallrainIO::OnProcess() {
+    if (!m_BML->IsPlaying())
+        return;
+
+    m_inputSystem->Process();
+    m_timeSystem->Process();
+}
 
 void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {}
 

@@ -1,4 +1,7 @@
 #include <BML/IMod.h>
+#include <memory>
+#include "InputSystem.h"
+#include "TimeSystem.h"
 
 class BallrainIO final : public IMod {
 public:
@@ -85,6 +88,10 @@ public:
 
     virtual void OnPreLifeUp() override;
     virtual void OnPostLifeUp() override;
+
+private:
+    std::unique_ptr<InputSystem> m_inputSystem;
+    std::unique_ptr<TimeSystem> m_timeSystem;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }
