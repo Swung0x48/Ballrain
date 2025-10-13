@@ -5,3 +5,4 @@ dependencies:
   - pip:
       - gymnasium==1.2.1
       - stable-baselines3==2.7.0
+      - pywin32==311

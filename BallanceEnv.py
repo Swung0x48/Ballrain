@@ -2,23 +2,26 @@ from typing import Optional
 import numpy as np
 import gymnasium as gym
 
+from Pipe import Pipe
 
 class BallanceEnv(gym.Env):
 
     def __init__(self):
-        # 6 keys that player can control
-        # Up / Down / Left / Right / Shift / Space
-        # Not necessarily useful, but put those here just in case
-        self.action_space = gym.spaces.Box(0, 1, shape=(6,), dtype=np.int8)
+        print("Opened BallancePipe. Waiting for connection...")
+        # Wait for game to go online
+        self.pipe = Pipe('BallancePipe')
+        self.pipe.run()
+        print("Connection established")
 
-        self.observation_space = gym.spaces.Dict(
-            {
-                "ball_location": gym.spaces.Space(shape=(3,), dtype=float)
-            }
-        )
+        # 4 keys that player can control, and multiple keys can be pressed at once
+        # Up / Down / Left / Right
+        # Not necessarily useful, but put those here just in case
+        self.action_space = gym.spaces.Box(0, 1, shape=(4,), dtype=np.int8)
+
+        self.observation_space = gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32)
 
     def _get_obs(self):
-        return { "ball_location": gym.spaces.Space(shape=(3,), dtype=float) }
+        return np.array([1., 2., 3.], dtype=np.float32)
 
     def _get_info(self):
         return {}
@@ -53,6 +56,8 @@ class BallanceEnv(gym.Env):
         # TODO: Apply input to game
 
         # TODO: Update observable state from game, check if still in valid shape
+        data = self.pipe._read_raw(10)
+        print(data)
 
         # Check if agent reached the target
         terminated = False
@@ -76,6 +81,3 @@ gym.register(
     entry_point=BallanceEnv,
     max_episode_steps=300,  # Prevent infinite episodes
 )
-
-env = gym.make("ballance_env/Ballance-v0")
-print(env.action_space.sample())
