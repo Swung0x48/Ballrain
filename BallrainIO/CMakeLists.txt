@@ -4,6 +4,8 @@ project(BallrainIO)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+add_subdirectory(3rdparty)
+
 find_package(BML REQUIRED)
 
 add_library(BallrainIO SHARED
@@ -12,9 +14,17 @@ add_library(BallrainIO SHARED
 			src/InputSystem.h
 			src/InputSystem.cpp
 			src/TimeSystem.h
-			src/TimeSystem.cpp)
+			src/TimeSystem.cpp
+			src/Hook.h
+			src/TASHook.cpp
+			src/TASHook.h
+)
 
 target_include_directories(BallrainIO PRIVATE ${BML_INCLUDE_DIRS})
-target_link_libraries(BallrainIO PRIVATE BML)
+target_link_libraries(BallrainIO
+						PUBLIC
+						BML
+						PRIVATE
+						minhook)
 set_target_properties(BallrainIO PROPERTIES OUTPUT_NAME "BallrainIO")
 set_target_properties(BallrainIO PROPERTIES SUFFIX ".bmodp")

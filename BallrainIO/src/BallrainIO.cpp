@@ -1,4 +1,5 @@
 #include "BallrainIO.h"
+#include "TASHook.h"
 
 void BallrainIO::OnLoad() {
     GetLogger()->Info("Hello from BallrainIO!");
@@ -7,6 +8,27 @@ void BallrainIO::OnLoad() {
 
     m_inputSystem = std::make_unique<InputSystem>(m_BML->GetInputManager());
     m_timeSystem = std::make_unique<TimeSystem>(m_BML->GetTimeManager());
+
+    MH_STATUS status = MH_Initialize();
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
+        GetLogger()->Error("MinHook failed to initialize: %s", MH_StatusToString(status));
+    }
+
+    CKContext* context = m_BML->GetCKContext();
+    auto* timemgr = context->GetManagerByGuid(TIME_MANAGER_GUID);
+    if (!CKTimeManagerHook::Enable(timemgr)) {
+        GetLogger()->Error("Failed to enable TimeManager hook.");
+    }
+    auto* inputmgr = context->GetManagerByGuid(INPUT_MANAGER_GUID);
+    if (!CKInputManagerHook::Enable(inputmgr)) {
+        GetLogger()->Error("Failed to enable InputManager hook.");
+    }
+    CKTimeManagerHook::AddPostCallback([this](CKBaseManager* man) {
+        auto* timeManager = static_cast<CKTimeManager*>(man);
+        if (m_BML->IsPlaying()) {
+            timeManager->SetLastDeltaTime(1000.0f / 132.0f / 2.0f);
+        }
+    });
 }
 
 void BallrainIO::OnUnload() {}
@@ -24,8 +46,8 @@ void BallrainIO::OnProcess() {
     if (!m_BML->IsPlaying())
         return;
 
-    m_inputSystem->Process();
     m_timeSystem->Process();
+    m_inputSystem->Process();
 }
 
 void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {}
