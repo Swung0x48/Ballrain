@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_subdirectory(3rdparty)
 
+set(BML_DIR "${CMAKE_CURRENT_LIST_DIR}/3rdparty/BMLPlus/lib/cmake/BML")
+message(STATUS "BML_DIR=${BML_DIR}")
 find_package(BML REQUIRED)
 
 add_library(BallrainIO SHARED
