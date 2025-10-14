@@ -27,6 +27,14 @@ public:
 	int SendMsg(MessageType type, const void* data = nullptr);
 	MessageType ReceiveMsg();
 	const std::vector<uint8_t>& GetMessageBuf() const;
+
+	template <typename Msg>
+	Msg* GetMessageFromBuf() const {
+		if (m_recvBuffer.size() < sizeof(Msg))
+			return nullptr;
+		return (Msg*)m_recvBuffer.data();
+	}
+
 private:
 	int m_lastError = 0;
 	bool m_connected = false;

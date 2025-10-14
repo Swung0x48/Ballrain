@@ -1,6 +1,5 @@
 import socket
-import threading
-
+from Message import MsgType
 
 class TCPServer:
     def __init__(self, host='127.0.0.1', port=27787):
@@ -41,7 +40,14 @@ class TCPServer:
     def recv_msg(self):
         btype = self.recv(4)
         msg_type = int.from_bytes(btype, byteorder='little')
-        return msg_type, None
+        msg_body = None
+        return msg_type, msg_body
+
+    def send_msg(self, msg_type: MsgType, msg_body):
+        bmsg_type = msg_type.value.to_bytes(4, byteorder='little')
+        self.send(bmsg_type)
+        if msg_body is not None:
+            self.send(msg_body)
 
 if __name__ == "__main__":
     server = TCPServer()

@@ -100,6 +100,8 @@ private:
 
     CKDataArray* m_currentLevelArray = nullptr;
     CKDataArray* m_inGameParameterArray = nullptr;
+
+    bool m_ballNavActive = false;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }

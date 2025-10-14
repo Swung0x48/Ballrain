@@ -12,8 +12,8 @@ struct KeyState {
 		BR_DOWN,
 		BR_LEFT,
 		BR_RIGHT,
-		BR_ESC,
-		BR_SHIFT,
+		// BR_ESC,
+		// BR_SHIFT,
 		BR_KEY_COUNT
 	};
 	char states[BR_KEY_COUNT] = { 0 };
@@ -33,8 +33,8 @@ private:
 		CKKEY_DOWN,
 		CKKEY_LEFT,
 		CKKEY_RIGHT,
-		CKKEY_ESCAPE,
-		CKKEY_LSHIFT
+		// CKKEY_ESCAPE,
+		// CKKEY_LSHIFT
 	};
 };
 

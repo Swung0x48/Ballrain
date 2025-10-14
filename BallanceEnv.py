@@ -1,16 +1,11 @@
-from enum import Enum
 import random
 from typing import Optional
 import numpy as np
 import gymnasium as gym
 
 from TCPServer import TCPServer
+from Message import MsgType
 
-class MsgType(Enum):
-    BallNavActive = 0
-    BallNavInactive = 1
-    BallState = 2,
-    KbdInput = 3
 
 class BallanceEnv(gym.Env):
 
@@ -78,6 +73,8 @@ class BallanceEnv(gym.Env):
             tuple: (observation, reward, terminated, truncated, info)
         """
         # TODO: Apply input to game
+        print("Action: ", action)
+        self.server.send_msg(MsgType.KbdInput, action.tobytes())
 
         # TODO: Update observable state from game, check if still in valid shape
 

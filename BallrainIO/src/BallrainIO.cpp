@@ -36,10 +36,10 @@ void BallrainIO::OnLoad() {
         GetLogger()->Error("Failed to enable InputManager hook.");
     }
     CKTimeManagerHook::AddPostCallback([this](CKBaseManager* man) {
+        if (!m_BML->IsPlaying())
+            return;
         auto* timeManager = static_cast<CKTimeManager*>(man);
-        if (m_BML->IsPlaying()) {
-            timeManager->SetLastDeltaTime(1000.0f / 132.0f / 2.0f);
-        }
+        timeManager->SetLastDeltaTime(1000.0f / 132.0f / 2.0f);    
     });
 }
 
@@ -58,14 +58,15 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
 void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {}
 
 void BallrainIO::OnProcess() {
-    if (!m_BML->IsPlaying())
+    if (!m_ballNavActive)
         return;
 
-    //m_timeSystem->Process();
+    ////m_timeSystem->Process();
+    
     MessageType msgType = MessageType::BRM_InvalidType;
     while (msgType != MessageType::BRM_KbdInput)
         msgType = m_tcpClient->ReceiveMsg();
-    m_inputSystem->Process(((MsgKbdInput*)m_tcpClient->GetMessageBuf().data())->keyState);
+    m_inputSystem->Process(m_tcpClient->GetMessageFromBuf<MsgKbdInput>()->keyState);
 }
 
 void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {}
@@ -117,9 +118,13 @@ void BallrainIO::OnCounterInactive() {}
 
 void BallrainIO::OnBallNavActive() {
     m_tcpClient->SendMsg(MessageType::BRM_BallNavActive);
+    m_ballNavActive = true;
 }
 
-void BallrainIO::OnBallNavInactive() {}
+void BallrainIO::OnBallNavInactive() {
+    m_tcpClient->SendMsg(MessageType::BRM_BallNavInactive);
+    m_ballNavActive = false;
+}
 
 void BallrainIO::OnCamNavActive() {}
 void BallrainIO::OnCamNavInactive() {}
