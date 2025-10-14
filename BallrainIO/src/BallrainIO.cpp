@@ -50,7 +50,10 @@ void BallrainIO::OnModifyConfig(const char* category, const char* key, IProperty
 void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* masterName, CK_CLASSID filterClass,
     CKBOOL addToScene, CKBOOL reuseMeshes, CKBOOL reuseMaterials, CKBOOL dynamic,
     XObjectArray* objArray, CKObject* masterObj) {
-
+    if (strcmp(filename, "3D Entities\\Gameplay.nmo") == 0) {
+        m_currentLevelArray = m_BML->GetArrayByName("CurrentLevel");
+        m_inGameParameterArray = m_BML->GetArrayByName("IngameParameter");
+}
 }
 void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {}
 
@@ -135,3 +138,10 @@ void BallrainIO::OnPostSubLife() {}
 
 void BallrainIO::OnPreLifeUp() {}
 void BallrainIO::OnPostLifeUp() {}
+
+CK3dObject* BallrainIO::GetCurrentBall()
+{
+    if (!m_currentLevelArray)
+        return nullptr;
+    return static_cast<CK3dObject*>(m_currentLevelArray->GetElementObject(0, 1));
+}

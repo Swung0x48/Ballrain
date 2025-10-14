@@ -91,10 +91,14 @@ public:
     virtual void OnPreLifeUp() override;
     virtual void OnPostLifeUp() override;
 
+    CK3dObject* GetCurrentBall();
 private:
     std::unique_ptr<InputSystem> m_inputSystem;
     std::unique_ptr<TimeSystem> m_timeSystem;
     std::unique_ptr<TCPClient> m_tcpClient;
+
+    CKDataArray* m_currentLevelArray = nullptr;
+    CKDataArray* m_inGameParameterArray = nullptr;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }
