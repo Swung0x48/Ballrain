@@ -8,6 +8,23 @@ void BallrainIO::OnLoad() {
 
     m_inputSystem = std::make_unique<InputSystem>(m_BML->GetInputManager());
     m_timeSystem = std::make_unique<TimeSystem>(m_BML->GetTimeManager());
+    m_tcpClient = std::make_unique<TCPClient>();
+
+    if (!m_tcpClient->Connect("127.0.0.1", 27787)) {
+        m_BML->SendIngameMessage("\x1b[32mConnect failed!\x1b[0m");
+        return;
+    }
+
+    int val = 1;
+    while (val <= 100) {
+        assert(m_tcpClient->Send(&val, sizeof(int)) == sizeof(int));
+        GetLogger()->Info("send %d", val);
+        assert(m_tcpClient->Receive(sizeof(val), &val) == sizeof(int));
+        GetLogger()->Info("recv %d", val);
+        val++;
+    }
+    m_tcpClient->Disconnect();
+    m_tcpClient.reset();
 
     MH_STATUS status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {

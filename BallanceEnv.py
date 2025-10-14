@@ -2,15 +2,12 @@ from typing import Optional
 import numpy as np
 import gymnasium as gym
 
-from Pipe import Pipe
 
 class BallanceEnv(gym.Env):
 
     def __init__(self):
-        print("Opened BallancePipe. Waiting for connection...")
+        print("Started server. Waiting for connection...")
         # Wait for game to go online
-        self.pipe = Pipe('BallancePipe')
-        self.pipe.run()
         print("Connection established")
 
         # 4 keys that player can control, and multiple keys can be pressed at once

@@ -1,0 +1,56 @@
+import socket
+import threading
+
+
+class TCPServer:
+    def __init__(self, host='127.0.0.1', port=27787):
+        self.client_socket = None
+        self.client_address = None
+        self.host = host
+        self.port = port
+        self.socket = None
+        self.running = False
+
+    def start(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.socket.bind((self.host, self.port))
+            self.socket.listen(5)
+            self.running = True
+
+            print(f"Waiting connection at {self.host}:{self.port}")
+            self.client_socket, self.client_address = self.socket.accept()
+            print(f"Accepted client at: {self.client_address}")
+        except Exception as e:
+            print(f"Server error: {e}")
+
+    def stop(self):
+        self.running = False
+        if self.socket:
+            self.socket.close()
+        print("Server stopped")
+
+    def recv(self, length):
+        data = self.client_socket.recv(length)
+        return data
+
+    def send(self, data):
+        self.client_socket.send(data)
+
+if __name__ == "__main__":
+    server = TCPServer()
+    try:
+        server.start()
+        while True:
+            b = server.recv(4)
+            if b:
+                val = int.from_bytes(b, byteorder='little')
+                print(f'rcvd: {val}')
+                val += 1
+                out_bytes = val.to_bytes(length=4, byteorder='little')
+                server.send(out_bytes)
+                print(f'sent: {val}')
+    except KeyboardInterrupt:
+        print("\nShutting down server...")
+        server.stop()

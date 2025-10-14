@@ -1,7 +1,7 @@
 #include <BML/IMod.h>
 #include <CKInputManager.h>
 #define _WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include <Windows.h>
 
 class InputSystem {
 public:

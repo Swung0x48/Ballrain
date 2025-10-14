@@ -1,5 +1,7 @@
 #include <BML/IMod.h>
 #include <memory>
+
+#include "TCPClient.h"
 #include "InputSystem.h"
 #include "TimeSystem.h"
 
@@ -92,6 +94,7 @@ public:
 private:
     std::unique_ptr<InputSystem> m_inputSystem;
     std::unique_ptr<TimeSystem> m_timeSystem;
+    std::unique_ptr<TCPClient> m_tcpClient;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }
