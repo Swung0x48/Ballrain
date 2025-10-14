@@ -2,5 +2,5 @@
 
 void TimeSystem::Process()
 {
-	m_timeManager->SetLastDeltaTime(DEFAULT_INPUT_DT);
+	//m_timeManager->SetLastDeltaTime(DEFAULT_INPUT_DT);
 }
