@@ -2,6 +2,8 @@
 #define BALLRAIN_TCPCLIENT_H
 
 #include <string>
+#include <vector>
+#include <cstdint>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -11,15 +13,10 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
+#include "MessageTypes.h"
+
 class TCPClient {
 public:
-	enum class MessageType: int {
-		BRM_BallNavActive,
-		BRM_BallNavInactive,
-		BRM_BallState,
-		BRM_InvalidType
-	};
-
 	TCPClient();
 	~TCPClient();
 	int GetLastError();
@@ -27,13 +24,17 @@ public:
 	void Disconnect();
 	int Send(const void* data, int len);
 	int Receive(int len, void* dest);
-	int SendMsg(MessageType type, void* data = nullptr);
+	int SendMsg(MessageType type, const void* data = nullptr);
+	MessageType ReceiveMsg();
+	const std::vector<uint8_t>& GetMessageBuf() const;
 private:
 	int m_lastError = 0;
 	bool m_connected = false;
 	WSADATA m_wsaData;
 	SOCKET m_socket;
 	sockaddr_in m_serverAddr;
+
+	std::vector<uint8_t> m_recvBuffer;
 };
 
 #endif // !BALLRAIN_TCPCLIENT_H

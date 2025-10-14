@@ -2,7 +2,7 @@
 #include <cassert>
 
 
-TCPClient::TCPClient()
+TCPClient::TCPClient(): m_recvBuffer(512)
 {
     if (WSAStartup(MAKEWORD(2, 2), &m_wsaData) != 0) {
         m_lastError = WSAGetLastError();
@@ -97,8 +97,42 @@ int TCPClient::Receive(int len, void* dest)
     return bytesReceived;
 }
 
-int TCPClient::SendMsg(MessageType type, void* data)
+int TCPClient::SendMsg(MessageType type, const void* data)
 {
-    auto cnt = Send(&type, sizeof(type));
-    return cnt;
+    auto sz = Send(&type, sizeof(type));
+    switch (type) {
+        case MessageType::BRM_BallState: {
+            assert(data != nullptr);
+            auto datasz = Send(data, sizeof(MsgBallState));
+            if (datasz < 0)
+                return datasz;
+            else
+                sz += datasz;
+            break;
+        }
+    }
+    return sz;
 }
+
+MessageType TCPClient::ReceiveMsg()
+{
+    MessageType type = MessageType::BRM_InvalidType;
+    auto sz = Receive(sizeof(MessageType), &type);
+    switch (type) {
+        case MessageType::BRM_KbdInput: {
+            m_recvBuffer.resize(sizeof(MsgKbdInput));
+            auto msgsz = Receive(sizeof(MsgKbdInput), m_recvBuffer.data());
+            if (msgsz < 0)
+                return MessageType::BRM_InvalidType;
+        }
+            
+    }
+    return type;
+}
+
+const std::vector<uint8_t>& TCPClient::GetMessageBuf() const
+{
+    return m_recvBuffer;
+}
+
+

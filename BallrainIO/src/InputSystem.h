@@ -1,3 +1,6 @@
+#ifndef BALLRAIN_INPUTSYSTEM_H
+#define BALLRAIN_INPUTSYSTEM_H
+
 #include <BML/IMod.h>
 #include <CKInputManager.h>
 #define _WIN32_LEAN_AND_MEAN
@@ -13,7 +16,7 @@ struct KeyState {
 		BR_SHIFT,
 		BR_KEY_COUNT
 	};
-	char states[BR_KEY_COUNT];
+	char states[BR_KEY_COUNT] = { 0 };
 };
 
 
@@ -34,3 +37,5 @@ private:
 		CKKEY_LSHIFT
 	};
 };
+
+#endif // BALLRAIN_INPUTSYSTEM_H

@@ -53,7 +53,7 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
     if (strcmp(filename, "3D Entities\\Gameplay.nmo") == 0) {
         m_currentLevelArray = m_BML->GetArrayByName("CurrentLevel");
         m_inGameParameterArray = m_BML->GetArrayByName("IngameParameter");
-}
+    }
 }
 void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {}
 
@@ -62,8 +62,10 @@ void BallrainIO::OnProcess() {
         return;
 
     //m_timeSystem->Process();
-    
-    //m_inputSystem->Process();
+    MessageType msgType = MessageType::BRM_InvalidType;
+    while (msgType != MessageType::BRM_KbdInput)
+        msgType = m_tcpClient->ReceiveMsg();
+    m_inputSystem->Process(((MsgKbdInput*)m_tcpClient->GetMessageBuf().data())->keyState);
 }
 
 void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {}
@@ -114,7 +116,7 @@ void BallrainIO::OnCounterActive() {}
 void BallrainIO::OnCounterInactive() {}
 
 void BallrainIO::OnBallNavActive() {
-    m_tcpClient->SendMsg(TCPClient::MessageType::BRM_BallNavActive);
+    m_tcpClient->SendMsg(MessageType::BRM_BallNavActive);
 }
 
 void BallrainIO::OnBallNavInactive() {}

@@ -22,6 +22,8 @@ add_library(BallrainIO SHARED
 			src/TASHook.h
 			src/TCPClient.cpp
 			src/TCPClient.h
+			src/MessageTypes.cpp
+			src/MessageTypes.h
 )
 
 target_include_directories(BallrainIO PRIVATE ${BML_INCLUDE_DIRS})
