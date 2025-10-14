@@ -1,9 +1,15 @@
+from enum import Enum
 import random
 from typing import Optional
 import numpy as np
 import gymnasium as gym
 
 from TCPServer import TCPServer
+
+class MsgType(Enum):
+    BallNavActive = 0
+    BallNavInactive = 1
+    BallState = 2
 
 class BallanceEnv(gym.Env):
 
@@ -25,10 +31,16 @@ class BallanceEnv(gym.Env):
         # Not necessarily useful, but put those here just in case
         self.action_space = gym.spaces.Box(0, 1, shape=(4,), dtype=np.int8)
 
-        self.observation_space = gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32)
+        self.observation_space = gym.spaces.Dict(
+            {
+                "location": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32)
+            }
+        )
 
     def _get_obs(self):
-        return np.array([random.randint(10,20), 2., 3.], dtype=np.float32)
+        return {
+            "location": np.array([random.randint(10,20), 2., 3.], dtype=np.float32)
+        }
 
     def _get_info(self):
         return {}
@@ -45,6 +57,10 @@ class BallanceEnv(gym.Env):
         """
         # IMPORTANT: Must call this first to seed the random number generator
         super().reset(seed=seed)
+
+        msg_type = -1
+        while msg_type != MsgType.BallNavActive.value:
+            msg_type, byte = self.server.recv_msg()
 
         observation = self._get_obs()
         info = self._get_info()

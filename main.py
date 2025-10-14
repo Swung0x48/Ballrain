@@ -5,17 +5,13 @@ from stable_baselines3 import PPO
 import BallanceEnv
 
 env = gym.make("ballance_env/Ballance-v0")
+obs, info = env.reset()
 
-model = PPO("MlpPolicy", env, verbose=1)
-model.learn(total_timesteps=10_000)
+print(env.action_space.sample())
 
-vec_env = model.get_env()
-obs = vec_env.reset()
-for i in range(1000):
-    action, _states = model.predict(obs, deterministic=True)
-    obs, reward, done, info = vec_env.step(action)
+for i in range(10):
+    print(obs['location'])
+    action = env.action_space.sample()
+    obs, reward, terminated, truncated, info = env.step(action)
+    print(obs['location'])
 
-    if done:
-      obs, info = env.reset()
-
-env.close()

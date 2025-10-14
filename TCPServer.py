@@ -38,6 +38,11 @@ class TCPServer:
     def send(self, data):
         self.client_socket.send(data)
 
+    def recv_msg(self):
+        btype = self.recv(4)
+        msg_type = int.from_bytes(btype, byteorder='little')
+        return msg_type, None
+
 if __name__ == "__main__":
     server = TCPServer()
     try:

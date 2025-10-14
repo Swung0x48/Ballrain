@@ -1,4 +1,5 @@
 #include "TCPClient.h"
+#include <cassert>
 
 
 TCPClient::TCPClient()
@@ -94,4 +95,10 @@ int TCPClient::Receive(int len, void* dest)
     }
     
     return bytesReceived;
+}
+
+int TCPClient::SendMsg(MessageType type, void* data)
+{
+    auto cnt = Send(&type, sizeof(type));
+    return cnt;
 }

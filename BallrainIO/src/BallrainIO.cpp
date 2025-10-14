@@ -58,7 +58,8 @@ void BallrainIO::OnProcess() {
     if (!m_BML->IsPlaying())
         return;
 
-    m_timeSystem->Process();
+    //m_timeSystem->Process();
+    
     //m_inputSystem->Process();
 }
 
@@ -109,7 +110,10 @@ void BallrainIO::OnPostEndLevel() {}
 void BallrainIO::OnCounterActive() {}
 void BallrainIO::OnCounterInactive() {}
 
-void BallrainIO::OnBallNavActive() {}
+void BallrainIO::OnBallNavActive() {
+    m_tcpClient->SendMsg(TCPClient::MessageType::BRM_BallNavActive);
+}
+
 void BallrainIO::OnBallNavInactive() {}
 
 void BallrainIO::OnCamNavActive() {}
