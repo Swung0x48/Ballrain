@@ -18,8 +18,8 @@ void InputSystem::ApplyKeyState(unsigned char& state, char newState)
 	}
 	else {
 		if (state == KS_PRESSED)
-			state == KS_RELEASED;
+			state = KS_RELEASED;
 		else
-			state == KS_IDLE;
+			state = KS_IDLE;
 	}
 }
