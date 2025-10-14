@@ -1,14 +1,24 @@
+import random
 from typing import Optional
 import numpy as np
 import gymnasium as gym
 
+from TCPServer import TCPServer
 
 class BallanceEnv(gym.Env):
 
     def __init__(self):
         print("Started server. Waiting for connection...")
+        self.server = TCPServer(port=27787)
+        self.server.start()
         # Wait for game to go online
         print("Connection established")
+        self.server.send('Ping'.encode('utf-8'))
+        pong_msg = self.server.recv(4)
+        if pong_msg == b'Pong':
+            print('Client ping-pong OK')
+        else:
+            raise Exception("Not a valid client!")
 
         # 4 keys that player can control, and multiple keys can be pressed at once
         # Up / Down / Left / Right
@@ -18,7 +28,7 @@ class BallanceEnv(gym.Env):
         self.observation_space = gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32)
 
     def _get_obs(self):
-        return np.array([1., 2., 3.], dtype=np.float32)
+        return np.array([random.randint(10,20), 2., 3.], dtype=np.float32)
 
     def _get_info(self):
         return {}
@@ -53,8 +63,6 @@ class BallanceEnv(gym.Env):
         # TODO: Apply input to game
 
         # TODO: Update observable state from game, check if still in valid shape
-        data = self.pipe._read_raw(10)
-        print(data)
 
         # Check if agent reached the target
         terminated = False

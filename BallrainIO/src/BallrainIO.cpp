@@ -14,17 +14,12 @@ void BallrainIO::OnLoad() {
         m_BML->SendIngameMessage("\x1b[32mConnect failed!\x1b[0m");
         return;
     }
-
-    int val = 1;
-    while (val <= 100) {
-        assert(m_tcpClient->Send(&val, sizeof(int)) == sizeof(int));
-        GetLogger()->Info("send %d", val);
-        assert(m_tcpClient->Receive(sizeof(val), &val) == sizeof(int));
-        GetLogger()->Info("recv %d", val);
-        val++;
+    std::string msg = "Pong";
+    assert(m_tcpClient->Receive(msg.length(), msg.data()) == msg.length());
+    if (msg == "Ping") {
+        msg = "Pong";
+        assert(m_tcpClient->Send(msg.c_str(), msg.length()) == msg.length());
     }
-    m_tcpClient->Disconnect();
-    m_tcpClient.reset();
 
     MH_STATUS status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
@@ -64,7 +59,7 @@ void BallrainIO::OnProcess() {
         return;
 
     m_timeSystem->Process();
-    m_inputSystem->Process();
+    //m_inputSystem->Process();
 }
 
 void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {}
