@@ -102,8 +102,11 @@ void BallrainIO::OnProcess() {
     ball->GetPosition(&gameState.position);
     ball->GetQuaternion(&gameState.quaternion);
     gameState.currentSector = GetCurrentSector();
-    GetNextSectorObject(gameState.currentSector)->GetPosition(&gameState.nextSectorPosition);
-    GetLastSectorObject(gameState.currentSector)->GetPosition(&gameState.lastSectorPosition);
+    auto* nextSector = GetNextSectorObject(gameState.currentSector);
+    auto* lastSector = GetLastSectorObject(gameState.currentSector);
+    GetLogger()->Info("next: %d, last: %d", nextSector->GetName(), lastSector->GetName());
+    nextSector->GetPosition(&gameState.nextSectorPosition);
+    lastSector->GetPosition(&gameState.lastSectorPosition);
     auto sentsz = m_tcpClient->SendMsg(MessageType::BRM_GameState, &gameState);
     assert(sentsz == sizeof(MessageType) + sizeof(MsgGameState));
 
@@ -180,7 +183,10 @@ void BallrainIO::OnBallNavInactive() {
 void BallrainIO::OnCamNavActive() {}
 void BallrainIO::OnCamNavInactive() {}
 
-void BallrainIO::OnBallOff() {}
+void BallrainIO::OnBallOff() {
+    m_tcpClient->SendMsg(MessageType::BRM_BallOff);
+	m_ballNavActive = false;
+}
 
 void BallrainIO::OnPreCheckpointReached() {}
 void BallrainIO::OnPostCheckpointReached() {

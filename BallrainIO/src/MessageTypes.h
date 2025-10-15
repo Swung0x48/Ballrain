@@ -11,6 +11,7 @@ enum class MessageType : int {
 	BRM_KbdInput,
 	BRM_Tick, // Tell server to advance to next tick
 	BRM_ResetInput,
+	BRM_BallOff,
 	BRM_InvalidType
 };
 

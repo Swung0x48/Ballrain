@@ -16,6 +16,8 @@ class BallanceEnv(gym.Env):
         self._current_sector = 0
         self._last_sector_position = np.zeros(shape=(4,), dtype=np.float32)
         self._next_sector_position = np.zeros(shape=(4,), dtype=np.float32)
+        self._step = 0
+        self._should_truncate = False
 
         print("Started server. Waiting for connection...")
         self.server = TCPServer(port=27787)
@@ -38,7 +40,7 @@ class BallanceEnv(gym.Env):
         # 4 keys that player can control, and multiple keys can be pressed at once
         # Up / Down / Left / Right
         # Not necessarily useful, but put those here just in case
-        self.action_space = gym.spaces.Box(0, 1, shape=(4,), dtype=np.int8)
+        self.action_space = gym.spaces.Discrete(8)
 
         self.observation_space = gym.spaces.Dict(
             {
@@ -62,7 +64,9 @@ class BallanceEnv(gym.Env):
         }
 
     def _get_reward(self):
-        return np.linalg.norm(self._position - self._next_sector_position)
+        sector_dist = np.linalg.norm(self._last_sector_position - self._next_sector_position)
+        dist_done = np.linalg.norm(self._position - self._last_sector_position)
+        return sector_dist / dist_done
 
     def _get_info(self):
         return {}
@@ -80,13 +84,18 @@ class BallanceEnv(gym.Env):
         # IMPORTANT: Must call this first to seed the random number generator
         super().reset(seed=seed)
 
+        self._step = 0
+        self._should_truncate = False
+
         self.server.send_msg(MsgType.ResetInput)
         print('Game reset request sent...', end='')
         msg_type, _ = self.server.recv_msg()
+        lingering_msg_cnt = 0
         # This should eat up lingering states from last session
         while msg_type != MsgType.BallNavActive.value:
+            lingering_msg_cnt += 1
             msg_type, _ = self.server.recv_msg()
-        print('BallNav active regained.')
+        print(f'After eating up {lingering_msg_cnt} lingering states, BallNav active regained.')
 
         # Should get first game tick here
         # Game should send tick first then wait for input
@@ -107,6 +116,8 @@ class BallanceEnv(gym.Env):
                 self._current_sector = msgbody.current_sector
                 self._next_sector_position = msgbody.next_sector_position
                 self._last_sector_position = msgbody.last_sector_position
+            elif msgtype == MsgType.BallOff.value:
+                self._should_truncate = True
             msgtype, msgbody = self.server.recv_msg()
 
     def step(self, action):
@@ -118,9 +129,16 @@ class BallanceEnv(gym.Env):
         Returns:
             tuple: (observation, reward, terminated, truncated, info)
         """
+        self._step += 1
         # TODO: Apply input to game
-        # print("Action: ", action)
-        self.server.send_msg(MsgType.KbdInput, action.tobytes())
+        naction = np.array([
+            (action & 0b0001) >> 0,
+            (action & 0b0010) >> 1,
+            (action & 0b0100) >> 2,
+            (action & 0b1000) >> 3,
+        ], dtype=np.uint8)
+        print(f"Action: {action} {naction}", end=' ')
+        self.server.send_msg(MsgType.KbdInput, naction.tobytes())
 
         # Store previous state for reward calculation
         prev_position = self._position.copy()
@@ -133,11 +151,11 @@ class BallanceEnv(gym.Env):
         # For now, let's define terminated if the ball goes too far from origin
         terminated = False  # Terminate if too far from center
 
-        # We don't use truncation now
-        # (could add a step limit here if desired)
-        truncated = False
+        # Decide if should truncate
+        truncated = self._should_truncate
 
-        reward =self._get_reward()
+        reward = self._get_reward()
+        print(f"Reward: {reward}")
 
         observation = self._get_obs()
         info = self._get_info()
