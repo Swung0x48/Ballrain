@@ -103,6 +103,7 @@ void BallrainIO::OnProcess() {
     ball->GetQuaternion(&gameState.quaternion);
     gameState.currentSector = GetCurrentSector();
     GetNextSectorObject(gameState.currentSector)->GetPosition(&gameState.nextSectorPosition);
+    GetLastSectorObject(gameState.currentSector)->GetPosition(&gameState.lastSectorPosition);
     auto sentsz = m_tcpClient->SendMsg(MessageType::BRM_GameState, &gameState);
     assert(sentsz == sizeof(MessageType) + sizeof(MsgGameState));
 
@@ -232,6 +233,11 @@ int BallrainIO::GetCurrentSector()
 CK3dObject* BallrainIO::GetNextSectorObject(int sector)
 {
     return m_sectorObjects[sector];
+}
+
+CK3dObject* BallrainIO::GetLastSectorObject(int sector)
+{
+    return m_sectorObjects[sector - 1];
 }
 
 void BallrainIO::RestartLevel()

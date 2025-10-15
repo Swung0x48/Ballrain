@@ -102,6 +102,7 @@ private:
 
     int GetCurrentSector();
 
+    CK3dObject* GetLastSectorObject(int sector);
     CK3dObject* GetNextSectorObject(int sector);
 
     void RestartLevel();

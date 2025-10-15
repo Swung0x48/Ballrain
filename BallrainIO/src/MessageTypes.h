@@ -20,6 +20,7 @@ struct MsgGameState {
 	VxQuaternion quaternion;
 	int currentSector = 0;
 	VxVector nextSectorPosition;
+	VxVector lastSectorPosition;
 };
 
 struct MsgKbdInput {

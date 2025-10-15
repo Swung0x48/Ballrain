@@ -14,6 +14,7 @@ class BallanceEnv(gym.Env):
         self._position = np.zeros(shape=(3,), dtype=np.float32)
         self._quaternion = np.zeros(shape=(4,), dtype=np.float32)
         self._current_sector = 0
+        self._last_sector_position = np.zeros(shape=(4,), dtype=np.float32)
         self._next_sector_position = np.zeros(shape=(4,), dtype=np.float32)
 
         print("Started server. Waiting for connection...")
@@ -45,6 +46,7 @@ class BallanceEnv(gym.Env):
                 "position": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32),
                 "quaternion": gym.spaces.Box(-1., 1., shape=(4,), dtype=np.float32),
                 "current_sector": gym.spaces.Discrete(100),
+                "last_sector_position": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32),
                 "next_sector_position": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32),
             }
         )
@@ -55,8 +57,12 @@ class BallanceEnv(gym.Env):
             "position": self._position,
             "quaternion": self._quaternion,
             "current_sector": self._current_sector,
+            "last_sector_position": self._last_sector_position,
             "next_sector_position": self._next_sector_position,
         }
+
+    def _get_reward(self):
+        return np.linalg.norm(self._position - self._next_sector_position)
 
     def _get_info(self):
         return {}
@@ -100,6 +106,7 @@ class BallanceEnv(gym.Env):
                 self._quaternion = msgbody.quaternion
                 self._current_sector = msgbody.current_sector
                 self._next_sector_position = msgbody.next_sector_position
+                self._last_sector_position = msgbody.last_sector_position
             msgtype, msgbody = self.server.recv_msg()
 
     def step(self, action):
@@ -116,7 +123,7 @@ class BallanceEnv(gym.Env):
         self.server.send_msg(MsgType.KbdInput, action.tobytes())
 
         # Store previous state for reward calculation
-        prev_location = self._position.copy()
+        prev_position = self._position.copy()
 
         # TODO: Update observable state from game, check if still in valid shape
         self.fetch_tick()
@@ -130,7 +137,7 @@ class BallanceEnv(gym.Env):
         # (could add a step limit here if desired)
         truncated = False
 
-        reward = 1.
+        reward =self._get_reward()
 
         observation = self._get_obs()
         info = self._get_info()

@@ -12,7 +12,7 @@ class MsgType(Enum):
 msg_body_len = {
     MsgType.BallNavActive.value: 0,
     MsgType.BallNavInactive.value: 0,
-    MsgType.GameState.value: 48,
+    MsgType.GameState.value: 60,
     MsgType.KbdInput.value: 4,
     MsgType.Tick.value: 0,
     MsgType.ResetInput.value: 0
@@ -28,3 +28,4 @@ class MsgGameState:
         self.quaternion = np.frombuffer(bmsg_body, dtype=dt, count=4, offset=16)
         self.current_sector = int.from_bytes(bmsg_body[32:35], byteorder='little')
         self.next_sector_position = np.frombuffer(bmsg_body, dtype=dt, count=3, offset=36)
+        self.last_sector_position = np.frombuffer(bmsg_body, dtype=dt, count=3, offset=48)
