@@ -75,7 +75,7 @@ class BallanceEnv(gym.Env):
         """Execute one timestep within the environment.
 
         Args:
-            action: The action to take (0-3 for directions)
+            action: The action to take
 
         Returns:
             tuple: (observation, reward, terminated, truncated, info)
@@ -86,11 +86,12 @@ class BallanceEnv(gym.Env):
 
         # TODO: Update observable state from game, check if still in valid shape
         msgtype, msgbody = self.server.recv_msg()
-        while msgtype != MsgType.BallState.value:
+        while msgtype != MsgType.Tick.value:
+            if msgtype == MsgType.BallState.value:
+                self._ball_id = msgbody.ball_type
+                self._location = msgbody.position
+                self._quaternion = msgbody.quaternion
             msgtype, msgbody = self.server.recv_msg()
-        self._ball_id = msgbody.ball_type
-        self._location = msgbody.position
-        self._quaternion = msgbody.quaternion
 
         # Check if agent reached the target
         terminated = False

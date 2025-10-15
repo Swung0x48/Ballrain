@@ -9,6 +9,7 @@ enum class MessageType : int {
 	BRM_BallNavInactive,
 	BRM_BallState,
 	BRM_KbdInput,
+	BRM_Tick, // Tell server to advance to next tick
 	BRM_InvalidType
 };
 

@@ -72,6 +72,9 @@ void BallrainIO::OnProcess() {
     auto sentsz = m_tcpClient->SendMsg(MessageType::BRM_BallState, &ballState);
     assert(sentsz == sizeof(MessageType) + sizeof(MsgBallState));
 
+    sentsz = m_tcpClient->SendMsg(MessageType::BRM_Tick);
+    assert(sentsz == sizeof(MessageType));
+
     MessageType msgType = MessageType::BRM_InvalidType;
     while (msgType != MessageType::BRM_KbdInput)
         msgType = m_tcpClient->ReceiveMsg();
