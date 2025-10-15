@@ -62,14 +62,25 @@ class BallanceEnv(gym.Env):
         # IMPORTANT: Must call this first to seed the random number generator
         super().reset(seed=seed)
 
-        msg_type = -1
+        msg_type, _ =  self.server.recv_msg()
         while msg_type != MsgType.BallNavActive.value:
             msg_type, _ = self.server.recv_msg()
+
+        self.game_tick()
 
         observation = self._get_obs()
         info = self._get_info()
 
         return observation, info
+
+    def game_tick(self):
+        msgtype, msgbody = self.server.recv_msg()
+        while msgtype != MsgType.Tick.value:
+            if msgtype == MsgType.BallState.value:
+                self._ball_id = msgbody.ball_type
+                self._location = msgbody.position
+                self._quaternion = msgbody.quaternion
+            msgtype, msgbody = self.server.recv_msg()
 
     def step(self, action):
         """Execute one timestep within the environment.
@@ -85,13 +96,7 @@ class BallanceEnv(gym.Env):
         self.server.send_msg(MsgType.KbdInput, action.tobytes())
 
         # TODO: Update observable state from game, check if still in valid shape
-        msgtype, msgbody = self.server.recv_msg()
-        while msgtype != MsgType.Tick.value:
-            if msgtype == MsgType.BallState.value:
-                self._ball_id = msgbody.ball_type
-                self._location = msgbody.position
-                self._quaternion = msgbody.quaternion
-            msgtype, msgbody = self.server.recv_msg()
+        self.game_tick()
 
         # Check if agent reached the target
         terminated = False
