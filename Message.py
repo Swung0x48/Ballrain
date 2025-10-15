@@ -17,7 +17,7 @@ msg_body_len = {
 class MsgBallState:
     def __init__(self, bmsg_body):
         assert(len(bmsg_body) == msg_body_len[MsgType.BallState.value])
-        self.ball_type = int.from_bytes(bmsg_body, byteorder='little')
+        self.ball_type = int.from_bytes(bmsg_body[:3], byteorder='little')
         dt = np.dtype("float32")
         dt = dt.newbyteorder('<')
         self.position = np.frombuffer(bmsg_body, dtype=dt, count=3, offset=4)

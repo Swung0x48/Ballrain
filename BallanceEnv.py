@@ -10,7 +10,9 @@ from Message import MsgType
 class BallanceEnv(gym.Env):
 
     def __init__(self):
+        self._ball_id = 0
         self._location = np.zeros(shape=(3,), dtype=np.float32)
+        self._quaternion = np.zeros(shape=(4,), dtype=np.float32)
 
         print("Started server. Waiting for connection...")
         self.server = TCPServer(port=27787)
@@ -31,13 +33,17 @@ class BallanceEnv(gym.Env):
 
         self.observation_space = gym.spaces.Dict(
             {
-                "location": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32)
+                "ball_id": gym.spaces.Discrete(3),
+                "location": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32),
+                "quaternion": gym.spaces.Box(-1., 1., shape=(4,), dtype=np.float32)
             }
         )
 
     def _get_obs(self):
         return {
-            "location": self._location
+            "ball_id": self._ball_id,
+            "location": self._location,
+            "quaternion": self._quaternion
         }
 
     def _get_info(self):
@@ -58,7 +64,7 @@ class BallanceEnv(gym.Env):
 
         msg_type = -1
         while msg_type != MsgType.BallNavActive.value:
-            msg_type, byte = self.server.recv_msg()
+            msg_type, _ = self.server.recv_msg()
 
         observation = self._get_obs()
         info = self._get_info()
@@ -82,7 +88,9 @@ class BallanceEnv(gym.Env):
         msgtype, msgbody = self.server.recv_msg()
         while msgtype != MsgType.BallState.value:
             msgtype, msgbody = self.server.recv_msg()
+        self._ball_id = msgbody.ball_type
         self._location = msgbody.position
+        self._quaternion = msgbody.quaternion
 
         # Check if agent reached the target
         terminated = False
