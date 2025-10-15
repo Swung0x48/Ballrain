@@ -1,4 +1,5 @@
 #include <BML/IMod.h>
+#include <BML/ScriptHelper.h>
 #include <memory>
 
 #include "TCPClient.h"
@@ -103,9 +104,14 @@ private:
 
     CK3dObject* GetNextSectorObject(int sector);
 
+    void RestartLevel();
+
     std::unique_ptr<InputSystem> m_inputSystem;
     std::unique_ptr<TimeSystem> m_timeSystem;
     std::unique_ptr<TCPClient> m_tcpClient;
+
+    CKBehavior* m_escBeh = nullptr;
+    CKBehavior* m_restartBeh = nullptr;
 
     CKDataArray* m_currentLevelArray = nullptr;
     CKDataArray* m_inGameParameterArray = nullptr;

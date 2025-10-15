@@ -7,7 +7,7 @@ import BallanceEnv
 
 env = gym.make("ballance_env/Ballance-v0")
 obs, info = env.reset()
-print(obs)
+print(f'reset obs: {obs}')
 
 for i in range(1000000):
     action = env.action_space.sample()

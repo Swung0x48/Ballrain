@@ -7,13 +7,15 @@ class MsgType(Enum):
     GameState = 2
     KbdInput = 3
     Tick = 4
+    ResetInput = 5
 
 msg_body_len = {
     MsgType.BallNavActive.value: 0,
     MsgType.BallNavInactive.value: 0,
     MsgType.GameState.value: 48,
     MsgType.KbdInput.value: 4,
-    MsgType.Tick.value: 0
+    MsgType.Tick.value: 0,
+    MsgType.ResetInput.value: 0
 }
 
 class MsgGameState:

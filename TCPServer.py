@@ -54,7 +54,7 @@ class TCPServer:
         else:
             return None
 
-    def send_msg(self, msg_type: MsgType, msg_body):
+    def send_msg(self, msg_type: MsgType, msg_body=None):
         bmsg_type = msg_type.value.to_bytes(4, byteorder='little')
         self.send(bmsg_type)
         if msg_body is not None:

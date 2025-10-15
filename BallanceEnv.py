@@ -28,6 +28,12 @@ class BallanceEnv(gym.Env):
         else:
             raise Exception("Not a valid client!")
 
+        print('Waiting for client to be controllable...')
+        msg_type, _ = self.server.recv_msg()
+        while msg_type != MsgType.BallNavActive.value:
+            msg_type, _ = self.server.recv_msg()
+        print('Client control taken. Env created.')
+
         # 4 keys that player can control, and multiple keys can be pressed at once
         # Up / Down / Left / Right
         # Not necessarily useful, but put those here just in case
@@ -68,18 +74,24 @@ class BallanceEnv(gym.Env):
         # IMPORTANT: Must call this first to seed the random number generator
         super().reset(seed=seed)
 
-        msg_type, _ =  self.server.recv_msg()
+        self.server.send_msg(MsgType.ResetInput)
+        print('Game reset request sent...', end='')
+        msg_type, _ = self.server.recv_msg()
+        # This should eat up lingering states from last session
         while msg_type != MsgType.BallNavActive.value:
             msg_type, _ = self.server.recv_msg()
+        print('BallNav active regained.')
 
-        self.game_tick()
+        # Should get first game tick here
+        # Game should send tick first then wait for input
+        self.fetch_tick()
 
         observation = self._get_obs()
         info = self._get_info()
 
         return observation, info
 
-    def game_tick(self):
+    def fetch_tick(self):
         msgtype, msgbody = self.server.recv_msg()
         while msgtype != MsgType.Tick.value:
             if msgtype == MsgType.GameState.value:
@@ -107,7 +119,7 @@ class BallanceEnv(gym.Env):
         prev_location = self._position.copy()
 
         # TODO: Update observable state from game, check if still in valid shape
-        self.game_tick()
+        self.fetch_tick()
 
         # Check if agent reached the target or failed
         # In a ball balancing game, we might consider falling off as terminated

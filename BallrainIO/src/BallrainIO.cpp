@@ -77,7 +77,20 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
     }
 }
 
-void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {}
+void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {
+    if (strcmp(script->GetName(), "Gameplay_Events") == 0) {
+        m_escBeh = ScriptHelper::FindFirstBB(script, "Key Event");
+    }
+    else if (strcmp(script->GetName(), "Menu_Pause") == 0) {
+        m_restartBeh = ScriptHelper::FindFirstBB(script, "Restart Level");
+    }
+    /*else if (strcmp(script->GetName(), "Gameplay_Ingame") == 0) {
+        CKBehavior* ballMgr = ScriptHelper::FindFirstBB(script, "BallManager");
+        CKBehavior* newBall = ScriptHelper::FindFirstBB(ballMgr, "New Ball");
+        dynamic_pos = ScriptHelper::FindNextBB(script, ballMgr, "TT Set Dynamic Position");
+        phy_new_ball = ScriptHelper::FindFirstBB(newBall, "physicalize new Ball");
+    }*/
+}
 
 void BallrainIO::OnProcess() {
     if (!m_ballNavActive)
@@ -96,10 +109,14 @@ void BallrainIO::OnProcess() {
     sentsz = m_tcpClient->SendMsg(MessageType::BRM_Tick);
     assert(sentsz == sizeof(MessageType));
 
-    MessageType msgType = MessageType::BRM_InvalidType;
-    while (msgType != MessageType::BRM_KbdInput)
-        msgType = m_tcpClient->ReceiveMsg();
-    m_inputSystem->Process(m_tcpClient->GetMessageFromBuf<MsgKbdInput>()->keyState);
+    MessageType msgType = m_tcpClient->ReceiveMsg();
+    if (msgType == MessageType::BRM_ResetInput) {
+        RestartLevel();
+        return;
+    }
+    else if (msgType == MessageType::BRM_KbdInput) {
+        m_inputSystem->Process(m_tcpClient->GetMessageFromBuf<MsgKbdInput>()->keyState);
+    }
 }
 
 void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {}
@@ -215,6 +232,27 @@ int BallrainIO::GetCurrentSector()
 CK3dObject* BallrainIO::GetNextSectorObject(int sector)
 {
     return m_sectorObjects[sector];
+}
+
+void BallrainIO::RestartLevel()
+{
+    if (!m_BML->IsIngame())
+        return;
+
+    m_ballNavActive = false;
+    m_escBeh->GetOutput(0)->Activate();
+    m_BML->AddTimer(CKDWORD(3), [this]() {
+        // std::thread([this] {
+        CKMessageManager* mm = m_BML->GetMessageManager();
+        // std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+        CKMessageType reset_level_msg = mm->AddMessageType("Reset Level");
+        mm->SendMessageSingle(reset_level_msg, static_cast<CKBeObject*>(m_BML->GetCKContext()->GetObjectByNameAndParentClass("Level", CKCID_BEOBJECT, nullptr)));
+        mm->SendMessageSingle(reset_level_msg, static_cast<CKBeObject*>(m_BML->GetCKContext()->GetObjectByNameAndParentClass("All_Balls", CKCID_BEOBJECT, nullptr)));
+
+        auto* output = m_restartBeh->GetOutput(0);
+        output->Activate();
+    });
 }
 
 void BallrainIO::InitBallInfo()
