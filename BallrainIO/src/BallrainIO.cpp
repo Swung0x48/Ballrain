@@ -64,9 +64,19 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
         fourFlamesObj->GetPosition(&pos);
         m_sectorPositions.emplace_back(pos);
 
-        char name[256];
-        for (int i = 1; i < 100; ++i) {
-            snprintf(name, 256, "PC_TwoFlames_%02d", i);
+        char name[64];
+		int sectorCount = 1;
+		for (; sectorCount <= 999; ++sectorCount) { // ExtraSector mod allows loading up to 999 sectors
+			// checks if the next sector exists
+			int sector = sectorCount + 1; // assume we have at least 1 sector (map fails to load otherwise)
+			snprintf(name, sizeof(name), "Sector_%02d", sector);
+			if (m_BML->GetGroupByName(sector == 9 ? "Sector_9" : name) == nullptr) // see pull request #1
+				break;
+		}
+
+        for (int i = 1; i <= sectorCount - 1; ++i) {
+			// we could write `i < sectorCount` here but it's better to be explicit
+            snprintf(name, sizeof(name), "PC_TwoFlames_%02d", i);
             auto* twoFlamesObj = m_BML->Get3dObjectByName(name);
             if (twoFlamesObj == nullptr)
                 break;
@@ -74,6 +84,11 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
             twoFlamesObj->GetPosition(&pos);
 			m_sectorPositions.emplace_back(pos);
         }
+		// NOTE: if we break before finding all sector's corresponding checkpoints
+		//     it means the map can't be completed although it will load fine
+		//     commonly seen with unfinished custom maps
+		// TODO: display some warning about unable to finish here, instead of crashing
+		assert(m_sectorPositions.size() == sectorCount);
 
         auto* balloonObj = m_BML->Get3dObjectByName("PE_Balloon_01");
         balloonObj->GetPosition(&pos);
