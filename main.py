@@ -9,6 +9,30 @@ env = gym.make("ballance_env/Ballance-v0")
 obs, info = env.reset()
 print(f'reset obs: {obs}')
 
+# Define the PPO model with custom parameters
+model = PPO(
+    "MultiInputPolicy",  # Using MultiInputPolicy since observation space is a Dict
+    env,
+    policy_kwargs=dict(
+        net_arch=[dict(pi=[64, 64], vf=[64, 64])]  # Define policy and value networks
+    ),
+    n_steps=2048,  # Number of steps to run for each environment per update
+    batch_size=64,  # Minibatch size
+    n_epochs=10,  # Number of epoch when optimizing the surrogate loss
+    gamma=0.99,  # Discount factor
+    gae_lambda=0.95,  # Factor for trade-off of bias vs variance for Generalized Advantage Estimator
+    clip_range=0.2,  # Clipping parameter
+    verbose=1  # Print out information
+)
+
+# Train the model
+print("Starting training...")
+model.learn(total_timesteps=50000)  # Train for 50000 timesteps
+
+# Save the trained model
+model.save("ballance_ppo_model")
+print("Model saved as 'ballance_ppo_model'")
+
 for i in range(1000000):
     action = env.action_space.sample()
     obs, reward, terminated, truncated, info = env.step(action)
