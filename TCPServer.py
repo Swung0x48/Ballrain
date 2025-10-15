@@ -1,5 +1,6 @@
 import socket
-from Message import MsgType
+from Message import MsgType, MsgBallState
+from Message import msg_body_len
 
 class TCPServer:
     def __init__(self, host='127.0.0.1', port=27787):
@@ -9,6 +10,9 @@ class TCPServer:
         self.port = port
         self.socket = None
         self.running = False
+        self.msg_size = {
+
+        }
 
     def start(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -40,8 +44,15 @@ class TCPServer:
     def recv_msg(self):
         btype = self.recv(4)
         msg_type = int.from_bytes(btype, byteorder='little')
-        msg_body = None
+        msg_body = self._recv_msg_body(msg_type)
         return msg_type, msg_body
+
+    def _recv_msg_body(self, msg_type):
+        if msg_body_len[msg_type] > 0:
+            bmsg_body = self.recv(msg_body_len[msg_type])
+            return MsgBallState(bmsg_body)
+        else:
+            return None
 
     def send_msg(self, msg_type: MsgType, msg_body):
         bmsg_type = msg_type.value.to_bytes(4, byteorder='little')

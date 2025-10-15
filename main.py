@@ -6,10 +6,10 @@ import BallanceEnv
 
 env = gym.make("ballance_env/Ballance-v0")
 obs, info = env.reset()
+print(obs['location'])
 
 for i in range(10000000):
-    # print(obs['location'])
     action = env.action_space.sample()
     obs, reward, terminated, truncated, info = env.step(action)
-    # print(obs['location'])
+    print(obs['location'])
 

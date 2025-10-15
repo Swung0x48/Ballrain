@@ -92,8 +92,13 @@ public:
     virtual void OnPreLifeUp() override;
     virtual void OnPostLifeUp() override;
 
-    CK3dObject* GetCurrentBall();
 private:
+    void InitBallInfo();
+
+    CK3dObject* GetCurrentBall();
+
+    int GetBallID(CK3dObject* ball);
+
     std::unique_ptr<InputSystem> m_inputSystem;
     std::unique_ptr<TimeSystem> m_timeSystem;
     std::unique_ptr<TCPClient> m_tcpClient;
@@ -102,6 +107,9 @@ private:
     CKDataArray* m_inGameParameterArray = nullptr;
 
     bool m_ballNavActive = false;
+
+    //std::vector<CK3dObject*> m_balls;
+    std::vector<std::string> m_ballNames;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }

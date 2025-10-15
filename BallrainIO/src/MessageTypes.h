@@ -15,7 +15,7 @@ enum class MessageType : int {
 struct MsgBallState {
 	int ballType = 0;
 	VxVector position;
-	VxQuaternion rotation;
+	VxQuaternion quaternion;
 };
 
 struct MsgKbdInput {

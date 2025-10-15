@@ -10,6 +10,8 @@ from Message import MsgType
 class BallanceEnv(gym.Env):
 
     def __init__(self):
+        self._location = np.zeros(shape=(3,), dtype=np.float32)
+
         print("Started server. Waiting for connection...")
         self.server = TCPServer(port=27787)
         self.server.start()
@@ -35,7 +37,7 @@ class BallanceEnv(gym.Env):
 
     def _get_obs(self):
         return {
-            "location": np.array([random.randint(10,20), 2., 3.], dtype=np.float32)
+            "location": self._location
         }
 
     def _get_info(self):
@@ -77,6 +79,10 @@ class BallanceEnv(gym.Env):
         self.server.send_msg(MsgType.KbdInput, action.tobytes())
 
         # TODO: Update observable state from game, check if still in valid shape
+        msgtype, msgbody = self.server.recv_msg()
+        while msgtype != MsgType.BallState.value:
+            msgtype, msgbody = self.server.recv_msg()
+        self._location = msgbody.position
 
         # Check if agent reached the target
         terminated = False

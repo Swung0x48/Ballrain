@@ -1,5 +1,6 @@
 #include "BallrainIO.h"
 #include "TASHook.h"
+#include <format>
 
 void BallrainIO::OnLoad() {
     GetLogger()->Info("Hello from BallrainIO!");
@@ -53,6 +54,8 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
     if (strcmp(filename, "3D Entities\\Gameplay.nmo") == 0) {
         m_currentLevelArray = m_BML->GetArrayByName("CurrentLevel");
         m_inGameParameterArray = m_BML->GetArrayByName("IngameParameter");
+    } else if (strcmp(filename, "3D Entities\\Balls.nmo") == 0) {
+        InitBallInfo();
     }
 }
 void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {}
@@ -61,8 +64,14 @@ void BallrainIO::OnProcess() {
     if (!m_ballNavActive)
         return;
 
-    ////m_timeSystem->Process();
-    
+    auto* ball = GetCurrentBall();
+    MsgBallState ballState;
+    ballState.ballType = GetBallID(ball);
+    ball->GetPosition(&ballState.position);
+    ball->GetQuaternion(&ballState.quaternion);
+    auto sentsz = m_tcpClient->SendMsg(MessageType::BRM_BallState, &ballState);
+    assert(sentsz == sizeof(MessageType) + sizeof(MsgBallState));
+
     MessageType msgType = MessageType::BRM_InvalidType;
     while (msgType != MessageType::BRM_KbdInput)
         msgType = m_tcpClient->ReceiveMsg();
@@ -151,4 +160,59 @@ CK3dObject* BallrainIO::GetCurrentBall()
     if (!m_currentLevelArray)
         return nullptr;
     return static_cast<CK3dObject*>(m_currentLevelArray->GetElementObject(0, 1));
+}
+
+int BallrainIO::GetBallID(CK3dObject* ball)
+{
+    for (int i = 0; i < m_ballNames.size(); ++i) {
+        if (m_ballNames[i] == ball->GetName()) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void BallrainIO::InitBallInfo()
+{
+    auto* phBallArray = m_BML->GetArrayByName("Physicalize_GameBall");
+    
+    auto ballTypeCount = phBallArray->GetRowCount();
+    m_ballNames.resize(0);
+    m_ballNames.reserve(ballTypeCount);
+    for (int i = 0; i < ballTypeCount; ++i) {
+        std::string ballName;
+        ballName.resize(phBallArray->GetElementStringValue(i, 0, nullptr), '\0');
+        phBallArray->GetElementStringValue(i, 0, ballName.data());
+        ballName.pop_back();
+        m_ballNames.emplace_back(ballName);
+
+        //CK3dObject* ball;
+        //ball = m_BML->Get3dObjectByName(ballName.data());
+        /*CKDependencies dep;
+        dep.Resize(40); dep.Fill(0);
+        dep.m_Flags = CK_DEPENDENCIES_CUSTOM;
+        dep[CKCID_OBJECT] = CK_DEPENDENCIES_COPY_OBJECT_NAME | CK_DEPENDENCIES_COPY_OBJECT_UNIQUENAME;
+        dep[CKCID_MESH] = CK_DEPENDENCIES_COPY_MESH_MATERIAL;
+        dep[CKCID_3DENTITY] = CK_DEPENDENCIES_COPY_3DENTITY_MESH;
+        ball = static_cast<CK3dObject*>(m_BML->GetCKContext()->CopyObject(ball, &dep, "_Peer_"));
+        if (!ball) {
+            m_BML->SendIngameMessage(std::format("Failed to init ball: {}", i).c_str());
+            continue;
+        }
+        assert(ball->GetMeshCount() == 1);
+        for (int j = 0; j < ball->GetMeshCount(); j++) {
+            CKMesh* mesh = ball->GetMesh(j);
+            assert(mesh->GetMaterialCount() >= 1);
+            for (int k = 0; k < mesh->GetMaterialCount(); k++) {
+                CKMaterial* mat = mesh->GetMaterial(k);
+                mat->EnableAlphaBlend();
+                mat->SetSourceBlend(VXBLEND_SRCALPHA);
+                mat->SetDestBlend(VXBLEND_INVSRCALPHA);
+                VxColor color = mat->GetDiffuse();
+                mat->SetDiffuse(color);
+                m_BML->SetIC(mat);
+            }
+        }
+        m_balls.emplace_back(ball);*/
+    }
 }
