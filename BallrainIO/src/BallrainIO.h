@@ -99,12 +99,18 @@ private:
 
     int GetBallID(CK3dObject* ball);
 
+    int GetCurrentSector();
+
+    CK3dObject* GetNextSectorObject(int sector);
+
     std::unique_ptr<InputSystem> m_inputSystem;
     std::unique_ptr<TimeSystem> m_timeSystem;
     std::unique_ptr<TCPClient> m_tcpClient;
 
     CKDataArray* m_currentLevelArray = nullptr;
     CKDataArray* m_inGameParameterArray = nullptr;
+
+    std::vector<CK3dObject*> m_sectorObjects;
 
     bool m_ballNavActive = false;
 

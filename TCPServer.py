@@ -1,5 +1,5 @@
 import socket
-from Message import MsgType, MsgBallState
+from Message import MsgType, MsgGameState
 from Message import msg_body_len
 
 class TCPServer:
@@ -50,7 +50,7 @@ class TCPServer:
     def _recv_msg_body(self, msg_type):
         if msg_body_len[msg_type] > 0:
             bmsg_body = self.recv(msg_body_len[msg_type])
-            return MsgBallState(bmsg_body)
+            return MsgGameState(bmsg_body)
         else:
             return None
 

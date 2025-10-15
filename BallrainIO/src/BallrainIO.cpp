@@ -56,8 +56,27 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
         m_inGameParameterArray = m_BML->GetArrayByName("IngameParameter");
     } else if (strcmp(filename, "3D Entities\\Balls.nmo") == 0) {
         InitBallInfo();
+    } else if (isMap) {
+        m_sectorObjects.clear();
+
+        auto* fourFlamesObj = m_BML->Get3dObjectByName("PS_FourFlames_01");
+        m_sectorObjects.emplace_back(fourFlamesObj);
+
+        char name[256];
+        for (int i = 1; i < 100; ++i) {
+            snprintf(name, 256, "PC_TwoFlames_%02d", i);
+            auto* twoFlamesObj = m_BML->Get3dObjectByName(name);
+            if (twoFlamesObj == nullptr)
+                break;
+
+            m_sectorObjects.emplace_back(twoFlamesObj);
+        }
+
+        auto* balloonObj = m_BML->Get3dObjectByName("PE_Balloon_01");
+        m_sectorObjects.emplace_back(balloonObj);
     }
 }
+
 void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {}
 
 void BallrainIO::OnProcess() {
@@ -65,12 +84,14 @@ void BallrainIO::OnProcess() {
         return;
 
     auto* ball = GetCurrentBall();
-    MsgBallState ballState;
-    ballState.ballType = GetBallID(ball);
-    ball->GetPosition(&ballState.position);
-    ball->GetQuaternion(&ballState.quaternion);
-    auto sentsz = m_tcpClient->SendMsg(MessageType::BRM_BallState, &ballState);
-    assert(sentsz == sizeof(MessageType) + sizeof(MsgBallState));
+    MsgGameState gameState;
+    gameState.ballType = GetBallID(ball);
+    ball->GetPosition(&gameState.position);
+    ball->GetQuaternion(&gameState.quaternion);
+    gameState.currentSector = GetCurrentSector();
+    GetNextSectorObject(gameState.currentSector)->GetPosition(&gameState.nextSectorPosition);
+    auto sentsz = m_tcpClient->SendMsg(MessageType::BRM_GameState, &gameState);
+    assert(sentsz == sizeof(MessageType) + sizeof(MsgGameState));
 
     sentsz = m_tcpClient->SendMsg(MessageType::BRM_Tick);
     assert(sentsz == sizeof(MessageType));
@@ -144,7 +165,9 @@ void BallrainIO::OnCamNavInactive() {}
 void BallrainIO::OnBallOff() {}
 
 void BallrainIO::OnPreCheckpointReached() {}
-void BallrainIO::OnPostCheckpointReached() {}
+void BallrainIO::OnPostCheckpointReached() {
+    
+}
 
 void BallrainIO::OnLevelFinish() {}
 
@@ -167,6 +190,9 @@ CK3dObject* BallrainIO::GetCurrentBall()
 
 int BallrainIO::GetBallID(CK3dObject* ball)
 {
+    if (ball == nullptr)
+        return -1;
+
     for (int i = 0; i < m_ballNames.size(); ++i) {
         if (m_ballNames[i] == ball->GetName()) {
             return i;
@@ -175,12 +201,28 @@ int BallrainIO::GetBallID(CK3dObject* ball)
     return -1;
 }
 
+int BallrainIO::GetCurrentSector()
+{
+    // Get sector index (1-indexed)
+    int sector = -1;
+    if (!m_inGameParameterArray)
+        return sector;
+
+    m_inGameParameterArray->GetElementValue(0, 1, &sector);
+    return sector;
+}
+
+CK3dObject* BallrainIO::GetNextSectorObject(int sector)
+{
+    return m_sectorObjects[sector];
+}
+
 void BallrainIO::InitBallInfo()
 {
     auto* phBallArray = m_BML->GetArrayByName("Physicalize_GameBall");
     
     auto ballTypeCount = phBallArray->GetRowCount();
-    m_ballNames.resize(0);
+    m_ballNames.clear();
     m_ballNames.reserve(ballTypeCount);
     for (int i = 0; i < ballTypeCount; ++i) {
         std::string ballName;

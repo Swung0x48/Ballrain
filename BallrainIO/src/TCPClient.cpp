@@ -101,9 +101,9 @@ int TCPClient::SendMsg(MessageType type, const void* data)
 {
     auto sz = Send(&type, sizeof(type));
     switch (type) {
-        case MessageType::BRM_BallState: {
+        case MessageType::BRM_GameState: {
             assert(data != nullptr);
-            auto datasz = Send(data, sizeof(MsgBallState));
+            auto datasz = Send(data, sizeof(MsgGameState));
             if (datasz < 0)
                 return datasz;
             else

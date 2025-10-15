@@ -11,8 +11,10 @@ class BallanceEnv(gym.Env):
 
     def __init__(self):
         self._ball_id = 0
-        self._location = np.zeros(shape=(3,), dtype=np.float32)
+        self._position = np.zeros(shape=(3,), dtype=np.float32)
         self._quaternion = np.zeros(shape=(4,), dtype=np.float32)
+        self._current_sector = 0
+        self._next_sector_position = np.zeros(shape=(4,), dtype=np.float32)
 
         print("Started server. Waiting for connection...")
         self.server = TCPServer(port=27787)
@@ -34,16 +36,20 @@ class BallanceEnv(gym.Env):
         self.observation_space = gym.spaces.Dict(
             {
                 "ball_id": gym.spaces.Discrete(3),
-                "location": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32),
-                "quaternion": gym.spaces.Box(-1., 1., shape=(4,), dtype=np.float32)
+                "position": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32),
+                "quaternion": gym.spaces.Box(-1., 1., shape=(4,), dtype=np.float32),
+                "current_sector": gym.spaces.Discrete(100),
+                "next_sector_position": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32),
             }
         )
 
     def _get_obs(self):
         return {
             "ball_id": self._ball_id,
-            "location": self._location,
-            "quaternion": self._quaternion
+            "position": self._position,
+            "quaternion": self._quaternion,
+            "current_sector": self._current_sector,
+            "next_sector_position": self._next_sector_position,
         }
 
     def _get_info(self):
@@ -76,10 +82,12 @@ class BallanceEnv(gym.Env):
     def game_tick(self):
         msgtype, msgbody = self.server.recv_msg()
         while msgtype != MsgType.Tick.value:
-            if msgtype == MsgType.BallState.value:
+            if msgtype == MsgType.GameState.value:
                 self._ball_id = msgbody.ball_type
-                self._location = msgbody.position
+                self._position = msgbody.position
                 self._quaternion = msgbody.quaternion
+                self._current_sector = msgbody.current_sector
+                self._next_sector_position = msgbody.next_sector_position
             msgtype, msgbody = self.server.recv_msg()
 
     def step(self, action):
@@ -92,22 +100,25 @@ class BallanceEnv(gym.Env):
             tuple: (observation, reward, terminated, truncated, info)
         """
         # TODO: Apply input to game
-        print("Action: ", action)
+        # print("Action: ", action)
         self.server.send_msg(MsgType.KbdInput, action.tobytes())
+
+        # Store previous state for reward calculation
+        prev_location = self._position.copy()
 
         # TODO: Update observable state from game, check if still in valid shape
         self.game_tick()
 
-        # Check if agent reached the target
-        terminated = False
+        # Check if agent reached the target or failed
+        # In a ball balancing game, we might consider falling off as terminated
+        # For now, let's define terminated if the ball goes too far from origin
+        terminated = False  # Terminate if too far from center
 
         # We don't use truncation now
         # (could add a step limit here if desired)
         truncated = False
 
-        # Simple reward structure: +1 for reaching target, 0 otherwise
-        # Alternative: could give small negative rewards for each step to encourage efficiency
-        reward = 1 if terminated else 0
+        reward = 1.
 
         observation = self._get_obs()
         info = self._get_info()

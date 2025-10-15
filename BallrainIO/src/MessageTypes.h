@@ -7,16 +7,18 @@
 enum class MessageType : int {
 	BRM_BallNavActive,
 	BRM_BallNavInactive,
-	BRM_BallState,
+	BRM_GameState,
 	BRM_KbdInput,
 	BRM_Tick, // Tell server to advance to next tick
 	BRM_InvalidType
 };
 
-struct MsgBallState {
+struct MsgGameState {
 	int ballType = 0;
 	VxVector position;
 	VxQuaternion quaternion;
+	int currentSector = 0;
+	VxVector nextSectorPosition;
 };
 
 struct MsgKbdInput {
