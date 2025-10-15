@@ -57,10 +57,12 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
     } else if (strcmp(filename, "3D Entities\\Balls.nmo") == 0) {
         InitBallInfo();
     } else if (isMap) {
-        m_sectorObjects.clear();
+        m_sectorPositions.clear();
 
+        VxVector pos;
         auto* fourFlamesObj = m_BML->Get3dObjectByName("PS_FourFlames_01");
-        m_sectorObjects.emplace_back(fourFlamesObj);
+        fourFlamesObj->GetPosition(&pos);
+        m_sectorPositions.emplace_back(pos);
 
         char name[256];
         for (int i = 1; i < 100; ++i) {
@@ -69,11 +71,13 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
             if (twoFlamesObj == nullptr)
                 break;
 
-            m_sectorObjects.emplace_back(twoFlamesObj);
+            twoFlamesObj->GetPosition(&pos);
+			m_sectorPositions.emplace_back(pos);
         }
 
         auto* balloonObj = m_BML->Get3dObjectByName("PE_Balloon_01");
-        m_sectorObjects.emplace_back(balloonObj);
+        balloonObj->GetPosition(&pos);
+        m_sectorPositions.emplace_back(pos);
     }
 }
 
@@ -102,11 +106,11 @@ void BallrainIO::OnProcess() {
     ball->GetPosition(&gameState.position);
     ball->GetQuaternion(&gameState.quaternion);
     gameState.currentSector = GetCurrentSector();
-    auto* nextSector = GetNextSectorObject(gameState.currentSector);
-    auto* lastSector = GetLastSectorObject(gameState.currentSector);
-    GetLogger()->Info("next: %d, last: %d", nextSector->GetName(), lastSector->GetName());
-    nextSector->GetPosition(&gameState.nextSectorPosition);
-    lastSector->GetPosition(&gameState.lastSectorPosition);
+    gameState.nextSectorPosition = GetNextSectorPosition(gameState.currentSector);
+    gameState.lastSectorPosition = GetLastSectorPosition(gameState.currentSector);
+    //GetLogger()->Info("next: %d, last: %d", nextSector->GetName(), lastSector->GetName());
+    //nextSector->GetPosition(&gameState.nextSectorPosition);
+    //lastSector->GetPosition(&gameState.lastSectorPosition);
     auto sentsz = m_tcpClient->SendMsg(MessageType::BRM_GameState, &gameState);
     assert(sentsz == sizeof(MessageType) + sizeof(MsgGameState));
 
@@ -236,14 +240,14 @@ int BallrainIO::GetCurrentSector()
     return sector;
 }
 
-CK3dObject* BallrainIO::GetNextSectorObject(int sector)
+VxVector BallrainIO::GetNextSectorPosition(int sector)
 {
-    return m_sectorObjects[sector];
+    return m_sectorPositions[sector];
 }
 
-CK3dObject* BallrainIO::GetLastSectorObject(int sector)
+VxVector BallrainIO::GetLastSectorPosition(int sector)
 {
-    return m_sectorObjects[sector - 1];
+    return m_sectorPositions[sector - 1];
 }
 
 void BallrainIO::RestartLevel()

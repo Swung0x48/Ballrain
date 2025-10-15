@@ -102,8 +102,8 @@ private:
 
     int GetCurrentSector();
 
-    CK3dObject* GetLastSectorObject(int sector);
-    CK3dObject* GetNextSectorObject(int sector);
+    VxVector GetLastSectorPosition(int sector);
+    VxVector GetNextSectorPosition(int sector);
 
     void RestartLevel();
 
@@ -117,7 +117,7 @@ private:
     CKDataArray* m_currentLevelArray = nullptr;
     CKDataArray* m_inGameParameterArray = nullptr;
 
-    std::vector<CK3dObject*> m_sectorObjects;
+    std::vector<VxVector> m_sectorPositions;
 
     bool m_ballNavActive = false;
 
