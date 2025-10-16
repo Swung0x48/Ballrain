@@ -5,7 +5,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback
 import BallanceEnv
 
-seq = 1
+seq = 7
 
 env = gym.make("ballance_env/Ballance-v0", max_episode_steps=-1)
 obs, info = env.reset()
@@ -30,17 +30,20 @@ print(f'reset obs: {obs}')
 model = None
 try:
     model = DQN.load('ballance_dqn_model' + str(seq), env=env)
+    print('model loaded')
 except FileNotFoundError:
     model = DQN(
         "MultiInputPolicy",
         env,
-        learning_rate=1e-4,
-        learning_starts=10,
+        learning_rate=1e-5,
+        learning_starts=500,
+        device='cuda',
         verbose=1)
+    print('new model')
 
 # Train the model
 print("Starting training...")
-model.learn(total_timesteps=10000000)
+model.learn(total_timesteps=20000)
 
 # Save the trained model
 model.save("ballance_dqn_model" + str(seq+1))

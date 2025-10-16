@@ -4,7 +4,7 @@
 
 void BallrainIO::OnLoad() {
     GetLogger()->Info("Hello from BallrainIO!");
-    m_BML->SendIngameMessage("\x1b[32mHello BML+!\x1b[0m");
+    m_BML->SendIngameMessage("\x1b[32mLoaded Ballrain!\x1b[0m");
     m_BML->AddTimer(1000ul, [](){});
 
     m_inputSystem = std::make_unique<InputSystem>(m_BML->GetInputManager());
