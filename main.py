@@ -25,22 +25,27 @@ print(f'reset obs: {obs}')
 #     verbose=1  # Print out information
 # )
 
-model = DQN(
-    "MultiInputPolicy",
-    env,
-    learning_rate=1e-5,
-    verbose=1)
+model = None
+try:
+    model = DQN.load('ballance_dqn_model')
+except FileNotFoundError:
+    model = DQN(
+        "MultiInputPolicy",
+        env,
+        learning_rate=1e-5,
+        learning_starts=10,
+        verbose=1)
 
 # Train the model
 print("Starting training...")
-model.learn(total_timesteps=50000)
+model.learn(total_timesteps=1000000)
 
 # Save the trained model
-model.save("ballance_ppo_model")
-print("Model saved as 'ballance_ppo_model'")
+model.save("ballance_dqn_model")
+print("Model saved as 'ballance_dqn_model'")
 
-for i in range(1000000):
-    action = env.action_space.sample()
-    obs, reward, terminated, truncated, info = env.step(action)
-    if i % 5000 == 0:
-        print(obs)
+# for i in range(1000000):
+#     action = env.action_space.sample()
+#     obs, reward, terminated, truncated, info = env.step(action)
+#     if i % 5000 == 0:
+#         print(obs)
