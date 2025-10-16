@@ -27,7 +27,7 @@ print(f'reset obs: {obs}')
 
 model = None
 try:
-    model = DQN.load('ballance_dqn_model')
+    model = DQN.load('ballance_dqn_model', env=env)
 except FileNotFoundError:
     model = DQN(
         "MultiInputPolicy",
@@ -38,7 +38,7 @@ except FileNotFoundError:
 
 # Train the model
 print("Starting training...")
-model.learn(total_timesteps=1000000)
+model.learn(total_timesteps=100000)
 
 # Save the trained model
 model.save("ballance_dqn_model")
