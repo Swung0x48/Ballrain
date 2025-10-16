@@ -1,6 +1,9 @@
 #include <BML/IMod.h>
 #include <BML/ScriptHelper.h>
+#include <VxMath.h>
 #include <memory>
+#include <vector>
+#include <array>
 
 #include "TCPClient.h"
 #include "InputSystem.h"
@@ -123,6 +126,8 @@ private:
 
     //std::vector<CK3dObject*> m_balls;
     std::vector<std::string> m_ballNames;
+
+    std::vector<VxBbox> m_floorBoxes;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }

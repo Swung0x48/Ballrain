@@ -19,6 +19,7 @@ class BallanceEnv(gym.Env):
         self._next_sector_position = np.zeros(shape=(4,), dtype=np.float32)
         self._step = 0
         self._should_truncate = False
+        self._floor_boxes = []
 
         print("Started server. Waiting for connection...")
         self.server = TCPServer(port=27787)
@@ -67,10 +68,12 @@ class BallanceEnv(gym.Env):
     def _get_reward(self):
         sector_dist = np.linalg.norm(self._last_sector_position - self._next_sector_position)
         dist_done = np.linalg.norm(self._position - self._last_sector_position)
-        # dist_ahead = np.linalg.norm(self._position - self._next_sector_position)
+        dist_ahead = np.linalg.norm(self._position - self._next_sector_position)
         last_dist_done = np.linalg.norm(self._last_position - self._last_sector_position)
-        return ((dist_done - sector_dist) / sector_dist * 10.
-                + (dist_done - last_dist_done) / sector_dist * 100.
+        return ((dist_done - sector_dist) / sector_dist * 100.
+                - dist_ahead / sector_dist * 150.
+                - (100. if (self._naction[0] == self._naction[1] and self._naction[2] == self._naction[3]) else 0)
+                + (last_dist_done - dist_done) / sector_dist * self._step
                 + self._naction[0] * 10.
                 + ((self._position[1] + 10.) / 10.) * 20.
                 - (20. if self._should_truncate else 0))
@@ -96,13 +99,18 @@ class BallanceEnv(gym.Env):
 
         self.server.send_msg(MsgType.ResetInput)
         print('Game reset request sent...', end='')
-        msg_type, _ = self.server.recv_msg()
+        msg_type, msg_body = self.server.recv_msg()
         lingering_msg_cnt = 0
         # This should eat up lingering states from last session
         while msg_type != MsgType.BallNavActive.value:
-            lingering_msg_cnt += 1
-            msg_type, _ = self.server.recv_msg()
+            if msg_type == MsgType.SceneRep.value:
+                self._floor_boxes = msg_body.floor_boxes.copy()
+            else:
+                lingering_msg_cnt += 1
+            msg_type, msg_body = self.server.recv_msg()
         print(f'After eating up {lingering_msg_cnt} lingering states, BallNav active regained.')
+
+        print(f'scene rep: {self._floor_boxes}')
 
         # Should get first game tick here
         # Game should send tick first then wait for input

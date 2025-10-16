@@ -110,6 +110,22 @@ int TCPClient::SendMsg(MessageType type, const void* data)
                 sz += datasz;
             break;
         }
+        case MessageType::BRM_MsgSceneRep: {
+            auto* msg = (MsgSceneRep*)data;
+            int count = msg->floorBoxes.size();
+            auto datasz = Send(&count, sizeof(int));
+            if (datasz < 0)
+                return datasz;
+            for (int i = 0; i < count; ++i) {
+                auto* box = &msg->floorBoxes[i];
+                auto sentsz = Send(box, sizeof(VxBbox));
+                if (sentsz < 0)
+                    return sentsz;
+                else
+                    datasz += sentsz;
+            }
+            sz += datasz;
+        }
     }
     return sz;
 }

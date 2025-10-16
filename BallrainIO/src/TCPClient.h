@@ -22,6 +22,8 @@ public:
 	int GetLastError();
 	bool Connect(std::string host, int port);
 	void Disconnect();
+	bool Connected() { return m_connected; }
+	// Send*/Receive* functions should return bytes sent/rcvd. -1 for error
 	int Send(const void* data, int len);
 	int Receive(int len, void* dest);
 	int SendMsg(MessageType type, const void* data = nullptr);

@@ -1,5 +1,7 @@
 import socket
-from Message import MsgType, MsgGameState
+from operator import length_hint
+
+from Message import MsgType, MsgGameState, MsgSceneRep
 from Message import msg_body_len
 
 class TCPServer:
@@ -36,6 +38,8 @@ class TCPServer:
 
     def recv(self, length):
         data = self.client_socket.recv(length)
+        while len(data) < length:
+            data += self.client_socket.recv(length - len(data))
         return data
 
     def send(self, data):
@@ -50,7 +54,16 @@ class TCPServer:
     def _recv_msg_body(self, msg_type):
         if msg_body_len[msg_type] > 0:
             bmsg_body = self.recv(msg_body_len[msg_type])
-            return MsgGameState(bmsg_body)
+            if msg_type == MsgType.GameState.value:
+                return MsgGameState(bmsg_body)
+            else:
+                raise Exception("Msg body cannot parse!")
+        elif msg_body_len[msg_type] < 0:
+            if msg_type == MsgType.SceneRep.value:
+                bcount = self.recv(4)
+                count = int.from_bytes(bcount, byteorder='little')
+                bmsg_body = self.recv(count * 24) # every AABB is 6-fp32's
+                return MsgSceneRep(count, bmsg_body)
         else:
             return None
 

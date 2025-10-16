@@ -40,7 +40,7 @@ void BallrainIO::OnLoad() {
         if (!m_BML->IsPlaying())
             return;
         auto* timeManager = static_cast<CKTimeManager*>(man);
-        timeManager->SetLastDeltaTime(1000.0f / 132.0f / 2.0f);    
+        timeManager->SetLastDeltaTime(1000.0f / 132.0f / 2.0f);
     });
 }
 
@@ -57,6 +57,7 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
     } else if (strcmp(filename, "3D Entities\\Balls.nmo") == 0) {
         InitBallInfo();
     } else if (isMap) {
+        // Sector
         m_sectorPositions.clear();
 
         VxVector pos;
@@ -93,6 +94,20 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
         auto* balloonObj = m_BML->Get3dObjectByName("PE_Balloon_01");
         balloonObj->GetPosition(&pos);
         m_sectorPositions.emplace_back(pos);
+
+        // Floors
+        auto* floorGroup = m_BML->GetGroupByName("Phys_Floors");
+        int floorCount = floorGroup->GetObjectCount();
+        for (auto i = 0; i < floorCount; ++i) {
+            auto* floor = reinterpret_cast<CK3dObject*>(floorGroup->GetObjectA(i));
+            auto& box = floor->GetBoundingBox();
+            GetLogger()->Info("%s, box: (%.2f, %.2f, %.2f) (%.2f, %.2f, %.2f)", 
+                floor->GetName(),
+                box.Min.x, box.Min.y, box.Min.z,
+                box.Max.x, box.Max.y, box.Max.z
+            );
+            m_floorBoxes.emplace_back(box);
+        }
     }
 }
 
@@ -123,6 +138,26 @@ void BallrainIO::OnProcess() {
     gameState.currentSector = GetCurrentSector();
     gameState.nextSectorPosition = GetNextSectorPosition(gameState.currentSector);
     gameState.lastSectorPosition = GetLastSectorPosition(gameState.currentSector);
+
+    //static VxVector 
+    //    orig  ( 0., 0., 0.),
+    //    xplus ( 2., 0., 0.),
+    //    xminus(-2., 0., 0.),
+    //    yplus ( 0., 2., 0.),
+    //    yminus( 0.,-2., 0.),
+    //    zplus ( 0., 0., 2.),
+    //    zminus( 0., 0.,-2.);
+    //VxVector dir = gameState.position + yminus;
+    //if (ball->RayIntersection(&gameState.position, &dir, &m_rayIntersections[0])) {
+    //    auto& isect = m_rayIntersections[0];
+    //    GetLogger()->Info("isect: %s, dist = %.2f, UV = (%.2f, %.2f), point = (%.2f, %.2f, %.2f), norm = (%.2f, %.2f, %.2f)",
+    //        isect.Object->GetName(), isect.Distance, isect.TexU, isect.TexV,
+    //        isect.IntersectionPoint.x, isect.IntersectionPoint.y, isect.IntersectionPoint.z,
+    //        isect.IntersectionNormal.x, isect.IntersectionNormal.y, isect.IntersectionNormal.z);
+    //}
+
+    if (!m_tcpClient->Connected())
+        return;
     //GetLogger()->Info("next: %d, last: %d", nextSector->GetName(), lastSector->GetName());
     //nextSector->GetPosition(&gameState.nextSectorPosition);
     //lastSector->GetPosition(&gameState.lastSectorPosition);
@@ -190,6 +225,9 @@ void BallrainIO::OnCounterActive() {}
 void BallrainIO::OnCounterInactive() {}
 
 void BallrainIO::OnBallNavActive() {
+    MsgSceneRep msg;
+    msg.floorBoxes = m_floorBoxes;
+    m_tcpClient->SendMsg(MessageType::BRM_MsgSceneRep, &msg);
     m_tcpClient->SendMsg(MessageType::BRM_BallNavActive);
     m_ballNavActive = true;
 }

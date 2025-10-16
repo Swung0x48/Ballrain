@@ -9,6 +9,7 @@ class MsgType(Enum):
     Tick = 4
     ResetInput = 5
     BallOff = 6
+    SceneRep = 7
 
 msg_body_len = {
     MsgType.BallNavActive.value: 0,
@@ -17,7 +18,8 @@ msg_body_len = {
     MsgType.KbdInput.value: 4,
     MsgType.Tick.value: 0,
     MsgType.ResetInput.value: 0,
-    MsgType.BallOff.value: 0
+    MsgType.BallOff.value: 0,
+    MsgType.SceneRep.value: -1 # dynamic
 }
 
 class MsgGameState:
@@ -31,3 +33,14 @@ class MsgGameState:
         self.current_sector = int.from_bytes(bmsg_body[32:35], byteorder='little')
         self.next_sector_position = np.frombuffer(bmsg_body, dtype=dt, count=3, offset=36)
         self.last_sector_position = np.frombuffer(bmsg_body, dtype=dt, count=3, offset=48)
+
+class MsgSceneRep:
+    def __init__(self, count, bmsg_body):
+        self.floor_count = count
+        self.floor_boxes = []
+        dt = np.dtype("float32")
+        dt = dt.newbyteorder('<')
+        for i in range(self.floor_count):
+            box = np.frombuffer(bmsg_body, dtype=dt, count=6, offset=24*i).reshape(2, 3)
+            self.floor_boxes.append(box)
+
