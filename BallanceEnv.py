@@ -12,6 +12,7 @@ class BallanceEnv(gym.Env):
     def __init__(self):
         self._ball_id = 0
         self._position = np.zeros(shape=(3,), dtype=np.float32)
+        self._last_position = np.zeros(shape=(3,), dtype=np.float32)
         self._quaternion = np.zeros(shape=(4,), dtype=np.float32)
         self._current_sector = 0
         self._last_sector_position = np.zeros(shape=(4,), dtype=np.float32)
@@ -66,12 +67,13 @@ class BallanceEnv(gym.Env):
     def _get_reward(self):
         sector_dist = np.linalg.norm(self._last_sector_position - self._next_sector_position)
         dist_done = np.linalg.norm(self._position - self._last_sector_position)
-        dist_ahead = np.linalg.norm(self._position - self._next_sector_position)
+        # dist_ahead = np.linalg.norm(self._position - self._next_sector_position)
+        last_dist_done = np.linalg.norm(self._last_position - self._last_sector_position)
         return ((dist_done - sector_dist) / sector_dist * 10.
+                + (dist_done - last_dist_done) / sector_dist * 100.
                 + self._naction[0] * 10.
-                - (5 if (self._naction[0] == self._naction[1] and self._naction[2] == self._naction[3]) else 0)
-                + ((self._position[1] + 6.) / 10.) * 5.
-                - (50 if self._should_truncate else 0))
+                + ((self._position[1] + 10.) / 10.) * 20.
+                - (20. if self._should_truncate else 0))
 
     def _get_info(self):
         return {}
@@ -142,23 +144,21 @@ class BallanceEnv(gym.Env):
             (action & 0b0100) >> 2,
             (action & 0b1000) >> 3,
         ], dtype=np.uint8)
-        print(f"Action: {action} {self._naction}", end=' ')
+        # print(f"Action: {action} {self._naction}", end=' ')
         self.server.send_msg(MsgType.KbdInput, self._naction.tobytes())
 
         # TODO: Update observable state from game, check if still in valid shape
         self.fetch_tick()
-        print(f"position: {self._position}")
+        # print(f"position: {self._position}")
 
         # Check if agent reached the target or failed
-        # In a ball balancing game, we might consider falling off as terminated
-        # For now, let's define terminated if the ball goes too far from origin
-        terminated = False  # Terminate if too far from center
+        terminated = self._should_truncate
 
         # Decide if should truncate
         truncated = self._should_truncate
 
         reward = self._get_reward()
-        print(f"Reward: {reward}")
+        # print(f"Reward: {reward}")
 
         observation = self._get_obs()
         info = self._get_info()
