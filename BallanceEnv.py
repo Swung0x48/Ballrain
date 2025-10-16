@@ -40,7 +40,7 @@ class BallanceEnv(gym.Env):
         # 4 keys that player can control, and multiple keys can be pressed at once
         # Up / Down / Left / Right
         # Not necessarily useful, but put those here just in case
-        self.action_space = gym.spaces.Discrete(8)
+        self.action_space = gym.spaces.Discrete(16)
 
         self.observation_space = gym.spaces.Dict(
             {
