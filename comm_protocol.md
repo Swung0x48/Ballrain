@@ -79,11 +79,11 @@ enum class MessageType : int {
 **Direction**: Python → C++
 **Body size**: 4 bytes (key states)
 
-**Format**: 4-bit flags in single byte:
-- Bit 0: UP key (0=up, 1=pressed)
-- Bit 1: DOWN key (0=up, 1=pressed)
-- Bit 2: LEFT key (0=up, 1=pressed)
-- Bit 3: RIGHT key (0=up, 1=pressed)
+**Format**: 4-bytes flags:
+- Byte 0: UP key (0=up, 1=pressed)
+- Byte 1: DOWN key (0=up, 1=pressed)
+- Byte 2: LEFT key (0=up, 1=pressed)
+- Byte 3: RIGHT key (0=up, 1=pressed)
 
 ### 4. Tick Message (Type 4)
 **Direction**: C++ → Python
