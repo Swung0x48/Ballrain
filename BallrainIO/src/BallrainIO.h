@@ -5,6 +5,9 @@
 #include <vector>
 #include <array>
 
+#include <imgui.h>
+#include <imgui_internal.h>
+
 #include "TCPClient.h"
 #include "InputSystem.h"
 #include "TimeSystem.h"
@@ -110,6 +113,8 @@ private:
 
     void RestartLevel();
 
+    static CKBOOL ShowBoundingBoxRenderCallBack(CKRenderContext* rc, CKRenderObject* obj, void* arg);
+
     std::unique_ptr<InputSystem> m_inputSystem;
     std::unique_ptr<TimeSystem> m_timeSystem;
     std::unique_ptr<TCPClient> m_tcpClient;
@@ -128,6 +133,8 @@ private:
     std::vector<std::string> m_ballNames;
 
     std::vector<VxBbox> m_floorBoxes;
+
+    CKBehavior* m_showBoxBB = nullptr;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }
