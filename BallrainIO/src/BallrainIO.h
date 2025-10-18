@@ -141,6 +141,7 @@ private:
     std::vector<CKBehavior*> m_bbShowInformation;
 
     MsgGameState gameState;
+    KeyState currentkeyState;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }

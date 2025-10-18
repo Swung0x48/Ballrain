@@ -1,4 +1,4 @@
-#include "BallrainIO.h"
+﻿#include "BallrainIO.h"
 #include "TASHook.h"
 #include <format>
 
@@ -148,7 +148,12 @@ void BallrainIO::OnProcess() {
                 ImGui::Text("Last Sector: (%.2f, %.2f, %.2f)", gameState.lastSectorPosition.x, gameState.lastSectorPosition.y, gameState.lastSectorPosition.z);
                 ImGui::TreePop();
             }
-            if (ImGui::TreeNode("Last Action")) {
+            if (ImGui::TreeNode("Action")) {
+                ImGui::Text("%s %s %s %s",
+                    currentkeyState.states[KeyState::BR_UP] ? "U" : " ",
+                    currentkeyState.states[KeyState::BR_DOWN] ? "D" : " ",
+                    currentkeyState.states[KeyState::BR_LEFT] ? "L" : " ",
+                    currentkeyState.states[KeyState::BR_RIGHT] ? "R" : " ");
                 ImGui::TreePop();
             }
             ImGui::End();
@@ -204,7 +209,9 @@ void BallrainIO::OnProcess() {
         return;
     }
     else if (msgType == MessageType::BRM_KbdInput) {
-        m_inputSystem->Process(m_tcpClient->GetMessageFromBuf<MsgKbdInput>()->keyState);
+        auto* msg = m_tcpClient->GetMessageFromBuf<MsgKbdInput>();
+        currentkeyState = msg->keyState;
+        m_inputSystem->Process(msg->keyState);
     }
 }
 
