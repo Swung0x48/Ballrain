@@ -138,7 +138,9 @@ void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {
 void BallrainIO::OnProcess() {
     if (m_BML->IsIngame()) {
         // UI
-        if (ImGui::Begin("BallrainIO Inspector")) {
+        if (ImGui::Begin("BallrainIO Inspector", nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize |
+                ImGuiWindowFlags_NoResize)) {
             if (ImGui::TreeNode("State")) {
                 ImGui::Text("Ball Type: %d", gameState.ballType);
                 ImGui::Text("Position: (%3.2f, %3.2f, %3.2f)", gameState.position.x, gameState.position.y, gameState.position.z);
