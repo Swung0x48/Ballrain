@@ -96,6 +96,8 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
         m_sectorPositions.emplace_back(pos);
 
         // Floors
+        auto* script = m_BML->GetScriptByName("Gameplay_Events");
+
         auto* floorGroup = m_BML->GetGroupByName("Phys_Floors");
         int floorCount = floorGroup->GetObjectCount();
         for (auto i = 0; i < floorCount; ++i) {
@@ -107,6 +109,13 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
                 box.Max.x, box.Max.y, box.Max.z
             );
             m_floorBoxes.emplace_back(box);
+            /*auto* bbShowInfo = CreateShowObjectInformation(script, floor, TRUE);
+            m_bbShowInformation.push_back(bbShowInfo);
+            auto* getRowScript = ScriptHelper::FindFirstBB(script, "Get Row");
+            GetLogger()->Info("%s", getRowScript->GetName());
+            auto* scriptOut = ScriptHelper::FindEndOfChain(getRowScript);
+            auto* bbIn = bbShowInfo->GetInput(0);
+            ScriptHelper::CreateLink(script, bbIn, scriptOut);*/
         }
     }
 }
@@ -127,11 +136,33 @@ void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {
 }
 
 void BallrainIO::OnProcess() {
+    if (m_BML->IsIngame()) {
+        // UI
+        if (ImGui::Begin("BallrainIO Inspector")) {
+            if (ImGui::TreeNode("State")) {
+                ImGui::Text("Ball Type: %d", gameState.ballType);
+                ImGui::Text("Position: (%3.2f, %3.2f, %3.2f)", gameState.position.x, gameState.position.y, gameState.position.z);
+                ImGui::Text("Quaternion: (%3.2f, %3.2f, %3.2f, %3.2f)", gameState.quaternion.x, gameState.quaternion.y, gameState.quaternion.z, gameState.quaternion.w);
+                ImGui::Text("Now at sector #%d", gameState.currentSector);
+                ImGui::Text("Next Sector: (%.2f, %.2f, %.2f)", gameState.nextSectorPosition.x, gameState.nextSectorPosition.y, gameState.nextSectorPosition.z);
+                ImGui::Text("Last Sector: (%.2f, %.2f, %.2f)", gameState.lastSectorPosition.x, gameState.lastSectorPosition.y, gameState.lastSectorPosition.z);
+                ImGui::TreePop();
+            }
+            if (ImGui::TreeNode("Last Action")) {
+                ImGui::TreePop();
+            }
+            ImGui::End();
+        }
+    }
+
     if (!m_ballNavActive)
         return;
 
+    //for (auto bb : m_bbShowInformation) {
+    //    bb->ActivateInput(0);
+    //    bb->Execute(0);
+    //}
     auto* ball = GetCurrentBall();
-    MsgGameState gameState;
     gameState.ballType = GetBallID(ball);
     ball->GetPosition(&gameState.position);
     ball->GetQuaternion(&gameState.quaternion);
@@ -322,6 +353,24 @@ void BallrainIO::RestartLevel()
         auto* output = m_restartBeh->GetOutput(0);
         output->Activate();
     });
+}
+
+CKBehavior* BallrainIO::CreateShowObjectInformation(CKBehavior* script, CK3dEntity* target, CKBOOL showBoundingBox)
+{
+    CKBehavior* beh = ScriptHelper::CreateBB(script, VT_VISUALS_SHOWOBJECTINFORMATION, true);
+    beh->GetTargetParameter()->SetDirectSource(
+        ScriptHelper::CreateParamObject(script, "Target", CKPGUID_3DENTITY, target));
+    beh->GetInputParameter(0)->SetDirectSource(
+        ScriptHelper::CreateParamValue(script, "Show Bounding Box", CKPGUID_BOOL, showBoundingBox));
+    return beh;
+}
+
+void BallrainIO::ShowBoundingBox(CK3dEntity* target, CKBOOL show)
+{
+    //ScriptHelper::SetParamObject(m_bbShowObjectInfo->GetTargetParameter()->GetDirectSource(), target);
+    //ScriptHelper::SetParamValue(m_bbShowObjectInfo->GetInputParameter(0)->GetDirectSource(), show);
+   // m_bbShowObjectInfo->ActivateInput(0);
+ //   m_bbShowObjectInfo->Execute(0);
 }
 
 void BallrainIO::InitBallInfo()
