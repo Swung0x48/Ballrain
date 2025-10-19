@@ -16,7 +16,8 @@ void BallrainIO::OnLoad() {
         return;
     }
     std::string msg = "Pong";
-    assert(m_tcpClient->Receive(msg.length(), msg.data()) == msg.length());
+    auto len = m_tcpClient->Receive(msg.length(), msg.data());
+    assert(len == msg.length());
     if (msg == "Ping") {
         msg = "Pong";
         assert(m_tcpClient->Send(msg.c_str(), msg.length()) == msg.length());
@@ -96,7 +97,7 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
         m_sectorPositions.emplace_back(pos);
 
         // Floors
-        auto* script = m_BML->GetScriptByName("Gameplay_Events");
+        auto* script = m_BML->GetScriptByName("Gameplay_Refresh");
 
         auto* floorGroup = m_BML->GetGroupByName("Phys_Floors");
         int floorCount = floorGroup->GetObjectCount();
@@ -109,11 +110,11 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
                 box.Max.x, box.Max.y, box.Max.z
             );
             m_floorBoxes.emplace_back(box);
-            /*auto* bbShowInfo = CreateShowObjectInformation(script, floor, TRUE);
+            auto* bbShowInfo = CreateShowObjectInformation(script, floor, TRUE);
             m_bbShowInformation.push_back(bbShowInfo);
-            auto* getRowScript = ScriptHelper::FindFirstBB(script, "Get Row");
+            /*auto* getRowScript = ScriptHelper::FindFirstBB(script, "Get Row");
             GetLogger()->Info("%s", getRowScript->GetName());
-            auto* scriptOut = ScriptHelper::FindEndOfChain(getRowScript);
+            auto* scriptOut = getRowScript->GetOutput(0);
             auto* bbIn = bbShowInfo->GetInput(0);
             ScriptHelper::CreateLink(script, bbIn, scriptOut);*/
         }
@@ -242,7 +243,12 @@ void BallrainIO::OnExitGame() {}
 void BallrainIO::OnPreLoadLevel() {}
 void BallrainIO::OnPostLoadLevel() {}
 
-void BallrainIO::OnStartLevel() {}
+void BallrainIO::OnStartLevel() {
+    for (auto bbShowInfo : m_bbShowInformation) {
+		bbShowInfo->ActivateInput(0);
+		bbShowInfo->Execute(0);
+	}
+}
 
 void BallrainIO::OnPreResetLevel() {}
 void BallrainIO::OnPostResetLevel() {}
@@ -371,6 +377,8 @@ CKBehavior* BallrainIO::CreateShowObjectInformation(CKBehavior* script, CK3dEnti
         ScriptHelper::CreateParamObject(script, "Target", CKPGUID_3DENTITY, target));
     beh->GetInputParameter(0)->SetDirectSource(
         ScriptHelper::CreateParamValue(script, "Show Bounding Box", CKPGUID_BOOL, showBoundingBox));
+    //beh->ActivateInput(0);
+    //beh->Execute(0);
     return beh;
 }
 
