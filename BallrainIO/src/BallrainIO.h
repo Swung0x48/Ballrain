@@ -1,5 +1,8 @@
 #include <BML/IMod.h>
+#include <BML/ExecuteBB.h>
 #include <BML/ScriptHelper.h>
+#include <BML/Guids/Visuals.h>
+#include <imgui.h>
 #include <VxMath.h>
 #include <memory>
 #include <vector>
@@ -112,6 +115,11 @@ private:
     VxVector GetNextSectorPosition(int sector);
 
     void RestartLevel();
+    static CKBehavior* CreateShowObjectInformation(
+        CKBehavior* script,
+        CK3dEntity* target,
+        CKBOOL showBoundingBox);
+    void ShowBoundingBox(CK3dEntity* target, CKBOOL show);
 
     static CKBOOL ShowBoundingBoxRenderCallBack(CKRenderContext* rc, CKRenderObject* obj, void* arg);
 
@@ -129,12 +137,18 @@ private:
 
     bool m_ballNavActive = false;
 
+    //CKBehavior* m_bbShowObjectInfo = nullptr;
+
     //std::vector<CK3dObject*> m_balls;
     std::vector<std::string> m_ballNames;
 
     std::vector<VxBbox> m_floorBoxes;
 
     CKBehavior* m_showBoxBB = nullptr;
+    std::vector<CKBehavior*> m_bbShowInformation;
+
+    MsgGameState gameState;
+    KeyState currentkeyState;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }

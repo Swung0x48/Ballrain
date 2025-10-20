@@ -1,4 +1,4 @@
-#include "BallrainIO.h"
+﻿#include "BallrainIO.h"
 #include "TASHook.h"
 #include <format>
 
@@ -20,7 +20,8 @@ void BallrainIO::OnLoad() {
         return;
     }
     std::string msg = "Pong";
-    assert(m_tcpClient->Receive(msg.length(), msg.data()) == msg.length());
+    auto len = m_tcpClient->Receive(msg.length(), msg.data());
+    assert(len == msg.length());
     if (msg == "Ping") {
         msg = "Pong";
         assert(m_tcpClient->Send(msg.c_str(), msg.length()) == msg.length());
@@ -100,6 +101,8 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
         m_sectorPositions.emplace_back(pos);
 
         // Floors
+        auto* script = m_BML->GetScriptByName("Gameplay_Refresh");
+
         auto* floorGroup = m_BML->GetGroupByName("Phys_Floors");
         int floorCount = floorGroup->GetObjectCount();
         for (auto i = 0; i < floorCount; ++i) {
@@ -430,11 +433,36 @@ void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {
 }
 
 void BallrainIO::OnProcess() {
+    if (m_BML->IsIngame()) {
+        // UI
+        if (ImGui::Begin("BallrainIO Inspector", nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize |
+                ImGuiWindowFlags_NoResize)) {
+            if (ImGui::TreeNode("State")) {
+                ImGui::Text("Ball Type: %d", gameState.ballType);
+                ImGui::Text("Position: (%3.2f, %3.2f, %3.2f)", gameState.position.x, gameState.position.y, gameState.position.z);
+                ImGui::Text("Quaternion: (%3.2f, %3.2f, %3.2f, %3.2f)", gameState.quaternion.x, gameState.quaternion.y, gameState.quaternion.z, gameState.quaternion.w);
+                ImGui::Text("Now at sector #%d", gameState.currentSector);
+                ImGui::Text("Next Sector: (%.2f, %.2f, %.2f)", gameState.nextSectorPosition.x, gameState.nextSectorPosition.y, gameState.nextSectorPosition.z);
+                ImGui::Text("Last Sector: (%.2f, %.2f, %.2f)", gameState.lastSectorPosition.x, gameState.lastSectorPosition.y, gameState.lastSectorPosition.z);
+                ImGui::TreePop();
+            }
+            if (ImGui::TreeNode("Action")) {
+                ImGui::Text("%s %s %s %s",
+                    currentkeyState.states[KeyState::BR_UP] ? "U" : " ",
+                    currentkeyState.states[KeyState::BR_DOWN] ? "D" : " ",
+                    currentkeyState.states[KeyState::BR_LEFT] ? "L" : " ",
+                    currentkeyState.states[KeyState::BR_RIGHT] ? "R" : " ");
+                ImGui::TreePop();
+            }
+            ImGui::End();
+        }
+    }
+
     if (!m_ballNavActive)
         return;
 
     auto* ball = GetCurrentBall();
-    MsgGameState gameState;
     gameState.ballType = GetBallID(ball);
     ball->GetPosition(&gameState.position);
     ball->GetQuaternion(&gameState.quaternion);
@@ -476,7 +504,9 @@ void BallrainIO::OnProcess() {
         return;
     }
     else if (msgType == MessageType::BRM_KbdInput) {
-        m_inputSystem->Process(m_tcpClient->GetMessageFromBuf<MsgKbdInput>()->keyState);
+        auto* msg = m_tcpClient->GetMessageFromBuf<MsgKbdInput>();
+        currentkeyState = msg->keyState;
+        m_inputSystem->Process(msg->keyState);
     }
 }
 
@@ -505,7 +535,12 @@ void BallrainIO::OnExitGame() {}
 void BallrainIO::OnPreLoadLevel() {}
 void BallrainIO::OnPostLoadLevel() {}
 
-void BallrainIO::OnStartLevel() {}
+void BallrainIO::OnStartLevel() {
+    for (auto bbShowInfo : m_bbShowInformation) {
+		bbShowInfo->ActivateInput(0);
+		bbShowInfo->Execute(0);
+	}
+}
 
 void BallrainIO::OnPreResetLevel() {}
 void BallrainIO::OnPostResetLevel() {}
@@ -625,6 +660,26 @@ void BallrainIO::RestartLevel()
         auto* output = m_restartBeh->GetOutput(0);
         output->Activate();
     });
+}
+
+CKBehavior* BallrainIO::CreateShowObjectInformation(CKBehavior* script, CK3dEntity* target, CKBOOL showBoundingBox)
+{
+    CKBehavior* beh = ScriptHelper::CreateBB(script, VT_VISUALS_SHOWOBJECTINFORMATION, true);
+    beh->GetTargetParameter()->SetDirectSource(
+        ScriptHelper::CreateParamObject(script, "Target", CKPGUID_3DENTITY, target));
+    beh->GetInputParameter(0)->SetDirectSource(
+        ScriptHelper::CreateParamValue(script, "Show Bounding Box", CKPGUID_BOOL, showBoundingBox));
+    //beh->ActivateInput(0);
+    //beh->Execute(0);
+    return beh;
+}
+
+void BallrainIO::ShowBoundingBox(CK3dEntity* target, CKBOOL show)
+{
+    //ScriptHelper::SetParamObject(m_bbShowObjectInfo->GetTargetParameter()->GetDirectSource(), target);
+    //ScriptHelper::SetParamValue(m_bbShowObjectInfo->GetInputParameter(0)->GetDirectSource(), show);
+   // m_bbShowObjectInfo->ActivateInput(0);
+ //   m_bbShowObjectInfo->Execute(0);
 }
 
 void BallrainIO::InitBallInfo()
