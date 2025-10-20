@@ -24,7 +24,8 @@ void BallrainIO::OnLoad() {
     assert(len == msg.length());
     if (msg == "Ping") {
         msg = "Pong";
-        assert(m_tcpClient->Send(msg.c_str(), msg.length()) == msg.length());
+        len = m_tcpClient->Send(msg.c_str(), msg.length());
+        assert(len == msg.length());
     }
 
     MH_STATUS status = MH_Initialize();
