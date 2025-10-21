@@ -149,6 +149,8 @@ private:
 
     MsgGameState gameState;
     KeyState currentkeyState;
+
+    std::vector<uint8_t> m_zbuffer;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }

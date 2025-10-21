@@ -1,6 +1,7 @@
 ﻿#include "BallrainIO.h"
 #include "TASHook.h"
 #include <format>
+#include <fstream>
 
 void BallrainIO::OnLoad() {
     GetLogger()->Info("Hello from BallrainIO!");
@@ -511,7 +512,26 @@ void BallrainIO::OnProcess() {
     }
 }
 
-void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {}
+void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {
+    if (m_ballNavActive) {
+        VxImageDescEx image;
+        int size = m_BML->GetRenderContext()->DumpToMemory(nullptr, VXBUFFER_ZBUFFER, image);
+        GetLogger()->Info("size: %d", size);
+        if (size > 0) {
+            m_zbuffer.resize(size);
+            image.Image = m_zbuffer.data();
+            m_BML->GetRenderContext()->DumpToMemory(nullptr, VXBUFFER_ZBUFFER, image);
+
+            static int cnt = 0;
+            static char buf[100];
+            sprintf(buf, "zdumps/d%06d.zdp", cnt++);
+            std::ofstream of(buf, std::ios::binary);
+            of.write((char*)m_zbuffer.data(), m_zbuffer.size());
+            of.flush();
+            of.close();
+        }
+    }
+}
 
 void BallrainIO::OnCheatEnabled(bool enable) {}
 
