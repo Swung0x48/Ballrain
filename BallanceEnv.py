@@ -179,7 +179,8 @@ class BallanceEnv(gym.Env):
         # TODO: Apply input to game
         self._naction = np.array([
             (action & 0b0001) >> 0,
-            (action & 0b0010) >> 1,
+            # (action & 0b0010) >> 1,
+            0,
             (action & 0b0100) >> 2,
             (action & 0b1000) >> 3,
         ], dtype=np.uint8)
