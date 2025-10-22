@@ -79,11 +79,11 @@ class BallanceEnv(gym.Env):
 
         sector_dist = np.linalg.norm(lsp_2d - nsp_2d)
 
-        sector_vec = (lsp_2d - nsp_2d) / sector_dist
-        ball_vec = (lsp_2d - pos_2d) / sector_dist
+        sector_vec = (nsp_2d - lsp_2d) / sector_dist
+        ball_vec = (pos_2d - lsp_2d) / sector_dist
         ball_progress = np.dot(ball_vec, sector_vec)
 
-        pos_delta_vec = (pos_2d - lpos_2d) / np.linalg.norm(ball_vec) # dont normalize here?
+        pos_delta_vec = (pos_2d - lpos_2d) / max(np.linalg.norm(ball_vec), 0.00001) # dont normalize here?
         delta_progress = np.dot(pos_delta_vec, sector_vec)
 
         if self._step % 10 == 0:
@@ -99,7 +99,7 @@ class BallanceEnv(gym.Env):
         return (
             ball_reward
             + delta_reward
-            - (2000 * self._step if ball_progress < 0.001 else 0)
+            - (5000. if (self._naction[2] == 1 and ball_progress < 0.0001) else 0.)
             - (2000. if self._should_truncate else 0.)
         )
 
