@@ -83,18 +83,23 @@ class BallanceEnv(gym.Env):
         ball_vec = (lsp_2d - pos_2d) / sector_dist
         ball_progress = np.dot(ball_vec, sector_vec)
 
-        pos_delta_vec = pos_2d - lpos_2d # dont normalize here?
+        pos_delta_vec = (pos_2d - lpos_2d) / np.linalg.norm(ball_vec) # dont normalize here?
         delta_progress = np.dot(pos_delta_vec, sector_vec)
 
-        if self._step % 1000 == 0:
+        if self._step % 10 == 0:
             self._last_position = self._position
 
-        ball_reward = ball_progress * 100.
+        ball_reward = ball_progress * 200.
         delta_reward = delta_progress * 100.
+
+        if self._step % 200 == 0:
+            print("Ball progress: {:.2f}%".format(ball_progress))
+            print("Delta progress: {:.2f}%".format(delta_progress))
 
         return (
             ball_reward
             + delta_reward
+            - (2000 * self._step if ball_progress < 0.001 else 0)
             - (2000. if self._should_truncate else 0.)
         )
 
@@ -135,6 +140,7 @@ class BallanceEnv(gym.Env):
         # Should get first game tick here
         # Game should send tick first then wait for input
         self.fetch_tick()
+        self._last_position = self._position
 
         observation = self._get_obs()
         info = self._get_info()
