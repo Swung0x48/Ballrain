@@ -128,7 +128,7 @@ int TCPClient::SendMsg(MessageType type, const void* data)
             break;
         }
         case MessageType::BRM_DepthImage: {
-            auto sentsz = Send(data, 320 * 240 * 2);
+            auto sentsz = Send(data, 320 * 240 * 1);
             if (sentsz < 0)
                 return sentsz;
             else

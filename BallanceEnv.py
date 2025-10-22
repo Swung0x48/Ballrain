@@ -28,7 +28,7 @@ class BallanceEnv(gym.Env):
         self._should_truncate = False
         self._floor_boxes = []
         self._reward = 0.
-        self._depth_image = np.zeros(shape=(240, 320), dtype=np.float32)
+        self._depth_image = np.zeros(shape=(1, 240, 320), dtype=np.uint8)
 
         print("Started server. Waiting for connection...")
         self.server = TCPServer(port=27787)
@@ -53,26 +53,11 @@ class BallanceEnv(gym.Env):
         # Not necessarily useful, but put those here just in case
         self.action_space = gym.spaces.Discrete(16)
 
-        self.observation_space = gym.spaces.Dict(
-            {
-                "ball_id": gym.spaces.Discrete(3),
-                "position": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32),
-                "quaternion": gym.spaces.Box(-1., 1., shape=(4,), dtype=np.float32),
-                "current_sector": gym.spaces.Discrete(100),
-                "last_sector_position": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32),
-                "next_sector_position": gym.spaces.Box(-9999., 9999., shape=(3,), dtype=np.float32),
-            }
-        )
+        self.observation_space = gym.spaces.Box(
+            low=0, high=255, shape=(1, 240, 320), dtype=np.uint8)
 
     def _get_obs(self):
-        return {
-            "ball_id": self._ball_id,
-            "position": self._position,
-            "quaternion": self._quaternion,
-            "current_sector": self._current_sector,
-            "last_sector_position": self._last_sector_position,
-            "next_sector_position": self._next_sector_position,
-        }
+        return self._depth_image
 
     def _is_on_floor(self):
         count = 0
@@ -197,7 +182,7 @@ class BallanceEnv(gym.Env):
         # TODO: Update observable state from game, check if still in valid shape
         self.fetch_tick()
         # print(f"position: {self._position}")
-        # plt.imshow(self._depth_image, cmap='gray', vmin=0.9, vmax=1.0)
+        # plt.imshow(self._depth_image.reshape(240, 320), cmap='gray', vmin=200, vmax=250)
         # plt.title("Depth Buffer")
         # plt.colorbar()
         # plt.show()

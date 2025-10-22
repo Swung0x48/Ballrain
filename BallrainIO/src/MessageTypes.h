@@ -39,7 +39,7 @@ struct MsgSceneRep
 
 struct MsgDepthImage
 {
-	std::array<float, 320 * 240> image;
+	std::array<uint8_t, 320 * 240> image;
 };
 
 #endif // BALLRAIN_MESSAGETYPES_H

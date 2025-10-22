@@ -21,7 +21,7 @@ msg_body_len = {
     MsgType.ResetInput.value: 0,
     MsgType.BallOff.value: 0,
     MsgType.SceneRep.value: -1, # dynamic
-    MsgType.DepthImage.value: 320 * 240 * 2
+    MsgType.DepthImage.value: 320 * 240 * 1
 }
 
 class MsgGameState:
@@ -48,4 +48,4 @@ class MsgSceneRep:
 
 class MsgDepthImage:
     def __init__(self, bmsg_body):
-        self.image = np.frombuffer(bmsg_body, dtype=np.float16).reshape(240, 320)
+        self.image = np.frombuffer(bmsg_body, dtype=np.uint8).reshape(1, 240, 320)

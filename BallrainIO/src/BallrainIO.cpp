@@ -482,7 +482,7 @@ void BallrainIO::OnProcess() {
     //GetLogger()->Info("GameState");
 
     sentsz = m_tcpClient->SendMsg(MessageType::BRM_DepthImage, depthImage.image.data());
-    assert(sentsz == sizeof(MessageType) + depthImage.image.size() * 2);
+    assert(sentsz == sizeof(MessageType) + depthImage.image.size() * 1);
     //GetLogger()->Info("DepthImage");
 
     sentsz = m_tcpClient->SendMsg(MessageType::BRM_Tick);
@@ -514,7 +514,7 @@ void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {
             static char buf[100];
             sprintf(buf, "zdumps/d%06d.zdp", cnt++);
             std::ofstream of(buf, std::ios::binary);
-            of.write((char*)m_zbuffer.data(), m_zbuffer.size());
+            of.write((char*)depthImage.image.data(), size);
             of.flush();
             of.close();*/
         }

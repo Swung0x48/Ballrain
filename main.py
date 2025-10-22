@@ -3,6 +3,7 @@ import numpy as np
 from stable_baselines3 import PPO, DQN
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.env_checker import check_env
 import BallanceEnv
 
 seq = 7
@@ -10,6 +11,9 @@ seq = 7
 env = gym.make("ballance_env/Ballance-v0", max_episode_steps=-1)
 obs, info = env.reset()
 print(f'reset obs: {obs}')
+
+check_env(env)
+exit(0)
 
 # Define the PPO model with custom parameters
 # model = PPO(
@@ -29,13 +33,13 @@ print(f'reset obs: {obs}')
 
 model = None
 try:
-    model = DQN.load('ballance_dqn_model' + str(seq), env=env)
+    model = PPO.load('ballance_dqn_model' + str(seq), env=env)
     print('model loaded')
 except FileNotFoundError:
-    model = DQN(
-        "MultiInputPolicy",
+    model = PPO(
+        "CnnPolicy",
         env,
-        learning_rate=1e-5,
+        learning_rate=1e-4,
         verbose=1)
     print('new model created')
 
