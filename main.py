@@ -12,8 +12,8 @@ env = gym.make("ballance_env/Ballance-v0", max_episode_steps=-1)
 obs, info = env.reset()
 print(f'reset obs: {obs}')
 
-check_env(env)
-exit(0)
+# check_env(env)
+# exit(0)
 
 # Define the PPO model with custom parameters
 # model = PPO(
@@ -33,13 +33,14 @@ exit(0)
 
 model = None
 try:
-    model = PPO.load('ballance_dqn_model' + str(seq), env=env)
+    model = DQN.load('ballance_dqn_model' + str(seq), env=env)
     print('model loaded')
 except FileNotFoundError:
-    model = PPO(
+    model = DQN(
         "CnnPolicy",
         env,
         learning_rate=1e-4,
+        buffer_size=10000,
         verbose=1)
     print('new model created')
 
