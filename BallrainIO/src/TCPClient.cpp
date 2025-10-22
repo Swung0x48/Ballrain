@@ -125,6 +125,15 @@ int TCPClient::SendMsg(MessageType type, const void* data)
                     datasz += sentsz;
             }
             sz += datasz;
+            break;
+        }
+        case MessageType::BRM_DepthImage: {
+            auto sentsz = Send(data, 320 * 240 * 2);
+            if (sentsz < 0)
+                return sentsz;
+            else
+                sz += sentsz;
+            break;
         }
     }
     return sz;

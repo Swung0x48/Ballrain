@@ -1,7 +1,7 @@
 import socket
 from operator import length_hint
 
-from Message import MsgType, MsgGameState, MsgSceneRep
+from Message import MsgType, MsgGameState, MsgSceneRep, MsgDepthImage
 from Message import msg_body_len
 
 class TCPServer:
@@ -56,6 +56,8 @@ class TCPServer:
             bmsg_body = self.recv(msg_body_len[msg_type])
             if msg_type == MsgType.GameState.value:
                 return MsgGameState(bmsg_body)
+            elif msg_type == MsgType.DepthImage.value:
+                return MsgDepthImage(bmsg_body)
             else:
                 raise Exception("Msg body cannot parse!")
         elif msg_body_len[msg_type] < 0:
@@ -64,6 +66,8 @@ class TCPServer:
                 count = int.from_bytes(bcount, byteorder='little')
                 bmsg_body = self.recv(count * 24) # every AABB is 6-fp32's
                 return MsgSceneRep(count, bmsg_body)
+            else:
+                raise Exception("Msg body (variable length) cannot parse!")
         else:
             return None
 

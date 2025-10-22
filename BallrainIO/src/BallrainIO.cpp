@@ -116,7 +116,7 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
                 box.Max.x, box.Max.y, box.Max.z
             );
             m_floorBoxes.emplace_back(box);
-            floor->AddPostRenderCallBack(BallrainIO::ShowBoundingBoxRenderCallBack, m_showBoxBB);
+            //floor->AddPostRenderCallBack(BallrainIO::ShowBoundingBoxRenderCallBack, m_showBoxBB);
         }
     }
 }
@@ -472,23 +472,6 @@ void BallrainIO::OnProcess() {
     gameState.nextSectorPosition = GetNextSectorPosition(gameState.currentSector);
     gameState.lastSectorPosition = GetLastSectorPosition(gameState.currentSector);
 
-    //static VxVector 
-    //    orig  ( 0., 0., 0.),
-    //    xplus ( 2., 0., 0.),
-    //    xminus(-2., 0., 0.),
-    //    yplus ( 0., 2., 0.),
-    //    yminus( 0.,-2., 0.),
-    //    zplus ( 0., 0., 2.),
-    //    zminus( 0., 0.,-2.);
-    //VxVector dir = gameState.position + yminus;
-    //if (ball->RayIntersection(&gameState.position, &dir, &m_rayIntersections[0])) {
-    //    auto& isect = m_rayIntersections[0];
-    //    GetLogger()->Info("isect: %s, dist = %.2f, UV = (%.2f, %.2f), point = (%.2f, %.2f, %.2f), norm = (%.2f, %.2f, %.2f)",
-    //        isect.Object->GetName(), isect.Distance, isect.TexU, isect.TexV,
-    //        isect.IntersectionPoint.x, isect.IntersectionPoint.y, isect.IntersectionPoint.z,
-    //        isect.IntersectionNormal.x, isect.IntersectionNormal.y, isect.IntersectionNormal.z);
-    //}
-
     if (!m_tcpClient->Connected())
         return;
     //GetLogger()->Info("next: %d, last: %d", nextSector->GetName(), lastSector->GetName());
@@ -496,9 +479,15 @@ void BallrainIO::OnProcess() {
     //lastSector->GetPosition(&gameState.lastSectorPosition);
     auto sentsz = m_tcpClient->SendMsg(MessageType::BRM_GameState, &gameState);
     assert(sentsz == sizeof(MessageType) + sizeof(MsgGameState));
+    //GetLogger()->Info("GameState");
+
+    sentsz = m_tcpClient->SendMsg(MessageType::BRM_DepthImage, depthImage.image.data());
+    assert(sentsz == sizeof(MessageType) + depthImage.image.size() * 2);
+    //GetLogger()->Info("DepthImage");
 
     sentsz = m_tcpClient->SendMsg(MessageType::BRM_Tick);
     assert(sentsz == sizeof(MessageType));
+    //GetLogger()->Info("Tick");
 
     MessageType msgType = m_tcpClient->ReceiveMsg();
     if (msgType == MessageType::BRM_ResetInput) {
@@ -516,19 +505,18 @@ void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {
     if (m_ballNavActive) {
         VxImageDescEx image;
         int size = m_BML->GetRenderContext()->DumpToMemory(nullptr, VXBUFFER_ZBUFFER, image);
-        GetLogger()->Info("size: %d", size);
+        //GetLogger()->Info("size: %d", size);
         if (size > 0) {
-            m_zbuffer.resize(size);
-            image.Image = m_zbuffer.data();
+            image.Image = (XBYTE*)depthImage.image.data();
             m_BML->GetRenderContext()->DumpToMemory(nullptr, VXBUFFER_ZBUFFER, image);
 
-            static int cnt = 0;
+            /*static int cnt = 0;
             static char buf[100];
             sprintf(buf, "zdumps/d%06d.zdp", cnt++);
             std::ofstream of(buf, std::ios::binary);
             of.write((char*)m_zbuffer.data(), m_zbuffer.size());
             of.flush();
-            of.close();
+            of.close();*/
         }
     }
 }

@@ -3,6 +3,8 @@
 
 #include <BML/IMod.h>
 #include "InputSystem.h"
+#include <vector>
+#include <array>
 
 enum class MessageType : int {
 	BRM_BallNavActive,
@@ -13,6 +15,7 @@ enum class MessageType : int {
 	BRM_ResetInput,
 	BRM_BallOff,
 	BRM_MsgSceneRep,
+	BRM_DepthImage,
 	BRM_InvalidType
 };
 
@@ -32,6 +35,11 @@ struct MsgKbdInput {
 struct MsgSceneRep
 {
 	std::vector<VxBbox> floorBoxes;
+};
+
+struct MsgDepthImage
+{
+	std::array<float, 320 * 240> image;
 };
 
 #endif // BALLRAIN_MESSAGETYPES_H

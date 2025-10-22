@@ -36,10 +36,8 @@ except FileNotFoundError:
         "MultiInputPolicy",
         env,
         learning_rate=1e-5,
-        learning_starts=500,
-        device='cuda',
         verbose=1)
-    print('new model')
+    print('new model created')
 
 # Train the model
 print("Starting training...")
@@ -47,7 +45,7 @@ model.learn(total_timesteps=20000)
 
 # Save the trained model
 model.save("ballance_dqn_model" + str(seq+1))
-print(f"Model saved as 'ballance_dqn_model{seq+1}'")
+print(f"Model saved as 'ballance_model{seq+1}'")
 
 # for i in range(1000000):
 #     action = env.action_space.sample()

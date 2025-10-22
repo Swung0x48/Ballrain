@@ -3,6 +3,8 @@ from typing import Optional
 import numpy as np
 import gymnasium as gym
 
+import matplotlib.pyplot as plt
+
 from TCPServer import TCPServer
 from Message import MsgType
 
@@ -12,7 +14,6 @@ def _is_in_box(position, box: np.ndarray) -> bool:
 
 
 class BallanceEnv(gym.Env):
-
     def __init__(self):
         self._ball_id = 0
         self._position = np.zeros(shape=(3,), dtype=np.float32)
@@ -27,6 +28,7 @@ class BallanceEnv(gym.Env):
         self._should_truncate = False
         self._floor_boxes = []
         self._reward = 0.
+        self._depth_image = np.zeros(shape=(240, 320), dtype=np.float32)
 
         print("Started server. Waiting for connection...")
         self.server = TCPServer(port=27787)
@@ -109,27 +111,6 @@ class BallanceEnv(gym.Env):
                 + (self._position[0] - self._last_sector_position[0]) * 10000.
                 )
 
-
-        # of = self._is_on_floor()
-        # # print(f"onfloor = {of}, delta = {(last_dist_past_ratio - dist_past_ratio)}")
-        # if self._naction[0] == 1:
-        #     self._up_hold_count += 1.
-        # else:
-        #     self._up_hold_count = 0.
-        #
-        # advanced_ratio = last_dist_past_ratio - dist_past_ratio
-        # if advanced_ratio > 0.:
-        #     self._advance_count += 1.
-        # else:
-        #     self._advance_count = -10.
-        # return (
-        #     - (1000. if self._should_truncate else 0)
-        #     + (50. if of else -10.)
-        #     + self._naction[0] * 10. * self._up_hold_count
-        #     + (last_dist_past_ratio - dist_past_ratio) * 50. * self._advance_count
-        #     + self._reward
-        # )
-
     def _get_info(self):
         return {}
 
@@ -150,7 +131,7 @@ class BallanceEnv(gym.Env):
         self._should_truncate = False
 
         self.server.send_msg(MsgType.ResetInput)
-        print('Game reset request sent...', end='')
+        print('Game reset request sent...')
         msg_type, msg_body = self.server.recv_msg()
         lingering_msg_cnt = 0
         # This should eat up lingering states from last session
@@ -187,6 +168,8 @@ class BallanceEnv(gym.Env):
                 self._last_sector_position = msgbody.last_sector_position
             elif msgtype == MsgType.BallOff.value:
                 self._should_truncate = True
+            elif msgtype == MsgType.DepthImage.value:
+                self._depth_image = msgbody.image
             msgtype, msgbody = self.server.recv_msg()
 
     def step(self, action):
@@ -214,6 +197,10 @@ class BallanceEnv(gym.Env):
         # TODO: Update observable state from game, check if still in valid shape
         self.fetch_tick()
         # print(f"position: {self._position}")
+        # plt.imshow(self._depth_image, cmap='gray', vmin=0.9, vmax=1.0)
+        # plt.title("Depth Buffer")
+        # plt.colorbar()
+        # plt.show()
 
         # Check if agent reached the target or failed
         terminated = self._should_truncate

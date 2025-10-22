@@ -10,6 +10,7 @@ class MsgType(Enum):
     ResetInput = 5
     BallOff = 6
     SceneRep = 7
+    DepthImage = 8
 
 msg_body_len = {
     MsgType.BallNavActive.value: 0,
@@ -19,7 +20,8 @@ msg_body_len = {
     MsgType.Tick.value: 0,
     MsgType.ResetInput.value: 0,
     MsgType.BallOff.value: 0,
-    MsgType.SceneRep.value: -1 # dynamic
+    MsgType.SceneRep.value: -1, # dynamic
+    MsgType.DepthImage.value: 320 * 240 * 2
 }
 
 class MsgGameState:
@@ -44,3 +46,6 @@ class MsgSceneRep:
             box = np.frombuffer(bmsg_body, dtype=dt, count=6, offset=24*i).reshape(2, 3)
             self.floor_boxes.append(box)
 
+class MsgDepthImage:
+    def __init__(self, bmsg_body):
+        self.image = np.frombuffer(bmsg_body, dtype=np.float16).reshape(240, 320)
