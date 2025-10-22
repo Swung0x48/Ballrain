@@ -67,34 +67,36 @@ class BallanceEnv(gym.Env):
         return count
 
     def _get_reward(self):
-        # if self._step < 5000:
-        #     return (500 if (self._naction[0] == 1 and self._naction[1] == 0 and self._naction[3]) else -5000) * self._step
+        # sector_dist = np.linalg.norm(self._last_sector_position - self._next_sector_position)
+        # dist_past = np.linalg.norm(self._position - self._last_sector_position)
+        # dist_ahead = np.linalg.norm(self._position - self._next_sector_position)
+        # last_dist_past = np.linalg.norm(self._last_position - self._last_sector_position)
 
-        sector_dist = np.linalg.norm(self._last_sector_position - self._next_sector_position)
-        dist_past = np.linalg.norm(self._position - self._last_sector_position)
-        dist_ahead = np.linalg.norm(self._position - self._next_sector_position)
-        last_dist_past = np.linalg.norm(self._last_position - self._last_sector_position)
+        lsp_2d = self._last_sector_position[0:3:2]
+        nsp_2d = self._next_sector_position[0:3:2]
+        pos_2d = self._position[0:3:2]
+        lpos_2d = self._last_position[0:3:2]
 
-        # if self._step % 100 == 0:
-        self._last_position = self._position
+        sector_dist = np.linalg.norm(lsp_2d - nsp_2d)
 
-        dist_past_ratio = dist_past / sector_dist
-        last_dist_past_ratio = last_dist_past / sector_dist
-        of = self._is_on_floor()
-        # if of:
-        #     print("of!")
-        return ((dist_past - sector_dist) / sector_dist * 100.
-                - dist_ahead / sector_dist * 150.
-                - (100. if (self._naction[0] == self._naction[1] and self._naction[2] == self._naction[3]) else 0)
-                + (last_dist_past - dist_past) / sector_dist * self._step
-                + self._naction[0] * 10.
-                + ((self._position[1] + 10.) / 10.) * 200.
-                - abs(self._position[2] - (-155.)) * 20000.
-                # + ((self._position[1] + 10.) / 10.) * 20.
-                # - (200. if self._should_truncate else 0)
-                + (500. * of if of else -200.)
-                + (self._position[0] - self._last_sector_position[0]) * 10000.
-                )
+        sector_vec = (lsp_2d - nsp_2d) / sector_dist
+        ball_vec = (lsp_2d - pos_2d) / sector_dist
+        ball_progress = np.dot(ball_vec, sector_vec)
+
+        pos_delta_vec = pos_2d - lpos_2d # dont normalize here?
+        delta_progress = np.dot(pos_delta_vec, sector_vec)
+
+        if self._step % 1000 == 0:
+            self._last_position = self._position
+
+        ball_reward = ball_progress * 100.
+        delta_reward = delta_progress * 100.
+
+        return (
+            ball_reward
+            + delta_reward
+            - (2000. if self._should_truncate else 0.)
+        )
 
     def _get_info(self):
         return {}
@@ -166,7 +168,6 @@ class BallanceEnv(gym.Env):
         Returns:
             tuple: (observation, reward, terminated, truncated, info)
         """
-        self._step += 1
         self._reward = 0.
 
         # TODO: Apply input to game
@@ -198,6 +199,8 @@ class BallanceEnv(gym.Env):
 
         observation = self._get_obs()
         info = self._get_info()
+
+        self._step += 1
 
         return observation, reward, terminated, truncated, info
 
