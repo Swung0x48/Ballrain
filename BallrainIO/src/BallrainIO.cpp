@@ -8,6 +8,9 @@ void BallrainIO::OnLoad() {
     m_BML->SendIngameMessage("\x1b[32mLoaded Ballrain!\x1b[0m");
     m_BML->AddTimer(1000ul, [](){});
 
+    m_config = new BallrainConfig([this]() { return GetConfig(); });
+    m_config->CreateProperty<bool>("General", "OnlyPhysicalized", true, "Only show physicalized objects (including hidden ones).");
+
     m_inputSystem = std::make_unique<InputSystem>(m_BML->GetInputManager());
     m_timeSystem = std::make_unique<TimeSystem>(m_BML->GetTimeManager());
     m_tcpClient = std::make_unique<TCPClient>();
@@ -64,6 +67,24 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
     } else if (strcmp(filename, "3D Entities\\Balls.nmo") == 0) {
         InitBallInfo();
     } else if (isMap) {
+        if (m_config->Get<bool>("OnlyPhysicalized")) {
+            CKGroup* physGroups[] = { m_BML->GetGroupByName("Phys_Floors"), m_BML->GetGroupByName("Phys_FloorRails") };
+            const auto IsPhysicalized = [&physGroups](CK3dObject* obj) -> bool {
+                for (auto* group : physGroups) {
+                    if (!group) continue;
+                    if (obj->IsInGroup(group))
+                        return true;
+                }
+                return false;
+            };
+
+            for (int i = 0; i < objArray->Size(); ++i) {
+                auto* obj = CK3dObject::Cast(m_BML->GetCKContext()->GetObject((*objArray)[i]));
+                if (!obj) continue;
+                obj->Show(IsPhysicalized(obj) ? CKSHOW : CKHIDE);
+            }
+        }
+
         // Sector
         m_sectorPositions.clear();
 
@@ -73,30 +94,30 @@ void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* ma
         m_sectorPositions.emplace_back(pos);
 
         char name[64];
-		int sectorCount = 1;
-		for (; sectorCount <= 999; ++sectorCount) { // ExtraSector mod allows loading up to 999 sectors
-			// checks if the next sector exists
-			int sector = sectorCount + 1; // assume we have at least 1 sector (map fails to load otherwise)
-			snprintf(name, sizeof(name), "Sector_%02d", sector);
-			if (m_BML->GetGroupByName(sector == 9 ? "Sector_9" : name) == nullptr) // see pull request #1
-				break;
-		}
+        int sectorCount = 1;
+        for (; sectorCount <= 999; ++sectorCount) { // ExtraSector mod allows loading up to 999 sectors
+            // checks if the next sector exists
+            int sector = sectorCount + 1; // assume we have at least 1 sector (map fails to load otherwise)
+            snprintf(name, sizeof(name), "Sector_%02d", sector);
+            if (m_BML->GetGroupByName(sector == 9 ? "Sector_9" : name) == nullptr) // see pull request #1
+                break;
+        }
 
         for (int i = 1; i <= sectorCount - 1; ++i) {
-			// we could write `i < sectorCount` here but it's better to be explicit
+            // we could write `i < sectorCount` here but it's better to be explicit
             snprintf(name, sizeof(name), "PC_TwoFlames_%02d", i);
             auto* twoFlamesObj = m_BML->Get3dObjectByName(name);
             if (twoFlamesObj == nullptr)
                 break;
 
             twoFlamesObj->GetPosition(&pos);
-			m_sectorPositions.emplace_back(pos);
+            m_sectorPositions.emplace_back(pos);
         }
-		// NOTE: if we break before finding all sector's corresponding checkpoints
-		//     it means the map can't be completed although it will load fine
-		//     commonly seen with unfinished custom maps
-		// TODO: display some warning about unable to finish here, instead of crashing
-		assert(m_sectorPositions.size() == sectorCount);
+        // NOTE: if we break before finding all sector's corresponding checkpoints
+        //     it means the map can't be completed although it will load fine
+        //     commonly seen with unfinished custom maps
+        // TODO: display some warning about unable to finish here, instead of crashing
+        assert(m_sectorPositions.size() == sectorCount);
 
         auto* balloonObj = m_BML->Get3dObjectByName("PE_Balloon_01");
         balloonObj->GetPosition(&pos);
@@ -546,9 +567,9 @@ void BallrainIO::OnPostLoadLevel() {}
 
 void BallrainIO::OnStartLevel() {
     for (auto bbShowInfo : m_bbShowInformation) {
-		bbShowInfo->ActivateInput(0);
-		bbShowInfo->Execute(0);
-	}
+    bbShowInfo->ActivateInput(0);
+    bbShowInfo->Execute(0);
+  }
 }
 
 void BallrainIO::OnPreResetLevel() {}
@@ -589,7 +610,7 @@ void BallrainIO::OnCamNavInactive() {}
 
 void BallrainIO::OnBallOff() {
     m_tcpClient->SendMsg(MessageType::BRM_BallOff);
-	m_ballNavActive = false;
+  m_ballNavActive = false;
 }
 
 void BallrainIO::OnPreCheckpointReached() {}

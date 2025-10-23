@@ -15,6 +15,7 @@
 #include "InputSystem.h"
 #include "TimeSystem.h"
 #include "MessageTypes.h"
+#include "Config.h"
 
 class BallrainIO final : public IMod {
 public:
@@ -150,6 +151,8 @@ private:
     MsgGameState gameState;
     KeyState currentkeyState;
     MsgDepthImage depthImage;
+
+    BallrainConfig* m_config = nullptr;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }
