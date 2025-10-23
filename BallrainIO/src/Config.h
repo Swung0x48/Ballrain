@@ -28,10 +28,8 @@ public:
 
     // used for more complex access instead of GetValue/SetValue
     IProperty* GetProperty(const char* key) {
-        auto it = m_props.find(key);
-        if (it != m_props.end()) {
+        if (auto it = m_props.find(key); it != m_props.end())
             return it->second;
-        }
         return nullptr;
     }
 
@@ -46,8 +44,10 @@ public:
             return prop->GetFloat();
         else if constexpr (std::is_same_v<T, std::string>)
             return std::string(prop->GetString());
+        else if constexpr (std::is_same_v<T, const char*>)
+            return prop->GetString();
         else
-            static_assert("Unsupported type");
+            static_assert("Unsupported type used for BallrainConfig::Get");
     }
 
     template <typename T>
@@ -61,6 +61,10 @@ public:
             prop->SetFloat(value);
         else if constexpr (std::is_same_v<T, const char*> || std::is_same_v<T, char*>)
             prop->SetString(value);
+        else if constexpr (std::is_same_v<T, std::string>)
+            prop->SetString(value.c_str());
+        else
+            static_assert("Unsupported type used for BallrainConfig::Set");
     }
 
     ~BallrainConfig() {
