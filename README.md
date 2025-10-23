@@ -52,7 +52,11 @@ cd BallrainIO
 cmake . -B build -A Win32 -DVirtoolsSDK_DIR="/path/to/Virtools-SDK-2.1/CMake"
 ```
 
-打开 `build` 目录中的 `Ballrain.sln` 进行编译。
+打开 `BallrainIO/build` 目录中的 `Ballrain.sln` 编译，或使用命令行编译：
+
+```bash
+cmake --build . --config Release
+```
 
 4. 安装编译后的 C++ Mod 到 Ballance 游戏目录
 
