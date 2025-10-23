@@ -13,6 +13,7 @@ find_package(BML REQUIRED)
 add_library(BallrainIO SHARED
 			src/BallrainIO.h
 			src/BallrainIO.cpp
+			src/Config.h
 			src/InputSystem.h
 			src/InputSystem.cpp
 			src/TimeSystem.h
