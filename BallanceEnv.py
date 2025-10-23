@@ -1,3 +1,4 @@
+import math
 import random
 from typing import Optional
 import numpy as np
@@ -15,6 +16,17 @@ def _is_in_box(position, box: np.ndarray) -> bool:
 
 class BallanceEnv(gym.Env):
     def __init__(self):
+        self._action_lut = [
+            [0, 0, 0, 0],
+            [0, 0, 0, 1],
+            [0, 0, 1, 0],
+            [0, 1, 0, 0],
+            [0, 1, 0, 1],
+            [0, 1, 1, 0],
+            [1, 0, 0, 0],
+            [1, 0, 0, 1],
+            [1, 0, 1, 0],
+        ]
         self._ball_id = 0
         self._position = np.zeros(shape=(3,), dtype=np.float32)
         self._last_position = np.zeros(shape=(3,), dtype=np.float32)
@@ -51,7 +63,7 @@ class BallanceEnv(gym.Env):
         # 4 keys that player can control, and multiple keys can be pressed at once
         # Up / Down / Left / Right
         # Not necessarily useful, but put those here just in case
-        self.action_space = gym.spaces.Discrete(16)
+        self.action_space = gym.spaces.Discrete(len(self._action_lut))
 
         self.observation_space = gym.spaces.Box(
             low=0, high=255, shape=(1, 240, 320), dtype=np.uint8)
@@ -110,16 +122,16 @@ class BallanceEnv(gym.Env):
         progress_reward = normalized_progress * 100.0
 
         # Reward for moving forward in the sector
-        movement_reward = np.clip(delta_progress * 50.0, -25.0, 25.0)  # Limit movement reward/penalty
+        movement_reward = np.clip(delta_progress * 50.0, -100.0, 100.0)  # Limit movement reward/penalty
 
         # Small reward for staying in the game
-        time_reward = -0.1  # Small negative reward to encourage efficiency
+        time_reward = -0.1 * math.log2(self._step + 1)  # Small negative reward to encourage efficiency
 
         # Penalty for being off track (if ball is too far from sector path)
         # Calculate perpendicular distance to sector line
-        projected_point = lsp_2d + np.dot(ball_vec, sector_vec) * sector_vec
-        perpendicular_dist = np.linalg.norm(pos_2d - projected_point)
-        off_track_penalty = -np.clip(perpendicular_dist * 2.0, 0.0, 20.0)
+        # projected_point = lsp_2d + np.dot(ball_vec, sector_vec) * sector_vec
+        # perpendicular_dist = np.linalg.norm(pos_2d - projected_point)
+        # off_track_penalty = -np.clip(perpendicular_dist * 2.0, 0.0, 20.0)
 
         # Large penalty for falling off or truncation
         failure_penalty = -200.0 if self._should_truncate else 0.0
@@ -129,7 +141,7 @@ class BallanceEnv(gym.Env):
             progress_reward      # Reward for how far along the sector we are
             + movement_reward    # Reward for positive movement in the right direction
             + time_reward        # Small penalty for each step to encourage efficiency
-            + off_track_penalty  # Penalty for being far from the sector path
+            # + off_track_penalty  # Penalty for being far from the sector path
             + failure_penalty    # Penalty for falling off
         )
 
@@ -214,13 +226,7 @@ class BallanceEnv(gym.Env):
         self._reward = 0.
 
         # TODO: Apply input to game
-        self._naction = np.array([
-            (action & 0b0001) >> 0,
-            (action & 0b0010) >> 1,
-            # 0,
-            (action & 0b0100) >> 2,
-            (action & 0b1000) >> 3,
-        ], dtype=np.uint8)
+        self._naction = np.array(self._action_lut[action], dtype=np.uint8)
         # print(f"Action: {action} {self._naction}", end=' ')
         self.server.send_msg(MsgType.KbdInput, self._naction.tobytes())
 
