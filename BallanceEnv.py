@@ -83,25 +83,28 @@ class BallanceEnv(gym.Env):
         ball_vec = (pos_2d - lsp_2d) / sector_dist
         ball_progress = np.dot(ball_vec, sector_vec)
 
-        pos_delta_vec = (pos_2d - lpos_2d) / max(np.linalg.norm(ball_vec), 0.00001) # dont normalize here?
+        pos_delta_vec = (pos_2d - lpos_2d) / sector_dist
         delta_progress = np.dot(pos_delta_vec, sector_vec)
 
         if self._step % 10 == 0:
             self._last_position = self._position
 
-        ball_reward = ball_progress * 200.
-        delta_reward = delta_progress * 100.
+        ball_reward = ball_progress * 100.
+        delta_reward = delta_progress * 10000.
 
-        if self._step % 200 == 0:
-            print("Ball progress: {:.2f}%".format(ball_progress))
-            print("Delta progress: {:.2f}%".format(delta_progress))
-
-        return (
+        reward = (
             ball_reward
             + delta_reward
             - (5000. if (self._naction[2] == 1 and ball_progress < 0.0001) else 0.)
             - (2000. if self._should_truncate else 0.)
         )
+
+        if self._step % 200 == 0:
+            print("Ball progress: {:.2f}%, reward: {:.2f}".format(ball_progress * 100, ball_reward))
+            print("Delta progress: {:.2f}%, reward: {:.2f}".format(delta_progress * 100, delta_reward))
+            print("Reward: {:.2f}".format(reward))
+
+        return reward
 
     def _get_info(self):
         return {}

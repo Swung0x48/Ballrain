@@ -6,7 +6,7 @@ from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.env_checker import check_env
 import BallanceEnv
 
-seq = 7
+seq = 3
 
 env = gym.make("ballance_env/Ballance-v0", max_episode_steps=-1)
 obs, info = env.reset()
@@ -46,14 +46,14 @@ except FileNotFoundError:
 
 # Train the model
 print("Starting training...")
-model.learn(total_timesteps=2000000)
+model.learn(total_timesteps=100000)
 
 # Save the trained model
 model.save("ballance_dqn_model" + str(seq+1))
 print(f"Model saved as 'ballance_model{seq+1}'")
 
 # for i in range(1000000):
-#     action = env.action_space.sample()
+#     action, _ = model.predict(obs)
 #     obs, reward, terminated, truncated, info = env.step(action)
 #     if i % 5000 == 0:
 #         print(obs)
