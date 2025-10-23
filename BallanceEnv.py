@@ -59,7 +59,7 @@ class BallanceEnv(gym.Env):
     def _get_obs(self):
         return self._depth_image
 
-    def _is_on_floor(self):
+    def _is_in_any_box(self):
         count = 0
         for box in self._floor_boxes:
             if _is_in_box(self._position, box):
@@ -67,41 +67,75 @@ class BallanceEnv(gym.Env):
         return count
 
     def _get_reward(self):
-        # sector_dist = np.linalg.norm(self._last_sector_position - self._next_sector_position)
-        # dist_past = np.linalg.norm(self._position - self._last_sector_position)
-        # dist_ahead = np.linalg.norm(self._position - self._next_sector_position)
-        # last_dist_past = np.linalg.norm(self._last_position - self._last_sector_position)
-
+        # Extract 2D positions (x, z coordinates)
         lsp_2d = self._last_sector_position[0:3:2]
         nsp_2d = self._next_sector_position[0:3:2]
         pos_2d = self._position[0:3:2]
         lpos_2d = self._last_position[0:3:2]
 
-        sector_dist = np.linalg.norm(lsp_2d - nsp_2d)
+        # Calculate the distance of the current sector
+        sector_dist = np.linalg.norm(nsp_2d - lsp_2d)
 
+        # Handle case where sector positions are the same to avoid division by zero
+        if sector_dist == 0:
+            sector_dist = 1e-8
+
+        # Calculate the unit vector pointing from last sector to next sector
         sector_vec = (nsp_2d - lsp_2d) / sector_dist
-        ball_vec = (pos_2d - lsp_2d) / sector_dist
+
+        # Calculate the vector from last sector position to current ball position
+        ball_vec = pos_2d - lsp_2d
+
+        # Calculate how much progress the ball has made along the sector direction
+        # Project the ball vector onto the sector vector to get progress
         ball_progress = np.dot(ball_vec, sector_vec)
 
-        pos_delta_vec = (pos_2d - lpos_2d) / sector_dist
+        # Normalize the progress to be in range [0, 1] based on the sector length
+        # This represents the percentage of the sector completed
+        if sector_dist > 0:
+            normalized_progress = np.clip(ball_progress / sector_dist, 0.0, 1.0)
+        else:
+            normalized_progress = 0.0
+
+        # Calculate movement since last position check
+        pos_delta_vec = pos_2d - lpos_2d
+        # Calculate progress made in the current step along the sector direction
         delta_progress = np.dot(pos_delta_vec, sector_vec)
 
+        # Update last position every 10 steps to track movement
         if self._step % 10 == 0:
-            self._last_position = self._position
+            self._last_position = self._position.copy()
 
-        ball_reward = ball_progress * 100.
-        delta_reward = delta_progress * 10000.
+        # Base reward based on progress made in the level
+        progress_reward = normalized_progress * 100.0
 
+        # Reward for moving forward in the sector
+        movement_reward = np.clip(delta_progress * 50.0, -25.0, 25.0)  # Limit movement reward/penalty
+
+        # Small reward for staying in the game
+        time_reward = -0.1  # Small negative reward to encourage efficiency
+
+        # Penalty for being off track (if ball is too far from sector path)
+        # Calculate perpendicular distance to sector line
+        projected_point = lsp_2d + np.dot(ball_vec, sector_vec) * sector_vec
+        perpendicular_dist = np.linalg.norm(pos_2d - projected_point)
+        off_track_penalty = -np.clip(perpendicular_dist * 2.0, 0.0, 20.0)
+
+        # Large penalty for falling off or truncation
+        failure_penalty = -200.0 if self._should_truncate else 0.0
+
+        # Combine rewards
         reward = (
-            ball_reward
-            + delta_reward
-            - (5000. if (self._naction[2] == 1 and ball_progress < 0.0001) else 0.)
-            - (2000. if self._should_truncate else 0.)
+            progress_reward      # Reward for how far along the sector we are
+            + movement_reward    # Reward for positive movement in the right direction
+            + time_reward        # Small penalty for each step to encourage efficiency
+            + off_track_penalty  # Penalty for being far from the sector path
+            + failure_penalty    # Penalty for falling off
         )
 
         if self._step % 200 == 0:
-            print("Ball progress: {:.2f}%, reward: {:.2f}".format(ball_progress * 100, ball_reward))
-            print("Delta progress: {:.2f}%, reward: {:.2f}".format(delta_progress * 100, delta_reward))
+            print("Normalized progress: {:.2f}%, progress reward: {:.2f}".format(normalized_progress * 100, progress_reward))
+            print("Delta progress: {:.2f}, movement reward: {:.2f}".format(delta_progress, movement_reward))
             print("Reward: {:.2f}".format(reward))
 
         return reward
@@ -182,8 +216,8 @@ class BallanceEnv(gym.Env):
         # TODO: Apply input to game
         self._naction = np.array([
             (action & 0b0001) >> 0,
-            # (action & 0b0010) >> 1,
-            0,
+            (action & 0b0010) >> 1,
+            # 0,
             (action & 0b0100) >> 2,
             (action & 0b1000) >> 3,
         ], dtype=np.uint8)

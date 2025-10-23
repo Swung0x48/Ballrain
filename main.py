@@ -46,7 +46,7 @@ except FileNotFoundError:
 
 # Train the model
 print("Starting training...")
-model.learn(total_timesteps=100000)
+model.learn(total_timesteps=100000, progress_bar=True)
 
 # Save the trained model
 model.save("ballance_dqn_model" + str(seq+1))
