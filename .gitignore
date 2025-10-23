@@ -1,4 +1,13 @@
-﻿/__pycache__
-/BallrainIO/build
-/.idea
-/.vs
+﻿# python cache
+/__pycache__/
+
+# IDE settings
+/.idea/
+/.vs/
+/.vscode/
+
+# custom build scripts
+/BallrainIO/*.bat
+
+# build output
+/BallrainIO/build/
