@@ -50,7 +50,7 @@ void BallrainIO::OnLoad() {
         if (!m_BML->IsPlaying())
             return;
         auto* timeManager = static_cast<CKTimeManager*>(man);
-        timeManager->SetLastDeltaTime(1000.0f / 132.0f / 2.0f);
+        timeManager->SetLastDeltaTime(DEFAULT_INPUT_DT);
     });
 }
 

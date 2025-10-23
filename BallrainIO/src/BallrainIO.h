@@ -153,6 +153,9 @@ private:
     MsgDepthImage depthImage;
 
     BallrainConfig* m_config = nullptr;
+
+    const float PHYSICS_DT = 1000.0f / 132.0f;
+    const float DEFAULT_INPUT_DT = PHYSICS_DT / 1.0f;
 };
 
 extern "C" __declspec(dllexport) IMod* BMLEntry(IBML* bml) { return new BallrainIO(bml); }
