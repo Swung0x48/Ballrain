@@ -478,8 +478,8 @@ void BallrainIO::OnProcess() {
                     currentkeyState.states[KeyState::BR_RIGHT] ? "R" : " ");
                 ImGui::TreePop();
             }
-            ImGui::End();
         }
+        ImGui::End();
     }
 
     if (!m_ballNavActive)
