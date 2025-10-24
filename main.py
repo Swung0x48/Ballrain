@@ -6,7 +6,7 @@ from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.env_checker import check_env
 import BallanceEnv
 
-seq = 3
+seq = 0
 
 env = gym.make("ballance_env/Ballance-v0", max_episode_steps=-1)
 obs, info = env.reset()
@@ -37,7 +37,7 @@ try:
     print('model loaded')
 except FileNotFoundError:
     model = DQN(
-        "CnnPolicy",
+        "MultiInputPolicy",
         env,
         learning_rate=1e-4,
         buffer_size=10000,

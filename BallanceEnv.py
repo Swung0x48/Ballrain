@@ -42,9 +42,9 @@ class BallanceEnv(gym.Env):
             [0, 0, 0, 1],
             [0, 0, 1, 0],
             [0, 1, 0, 0],
+            [1, 0, 0, 0],
             [0, 1, 0, 1],
             [0, 1, 1, 0],
-            [1, 0, 0, 0],
             [1, 0, 0, 1],
             [1, 0, 1, 0],
         ]
@@ -112,6 +112,12 @@ class BallanceEnv(gym.Env):
         return count
 
     def _get_reward(self):
+        # if self._step <= 1000:
+        #     if self._naction[3] == 1:
+        #         return 10000.
+        #     else:
+        #         return -10.
+
         # Extract 2D positions (x, z coordinates)
         lsp_2d = self._last_sector_position[0:3:2]
         nsp_2d = self._next_sector_position[0:3:2]
@@ -133,14 +139,9 @@ class BallanceEnv(gym.Env):
 
         # Calculate how much progress the ball has made along the sector direction
         # Project the ball vector onto the sector vector to get progress
-        ball_progress = np.dot(ball_vec, sector_vec)
+        # ball_progress = (ball_vec[0] / sector_vec[0]) + (ball_vec[1] / sector_vec[1])
 
-        # Normalize the progress to be in range [0, 1] based on the sector length
-        # This represents the percentage of the sector completed
-        if sector_dist > 0:
-            normalized_progress = np.clip(ball_progress / sector_dist, 0.0, 1.0)
-        else:
-            normalized_progress = 0.0
+        # normalized_progress = ball_progress / sector_dist
 
         # Calculate movement since last position check
         pos_delta_vec = pos_2d - lpos_2d
@@ -152,7 +153,7 @@ class BallanceEnv(gym.Env):
             self._last_position = self._position.copy()
 
         # Base reward based on progress made in the level
-        progress_reward = normalized_progress * 1.0
+        # progress_reward = normalized_progress * 1.0
 
         # Reward for moving forward in the sector
         movement_reward = np.clip(delta_progress * 10.0, -100.0, 10.0)  # Reduced weight and limits
@@ -161,12 +162,25 @@ class BallanceEnv(gym.Env):
         # Reduced time penalty to encourage longer episodes
         time_reward = -1. * math.log2(self._step + 1)
 
-        dist_to_edge_prod = np.float_power(abs(np.prod(self._dist_to_edge, where=self._dist_to_edge > 0)), 1./8.)
-        is_on_track = np.count_nonzero(self._dist_to_edge) >= 5
-        on_track_reward = (2.
-            * dist_to_edge_prod
-            * (10. if is_on_track else -250.)
-        )
+        off_lr = self._dist_to_edge[0] - self._dist_to_edge[1]      # + L / - R
+        off_ud = self._dist_to_edge[2] - self._dist_to_edge[3]      # +U / -D
+        off_ludr = self._dist_to_edge[4] - self._dist_to_edge[5]    # +UL / -DR
+        off_urdl = self._dist_to_edge[6] - self._dist_to_edge[7]    # +UR / -DL
+
+        # LUT:
+        # 0 - Nop
+        # 1 - Up
+        # 2 - Down
+        # 3 - Left
+        # 4 - Right
+        # 5 - Up-Left
+        # 6 - Down-Left
+        # 7 - Up-Right
+        # 8 - Down-Right
+
+        norm_off_track_sum = (abs(off_lr) + abs(off_ud) + abs(off_ludr) + abs(off_urdl)) * 2. / 4.
+        off_track_penalty = 10. * -norm_off_track_sum
+
 
         # Large penalty for falling off or truncation
         failure_penalty = -500.0 if self._should_truncate else 0.0
@@ -174,20 +188,21 @@ class BallanceEnv(gym.Env):
         # Combine rewards
         reward = (
             # progress_reward      # Reward for how far along the sector we are, [0, 1]
-            + movement_reward    # Reward for positive movement in the right direction, [-100, 10]
+            # + movement_reward    # Reward for positive movement in the right direction, [-100, 10]
             + time_reward        # Small penalty for each step to encourage efficiency, -log
-            + on_track_reward    # Reward for being on the sector path
+            + off_track_penalty    # Reward for being on path
             + failure_penalty    # Penalty for falling off
         )
 
         if self._step % 200 == 0:
             np.set_printoptions(precision=3)
-            print("Normalized progress: {:.2f}%, progress reward: {:.2f}".format(normalized_progress * 100, progress_reward))
+            # print("Normalized progress: {:.2f}%, progress reward: {:.2f}".format(normalized_progress * 100, progress_reward))
             print("Delta progress: {:.2f}, movement reward: {:.2f}".format(delta_progress, movement_reward))
-            print("dist_to_edge_prod: {:.2f}".format(dist_to_edge_prod))
-            print("On-track reward: {:.2f}".format(on_track_reward))
-            print("Reward: {:.2f}".format(reward))
+            print("Off track sum normalized: {:.2f}".format(norm_off_track_sum))
+            print("Off-track penalty: {:.2f}".format(off_track_penalty))
             print(f"Dist to edge: {self._dist_to_edge}")
+            print("R G B Y: [{:.2f} {:.2f} {:.2f} {:.2f}]".format(off_lr, off_ud, off_ludr, off_urdl))
+            print("Reward: {:.2f}".format(reward))
 
         return reward
 
@@ -288,9 +303,9 @@ class BallanceEnv(gym.Env):
             get_dist_to_edge(self._depth_image, sample_pt, np.array([ 0, 1]), ignore_dist, 254) / img_shape[1], # Down
 
             get_dist_to_edge(self._depth_image, sample_pt, np.array([-1,-1]), ignore_dist, 254) / diag_len,     # Up-left
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1, 1]), ignore_dist, 254) / diag_len,     # Down-right
             get_dist_to_edge(self._depth_image, sample_pt, np.array([-1, 1]), ignore_dist, 254) / diag_len,     # Up-right
             get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1,-1]), ignore_dist, 254) / diag_len,     # Down-left
-            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1, 1]), ignore_dist, 254) / diag_len,     # Down-right
         ], dtype=np.float32)
 
         # Check if agent reached the target or failed
