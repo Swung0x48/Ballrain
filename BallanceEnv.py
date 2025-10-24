@@ -26,8 +26,8 @@ def get_dist_to_edge(image: np.ndarray,  # in (C,H,W)
     height = shape[1]
     first_sample_loc = point + ignore_vec
     next_sample_loc = first_sample_loc
-    while ((0 <= next_sample_loc[0] < width) or
-           (0 <= next_sample_loc[1] < height)):
+    while ((0 <= int(next_sample_loc[0]) < width) and
+           (0 <= int(next_sample_loc[1]) < height)):
         sample = image[0, int(next_sample_loc[1]), int(next_sample_loc[0])]
         if sample >= threshold:
             break
@@ -56,13 +56,11 @@ class BallanceEnv(gym.Env):
         self._last_sector_position = np.zeros(shape=(4,), dtype=np.float32)
         self._next_sector_position = np.zeros(shape=(4,), dtype=np.float32)
         self._step = 0
-        self._advance_count = 0.
-        self._up_hold_count = 0.
         self._should_truncate = False
         self._floor_boxes = []
         self._reward = 0.
         self._depth_image = np.zeros(shape=(1, 240, 320), dtype=np.uint8)
-        self._dist_to_edge = [0, 0, 0, 0, 0, 0, 0, 0]
+        self._dist_to_edge = np.zeros(shape=(8,), dtype=np.float32)
 
         print("Started server. Waiting for connection...")
         self.server = TCPServer(port=27787)
@@ -87,11 +85,24 @@ class BallanceEnv(gym.Env):
         # Not necessarily useful, but put those here just in case
         self.action_space = gym.spaces.Discrete(len(self._action_lut))
 
-        self.observation_space = gym.spaces.Box(
-            low=0, high=255, shape=(1, 240, 320), dtype=np.uint8)
+        self.observation_space = gym.spaces.Dict(
+            {
+                'position': gym.spaces.Box(-1e6, 1e6, shape=(3,), dtype=np.float32),
+                'quaternion': gym.spaces.Box(-1., 1., shape=(4,), dtype=np.float32),
+                'last_sector_position': gym.spaces.Box(-1e6, 1e6, shape=(3,), dtype=np.float32),
+                'next_sector_position': gym.spaces.Box(-1e6, 1e6, shape=(3,), dtype=np.float32),
+                'dist_to_edge': gym.spaces.Box(0., 1., shape=(8,), dtype=np.float32),
+            }
+        )
 
     def _get_obs(self):
-        return self._depth_image
+        return {
+            'position': self._position,
+            'quaternion': self._quaternion,
+            'last_sector_position': self._last_sector_position,
+            'next_sector_position': self._next_sector_position,
+            'dist_to_edge': self._dist_to_edge,
+        }
 
     def _is_in_any_box(self):
         count = 0
@@ -99,6 +110,9 @@ class BallanceEnv(gym.Env):
             if _is_in_box(self._position, box):
                 count += 1
         return count
+
+    def _is_off_track(self):
+        self._dist_to_edge = np.linalg.norm(self._last_sector_position - self._position)
 
     def _get_reward(self):
         # Extract 2D positions (x, z coordinates)
@@ -149,11 +163,11 @@ class BallanceEnv(gym.Env):
         # Small reward for staying in the game
         time_reward = -0.1 * math.log2(self._step + 1)  # Small negative reward to encourage efficiency
 
+        normalized_edge_product = (abs(np.prod(self._dist_to_edge)) ** (1./8.))
         # Penalty for being off track (if ball is too far from sector path)
-        # Calculate perpendicular distance to sector line
-        # projected_point = lsp_2d + np.dot(ball_vec, sector_vec) * sector_vec
-        # perpendicular_dist = np.linalg.norm(pos_2d - projected_point)
-        # off_track_penalty = -np.clip(perpendicular_dist * 2.0, 0.0, 20.0)
+        off_track_penalty = normalized_edge_product * (-1. if np.any(self._dist_to_edge < 0) else 1.)
+
+        on_track_reward = normalized_edge_product * (-1. if np.any(self._dist_to_edge < 0) else 1.)
 
         # Large penalty for falling off or truncation
         failure_penalty = -200.0 if self._should_truncate else 0.0
@@ -163,14 +177,16 @@ class BallanceEnv(gym.Env):
             progress_reward      # Reward for how far along the sector we are
             + movement_reward    # Reward for positive movement in the right direction
             + time_reward        # Small penalty for each step to encourage efficiency
-            # + off_track_penalty  # Penalty for being far from the sector path
+            + on_track_reward    # Reward for being on the sector path
+            + off_track_penalty  # Penalty for being far from the sector path
             + failure_penalty    # Penalty for falling off
         )
 
-        # if self._step % 200 == 0:
-        #     print("Normalized progress: {:.2f}%, progress reward: {:.2f}".format(normalized_progress * 100, progress_reward))
-        #     print("Delta progress: {:.2f}, movement reward: {:.2f}".format(delta_progress, movement_reward))
-        #     print("Reward: {:.2f}".format(reward))
+        if self._step % 200 == 0:
+            print("Normalized progress: {:.2f}%, progress reward: {:.2f}".format(normalized_progress * 100, progress_reward))
+            print("Delta progress: {:.2f}, movement reward: {:.2f}".format(delta_progress, movement_reward))
+            print("Off-track penalty: {:.2f}".format(off_track_penalty))
+            print("Reward: {:.2f}".format(reward))
 
         return reward
 
@@ -265,16 +281,16 @@ class BallanceEnv(gym.Env):
         sample_pt = np.array([img_shape[1] / 2, img_shape[0] / 2])
         ignore_dist = 15 # ball diameter, in px
         self._dist_to_edge = np.array([
-            get_dist_to_edge(self._depth_image, sample_pt, np.array([-1, 0]), ignore_dist, 254) / img_shape[0],
-            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1, 0]), ignore_dist, 254) / img_shape[0],
-            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 0,-1]), ignore_dist, 254) / img_shape[1],
-            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 0, 1]), ignore_dist, 254) / img_shape[1],
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([-1, 0]), ignore_dist, 254) / img_shape[0], # Left
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1, 0]), ignore_dist, 254) / img_shape[0], # Right
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 0,-1]), ignore_dist, 254) / img_shape[1], # Up
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 0, 1]), ignore_dist, 254) / img_shape[1], # Down
 
-            get_dist_to_edge(self._depth_image, sample_pt, np.array([-1,-1]), ignore_dist, 254) / diag_len,
-            get_dist_to_edge(self._depth_image, sample_pt, np.array([-1, 1]), ignore_dist, 254) / diag_len,
-            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1,-1]), ignore_dist, 254) / diag_len,
-            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1, 1]), ignore_dist, 254) / diag_len,
-        ])
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([-1,-1]), ignore_dist, 254) / diag_len,     # Up-left
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([-1, 1]), ignore_dist, 254) / diag_len,     # Up-right
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1,-1]), ignore_dist, 254) / diag_len,     # Down-left
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1, 1]), ignore_dist, 254) / diag_len,     # Down-right
+        ], dtype=np.float32)
         # print(self._dist_to_edge)
 
         # Check if agent reached the target or failed
