@@ -152,32 +152,31 @@ class BallanceEnv(gym.Env):
             self._last_position = self._position.copy()
 
         # Base reward based on progress made in the level
-        progress_reward = normalized_progress * 10.0
+        progress_reward = normalized_progress * 1.0
 
         # Reward for moving forward in the sector
-        movement_reward = np.clip(delta_progress * 5.0, -100.0, 50.0)  # Limit movement reward/penalty
+        movement_reward = np.clip(delta_progress * 10.0, -100.0, 10.0)  # Reduced weight and limits
 
         # Small reward for staying in the game
-        time_reward = -0.1 * math.log2(self._step + 1)  # Small negative reward to encourage efficiency
+        # Reduced time penalty to encourage longer episodes
+        time_reward = -1. * math.log2(self._step + 1)
 
-        normalized_edge_sum = np.sum(self._dist_to_edge) ** (1/8)
-        # Penalty for being off track (if ball is too far from sector path)
-        off_track_count = len(self._dist_to_edge) - np.count_nonzero(self._dist_to_edge)
-        off_track_penalty = off_track_count * -100.
-
-        on_track = np.any(self._dist_to_edge > 0)
-        on_track_reward = normalized_edge_sum * 10.
+        dist_to_edge_prod = np.float_power(abs(np.prod(self._dist_to_edge, where=self._dist_to_edge > 0)), 1./8.)
+        is_on_track = np.count_nonzero(self._dist_to_edge) >= 5
+        on_track_reward = (2.
+            * dist_to_edge_prod
+            * (10. if is_on_track else -250.)
+        )
 
         # Large penalty for falling off or truncation
-        failure_penalty = -200.0 if self._should_truncate else 0.0
+        failure_penalty = -500.0 if self._should_truncate else 0.0
 
         # Combine rewards
         reward = (
-            # progress_reward      # Reward for how far along the sector we are
-            + movement_reward    # Reward for positive movement in the right direction
-            + time_reward        # Small penalty for each step to encourage efficiency
+            # progress_reward      # Reward for how far along the sector we are, [0, 1]
+            + movement_reward    # Reward for positive movement in the right direction, [-100, 10]
+            + time_reward        # Small penalty for each step to encourage efficiency, -log
             + on_track_reward    # Reward for being on the sector path
-            + off_track_penalty  # Penalty for being far from the sector path
             + failure_penalty    # Penalty for falling off
         )
 
@@ -185,8 +184,8 @@ class BallanceEnv(gym.Env):
             np.set_printoptions(precision=3)
             print("Normalized progress: {:.2f}%, progress reward: {:.2f}".format(normalized_progress * 100, progress_reward))
             print("Delta progress: {:.2f}, movement reward: {:.2f}".format(delta_progress, movement_reward))
+            print("dist_to_edge_prod: {:.2f}".format(dist_to_edge_prod))
             print("On-track reward: {:.2f}".format(on_track_reward))
-            print("Off-track penalty: {:.2f}".format(off_track_penalty))
             print("Reward: {:.2f}".format(reward))
             print(f"Dist to edge: {self._dist_to_edge}")
 
