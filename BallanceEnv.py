@@ -14,6 +14,27 @@ def _is_in_box(position, box: np.ndarray) -> bool:
     return np.all(position <= box[0]) and np.all(position >= box[1])
 
 
+def get_dist_to_edge(image: np.ndarray,  # in (C,H,W)
+                     point: np.ndarray,
+                     direction: np.ndarray,
+                     ignore_dist: float,
+                     threshold: float) -> float:
+    direction = direction / np.linalg.norm(direction)
+    ignore_vec = direction * ignore_dist
+    shape = image.shape
+    width = shape[2]
+    height = shape[1]
+    first_sample_loc = point + ignore_vec
+    next_sample_loc = first_sample_loc
+    while ((0 <= next_sample_loc[0] < width) or
+           (0 <= next_sample_loc[1] < height)):
+        sample = image[0, int(next_sample_loc[1]), int(next_sample_loc[0])]
+        if sample >= threshold:
+            break
+        next_sample_loc = next_sample_loc + direction
+    return float(np.linalg.norm(next_sample_loc - first_sample_loc))
+
+
 class BallanceEnv(gym.Env):
     def __init__(self):
         self._action_lut = [
@@ -41,6 +62,7 @@ class BallanceEnv(gym.Env):
         self._floor_boxes = []
         self._reward = 0.
         self._depth_image = np.zeros(shape=(1, 240, 320), dtype=np.uint8)
+        self._dist_to_edge = [0, 0, 0, 0, 0, 0, 0, 0]
 
         print("Started server. Waiting for connection...")
         self.server = TCPServer(port=27787)
@@ -145,10 +167,10 @@ class BallanceEnv(gym.Env):
             + failure_penalty    # Penalty for falling off
         )
 
-        if self._step % 200 == 0:
-            print("Normalized progress: {:.2f}%, progress reward: {:.2f}".format(normalized_progress * 100, progress_reward))
-            print("Delta progress: {:.2f}, movement reward: {:.2f}".format(delta_progress, movement_reward))
-            print("Reward: {:.2f}".format(reward))
+        # if self._step % 200 == 0:
+        #     print("Normalized progress: {:.2f}%, progress reward: {:.2f}".format(normalized_progress * 100, progress_reward))
+        #     print("Delta progress: {:.2f}, movement reward: {:.2f}".format(delta_progress, movement_reward))
+        #     print("Reward: {:.2f}".format(reward))
 
         return reward
 
@@ -237,6 +259,23 @@ class BallanceEnv(gym.Env):
         # plt.title("Depth Buffer")
         # plt.colorbar()
         # plt.show()
+
+        img_shape = self._depth_image.shape[1:]
+        diag_len = float(np.linalg.norm(img_shape))
+        sample_pt = np.array([img_shape[1] / 2, img_shape[0] / 2])
+        ignore_dist = 15 # ball diameter, in px
+        self._dist_to_edge = np.array([
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([-1, 0]), ignore_dist, 254) / img_shape[0],
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1, 0]), ignore_dist, 254) / img_shape[0],
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 0,-1]), ignore_dist, 254) / img_shape[1],
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 0, 1]), ignore_dist, 254) / img_shape[1],
+
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([-1,-1]), ignore_dist, 254) / diag_len,
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([-1, 1]), ignore_dist, 254) / diag_len,
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1,-1]), ignore_dist, 254) / diag_len,
+            get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1, 1]), ignore_dist, 254) / diag_len,
+        ])
+        # print(self._dist_to_edge)
 
         # Check if agent reached the target or failed
         terminated = self._should_truncate
