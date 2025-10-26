@@ -137,11 +137,9 @@ class BallanceEnv(gym.Env):
         # Calculate the vector from last sector position to current ball position
         ball_vec = pos_2d - lsp_2d
 
-        # Calculate how much progress the ball has made along the sector direction
-        # Project the ball vector onto the sector vector to get progress
-        # ball_progress = (ball_vec[0] / sector_vec[0]) + (ball_vec[1] / sector_vec[1])
+        ball_progress = np.dot(ball_vec, sector_vec)
 
-        # normalized_progress = ball_progress / sector_dist
+        normalized_progress = ball_progress / sector_dist
 
         # Calculate movement since last position check
         pos_delta_vec = pos_2d - lpos_2d
@@ -153,10 +151,10 @@ class BallanceEnv(gym.Env):
             self._last_position = self._position.copy()
 
         # Base reward based on progress made in the level
-        # progress_reward = normalized_progress * 1.0
+        progress_reward = normalized_progress * 100.0
 
         # Reward for moving forward in the sector
-        movement_reward = np.clip(delta_progress * 10.0, -100.0, 10.0)  # Reduced weight and limits
+        movement_reward = delta_progress * 10.0
 
         # Small reward for staying in the game
         # Reduced time penalty to encourage longer episodes
@@ -166,6 +164,13 @@ class BallanceEnv(gym.Env):
         off_ud = self._dist_to_edge[2] - self._dist_to_edge[3]      # +U / -D
         off_ludr = self._dist_to_edge[4] - self._dist_to_edge[5]    # +UL / -DR
         off_urdl = self._dist_to_edge[6] - self._dist_to_edge[7]    # +UR / -DL
+
+        lr_vec   = np.array([-1, 0]) * off_lr
+        ud_vec   = np.array([ 0,-1]) * off_ud
+        ludr_vec = np.array([-1,-1]) * off_ludr
+        urdl_vec = np.array([-1, 1]) * off_urdl
+
+        combined_off_vec = lr_vec + ud_vec + ludr_vec + urdl_vec
 
         # LUT:
         # 0 - Nop
@@ -178,19 +183,25 @@ class BallanceEnv(gym.Env):
         # 7 - Up-Right
         # 8 - Down-Right
 
-        norm_off_track_sum = (abs(off_lr) + abs(off_ud) + abs(off_ludr) + abs(off_urdl)) * 2. / 4.
-        off_track_penalty = 10. * -norm_off_track_sum
+        combined_off_dist = float(np.linalg.norm(combined_off_vec))
+        off_track_penalty = 20. * (-combined_off_dist + 0.2)
 
+        ray_out_count = len(self._dist_to_edge) - np.count_nonzero(self._dist_to_edge)
+        if ray_out_count >= 4:
+            out_of_bound_penalty = ray_out_count * -100.
+        else:
+            out_of_bound_penalty = 0.0
 
         # Large penalty for falling off or truncation
         failure_penalty = -500.0 if self._should_truncate else 0.0
 
         # Combine rewards
         reward = (
-            # progress_reward      # Reward for how far along the sector we are, [0, 1]
-            # + movement_reward    # Reward for positive movement in the right direction, [-100, 10]
+            progress_reward      # Reward for how far along the sector we are, [0, 1]
+            + movement_reward    # Reward for positive movement in the right direction, [-100, 10]
             + time_reward        # Small penalty for each step to encourage efficiency, -log
-            + off_track_penalty    # Reward for being on path
+            + off_track_penalty  # Reward for being on path
+            + out_of_bound_penalty
             + failure_penalty    # Penalty for falling off
         )
 
@@ -198,8 +209,8 @@ class BallanceEnv(gym.Env):
             np.set_printoptions(precision=3)
             # print("Normalized progress: {:.2f}%, progress reward: {:.2f}".format(normalized_progress * 100, progress_reward))
             print("Delta progress: {:.2f}, movement reward: {:.2f}".format(delta_progress, movement_reward))
-            print("Off track sum normalized: {:.2f}".format(norm_off_track_sum))
-            print("Off-track penalty: {:.2f}".format(off_track_penalty))
+            # print("Off track sum normalized: {:.2f}".format(norm_off_track_sum))
+            # print("Off-track penalty: {:.2f}".format(off_track_penalty))
             print(f"Dist to edge: {self._dist_to_edge}")
             print("R G B Y: [{:.2f} {:.2f} {:.2f} {:.2f}]".format(off_lr, off_ud, off_ludr, off_urdl))
             print("Reward: {:.2f}".format(reward))
