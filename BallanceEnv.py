@@ -34,6 +34,22 @@ def get_dist_to_edge(image: np.ndarray,  # in (C,H,W)
         next_sample_loc = next_sample_loc + direction
     return float(np.linalg.norm(next_sample_loc - first_sample_loc))
 
+def get_nearest_depth(image: np.ndarray,
+                      point: np.ndarray,
+                      direction: np.ndarray,
+                      ignore_dist: float) -> float:
+    direction = direction / np.linalg.norm(direction)
+    ignore_vec = direction * ignore_dist
+    shape = image.shape
+    width = shape[2]
+    height = shape[1]
+    sample_loc = point + ignore_vec + direction
+    if ((0 <= int(sample_loc[0]) < width) and
+       (0 <= int(sample_loc[1]) < height)):
+        sample = image[0, int(sample_loc[1]), int(sample_loc[0])]
+    else:
+        sample = 255.
+    return float(sample) / 255.
 
 class BallanceEnv(gym.Env):
     def __init__(self):
@@ -61,6 +77,7 @@ class BallanceEnv(gym.Env):
         self._reward = 0.
         self._depth_image = np.zeros(shape=(1, 240, 320), dtype=np.uint8)
         self._dist_to_edge = np.zeros(shape=(8,), dtype=np.float32)
+        self._edge_depth_val = np.zeros(shape=(8,), dtype=np.float32)
 
         print("Started server. Waiting for connection...")
         self.server = TCPServer(port=27787)
@@ -92,6 +109,7 @@ class BallanceEnv(gym.Env):
                 'last_sector_position': gym.spaces.Box(-1e6, 1e6, shape=(3,), dtype=np.float32),
                 'next_sector_position': gym.spaces.Box(-1e6, 1e6, shape=(3,), dtype=np.float32),
                 'dist_to_edge': gym.spaces.Box(0., 1., shape=(8,), dtype=np.float32),
+                'edge_depth_val': gym.spaces.Box(0., 1., shape=(8,), dtype=np.float32),
             }
         )
 
@@ -102,6 +120,7 @@ class BallanceEnv(gym.Env):
             'last_sector_position': self._last_sector_position,
             'next_sector_position': self._next_sector_position,
             'dist_to_edge': self._dist_to_edge,
+            'edge_depth_val': self._edge_depth_val,
         }
 
     def _is_in_any_box(self):
@@ -306,7 +325,7 @@ class BallanceEnv(gym.Env):
         img_shape = self._depth_image.shape[1:]
         diag_len = float(np.linalg.norm(img_shape))
         sample_pt = np.array([img_shape[1] / 2, img_shape[0] / 2])
-        ignore_dist = 15 # ball diameter, in px
+        ignore_dist = 30 # ball diameter, in px, be a little bit generous (should be 15)
         self._dist_to_edge = np.array([
             get_dist_to_edge(self._depth_image, sample_pt, np.array([-1, 0]), ignore_dist, 254) / img_shape[0], # Left
             get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1, 0]), ignore_dist, 254) / img_shape[0], # Right
@@ -318,6 +337,19 @@ class BallanceEnv(gym.Env):
             get_dist_to_edge(self._depth_image, sample_pt, np.array([-1, 1]), ignore_dist, 254) / diag_len,     # Up-right
             get_dist_to_edge(self._depth_image, sample_pt, np.array([ 1,-1]), ignore_dist, 254) / diag_len,     # Down-left
         ], dtype=np.float32)
+
+        self._edge_depth_val = np.array([
+            get_nearest_depth(self._depth_image, sample_pt, np.array([-1, 0]), ignore_dist),  # Left
+            get_nearest_depth(self._depth_image, sample_pt, np.array([1, 0]), ignore_dist),  # Right
+            get_nearest_depth(self._depth_image, sample_pt, np.array([0, -1]), ignore_dist),  # Up
+            get_nearest_depth(self._depth_image, sample_pt, np.array([0, 1]), ignore_dist),  # Down
+
+            get_nearest_depth(self._depth_image, sample_pt, np.array([-1, -1]), ignore_dist),  # Up-left
+            get_nearest_depth(self._depth_image, sample_pt, np.array([1, 1]), ignore_dist),  # Down-right
+            get_nearest_depth(self._depth_image, sample_pt, np.array([-1, 1]), ignore_dist),  # Up-right
+            get_nearest_depth(self._depth_image, sample_pt, np.array([1, -1]), ignore_dist),  # Down-left
+        ], dtype=np.float32)
+        print(self._edge_depth_val)
 
         # Check if agent reached the target or failed
         terminated = self._should_truncate
