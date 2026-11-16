@@ -22,22 +22,21 @@ BallanceMMO 的无头引擎（SimTool：开源 CK2 / VxMath + 真 BuildingBlocks
 
 | 文件 | 层 | 内容 |
 |---|---|---|
-| `patches/0001-headless-engine-frame-delta.diff` | 基础 | `headless_engine`：`set_frame_ms`（逐帧 delta，0 = 固定 tick）、`set_random_patch`、`set_keep_precision`（加载关卡时不重置 x87 精度：2002 进程只在第一个凸包之前是 24 位，之后一直 64 位） |
-| `patches/0002-ballrain-agent-entry.diff` | 基础 | `sim_tool.cpp` 的 `--ballrain-agent` 入口；CMake 把 `sim/ballrain_agent.cpp` 加进 BallanceMMOSim |
-| `patches/0003-ivp-ball-order-key-hook.diff` | 基础 | 球-球接触对的排序键由宿主提供（`ivp_ball_order_key_hook`），agent 装入 CK id，去掉按堆地址排序带来的逐次运行不确定（x87-soft 会话 `patch_ballorder.py` 的 IVP 部分） |
-| `patches/0004-hx1-x87-game-math.diff` | 默认（`HL_VARIANT=plain` 时不打） | x87-soft 会话的实验代码 hx1：游戏侧 x87 数学（VxMatrix.inl + VxMathX87Game.cpp、CK2_3DX87 + CK3dEntity、TT_Toolbox_RT SetDynamicPosition、`VX_X87_GAME` 只在无头构建里定义）。**尚未进入产品代码**，等他们的产品提交落地后改用那些提交；源文件哈希写在补丁头 |
-| `src/ballrain_agent.cpp`、`src/ballrain_wire.h` | 基础 | agent 模式本体，复制到 `BallanceMMOServer/sim/` |
+| `patches/0001-hx1c-vs-b640cbc5.diff` | 基础 | x87-soft 会话的权威实验补丁集 hx1c，**原样复制**（sha256 `96c0cc0148cd5573fa50f9bfa2eeeb0025fb842277532e0e769cb1396f895b96`；来源 `tas-bisect/hx1c/`，其 README sha256 `e1954aeecc04a4ab…`、base-commits.txt `baf8480e8f5f1603…`）。内容：SimTool `--tas` 回放、legacy 改动 / 复位状态 / `HX1_KEEP_PRECISION` 的环境开关、`headless_engine` 的逐帧 delta 与 Random 开关、游戏侧 x87 数学（VxMath、CK2_3D、TT Set Dynamic Position）、`CKIpionManager::SetDeltaTime` 的 x87 平滑 delta、球-球接触对按 CK id 排序。**实验代码，尚未进入产品**；他们的产品提交落地后改用那些提交 |
+| `patches/0002-ballrain-agent-entry.diff` | 基础 | `sim_tool.cpp` 的 `--ballrain-agent` 入口；CMake 把 `sim/ballrain_agent.cpp` 加进 BallanceMMOSim（叠在 0001 之上） |
+| `src/ballrain_agent.cpp`、`src/ballrain_wire.h` | 基础 | agent 模式本体，复制到 `BallanceMMOServer/sim/`；legacy 改动、复位状态、`HX1_KEEP_PRECISION`、CK id 排序键都由它自己设好 |
 
-补丁只加东西、互不重叠，便于 rebase 到 x87-soft 会话以后的保真修复上。诊断用的补丁（相机注入、力 / 冲量日志等）不在补丁集里。
+我们自己的部分（0002 + `src/`）只加东西，跟着 hx1c 换基即可。诊断用的补丁（相机注入、力 / 冲量日志等）不在补丁集里。
 
 ## 编译（macOS arm64，Apple clang）
 
 ```sh
-SDL3_DIR=<SDL3 源码树> CMAKE=<cmake> NINJA=<ninja> [HL_VARIANT=plain] headless/build_mac.sh OUT/src.tar WORK
+SDL3_DIR=<SDL3 源码树> CMAKE=<cmake> NINJA=<ninja> headless/build_mac.sh OUT/src.tar WORK
 # -> WORK/build/BallanceMMOServer/BallanceMMOSimTool
 ```
 
-SDL3 在 macOS 上需要两处本地修改（见 `build_mac.sh` 头部）。从 `src.tar` 解包、打补丁到编译完成，M6 上两个变体并行各约 220 s（6 个并行任务）。
+SDL3 在 macOS 上需要两处本地修改（见 `build_mac.sh` 头部）。从 `src.tar` 解包、打补丁到编译完成，M6 上约 220 s（6 个并行任务）。
+正在被训练使用的二进制不要覆盖：每个构建放进新目录（例如 `~/ballrain/hl/hx1c-<diff 哈希>-<agent 哈希>`），训练重启时切换。
 
 ## 运行
 

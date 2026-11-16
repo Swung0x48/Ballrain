@@ -70,7 +70,8 @@ typedef int sock_t;
 
 int ivp_srand_read();      // ivu_os_dep.cxx
 void ivp_srand(int seed);
-// patches/0003: the key a ball-ball contact pair is ordered by outside a physics session (NULL = heap addresses)
+// patches/0001 (hx1c): the key a ball-ball contact pair is ordered by outside a physics session (NULL = heap addresses);
+// hx1c's CKIpionManager installs the same CK-id key in the VX_X87_GAME build, this makes it explicit
 extern unsigned int (*ivp_ball_order_key_hook)(void *client_data);
 
 namespace {
@@ -1212,7 +1213,7 @@ bool Agent::Boot() {
     // it, which made runs of the same frames differ (docs/headless.md). A fixed seed makes every run repeatable.
     std::srand(m_CrtSeed);
     // Ball-ball contact pairs ordered by CK object id (creation order: retail's address order whenever retail itself
-    // is consistent) instead of the heap addresses, which differ from run to run (patches/0003).
+    // is consistent) instead of the heap addresses, which differ from run to run (patches/0001).
     ivp_ball_order_key_hook = [](void *client_data) -> unsigned int {
         return client_data ? (unsigned int) static_cast<CK3dEntity *>(client_data)->GetID() : 0u;
     };
@@ -1221,7 +1222,15 @@ bool Agent::Boot() {
     m_Engine->set_random_patch(m_RandomPatch);
     // The 2002 process runs at 24 bits only until its first hull (built during the boot), then at 64 bits for good:
     // no precision reset at the level load (patches/0001).
-    m_Engine->set_keep_precision(m_KeepPrecision);
+    // patches/0001 (hx1c) reads HX1_KEEP_PRECISION in headless_engine::load_level
+#ifdef _WIN32
+    _putenv_s("HX1_KEEP_PRECISION", m_KeepPrecision ? "1" : "");
+#else
+    if (m_KeepPrecision)
+        setenv("HX1_KEEP_PRECISION", "1", 1);
+    else
+        unsetenv("HX1_KEEP_PRECISION");
+#endif
     m_Physics = m_Engine->physics();
     m_Engine->set_frame_ms(0.0f);
     for (int i = 0; i < m_BootTicks; ++i)

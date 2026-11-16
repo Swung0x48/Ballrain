@@ -6,7 +6,7 @@
 # SRC_TAR: the output of headless/mk_src.sh (src.tar, prefix src/). WORK_DIR gets src/ (pristine + patches +
 # headless/src) and build/. Environment: SDL3_DIR (an SDL3 source tree, required by the engine's CMake; on macOS
 # with two local edits: CMakeLists.txt "if(MACOS AND SDL_VIDEO)" for the tray, src/tray/dummy/SDL_tray.c "#if 1"),
-# CMAKE / NINJA (default: from PATH), JOBS (default: all cores - 1), HL_VARIANT (exact = default | plain).
+# CMAKE / NINJA (default: from PATH), JOBS (default: all cores - 1).
 # Flags: the sim-only x87 SOFT recipe (BMMO_BUILD_SIM_ONLY, no physics_RT plugin, portable math, strict FP).
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -19,9 +19,7 @@ JOBS=${JOBS:-$(( $(sysctl -n hw.ncpu 2>/dev/null || nproc) - 1 ))}
 mkdir -p "$WORK"
 rm -rf "$WORK/src"
 tar xf "$TAR" -C "$WORK"
-# HL_VARIANT=exact (default): every patch; plain: without 0004 (the x87-soft session's game-side x87 math)
 for p in "$HERE"/patches/0*.diff; do
-  case "$(basename "$p")" in 0004-*) [ "${HL_VARIANT:-exact}" = plain ] && { echo "skipping $(basename "$p") (plain)"; continue; };; esac
   echo "applying $(basename "$p")"
   patch -d "$WORK/src" -p1 --forward --quiet < "$p"
 done
@@ -29,7 +27,7 @@ cp "$HERE/src/ballrain_agent.cpp" "$HERE/src/ballrain_wire.h" "$WORK/src/Ballanc
 "$CMAKE" -S "$WORK/src" -B "$WORK/build" -G Ninja -DCMAKE_MAKE_PROGRAM="$(command -v "$NINJA")" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_CLIENT=OFF -DBUILD_SERVER=ON -DBMMO_BUILD_SIM=ON -DBMMO_BUILD_SIM_ONLY=ON -DBMMO_BUILD_PHYSICS_RT=OFF \
-  -DBMMO_PHYSICS_PORTABLE_MATH=ON -DBMMO_PHYSICS_FP_STRICT=ON -DBMMO_PHYSICS_X87=SOFT -DBMMO_BUILD_ID=ballrain-headless-${HL_VARIANT:-exact} \
+  -DBMMO_PHYSICS_PORTABLE_MATH=ON -DBMMO_PHYSICS_FP_STRICT=ON -DBMMO_PHYSICS_X87=SOFT -DBMMO_BUILD_ID=ballrain-headless-hx1c \
   -DFETCHCONTENT_SOURCE_DIR_BMMO_SDL3="$SDL3_DIR" -DFETCHCONTENT_FULLY_DISCONNECTED=ON > "$WORK/configure.log" 2>&1 \
   || { tail -30 "$WORK/configure.log"; echo CONFIGURE-FAILED; exit 3; }
 start=$(date +%s)
