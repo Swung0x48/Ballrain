@@ -74,6 +74,9 @@ class RunMeta:
     # a headless run is never evidence about the retail game
     backend: str = "retail"
     trace_hash: str | None = None  # headless: run fingerprint (same frames + same engine build => same hash)
+    # headless: the ball-pair contact order the engine ran with (BALLRAIN_HL_BALL_ORDER as resolved for this process,
+    # e.g. "ckid", "retail:123"; ballrain.headless.parse_ball_order); None for retail runs
+    ball_order: str | None = None
     started_at: float = 0.0
     wall_s: float = 0.0
     prefix: dict | None = None

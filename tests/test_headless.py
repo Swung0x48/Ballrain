@@ -192,8 +192,17 @@ def test_headless_launcher_environment(tmp_path, monkeypatch):
                                                            legacy_edit=False, extra_env={"BALLRAIN_HL_VERBOSE": 1}))
     env = la.environment({"BALLRAIN_LEVEL": "3", "BALLRAIN_SHM": None, "BALLRAIN_SOCK": "unix:/x"})
     assert env["BALLRAIN_LEVEL"] == "3" and "BALLRAIN_SHM" not in env and "BALLRAIN_TRACE" not in env
-    assert env["BALLRAIN_HL_SEED"] == "5" and env["BALLRAIN_HL_HIDDEN_TICKS"] == "34" and env["BALLRAIN_HL_LEGACY"] == "0"
-    assert env["BALLRAIN_HL_VERBOSE"] == "1" and env["PATH_KEEP_ME"] == "1" and "BALLRAIN_HL_NMC" not in env
+    assert env["BALLRAIN_HL_VERBOSE"] == "1" and env["PATH_KEEP_ME"] == "1" and env["BALLRAIN_HL_BALL_ORDER"] == "ckid"
+    # the recipe is SimTool's flags, passed only where the config differs from their defaults
+    assert not [k for k in env if k in ("BALLRAIN_HL_SEED", "BALLRAIN_HL_HIDDEN_TICKS", "BALLRAIN_HL_LEGACY")]
+    assert la.arguments() == ["b", "--ballrain-agent", "--root", str(Path("r").resolve()), "--tas-offset", "34",
+                              "--tas-seed", "5", "--tas-no-legacy"]
+    assert headless.HeadlessLauncher(headless.HeadlessConfig(binary="b", root="r")).arguments()[1:3] == ["--ballrain-agent",
+                                                                                                         "--root"]
+    full = headless.HeadlessLauncher(headless.HeadlessConfig(binary="b", root="r", boot_ticks=400, reset_nmc=-1,
+                                                             reset_frame=0, reset_precision=True, orig_random=True))
+    assert full.arguments()[4:] == ["--boot-ticks", "400", "--tas-movement-check", "-1", "--tas-reset-frame", "0",
+                                    "--tas-reset-precision", "--tas-orig-random"]
     assert headless.headless_copy_names(3) == ["hl-00", "hl-01", "hl-02"]
     ch = la.make_channel(None)
     try:
@@ -222,3 +231,87 @@ def test_trace_hash_repeats_with_the_same_frames(tmp_path):
         hashes.append(json.loads(Path(info["run_meta"]).read_text(encoding="utf-8"))["trace_hash"])
         env.close()
     assert hashes[0] == hashes[1] and hashes[0] is not None
+
+
+def test_ball_order_parsing():
+    P = headless.parse_ball_order
+    assert P(None) == P("") == P("ckid") == "ckid" and P("reverse") == "reverse"
+    assert P("perm:007") == "perm:7" and P("retail:18446744073709551615") == "retail:18446744073709551615"
+    assert P("table:Ball_Wood=0,P_Ball_Stone_MF004=1,P_Ball_Stone_MF002=02") == \
+        "table:Ball_Wood=0,P_Ball_Stone_MF004=1,P_Ball_Stone_MF002=2"
+    assert P("perm", allow_seedless=True) == "perm" and P("retail", allow_seedless=True) == "retail"
+    for bad in ("nope", "ckid:1", "reverse:2", "perm", "perm:", "perm:-1", "perm:1x", "retail:18446744073709551616",
+                "table:", "table:a", "table:=1", "table:a=1,a=2", "table:a=1,b=1", "table:a=1048576", "table:a=1,,b=2"):
+        with pytest.raises(ValueError):
+            P(bad)
+
+
+def test_ball_order_resolution_and_draws():
+    import random
+    rng = random.Random(5)
+    a, b = headless.resolve_ball_order("retail", rng), headless.resolve_ball_order("retail", rng)
+    assert a.startswith("retail:") and b.startswith("retail:") and a != b  # a fresh seed per process
+    assert headless.resolve_ball_order("perm:3") == "perm:3" and headless.resolve_ball_order(None) == "ckid"
+    # the draw (splitmix64, as the engine's RetailDrawL1): fixed per seed, Ball_Wood first, the measured blocks
+    names = {f"P_Ball_Stone_MF00{i}" for i in range(1, 5)}
+    stone_first, mf4_before_mf2 = 0, 0
+    for seed in range(2000):
+        d = headless.retail_draw_l1(seed)
+        assert d == headless.retail_draw_l1(seed) and d[0] == "Ball_Wood"
+        assert set(d[1:3]) == {"P_Ball_Stone_MF", "P_Ball_Wood_MF"} and set(d[3:]) == names
+        stone_first += d[1] == "P_Ball_Stone_MF"
+        mf4_before_mf2 += d.index("P_Ball_Stone_MF004") < d.index("P_Ball_Stone_MF002")
+    assert 0.62 < stone_first / 2000 < 0.70 and 0.45 < mf4_before_mf2 / 2000 < 0.55
+    assert headless.retail_draw_l1(0) == ["Ball_Wood", "P_Ball_Stone_MF", "P_Ball_Wood_MF", "P_Ball_Stone_MF003",
+                                          "P_Ball_Stone_MF004", "P_Ball_Stone_MF002", "P_Ball_Stone_MF001"]
+    assert sorted(headless.perm_draw(9, list("abcd"))) == list("abcd")
+    assert headless.effective_ball_order("retail:5", "1") == "retail:5"
+    assert headless.effective_ball_order("retail:5", 2) == "ckid" and headless.effective_ball_order("perm:5", 2) == "perm:5"
+
+
+def test_ball_order_extra_env_wins_and_is_validated():
+    la = headless.HeadlessLauncher(headless.HeadlessConfig(binary="b", root="r", ball_order="retail:1",
+                                                           extra_env={"BALLRAIN_HL_BALL_ORDER": "reverse"}))
+    assert la.environment({})["BALLRAIN_HL_BALL_ORDER"] == "reverse"
+    with pytest.raises(ValueError):
+        headless.HeadlessLauncher(headless.HeadlessConfig(binary="b", root="r", ball_order="sideways")).environment({})
+
+
+def test_headless_handle_carries_the_ball_order(tmp_path):
+    (tmp_path / "base.cmo").write_bytes(b"")
+    la = headless.HeadlessLauncher(headless.HeadlessConfig(binary=sys.executable, root=str(tmp_path), log=False,
+                                                           ball_order="perm"))
+    h = la.start({"BALLRAIN_LEVEL": "1"})  # python rejects the agent's arguments and exits: only the handle matters
+    try:
+        assert h.ball_order.startswith("perm:") and int(h.ball_order[5:]) < 1 << 32
+    finally:
+        headless.HeadlessLauncher.stop(h, 10)
+    la.cfg.ball_order = "retail"
+    h = la.start({"BALLRAIN_LEVEL": "3"})  # retail draws are measured on L1 only: the engine runs ckid
+    try:
+        assert h.ball_order == "ckid"
+    finally:
+        headless.HeadlessLauncher.stop(h, 10)
+
+
+class _OrderedFake(fakegame.FakeLauncher):
+    def start(self, env):
+        h = super().start(env)
+        h.ball_order = "retail:42"
+        return h
+
+
+def test_env_records_the_ball_order_in_the_metadata(tmp_path):
+    env = BallanceEnv(EnvConfig(level=1, out_root=str(tmp_path), action_repeat=4, backend="headless"),
+                      launcher=_OrderedFake(transport="socket"))
+    env.reset(seed=1)
+    info, _ = _run_episode(env, 1)
+    meta = json.loads(Path(info["run_meta"]).read_text(encoding="utf-8"))
+    assert meta["backend"] == "headless" and meta["ball_order"] == "retail:42"
+    env.close()
+    env = BallanceEnv(EnvConfig(level=1, out_root=str(tmp_path / "r"), action_repeat=8), launcher=fakegame.FakeLauncher(
+        transport="socket", backend="retail", hello="FakeGame 0.1 e72e4afcfa5c33a7"))
+    env.reset()
+    info, _ = _run_episode(env, 1)
+    assert json.loads(Path(info["run_meta"]).read_text(encoding="utf-8"))["ball_order"] is None
+    env.close()

@@ -2,17 +2,19 @@
 // x87-soft engine of BallanceMMO's SimTool, speaking the same OBS1 / ACT1 / LVL1 wire format over a
 // socket instead of shared memory (docs/headless.md).
 //
-//   BallanceMMOSimTool --ballrain-agent --root <game dir> [--boot-ticks N]
+//   BallanceMMOSimTool --ballrain-agent --root <game dir> [--boot-ticks N] [SimTool's --tas-* flags]
 //
 // Configuration comes from the BALLRAIN_* environment variables of the BallrainIO agent mode
 // (BALLRAIN_LEVEL, BALLRAIN_LEVELMSG, BALLRAIN_FRAMELOG, BALLRAIN_PREFIX, ...), plus BALLRAIN_SOCK
-// (unix:<path> | tcp:<host>:<port>, Python listens) and the BALLRAIN_HL_* knobs of the headless setup.
+// (unix:<path> | tcp:<host>:<port>, Python listens), BALLRAIN_HL_BALL_ORDER (the ball-pair contact order,
+// docs/headless.md) and BALLRAIN_HL_CRT_SEED / BALLRAIN_HL_VERBOSE.
 //
-// The frame path is the one of the TAS playback in this engine (headless x87-soft ↔ 2002 comparisons):
-// boot ticks, TASSupport's legacy edit (Ball_Explosion_* "Set Position" deleted), "Load Level", 34 hidden
-// fixed ticks, then every frame = time manager delta + 9 legacy keys written raw into the keyboard
-// state + one CKContext::Process; the physics clock reset before frame 1 with the retail reset state
-// (next_movement_check 4, ivp seed 75^21). BML+'s event hooks are re-created on the same graph
+// The frame path is SimTool's --tas playback (BallanceMMO x87-soft), with its flags and defaults
+// (ballrain_agent.h): boot ticks, TASSupport's legacy edit (SimTool's apply_tas_legacy_edit), no x87
+// precision reset at the level load, "Load Level", --tas-offset (34) hidden fixed ticks, then every
+// frame = time manager delta + 9 legacy keys written raw into the keyboard state + one CKContext::Process;
+// the physics clock reset before frame --tas-reset-frame (1) with the retail reset state
+// (--tas-movement-check 4, --tas-seed 75^21). BML+'s event hooks are re-created on the same graph
 // positions (BML+ 0.3.12 EventHook.cpp / ScriptHelper.cpp), and its Physicalize hook by wrapping the
 // prototype function. Everything else follows BallrainIO/src/Agent.cpp; where the 2002 DLL's raw IVP
 // memory was read, the open IVP classes are read by member name.
@@ -23,9 +25,11 @@
 // (computed as Points + Lifes x LifeBonus, BML+'s value), CK ids (allocated by this engine).
 
 #include "headless_engine.hpp"
+#include "ballrain_agent.h"
 
 #include "CKAll.h"
 #include "CKIpionManager.h"
+#include "ivp_environment.hxx"
 
 #include <physics/physics_state.hpp>
 
@@ -34,6 +38,7 @@
 #include "ballrain_wire.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -68,11 +73,12 @@ typedef int sock_t;
 #define BR_BADSOCK (-1)
 #endif
 
+#ifndef IVP_PORTABLE_BMMO
+#error "the agent reads IVP members of the BallanceMMO build (IVP_PORTABLE_BMMO)"
+#endif
+
 int ivp_srand_read();      // ivu_os_dep.cxx
 void ivp_srand(int seed);
-// patches/0001 (hx1c): the key a ball-ball contact pair is ordered by outside a physics session (NULL = heap addresses);
-// hx1c's CKIpionManager installs the same CK-id key in the VX_X87_GAME build, this makes it explicit
-extern unsigned int (*ivp_ball_order_key_hook)(void *client_data);
 
 namespace {
 
@@ -392,6 +398,247 @@ private:
     sock_t m_Sock = BR_BADSOCK;
 };
 
+// ------------------------------------------------------------------------------------------- ball-pair order
+// Which of two touching balls IVP takes as the first of their contact: the sign of the contact normal and the roles
+// of the two cores in the impact and friction solve. The 2002 DLL orders the pair by the CK3dEntity heap addresses,
+// which differ from one Player.exe process to the next (on L1 the pooled P_Ball_Stone_MF001-004 at the level load);
+// the product build orders by CK id (IVP_Environment::bmmo_ball_order_key, installed by CKIpionManager::
+// CreateEnvironment). BALLRAIN_HL_BALL_ORDER picks another key (smaller key = lower address = first):
+//   ckid (default)         the product's key, untouched
+//   reverse                the CK ids reversed
+//   perm:<seed>            the pooled balls (P_Ball_*_MF*) swap their CK-id places by a seeded permutation; every other
+//                          ball (the player ball included) keeps its place
+//   table:<name=rank,...>  the named entities by rank (distinct ranks), then every other ball by CK id
+//   retail:<seed>          a draw of retail's measured per-process order (L1: Ball_Wood, then P_Ball_Stone_MF /
+//                          P_Ball_Wood_MF with P(Stone_MF first) = 0.66, then a uniform permutation of
+//                          P_Ball_Stone_MF001-004, then every other ball by CK id); other levels: ckid (not measured)
+// The draws are splitmix64 (ballrain/headless.py makes the same ones).
+struct BallOrder {
+    enum Mode { CKID, REVERSE, PERM, TABLE, RETAIL } mode = CKID;
+    std::string spec = "ckid";
+    uint64_t seed = 0;
+    std::vector<std::pair<std::string, uint32_t>> ranks;   // TABLE / RETAIL: entity name -> rank
+    // built from the level's entities (lazily, at the first key asked for)
+    CKContext *ctx = nullptr;
+    bool built = false;
+    std::unordered_map<CK_ID, uint32_t> keys;   // PERM / TABLE / RETAIL
+};
+BallOrder g_BallOrder;
+constexpr uint32_t kUnranked = 1u << 20;   // TABLE / RETAIL: an unnamed ball's key is kUnranked + its CK id
+
+uint64_t SplitMix64(uint64_t &state) {
+    uint64_t z = (state += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+uint32_t DrawBelow(uint64_t &state, uint32_t n) {   // uniform in [0, n), by rejection
+    const uint64_t limit = UINT64_MAX - UINT64_MAX % n;
+    uint64_t x;
+    do
+        x = SplitMix64(state);
+    while (x >= limit);
+    return (uint32_t) (x % n);
+}
+template <class T>
+void Shuffle(std::vector<T> &v, uint64_t &state) {   // Fisher-Yates from the back
+    for (size_t i = v.size(); i > 1; --i)
+        std::swap(v[i - 1], v[DrawBelow(state, (uint32_t) i)]);
+}
+
+bool IsPooledBall(const char *name) {   // P_Ball_*_MF*
+    return StartsWith(name, "P_Ball_") && std::strstr(name + 7, "_MF") != nullptr;
+}
+
+bool ParseU64(const std::string &text, uint64_t &value) {
+    if (text.empty() || text.size() > 20 || text.find_first_not_of("0123456789") != std::string::npos)
+        return false;
+    errno = 0;
+    value = std::strtoull(text.c_str(), nullptr, 10);
+    return errno == 0;
+}
+
+// retail:<seed> on L1 (50 fresh Player.exe processes, runtime/analysis/ball_order/summary.json).
+std::vector<std::string> RetailDrawL1(uint64_t seed) {
+    uint64_t st = seed;
+    std::vector<std::string> order{"Ball_Wood"};
+    if (DrawBelow(st, 100) < 66)
+        order.insert(order.end(), {"P_Ball_Stone_MF", "P_Ball_Wood_MF"});
+    else
+        order.insert(order.end(), {"P_Ball_Wood_MF", "P_Ball_Stone_MF"});
+    std::vector<std::string> mf{"P_Ball_Stone_MF001", "P_Ball_Stone_MF002", "P_Ball_Stone_MF003", "P_Ball_Stone_MF004"};
+    Shuffle(mf, st);
+    order.insert(order.end(), mf.begin(), mf.end());
+    return order;
+}
+
+bool ParseBallOrder(const std::string &spec, int level, BallOrder &out, std::string &err) {
+    out = BallOrder();
+    out.spec = spec.empty() ? "ckid" : spec;
+    const std::string &s = out.spec;
+    const size_t colon = s.find(':');
+    const std::string mode = s.substr(0, colon), arg = colon == std::string::npos ? "" : s.substr(colon + 1);
+    if (mode == "ckid" || mode == "reverse") {
+        if (colon != std::string::npos) {
+            err = mode + " takes no argument";
+            return false;
+        }
+        out.mode = mode == "ckid" ? BallOrder::CKID : BallOrder::REVERSE;
+        return true;
+    }
+    if (mode == "perm" || mode == "retail") {
+        if (!ParseU64(arg, out.seed)) {
+            err = mode + ":<seed> needs a decimal seed (0 .. 2^64-1)";
+            return false;
+        }
+        if (mode == "perm") {
+            out.mode = BallOrder::PERM;
+            return true;
+        }
+        if (level != 1) {
+            Log("warning: ball order %s: retail's order is measured on level 1 only; level %d keeps ckid", s.c_str(),
+                level);
+            out.mode = BallOrder::CKID;
+            return true;
+        }
+        out.mode = BallOrder::RETAIL;
+        const std::vector<std::string> order = RetailDrawL1(out.seed);
+        for (size_t i = 0; i < order.size(); ++i)
+            out.ranks.emplace_back(order[i], (uint32_t) i);
+        return true;
+    }
+    if (mode == "table") {
+        out.mode = BallOrder::TABLE;
+        std::unordered_set<std::string> names;
+        std::unordered_set<uint64_t> ranks;
+        size_t at = 0;
+        while (at <= arg.size()) {
+            size_t end = arg.find(',', at);
+            if (end == std::string::npos)
+                end = arg.size();
+            const std::string item = arg.substr(at, end - at);
+            const size_t eq = item.rfind('=');
+            uint64_t rank = 0;
+            if (eq == std::string::npos || eq == 0 || !ParseU64(item.substr(eq + 1), rank) || rank >= kUnranked) {
+                err = "table entry '" + item + "' is not <name>=<rank> (rank 0 .. 2^20-1)";
+                return false;
+            }
+            const std::string name = item.substr(0, eq);
+            if (!names.insert(name).second || !ranks.insert(rank).second) {
+                err = "table: '" + item + "' repeats a name or a rank";
+                return false;
+            }
+            out.ranks.emplace_back(name, (uint32_t) rank);
+            at = end + 1;
+        }
+        return true;
+    }
+    err = "unknown mode '" + mode + "' (ckid | reverse | perm:<seed> | table:<name=rank,...> | retail:<seed>)";
+    return false;
+}
+
+// Every 3D entity of the context, by CK id.
+std::vector<CK3dEntity *> AllEntities(CKContext *ctx) {
+    std::vector<CK3dEntity *> out;
+    for (CK_CLASSID cid : {CKCID_3DENTITY, CKCID_3DOBJECT, CKCID_CHARACTER, CKCID_SPRITE3D}) {
+        const int n = ctx->GetObjectsCountByClassID(cid);
+        CK_ID *ids = ctx->GetObjectsListByClassID(cid);
+        for (int i = 0; i < n; ++i)
+            if (auto *e = CK3dEntity::Cast(ctx->GetObject(ids[i])))
+                out.push_back(e);
+    }
+    std::sort(out.begin(), out.end(), [](CK3dEntity *a, CK3dEntity *b) { return a->GetID() < b->GetID(); });
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+void BuildBallOrder() {
+    BallOrder &o = g_BallOrder;
+    o.keys.clear();
+    o.built = true;
+    if (!o.ctx)
+        return;
+    const std::vector<CK3dEntity *> all = AllEntities(o.ctx);
+    if (o.mode == BallOrder::PERM) {
+        std::vector<CK_ID> slots;   // the pooled balls' CK ids, ascending
+        for (CK3dEntity *e : all)
+            if (IsPooledBall(e->GetName()))
+                slots.push_back(e->GetID());
+        std::vector<CK_ID> perm = slots;
+        uint64_t st = o.seed;
+        Shuffle(perm, st);
+        for (size_t i = 0; i < slots.size(); ++i)
+            o.keys[perm[i]] = (uint32_t) slots[i];   // perm[i] takes the i-th place
+    } else if (o.mode == BallOrder::TABLE || o.mode == BallOrder::RETAIL) {
+        std::unordered_map<std::string, uint32_t> rank(o.ranks.begin(), o.ranks.end());
+        std::unordered_set<std::string> seen;
+        for (CK3dEntity *e : all) {
+            auto it = e->GetName() ? rank.find(e->GetName()) : rank.end();
+            if (it == rank.end())
+                continue;
+            if (!seen.insert(it->first).second)
+                Log("warning: ball order %s: more than one entity named %s", o.spec.c_str(), it->first.c_str());
+            o.keys[e->GetID()] = it->second;
+        }
+    }
+}
+
+std::string DescribeBallOrder(CKContext *ctx, unsigned int (*key)(void *));
+
+unsigned int BallOrderKey(void *client_data) {
+    auto *e = static_cast<CK3dEntity *>(client_data);
+    if (!e)
+        return 0;
+    const CK_ID id = e->GetID();
+    BallOrder &o = g_BallOrder;
+    if (o.mode == BallOrder::REVERSE)
+        return 0xFFFFFFFFu - (uint32_t) id;
+    auto it = o.keys.find(id);
+    if (it == o.keys.end()) {
+        // a pooled (PERM) or named (TABLE / RETAIL) ball the last build did not see: the entities changed
+        const char *name = e->GetName();
+        bool missing = !o.built;
+        if (!missing && name && o.mode == BallOrder::PERM)
+            missing = IsPooledBall(name);
+        if (!missing && name && o.mode != BallOrder::PERM)
+            for (const auto &r : o.ranks)
+                missing = missing || r.first == name;
+        if (missing) {
+            const bool rebuilt = o.built;
+            BuildBallOrder();
+            if (rebuilt)
+                Log("ball order %s: %s (id %u) appeared after the order was built: rebuilt: %s", o.spec.c_str(),
+                    name ? name : "?", (unsigned) id, DescribeBallOrder(o.ctx, &BallOrderKey).c_str());
+            it = o.keys.find(id);
+        }
+    }
+    if (it != o.keys.end())
+        return it->second;
+    return o.mode == BallOrder::PERM ? (uint32_t) id : kUnranked + (uint32_t) id;
+}
+
+// The balls that can take part (pooled, named, player balls) in the order a key gives them, for the log.
+std::string DescribeBallOrder(CKContext *ctx, unsigned int (*key)(void *)) {
+    std::vector<std::pair<uint32_t, std::string>> rows;
+    for (CK3dEntity *e : AllEntities(ctx)) {
+        const char *name = e->GetName();
+        if (!name)
+            continue;
+        bool show = IsPooledBall(name) || !std::strcmp(name, "Ball_Wood") || !std::strcmp(name, "Ball_Stone") ||
+                    !std::strcmp(name, "Ball_Paper");
+        for (const auto &r : g_BallOrder.ranks)
+            show = show || r.first == name;
+        if (show)
+            rows.emplace_back(key ? key(e) : (uint32_t) e->GetID(),
+                              std::string(name) + "(" + std::to_string((unsigned) e->GetID()) + ")");
+    }
+    std::sort(rows.begin(), rows.end());
+    std::string out;
+    for (const auto &r : rows)
+        out += (out.empty() ? "" : " < ") + r.second;
+    return out;
+}
+
 // ------------------------------------------------------------------------------------------- agent
 struct Frame {
     float delta;
@@ -455,8 +702,9 @@ Agent *g_Agent = nullptr;
 
 class Agent {
 public:
-    bool Configure(int argc, char **argv);
+    bool Configure(const ballrain_agent_args &args);
     int Run();
+    void ApplyBallOrder();
 
     // hooks
     void Event(uint16_t code, uint16_t param = 0);
@@ -467,7 +715,6 @@ private:
     bool Fail(uint32_t code, const char *fmt, ...);
     bool Boot();
     bool InstallHooks();
-    void LegacyEdit();
     void ResetClock();
     void SetKeys(uint32_t keys);
     bool TickFrame(float delta, uint32_t keys, std::string &err);
@@ -497,9 +744,10 @@ private:
 
     // configuration
     std::string m_Root, m_Sock, m_LevelMsgPath, m_FrameLogPath, m_TracePath, m_EventsPath, m_PrefixPath;
-    int m_Level = 0, m_BootTicks = 400, m_HiddenTicks = 34, m_Nmc = 4;
-    uint32_t m_Seed = 3560118427u;   // 75^21 mod 2^32: Player.exe's IVP seed at TASSupport's reset
-    bool m_Legacy = true, m_PrefixEvents = false, m_RandomPatch = true, m_KeepPrecision = true;
+    int m_Level = 0;
+    ballrain_agent_args m_Recipe{};   // SimTool's --tas recipe (ballrain_agent.h): offset, reset, legacy, precision
+    std::string m_BallOrderSpec;      // BALLRAIN_HL_BALL_ORDER
+    bool m_PrefixEvents = false;
     unsigned m_CrtSeed = 1;
     uint32_t m_TimeoutMs = 60000, m_MaxFrames = 0, m_SrTail = 32;
     float m_BodyRadius = 60.0f;
@@ -660,25 +908,6 @@ CKBehavior *FindEndOfChain(CKBehavior *script, CKBehavior *beh) {
     }
     return beh;
 }
-void DeleteBB(CKBehavior *script, CKBehavior *beh) {
-    static CKBehavior *nop = nullptr;
-    static CKBehaviorIO *nopin = nullptr, *nopout = nullptr;
-    beh->Activate(FALSE);
-    const int linkCnt = script->GetSubBehaviorLinkCount();
-    for (int i = 0; i < linkCnt; i++) {
-        CKBehaviorLink *link = script->GetSubBehaviorLink(i);
-        if (link->GetInBehaviorIO()->GetOwner() == beh || link->GetOutBehaviorIO()->GetOwner() == beh) {
-            if (!nop) {
-                nop = (CKBehavior *) script->GetCKContext()->CreateObject(CKCID_BEHAVIOR);
-                nop->InitFromGuid(kNopGuid);
-                nopin = nop->GetInput(0);
-                nopout = nop->GetOutput(0);
-            }
-            link->SetInBehaviorIO(nopout);
-            link->SetOutBehaviorIO(nopin);
-        }
-    }
-}
 int MessageOf(CKBehavior *beh) {
     CKParameterIn *pin = beh->GetInputParameter(0);
     CKParameter *src = pin ? pin->GetDirectSource() : nullptr;
@@ -715,8 +944,10 @@ CKBehavior *Hook(CKBehavior *script, uint16_t code) {
 CKBEHAVIORFCT g_Physicalize = nullptr;
 int PhysicalizeHook(const CKBehaviorContext &behcontext) {
     CKBehavior *beh = behcontext.Behavior;
-    if (g_Agent)
+    if (g_Agent) {
+        g_Agent->ApplyBallOrder();
         g_Agent->OnPhysicalize(beh, beh->IsInputActive(0) != FALSE);
+    }
     return g_Physicalize ? g_Physicalize(behcontext) : CKBR_OK;
 }
 int PatchPhysicalizeBlocks(CKBehavior *b) {
@@ -753,26 +984,11 @@ bool Agent::Fail(uint32_t code, const char *fmt, ...) {
     return false;
 }
 
-bool Agent::Configure(int argc, char **argv) {
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        auto next = [&]() -> const char * { return i + 1 < argc ? argv[++i] : nullptr; };
-        const char *v = nullptr;
-        if (a == "--ballrain-agent")
-            continue;
-        if (a == "--root" && (v = next()))
-            m_Root = v;
-        else if (a == "--level" && (v = next()))
-            m_Level = std::atoi(v);
-        else if (a == "--boot-ticks" && (v = next()))
-            m_BootTicks = std::atoi(v);
-        else if (a == "--sock" && (v = next()))
-            m_Sock = v;
-        else {
-            Log("unknown argument %s", a.c_str());
-            return false;
-        }
-    }
+bool Agent::Configure(const ballrain_agent_args &args) {
+    m_Recipe = args;
+    m_Root = args.root;
+    m_Sock = args.sock;
+    m_Level = args.level;
     if (m_Sock.empty())
         m_Sock = GetEnvS("BALLRAIN_SOCK");
     if (m_Root.empty())
@@ -793,18 +1009,14 @@ bool Agent::Configure(int argc, char **argv) {
     num("BALLRAIN_TIMEOUT_MS", m_TimeoutMs);
     num("BALLRAIN_MAX_FRAMES", m_MaxFrames);
     num("BALLRAIN_SR_TAIL", m_SrTail);
-    num("BALLRAIN_HL_BOOT_TICKS", m_BootTicks);
-    num("BALLRAIN_HL_HIDDEN_TICKS", m_HiddenTicks);
-    num("BALLRAIN_HL_NMC", m_Nmc);
     num("BALLRAIN_HL_CRT_SEED", m_CrtSeed);
-    {
-        const std::string s = GetEnvS("BALLRAIN_HL_SEED");
-        if (!s.empty())
-            m_Seed = (uint32_t) std::strtoul(s.c_str(), nullptr, 10);
-    }
-    m_Legacy = GetEnvS("BALLRAIN_HL_LEGACY") != "0";
-    m_KeepPrecision = GetEnvS("BALLRAIN_HL_KEEP_PRECISION") != "0";
-    m_RandomPatch = GetEnvS("BALLRAIN_HL_ORIG_RANDOM") != "1";
+    // The recipe is SimTool's flags now (--boot-ticks, --tas-offset, --tas-movement-check, --tas-seed, --tas-no-legacy,
+    // --tas-reset-precision, --tas-orig-random); the variables of the hx1c builds are ignored.
+    for (const char *old : {"BALLRAIN_HL_BOOT_TICKS", "BALLRAIN_HL_HIDDEN_TICKS", "BALLRAIN_HL_NMC", "BALLRAIN_HL_SEED",
+                            "BALLRAIN_HL_LEGACY", "BALLRAIN_HL_KEEP_PRECISION", "BALLRAIN_HL_ORIG_RANDOM"})
+        if (!GetEnvS(old).empty())
+            Log("warning: %s is ignored (SimTool's --tas-* / --boot-ticks flags set the recipe)", old);
+    m_BallOrderSpec = GetEnvS("BALLRAIN_HL_BALL_ORDER");
     const std::string radius = GetEnvS("BALLRAIN_BODY_RADIUS");
     if (!radius.empty())
         m_BodyRadius = (float) std::atof(radius.c_str());
@@ -1183,21 +1395,6 @@ bool Agent::InstallHooks() {
     return ok == 5 && m_ActiveBallParam;
 }
 
-void Agent::LegacyEdit() {
-    // TASSupport legacy mode / BallrainIO OnLoadScript: the first "Set Position" of the three explosion
-    // scripts is deleted, so trafo pieces are never physicalized.
-    CKContext *ctx = Ctx();
-    for (const char *name : {"Ball_Explosion_Wood", "Ball_Explosion_Paper", "Ball_Explosion_Stone"}) {
-        auto *s = (CKBehavior *) ctx->GetObjectByNameAndClass((CKSTRING) name, CKCID_BEHAVIOR, nullptr);
-        CKBehavior *beh = s ? sh::FindFirstBB(s, "Set Position") : nullptr;
-        if (!beh) {
-            Log("legacy: no Set Position in %s", name);
-            continue;
-        }
-        sh::DeleteBB(s, beh);
-    }
-}
-
 bool Agent::Boot() {
     bmmo::sim::engine_options options;
     options.game_root = m_Root;
@@ -1212,35 +1409,35 @@ bool Agent::Boot() {
     // CKStartUp seeds the C runtime's rand() with time(): the Random blocks the engine does not reroute draw from
     // it, which made runs of the same frames differ (docs/headless.md). A fixed seed makes every run repeatable.
     std::srand(m_CrtSeed);
-    // Ball-ball contact pairs ordered by CK object id (creation order: retail's address order whenever retail itself
-    // is consistent) instead of the heap addresses, which differ from run to run (patches/0001).
-    ivp_ball_order_key_hook = [](void *client_data) -> unsigned int {
-        return client_data ? (unsigned int) static_cast<CK3dEntity *>(client_data)->GetID() : 0u;
-    };
     if (!m_Engine->load_composition(error))
         return Fail(ERR_ENV, "composition: %s", error.c_str());
-    m_Engine->set_random_patch(m_RandomPatch);
-    // The 2002 process runs at 24 bits only until its first hull (built during the boot), then at 64 bits for good:
-    // no precision reset at the level load (patches/0001).
-    // patches/0001 (hx1c) reads HX1_KEEP_PRECISION in headless_engine::load_level
-#ifdef _WIN32
-    _putenv_s("HX1_KEEP_PRECISION", m_KeepPrecision ? "1" : "");
-#else
-    if (m_KeepPrecision)
-        setenv("HX1_KEEP_PRECISION", "1", 1);
-    else
-        unsetenv("HX1_KEEP_PRECISION");
-#endif
+    // SimTool's --tas recipe (run_tas): the Random blocks, and no x87 precision reset at the level load (the 2002
+    // process runs at 24 bits only until its first hull, built during the boot, then at 64 bits for good).
+    m_Engine->set_random_patch(!m_Recipe.orig_random);
+    m_Engine->set_reset_precision_on_load(m_Recipe.reset_precision);
     m_Physics = m_Engine->physics();
+    g_BallOrder.ctx = Ctx();
     m_Engine->set_frame_ms(0.0f);
-    for (int i = 0; i < m_BootTicks; ++i)
+    for (int i = 0; i < m_Recipe.boot_ticks; ++i) {
+        ApplyBallOrder();
         if (!m_Engine->tick(error))
             return Fail(ERR_ENV, "boot tick %d: %s", i, error.c_str());
+    }
     if (!InstallHooks())
         return Fail(ERR_DLL, "BML+ event hooks could not be installed");
-    if (m_Legacy)
-        LegacyEdit();
+    if (m_Recipe.legacy && m_Recipe.legacy_edit)
+        m_Recipe.legacy_edit(*m_Engine);
     return true;
+}
+
+// BALLRAIN_HL_BALL_ORDER other than ckid: our key on the physics environment (CKIpionManager::Reset re-creates it with
+// the product's key, so before every tick and every Physicalize block). ckid leaves the product's key alone.
+void Agent::ApplyBallOrder() {
+    if (g_BallOrder.mode == BallOrder::CKID || !m_Physics)
+        return;
+    if (IVP_Environment *env = m_Physics->GetEnvironment())
+        if (env->bmmo_ball_order_key != &BallOrderKey)
+            env->bmmo_ball_order_key = &BallOrderKey;
 }
 
 void Agent::ResetClock() {
@@ -1256,8 +1453,11 @@ void Agent::ResetClock() {
     clock.current_time = 0;
     clock.time_of_last_psi = 0;
     clock.time_of_next_psi = 1.0 / 66;
-    clock.next_movement_check = m_Nmc;
-    ivp_srand((int) m_Seed);
+    // TASSupport resets the clock only: the movement-check counter and the ivp_rand seed are what the process left,
+    // in Player.exe the same on every level (SimTool --tas-movement-check / --tas-seed)
+    if (m_Recipe.movement_check >= 0)
+        clock.next_movement_check = m_Recipe.movement_check;
+    ivp_srand((int) m_Recipe.seed);
     if (!bmmo::physics::set_clock_state(m_Physics, clock, error))
         Log("clock reset: %s", error.c_str());
     m_Physics->m_DeltaTime = m_Engine->time_manager()->GetLastDeltaTime();
@@ -1402,6 +1602,9 @@ void Agent::Stop(StopReason reason) {
 void Agent::Finish(uint32_t endReason) {
     if (m_Phase == Phase::Ended)
         return;
+    // the pooled balls are created during the run (L1: when their sector loads): the order over all of them
+    Log("ball order %s at the end: %s", g_BallOrder.spec.c_str(),
+        DescribeBallOrder(Ctx(), g_BallOrder.mode == BallOrder::CKID ? nullptr : &BallOrderKey).c_str());
     if (m_Phase == Phase::Running || m_Phase == Phase::Tail || m_Phase == Phase::FinalPending)
         WriteFrameLog();
     Event(EV_RUNEND, (uint16_t) endReason);
@@ -2426,14 +2629,16 @@ void Agent::WriteLevelMessage() {
 bool Agent::TickFrame(float delta, uint32_t keys, std::string &err) {
     m_Engine->set_frame_ms(delta);
     SetKeys(keys);
+    ApplyBallOrder();
     return m_Engine->tick(err);
 }
 
 // BallrainIO AgentProcess (OnProcess), after the frame's CKContext::Process.
 void Agent::AfterTick() {
     // TASSupport's 1-tick timer from PreLoadLevel: the clock reset lands inside frame 0, before its observation
-    // (the retail frames_done 1 observation has env time 0); frame 1 is the first physics step from it.
-    if (m_Phase == Phase::Running && m_FrameIndex == 1 && !m_ClockReset) {
+    // (the retail frames_done 1 observation has env time 0); frame 1 is the first physics step from it
+    // (SimTool --tas-reset-frame R: before frame R, default 1).
+    if (m_Phase == Phase::Running && (int) m_FrameIndex == m_Recipe.reset_frame && !m_ClockReset) {
         ResetClock();
         m_ClockReset = true;
     }
@@ -2570,6 +2775,13 @@ int Agent::Run() {
         pong(ST_HELLO);
         return Fail(ERR_ENV, "BALLRAIN_LEVEL=%d / --root missing", m_Level) ? 0 : 2;
     }
+    {
+        std::string err;
+        if (!ParseBallOrder(m_BallOrderSpec, m_Level, g_BallOrder, err)) {
+            pong(ST_HELLO);
+            return Fail(ERR_ENV, "BALLRAIN_HL_BALL_ORDER=%s: %s", m_BallOrderSpec.c_str(), err.c_str()) ? 0 : 2;
+        }
+    }
     const auto t0 = std::chrono::steady_clock::now();
     if (!Boot())
         return 2;
@@ -2599,13 +2811,31 @@ int Agent::Run() {
     SetState(ST_LOADING);
     Event(EV_PRELOAD);
     std::string err;
+    ApplyBallOrder();
     if (!m_Engine->load_level(m_Level, err))
         return Fail(ERR_ENV, "load_level: %s", err.c_str()) ? 0 : 2;
     m_Engine->set_frame_ms(0.0f);
     SetKeys(0);
-    for (int i = 0; i < m_HiddenTicks; ++i)
+    for (int i = 0; i < m_Recipe.offset; ++i) {
+        ApplyBallOrder();
         if (!m_Engine->tick(err))
             return Fail(ERR_ENV, "hidden tick %d: %s", i, err.c_str()) ? 0 : 2;
+    }
+    {
+        // the product build's key (VX_X87_GAME): without it two balls are ordered by heap address, which changes from
+        // run to run
+        IVP_Environment *env = m_Physics ? m_Physics->GetEnvironment() : nullptr;
+        if (!env || !env->bmmo_ball_order_key)
+            return Fail(ERR_ENV, "the physics environment has no ball-pair key (a build without VX_X87_GAME?)") ? 0 : 2;
+        if (g_BallOrder.mode != BallOrder::CKID && !g_BallOrder.built)
+            BuildBallOrder();
+        Log("ball order %s: %s", g_BallOrder.spec.c_str(),
+            DescribeBallOrder(Ctx(), g_BallOrder.mode == BallOrder::CKID ? nullptr : &BallOrderKey).c_str());
+    }
+    if (m_Recipe.reset_frame == 0 && !m_ClockReset) {   // --tas-reset-frame 0: before frame 0
+        ResetClock();
+        m_ClockReset = true;
+    }
     // frame 0's observation (minimal) unless a prefix runs first
     if (m_PhysExported < m_Phys.size())
         ExportPhysicalized();
@@ -2671,13 +2901,13 @@ int Agent::Run() {
 
 }  // namespace
 
-int ballrain_agent_main(int argc, char **argv) {
+int ballrain_agent_main(const ballrain_agent_args &args) {
 #ifndef _WIN32
     std::signal(SIGPIPE, SIG_IGN);
 #endif
     std::setvbuf(stderr, nullptr, _IOLBF, 1 << 14);
     auto *agent = new Agent;   // never freed: the engine is torn down by process exit
-    if (!agent->Configure(argc, argv))
+    if (!agent->Configure(args))
         return 2;
     const int rc = agent->Run();
     std::fflush(nullptr);

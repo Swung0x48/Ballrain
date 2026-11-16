@@ -96,6 +96,19 @@ class EnvConfig:
     start_record: str | None = None
     start_frame: int | None = None
     curriculum: dict | None = None
+    # at-rest starts: with probability p_rest a new process starts at a valid frame drawn from one of rest_starts
+    # ([lo, hi] record frames), and after the hand-over the env brakes the ball (world arrows against its horizontal
+    # velocity) until it is slower than rest_speed or rest_max_frames passed; the episode's start kind is "tas_rest"
+    # (not a curriculum outcome). For skills a respawn at a checkpoint (ball at rest) needs, e.g. a run-up
+    rest_starts: list | None = None
+    p_rest: float = 0.0
+    # rehearsal starts: with probability p_rehearse a new process starts at a valid frame drawn uniformly from one of
+    # rehearse_starts ([lo, hi] record frames), a normal TAS start otherwise (kind "tas"): keeps a hard section in the
+    # draw after the curriculum frontier moved past it
+    rehearse_starts: list | None = None
+    p_rehearse: float = 0.0
+    rest_speed: float = 0.5
+    rest_max_frames: int = 600
     warm_pool: bool = False  # pre-launch the next process on warm_copy while the current one runs
     warm_copy: str | None = None  # second runtime copy of this env (vecenv.make_vec_env pairs train-2i, train-2i+1)
     start_check: bool = True  # compare the hand-over state with the dataset; relaunch on a mismatch
@@ -216,6 +229,7 @@ class BallanceEnv(gym.Env):
         self._copy_i = 0
         self._warm = None  # (thread, result box) of the pre-launched process
         self._start: dict = {}  # how the current episode started (info["start"])
+        self._rest_next = False  # the drawn start is an at-rest start (rest_starts)
         self._held = 0  # arrow keys down in the last injected frame (repress_stale_keys)
         self._press_q: dict = {}  # arrow bit -> Cam_OrientRef quarter turn when it went down
         self._repress = c.world_actions if c.repress_stale_keys is None else bool(c.repress_stale_keys)
@@ -229,8 +243,17 @@ class BallanceEnv(gym.Env):
     def _draw_start(self) -> int | None:
         """Start frame of the next process: None (no TAS start states), 0 (from level load) or a valid frame
         of the start record (curriculum draw, or the fixed start_frame snapped to the nearest valid one)."""
+        self._rest_next = False
         if self.starts is None:
             return None
+        c = self.cfg
+        if c.rehearse_starts and c.p_rehearse and self._start_rng.random() < c.p_rehearse:
+            lo, hi = c.rehearse_starts[int(self._start_rng.integers(len(c.rehearse_starts)))]
+            return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
+        if c.rest_starts and c.p_rest and self._start_rng.random() < c.p_rest:
+            lo, hi = c.rest_starts[int(self._start_rng.integers(len(c.rest_starts)))]
+            self._rest_next = True
+            return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
         if self.curriculum is not None:
             return self.curriculum.sample(self._start_rng)
         k = self.cfg.start_frame or 0
@@ -254,7 +277,41 @@ class BallanceEnv(gym.Env):
                "pos": np.asarray(o.ball["pos"], np.float64).tolist()}
         return None if got == exp else {"got": got, "expected": exp}
 
-    def _prepare(self, copy: str, k: int | None) -> dict:
+    def _brake(self, p: dict) -> None:
+        """At-rest start: push against the ball's horizontal velocity until it is slower than rest_speed."""
+        from .features import yaw_basis  # noqa: F401  (world_to_camera_keys uses it)
+        s, c = p["session"], self.cfg
+        n0 = s.frames_done
+        while s.frames_done - n0 < c.rest_max_frames and not s.ended:
+            o = s.tracker.obs
+            v = (np.asarray(o.ball["speed"], np.float64) + np.asarray(o.ball["speed_change"], np.float64)
+                 if o is not None and o.ball is not None else np.zeros(3))  # the velocity as in the features
+            vh = np.array([v[0], 0.0, v[2]])
+            if np.linalg.norm(vh) < c.rest_speed:
+                break
+            w = -vh / np.linalg.norm(vh)
+            best = max(ARROWS9[1:], key=lambda a: np.dot(w, np.array([bool(a & tas.KEY_RIGHT) - bool(a & tas.KEY_LEFT), 0.0,
+                                                                      bool(a & tas.KEY_UP) - bool(a & tas.KEY_DOWN)])
+                                                     / np.linalg.norm([bool(a & tas.KEY_RIGHT) - bool(a & tas.KEY_LEFT),
+                                                                       bool(a & tas.KEY_UP) - bool(a & tas.KEY_DOWN)])))
+            keys = world_to_camera_keys(best, o.cams["cams"][0]["matrix"]) if o.cams is not None else best
+            ev0 = len(s.tracker.events)
+            s.act(tas.make_frames([self.delta], [keys]), repeat=2, stop=EPISODE_STOP)
+            if any(c_ in (Ev.BallOff, Ev.LevelFinish, Ev.GameOver) for _, c_, _ in s.tracker.events[ev0:]):
+                break
+        s.act(tas.make_frames([self.delta], [0]), repeat=1, stop=EPISODE_STOP)  # release the arrows
+        if s.ended or s.tracker.flags.ball_off or not s.tracker.flags.ball_nav:
+            try:
+                s.stop()
+            finally:
+                s.close()
+            raise RuntimeError(f"at-rest start at frame {p['start'].get('frame')}: the ball was lost while braking")
+        p["start"]["kind"] = "tas_rest"
+        p["start"]["rest_frames"] = int(s.frames_done - n0)
+        p["recorder"].meta.start_state = dict(p["recorder"].meta.start_state or {}, kind="tas_rest",
+                                              rest_frames=int(s.frames_done - n0))
+
+    def _prepare(self, copy: str, k: int | None, rest: bool = False) -> dict:
         """_launch with the hand-over check (start_check): a process whose prefix replay did not reach the
         recorded state is stopped (its run directory is kept, marked by a start_mismatch.json) and relaunched."""
         mismatches = []
@@ -278,6 +335,8 @@ class BallanceEnv(gym.Env):
         p["start"]["handover_mismatches"] = len(mismatches)
         p["recorder"].meta.start_state = dict(p["recorder"].meta.start_state or {},
                                               handover_mismatches=len(mismatches))
+        if rest and k:
+            self._brake(p)
         return p
 
     def _launch(self, copy: str, k: int | None) -> dict:
@@ -318,6 +377,7 @@ class BallanceEnv(gym.Env):
         sess.start()  # closes (kills) its process on failure
         t1 = time.perf_counter()
         rec.meta.mod_version = (sess.hello or {}).get("mod_version", "")
+        rec.meta.ball_order = getattr(sess.handle, "ball_order", None)  # headless: the contact order it ran with
         try:
             self._intro(sess)
         except BaseException:
@@ -349,7 +409,8 @@ class BallanceEnv(gym.Env):
                 raise box["error"]
             prepared = box["prepared"]
         else:
-            prepared = self._prepare(self._copies[self._copy_i], self._draw_start())
+            k = self._draw_start()
+            prepared = self._prepare(self._copies[self._copy_i], k, self._rest_next)
         self.session, self.recorder = prepared["session"], prepared["recorder"]
         self.run_dir = prepared["run_dir"]
         self._start = prepared["start"]
@@ -363,11 +424,12 @@ class BallanceEnv(gym.Env):
         one process ahead of curriculum updates)."""
         nxt = self._copies[(self._copy_i + 1) % len(self._copies)]
         k = self._draw_start()
+        rest = self._rest_next
         box: dict = {}
 
         def run():
             try:
-                box["prepared"] = self._prepare(nxt, k)
+                box["prepared"] = self._prepare(nxt, k, rest)
             except BaseException as e:  # re-raised when the process is adopted
                 box["error"] = e
 

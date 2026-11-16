@@ -12,7 +12,7 @@ hello 串里有 `headless`；零售 run 是 `backend = "retail"`。不要把无�
 
 | 部分 | 位置 |
 |---|---|
-| 引擎 + agent 模式 | `BallanceMMOSimTool --ballrain-agent --root <游戏目录>`（`headless/build_mac.sh` 编译；配置来自 `BALLRAIN_*` 环境变量，§6） |
+| 引擎 + agent 模式 | `BallanceMMOSimTool --ballrain-agent --root <游戏目录> [--tas-* ...]`（`headless/build_mac.sh` 编译；帧方案是 SimTool `--tas` 的参数和默认值，其余配置来自 `BALLRAIN_*` 环境变量，§6） |
 | 传输 | `ballrain/transport.py`：`SocketChannel`（Python 端）/ `SocketModChannel`（游戏端，测试和 fakegame 用）；共享内存那条路径不变 |
 | 启动 | `ballrain/headless.py`：`HeadlessLauncher` / `HeadlessConfig`；`EnvConfig(backend="headless", headless={...})` 自动用它 |
 | 会话 | `ballrain/client.py`：launcher 可以提供 `make_channel()` 和 `backend`；hello 检查按 backend 分支（零售：physics_RT 哈希；无头：`headless`） |
@@ -42,21 +42,48 @@ socket EOF：游戏已结束时是"结束"（`wait_obs` 返回 None），否则�
 ## 3. 帧路径与零售对齐
 
 1. 引擎启动、加载 base.cmo，400 个固定 tick（15.15 ms）到主菜单。
-2. 装钩子（§4），做 TASSupport legacy 模式 / BallrainIO 的脚本改动：删掉 `Ball_Explosion_Wood/Paper/Stone` 里第一个 `Set Position`（变球碎片从不物理化）。
-3. 给 `Load Level`，再跑 **34 个隐藏的固定 tick**（不进帧日志，期间的事件记在第 0 帧）。之后的第 0 帧与零售的第 0 帧对齐（PreLoadLevel 之后的第一帧）：
+2. 装钩子（§4），做 TASSupport legacy 模式 / BallrainIO 的脚本改动：删掉 `Ball_Explosion_Wood/Paper/Stone` 里第一个 `Set Position`（变球碎片从不物理化；
+   用 SimTool 的 `apply_tas_legacy_edit`，`--tas-no-legacy` 关掉）。
+3. 给 `Load Level`，再跑 **34 个隐藏的固定 tick**（`--tas-offset`；不进帧日志，期间的事件记在第 0 帧）。之后的第 0 帧与零售的第 0 帧对齐（PreLoadLevel 之后的第一帧）：
    零售在 PreLoadLevel 之前还有一段菜单时间，这 34 个 tick 补的就是它（x87-soft 会话测定，对全部 31 条 TAS 都成立）。
 4. 每帧：Python 给的 delta 写进时间管理器，9 个 legacy 键按 `Keyboard` 数组的键位写原始 0/1（与 BallrainIO `SetKeyboardState` 相同），跑一次 `CKContext::Process`。
-5. 第 0 帧执行完、它的观测之前做物理时钟复位（TASSupport OnStart 的 1 tick 定时器）：IVP 时间 0、下一个 PSI 1/66 s、平滑 delta，
-   再加上 Player.exe 在那一刻的 IVP 状态：`next_movement_check = 4`、IVP 随机种子 3560118427（= 75^21）（x87-soft 会话测得，3 关 / 多次运行相同）。
-6. 加载关卡时**不**重置 x87 精度（`set_keep_precision`）：2002 进程只在第一个凸包（启动时 Init Ballpieces 建的）之前是 24 位，之后一直 64 位。
-7. 确定性：CRT `rand()` 固定种子 1（CKStartUp 原来按 `time()` 播种）；球-球接触对按 CK id 排序（hx1c；原来按堆地址，逐次运行会变）。
-   物理管理器的平滑 delta（m = (m·3 + delta)/4）按 2002 DLL 的 x87 方式算（hx1c 的 `CKIpionManager::SetDeltaTime`）：帧时间不变时与 float 写法相同，
+5. 第 0 帧执行完、它的观测之前做物理时钟复位（TASSupport OnStart 的 1 tick 定时器；`--tas-reset-frame`，默认 1）：IVP 时间 0、下一个 PSI 1/66 s、平滑 delta，
+   再加上 Player.exe 在那一刻的 IVP 状态：`next_movement_check = 4`（`--tas-movement-check`）、IVP 随机种子 3560118427（= 75^21，`--tas-seed`）（x87-soft 会话测得，3 关 / 多次运行相同）。
+6. 加载关卡时**不**重置 x87 精度（`headless_engine::set_reset_precision_on_load(false)`，`--tas-reset-precision` 恢复 BMMO 的逐关重置）：
+   2002 进程只在第一个凸包（启动时 Init Ballpieces 建的）之前是 24 位，之后一直 64 位。
+7. 确定性：CRT `rand()` 固定种子 1（CKStartUp 原来按 `time()` 播种）；球-球接触对默认按 CK id 排序（产品的 `IVP_Environment::bmmo_ball_order_key`；零售按堆地址，逐进程会变，§3.1）。
+   物理管理器的平滑 delta（m = (m·3 + delta)/4）按 2002 DLL 的 x87 方式算（`CKIpionManager::SetDeltaTime`）：帧时间不变时与 float 写法相同，
    一变就不同——课程交接（TAS 的 3.79 ms → agent 的 7.58 ms）之后 5–6 帧就会分开，这一项修好之前所有交接都偏离零售。
    同一构建、同一组帧，轨迹逐位相同（§8）。
 8. SR、尾帧、GameOver / LevelFinish / 帧数上限 / STOP / 超时的结束方式、前缀回放（含 `BALLRAIN_PREFIX_EVENTS` 的确认）都按 `Agent.cpp` 移植：
    SR = BML+ 0.3.12 规则的 double 和（本帧事件之后加本帧 delta），LevelFinish 后跑尾帧到 CounterInactive（最多 `BALLRAIN_SR_TAIL`），尾帧不进帧日志。
 
 第 1 关的 Q 和其它前奏策略照旧在 Python 侧（`env._intro`）；无头 L1 从关卡加载起第 527 帧拿到控制，与零售实测相同。
+
+2–6 的参数就是 SimTool `--tas` 的参数（BallanceMMO x87-soft 产品提交 `ba5ba279`），默认值是实测的 Player.exe 状态；agent 自己不再设一份
+（`HeadlessConfig` 只在与默认值不同时传参数）。hx1c 构建的 `BALLRAIN_HL_NMC / SEED / LEGACY / KEEP_PRECISION / HIDDEN_TICKS / ORIG_RANDOM / BOOT_TICKS`
+变量被忽略（设了会在 headless.log 里警告一行）。
+
+### 3.1 球-球接触顺序（`BALLRAIN_HL_BALL_ORDER`，`HeadlessConfig.ball_order`）
+
+两个球接触时 IVP 把哪个当第一个，决定接触法线的符号和冲量 / 摩擦求解里两个核的角色。2002 DLL 按两个 CK3dEntity 的堆地址排，地址顺序每个 Player.exe 进程都不同：
+第 1 关在关卡加载时池里的 P_Ball_Stone_MF001–004 互相接触，那一刻的顺序决定这个进程整条 run（零售 50 个新进程的实测：`runtime/analysis/ball_order/summary.json`）。
+无头引擎按一个键排（小的 = 低地址 = 第一个），模式：
+
+| 值 | 含义 |
+|---|---|
+| `ckid`（默认） | 产品的 CK id 键，不动它（门禁用的就是它） |
+| `reverse` | CK id 反过来（玩家球也跟着反，零售从不这样） |
+| `perm:<seed>` | 池里的球（名字 `P_Ball_*_MF*`）在它们自己的 CK id 位置之间按种子置换；其余的球（含玩家球）位置不变 |
+| `table:<名字=名次,...>` | 列出的实体按名次（不能重复）排在前面，其余的球按 CK id 排在后面 |
+| `retail:<seed>` | 按零售实测分布抽一个进程的顺序。第 1 关：Ball_Wood 最低；然后 P_Ball_Stone_MF / P_Ball_Wood_MF，Stone_MF 在前的概率 0.66；然后 MF001–004 的均匀随机排列；其余的球按 CK id。其它关没测过：用 `ckid`，headless.log 里警告一行 |
+
+`perm` / `retail` 不带种子时由 `HeadlessLauncher` 给每个进程抽一个新种子（32 位）。实际跑的值记进元数据 `RunMeta.ball_order`（`extra_env` 里的
+`BALLRAIN_HL_BALL_ORDER` 优先于 `ball_order`；第 1 关以外的 `retail:<seed>` 记成 `ckid`）；引擎在 headless.log 里写一行 `ball order <值>: <球按键排的顺序>`。抽法是 splitmix64 + Fisher–Yates，
+`ballrain.headless.retail_draw_l1` / `perm_draw` 和引擎抽得一样。非法的值是错误（引擎报 ERR_ENV 退出），不会悄悄退回 `ckid`。
+
+实现：非 `ckid` 模式下 agent 把自己的键函数写进物理环境（`CKIpionManager::Reset` 会重建环境并装回产品的键，所以每个 tick 之前和每个 Physicalize 块之前都重新写一次），
+排名表在第一次用到时按名字从关卡实体建（之后出现新的同类实体会重建并警告）。
 
 ## 4. 事件
 
@@ -92,8 +119,9 @@ BML+ 0.3.12 的事件钩子（`EventHook.cpp` / `ScriptHelper.cpp`）按同样�
 
 BallrainIO agent 模式的变量照用：`BALLRAIN_LEVEL`、`BALLRAIN_LEVELMSG`、`BALLRAIN_FRAMELOG`、`BALLRAIN_TRACE`、`BALLRAIN_EVENTS`、`BALLRAIN_PREFIX`、
 `BALLRAIN_PREFIX_EVENTS`、`BALLRAIN_MAX_FRAMES`、`BALLRAIN_TIMEOUT_MS`、`BALLRAIN_SR_TAIL`、`BALLRAIN_BODY_RADIUS`；新增 `BALLRAIN_SOCK`（`unix:<路径>` | `tcp:<主机>:<端口>`）。
-无头设置（`HeadlessConfig` 写进去，诊断用，默认就是对齐零售的值）：`BALLRAIN_HL_BOOT_TICKS`（400）、`BALLRAIN_HL_HIDDEN_TICKS`（34）、`BALLRAIN_HL_NMC`（4）、
-`BALLRAIN_HL_SEED`（3560118427）、`BALLRAIN_HL_LEGACY`（1）、`BALLRAIN_HL_KEEP_PRECISION`（1）、`BALLRAIN_HL_CRT_SEED`（1）、`BALLRAIN_HL_ORIG_RANDOM`（0）、`BALLRAIN_HL_VERBOSE`。
+无头设置：`BALLRAIN_HL_BALL_ORDER`（§3.1，默认 `ckid`）、`BALLRAIN_HL_CRT_SEED`（1）、`BALLRAIN_HL_VERBOSE`。帧方案是 SimTool 的参数（`HeadlessConfig` 字段 → 参数）：
+`boot_ticks` → `--boot-ticks`（400）、`hidden_ticks` → `--tas-offset`（34）、`reset_nmc` → `--tas-movement-check`（4）、`reset_seed` → `--tas-seed`（3560118427）、
+`reset_frame` → `--tas-reset-frame`（1）、`legacy_edit=False` → `--tas-no-legacy`、`reset_precision` → `--tas-reset-precision`、`orig_random` → `--tas-orig-random`。
 `BALLRAIN_SKIP_RENDER` / `BALLRAIN_EXIT` / `BALLRAIN_LOADS` 被忽略（不渲染、一进程一 run）。
 
 Python 侧：`BALLRAIN_HL_BIN`（SimTool 路径）、`BALLRAIN_HL_ROOT`（游戏目录）、`BALLRAIN_HL_SOCKET`（unix | tcp）是 `HeadlessConfig` 的默认值。
@@ -151,6 +179,26 @@ hx1c 构建（`hx1c-96c0cc01-ce6afc34`）上用 agent 模式回放，与零售�
 - 第 5、7、8、10、12、13 关的新参照（`scripts/offroute_refs.py`，零售 train-12..15，参考 TASSupport 3 次，`runtime/offroute-refs/L<nn>/<case>/`）：
   每关 3 个（random：死亡到 GameOver；hs_esc_random：Esc 暂停 / 解除 + 死亡；jitter：8000 帧上限），共 18 个，合计 61 次死亡、599 次暂停、12 次 GameOver。
   每个都是参考 TASSupport 3 次回放逐字节相同且等于 BallrainIO agent 轨迹；hx1c 无头 agent 模式回放 **18/18 全部帧相同**。
+
+### 7.3 产品提交构建（2026-11-16，M6 arm64，`x87s-ba5ba279-f7d25565-e9e7ac69`）
+
+BallanceMMO x87-soft 产品提交 `ba5ba279`（Ballanced `b70ab01` 等，`headless/README.md`）+ 新的 0002 + agent（帧方案用 SimTool 的 `--tas` 参数，默认 `ckid` 球序），
+与 hx1c 构建（`hx1c-96c0cc01-ce6afc34`）同样的输入逐个比较（`replay_stub`，K = 1，全部段）：
+
+| 用例 | 次数 | 与零售参照 | TraceHash / trace / events / framelog / level.msg / SR / 结束方式与 hx1c |
+|---|---|---|---|
+| 7 条门禁记录（SR01 ×3、HS01 ×3、SR06） | 各 3 次 | 7/7 全部帧相同（同 §7.1 的帧数） | 21/21 逐字节相同，3 次之间也相同 |
+| M1 / M2 离线路线（§7.2，13 + 3） | 1 | 16/16 全部帧相同 | 16/16 相同 |
+| `runtime/offroute-refs`（第 5、7、8、10、12、13 关） | 1 | 18/18 全部帧相同 | 18/18 相同 |
+
+TraceHash 都与 §7.1 / hx1c 相同（例如 SR01_1_14_457_264 `3bf0b490e7cf7acb`、SR06 `1a9f686e68ac71ff`）。`obs.bin` 和 `level.msg.inc` 不逐字节相同，
+但 hx1c 构建自己的 3 次 SR06 之间也不同：SCOR / SREN 的 Energy 第 4 列是指针（§5），IVPO 记录按 IVP 对象地址去重（地址复用时落到别的增量消息里）。
+`headless_gate.py` 在 7 条记录上复跑（报告在 `runtime/headless-results/gate-x87s-ba5ba279/`）：除特征版本号（现在是 f6）之外与 §7.1 的报告完全相同，
+特征不同的帧数也相同（SR01_1_14_457_264 20485/20485 帧逐位相同）。
+
+球序模式（§3.1）在 r3 的一条 L1 抽查 run（SR01 前缀 8907 帧 + agent 尾段，headless 轨迹与零售回放在第 17862 帧分开）上：`ckid`、`retail:12`、`perm:2195`
+和按 `ckid` 顺序写的 `table` 逐字节重现 headless 轨迹；把 P_Ball_Stone_MF004 放在 MF002 前面的 `table`、`retail:0`、`perm:1319` 逐字节重现零售回放轨迹；
+`reverse` 两个都不是（第 7386 行就分开，玩家球的顺序也反了）。所以这条 run 的分歧就是零售那个进程里 MF004 的地址低于 MF002。
 
 ## 8. 确定性
 
@@ -212,10 +260,11 @@ headless/mac/push_repo.sh -r SR01_1_14_457_264 [-c runtime/m2-train/r2/latest.pt
 headless/mac/pull_run.sh r3 300        # 每 5 分钟把 Mac 上的 runtime/m2-train/r3 拉回 PC 的 runtime/m2-train-mac/r3（TensorBoard 读这里）
 ```
 
-Mac 侧（`$MAC_DIR` 默认 `~/ballrain`：`repo/` 是推过去的工作树，`hl/hx1c-<补丁哈希>-<agent 哈希>/` 是引擎构建（`hl/ENGINE` 记着当前那个；运行中的训练用启动时的路径，新构建不会覆盖它），`game/` 是游戏目录）：
+Mac 侧（`$MAC_DIR` 默认 `~/ballrain`：`repo/` 是推过去的工作树，`hl/x87s-<BallanceMMO 提交>-<0002 哈希>-<agent 哈希>/` 是引擎构建（`hl/ENGINE` 记着当前那个；运行中的训练用启动时的路径，新构建不会覆盖它），`game/` 是游戏目录）：
 
 ```sh
-headless/mac/setup_mac.sh [src.tar]    # uv python install 3.12 + uv sync；没有引擎时用 src.tar 编译
+headless/mac/setup_mac.sh [src.tar]    # uv python install 3.12 + uv sync；没有引擎时用 src.tar 编译（不改 hl/ENGINE）
+headless/mac/setup_mac.sh --activate   # 门禁（§7.3 的比较）通过之后：把新构建写进 hl/ENGINE
 headless/mac/train_mac.sh r3 --workers N --world-actions ...   # = scripts/train_m2.py --run r3 --backend headless ...，
                                                                  # caffeinate（先 -u 再 -s -i），从 /bin/sh 启动，nohup
 touch repo/runtime/m2-train/r3/STOP    # 停止（learner 自己的停止文件）
