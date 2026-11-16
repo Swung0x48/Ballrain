@@ -1,758 +1,979 @@
 ﻿#include "BallrainIO.h"
-#include "TASHook.h"
-#include <format>
+
+#include <cstdarg>
+#include <cstdlib>
+#include <cstring>
+#include <float.h>
+#include <algorithm>
 #include <fstream>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
+#include <bcrypt.h>
+
+#include "TASHook.h"
+
+// Reference = reference/TASSupport/TASSupport.cpp (patched 0.3.12, LegacyMode 1). Line numbers cite that file.
+//
+// Contract (environment, read once at OnLoad):
+//   BALLRAIN_MODE=replay       anything else: the mod stays inert
+//   BALLRAIN_FRAMES=<path>     headerless 8-byte frames (the uncompressed payload of a legacy .tas)
+//   BALLRAIN_LEVEL=<1..13>     auto-load this level after the start menu
+//   BALLRAIN_TRACE=<path>      per-frame ball trace, the reference's BMMO_TAS_TRACE line format (no core section)
+//   BALLRAIN_FRAMELOG=<path>   the frames actually injected, same 8-byte format
+//   BALLRAIN_EVENTS=<path>     "<frameIndex> <EventName>" lines and a final Summary line
+//   BALLRAIN_SKIP_RENDER=1     skip rendering while a run plays
+//   BALLRAIN_EXIT=1            exit the game when the (last) run ends
+//   BALLRAIN_LOADS=<n>         load + replay n times in one process; outputs of load k>1 get ".k" appended.
+//                              NOT trajectory-exact after a full level: use one process per episode for
+//                              exact runs (see "Same-process reload" below; LOADS=1 never runs that code)
+//   BALLRAIN_DEBUG=<path>      debug log (+ .dump/.dumpS/.act files); changes callback registration time
+//
+// Same-process reload (LOADS > 1). After "Exit Level" the warm process differs from a cold one in ways
+// that change the next load. Written back to the cold process's values, in this order:
+//   - the menu waits until the behavior manager runs the same objects as at the cold autoload (the
+//     previous level's Ball_ResetPieces_* fade keeps All_Balls in it for ~1.9 s), then puts them in the
+//     cold order (equal-priority objects are qsorted, so their order depends on the list's history:
+//     with All_Sound before All_Levelinit, Execute Script(Music_Init) ends one frame early and the
+//     whole load, StartLevel included, is one frame short);
+//   - scripts idle at the cold autoload are reset, the Gameplay_* ones also get their parameter values
+//     back, and IngameParameter/Energy/LifeBalls their contents;
+//   - at PreLoadLevel: the physics time factor (the level leaves 0.002, cold is 0.001: the physics clock
+//     ran twice as fast during the load), IVP_RAND_SEED and Gameplay_Ingame's ActiveBall (cold: none,
+//     so no trace line is written before this load's ball is set).
+// With this a reload after a 3000-frame SR06 run replays byte-identically, but after a finished SR06
+// level the trace still drifts at frame 7323 (shared IVP environment; see the M0 report).
+
+// SHA-256 of the 2002 physics_RT.dll (the reference environment's BuildingBlocks/physics_RT.dll).
+// The raw offsets in ResetPhysicsTime are valid for this exact file only.
+static const char kPhysicsSha256[] = "e72e4afcfa5c33a7d3d27776137f8c997b3c52d89d8a8a4745f1ca21e45893ec";
+
+MOD_EXPORT IMod *BMLEntry(IBML *bml) { return new BallrainIO(bml); }
+MOD_EXPORT void BMLExit(IMod *mod) { delete mod; }
+
+static unsigned FpuCw() {
+    unsigned short cw = 0;
+    __asm fnstcw cw;
+    return cw;
+}
+
+void BallrainIO::Dbg(const char *fmt, ...) {
+    if (!m_Dbg)
+        return;
+    std::fprintf(m_Dbg, "t%u ", m_TimeManager ? (unsigned) m_TimeManager->GetMainTickCount() : 0u);
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(m_Dbg, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', m_Dbg);
+    std::fflush(m_Dbg);
+}
+
+static std::string GetEnv(const char *name) {
+    const char *v = std::getenv(name);
+    return v ? std::string(v) : std::string();
+}
+
+static bool Sha256File(const wchar_t *path, std::string &hex) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    bool ok = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 &&
+              BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) == 0;
+    std::vector<char> buf(1 << 16);
+    while (ok && file) {
+        file.read(buf.data(), (std::streamsize) buf.size());
+        const auto n = (ULONG) file.gcount();
+        if (n > 0)
+            ok = BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf.data()), n, 0) == 0;
+    }
+    unsigned char digest[32] = {};
+    ok = ok && file.eof() && BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0;
+    if (hash)
+        BCryptDestroyHash(hash);
+    if (alg)
+        BCryptCloseAlgorithmProvider(alg, 0);
+    if (!ok)
+        return false;
+    static const char digits[] = "0123456789abcdef";
+    hex.clear();
+    for (unsigned char b : digest) {
+        hex += digits[b >> 4];
+        hex += digits[b & 15];
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- loading
+
+bool BallrainIO::ReadEnvironment() {
+    if (GetEnv("BALLRAIN_MODE") != "replay") {
+        GetLogger()->Info("BALLRAIN_MODE is not 'replay': inactive");
+        return false;
+    }
+    m_FramesPath = GetEnv("BALLRAIN_FRAMES");
+    m_TracePath = GetEnv("BALLRAIN_TRACE");
+    m_FrameLogPath = GetEnv("BALLRAIN_FRAMELOG");
+    m_EventsPath = GetEnv("BALLRAIN_EVENTS");
+    m_Level = std::atoi(GetEnv("BALLRAIN_LEVEL").c_str());
+    m_SkipRender = GetEnv("BALLRAIN_SKIP_RENDER") == "1";
+    m_ExitWhenDone = GetEnv("BALLRAIN_EXIT") == "1";
+    const std::string loads = GetEnv("BALLRAIN_LOADS");
+    m_Loads = loads.empty() ? 1 : std::atoi(loads.c_str());
+    if (m_Loads < 1) {
+        GetLogger()->Error("BALLRAIN_LOADS=%s is invalid", loads.c_str());
+        return false;
+    }
+    if (m_Level != 0 && (m_Level < 1 || m_Level > 13)) {
+        GetLogger()->Error("BALLRAIN_LEVEL=%d is out of 1..13", m_Level);
+        return false;
+    }
+
+    if (m_FramesPath.empty()) {
+        GetLogger()->Error("BALLRAIN_FRAMES is not set");
+        return false;
+    }
+    std::ifstream file(m_FramesPath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        GetLogger()->Error("cannot open BALLRAIN_FRAMES %s", m_FramesPath.c_str());
+        return false;
+    }
+    const auto size = (size_t) file.tellg();
+    file.seekg(0);
+    // As the reference's legacy Load: frameCount = length / 8, trailing bytes ignored (TASRecord.cpp:476).
+    // A zero-frame input is accepted: the run stops at its first Time callback, as the reference's
+    // OnPreProcessTime does when the record is not playing (TASSupport.cpp:506-513).
+    m_Frames.resize(size / sizeof(Frame));
+    if (!m_Frames.empty() && !file.read(reinterpret_cast<char *>(m_Frames.data()),
+                                        (std::streamsize) (m_Frames.size() * sizeof(Frame)))) {
+        GetLogger()->Error("cannot read BALLRAIN_FRAMES %s", m_FramesPath.c_str());
+        m_Frames.clear();
+        return false;
+    }
+    if (size % sizeof(Frame))
+        GetLogger()->Warn("BALLRAIN_FRAMES: %u trailing bytes ignored", (unsigned) (size % sizeof(Frame)));
+    GetLogger()->Info("replay: %u frames from %s, level %d, loads %d", (unsigned) m_Frames.size(),
+                      m_FramesPath.c_str(), m_Level, m_Loads);
+    return true;
+}
+
 void BallrainIO::OnLoad() {
-    GetLogger()->Info("Hello from BallrainIO!");
-    m_BML->SendIngameMessage("\x1b[32mLoaded Ballrain!\x1b[0m");
-    m_BML->AddTimer(1000ul, [](){});
+    m_Active = ReadEnvironment();
+    if (!m_Active)
+        return;
+    VerifyPhysicsDll(false);   // refuses (m_Active = false) on a wrong DLL; retried at PostStartMenu / start
+    if (!m_Active)
+        return;
 
-    m_config = new BallrainConfig([this]() { return GetConfig(); });
-    m_config->CreateProperty<bool>("General", "OnlyPhysicalized", true, "Only show physicalized objects (including hidden ones).");
+    // Reference OnLoad (:91-100) + InitHooks (:667-679) with legacy mode: only the two PreProcess hooks.
+    m_IpionManager = m_BML->GetCKContext()->GetManagerByGuid(CKGUID(0x6bed328b, 0x141f5148));
+    m_TimeManager = m_BML->GetTimeManager();
+    m_InputHook = m_BML->GetInputManager();
 
-    m_inputSystem = std::make_unique<InputSystem>(m_BML->GetInputManager());
-    m_timeSystem = std::make_unique<TimeSystem>(m_BML->GetTimeManager());
-    m_tcpClient = std::make_unique<TCPClient>();
-
-    m_showBoxBB = (CKBehavior*)m_BML->GetCKContext()->CreateObject(CKCID_BEHAVIOR);
-    m_showBoxBB->InitFromGuid(CKGUID(0x17cb4c57, 0xf525fb));
-    GetLogger()->Info("bb: %s", m_showBoxBB->GetName());
-
-    if (!m_tcpClient->Connect("127.0.0.1", 27787)) {
-        m_BML->SendIngameMessage("\x1b[32mConnect failed!\x1b[0m");
+    const MH_STATUS status = MH_Initialize();
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
+        GetLogger()->Error("Failed to initialize MinHook: %s", MH_StatusToString(status));
+        m_Active = false;
         return;
     }
-    std::string msg = "Pong";
-    auto len = m_tcpClient->Receive(msg.length(), msg.data());
-    assert(len == msg.length());
-    if (msg == "Ping") {
-        msg = "Pong";
-        len = m_tcpClient->Send(msg.c_str(), msg.length());
-        assert(len == msg.length());
+    auto *inputManager = (CKInputManager *) m_BML->GetCKContext()->GetManagerByGuid(INPUT_MANAGER_GUID);
+    if (!m_IpionManager || !m_TimeManager || !m_InputHook || !inputManager ||
+        !CKTimeManagerHook::Enable(m_TimeManager) || !CKInputManagerHook::Enable(inputManager)) {
+        GetLogger()->Error("managers or PreProcess hooks unavailable: inactive");
+        m_Active = false;
     }
+    const std::string dbg = GetEnv("BALLRAIN_DEBUG");
+    if (m_Active && !dbg.empty()) {
+        m_Dbg = std::fopen(dbg.c_str(), "w");
+        CKTimeManagerHook::AddPostCallback([this](CKBaseManager *) { OnPreProcessTime(); });
+        CKInputManagerHook::AddPostCallback([this](CKBaseManager *) { OnPreProcessInput(); });
+        m_CallbacksRegistered = true;
+    }
+}
 
-    MH_STATUS status = MH_Initialize();
-    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
-        GetLogger()->Error("MinHook failed to initialize: %s", MH_StatusToString(status));
-    }
+void BallrainIO::OnUnload() {
+    if (m_Playing)
+        CloseOutputs(0);
+    FreeColdState();
+    CKTimeManagerHook::Disable();
+    CKInputManagerHook::Disable();
+    MH_Uninitialize();
+}
 
-    CKContext* context = m_BML->GetCKContext();
-    auto* timemgr = context->GetManagerByGuid(TIME_MANAGER_GUID);
-    if (!CKTimeManagerHook::Enable(timemgr)) {
-        GetLogger()->Error("Failed to enable TimeManager hook.");
+bool BallrainIO::VerifyPhysicsDll(bool mustBeLoaded) {
+    if (m_PhysicsOk != 0)
+        return m_PhysicsOk > 0;
+    HMODULE module = ::GetModuleHandleA("physics_RT.dll");
+    if (!module && !mustBeLoaded)
+        return false;   // not loaded yet: checked again before any run
+    m_PhysicsOk = -1;
+    wchar_t path[MAX_PATH] = {};
+    std::string hex;
+    if (!module || !::GetModuleFileNameW(module, path, MAX_PATH) || !Sha256File(path, hex)) {
+        GetLogger()->Error("physics_RT.dll is not loaded or cannot be hashed: refusing to run");
+        m_Active = false;
+        return false;
     }
-    auto* inputmgr = context->GetManagerByGuid(INPUT_MANAGER_GUID);
-    if (!CKInputManagerHook::Enable(inputmgr)) {
-        GetLogger()->Error("Failed to enable InputManager hook.");
+    if (hex != kPhysicsSha256) {
+        GetLogger()->Error("physics_RT.dll sha256 %s is not the 2002 DLL %s: refusing to run", hex.c_str(),
+                           kPhysicsSha256);
+        m_Active = false;
+        return false;
     }
-    CKTimeManagerHook::AddPostCallback([this](CKBaseManager* man) {
-        if (!m_BML->IsPlaying())
+    GetLogger()->Info("physics_RT.dll is the 2002 DLL (sha256 %.8s...)", hex.c_str());
+    m_PhysicsOk = 1;
+    return true;
+}
+
+void BallrainIO::OnLoadObject(const char *filename, CKBOOL isMap, const char *masterName, CK_CLASSID filterClass,
+                              CKBOOL addToScene, CKBOOL reuseMeshes, CKBOOL reuseMaterials, CKBOOL dynamic,
+                              XObjectArray *objArray, CKObject *masterObj) {
+    if (!m_Active)
+        return;
+    // Reference :125-136.
+    Dbg("LoadObject %s isMap=%d", filename, (int) isMap);
+    if (!strcmp(filename, "3D Entities\\Gameplay.nmo"))
+        m_CurLevel = m_BML->GetArrayByName("CurrentLevel");
+    if (!strcmp(filename, "3D Entities\\Menu.nmo")) {
+        m_Keyboard = m_BML->GetArrayByName("Keyboard");
+        m_ExitMain = ScriptHelper::FindFirstBB(m_BML->GetScriptByName("Menu_Main"), "Exit", false, 1, 0);
+    }
+}
+
+void BallrainIO::OnLoadScript(const char *filename, CKBehavior *script) {
+    if (!m_Active)
+        return;
+    // Reference :145-165, legacy branch.
+    const char *name = script->GetName();
+    if (!strcmp(name, "Ball_Explosion_Wood") || !strcmp(name, "Ball_Explosion_Paper") ||
+        !strcmp(name, "Ball_Explosion_Stone")) {
+        CKBehavior *beh = ScriptHelper::FindFirstBB(script, "Set Position");
+        if (beh)
+            ScriptHelper::DeleteBB(script, beh);
+        else
+            GetLogger()->Error("%s: no Set Position building block", name);
+    }
+    if (!strcmp(name, "Gameplay_Ingame")) {
+        for (int i = 0; i < script->GetLocalParameterCount(); ++i) {
+            CKParameter *param = script->GetLocalParameter(i);
+            if (!strcmp(param->GetName(), "ActiveBall")) {
+                m_ActiveBall = param;
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- auto-load
+
+void BallrainIO::OnPreStartMenu() { Dbg("PreStartMenu cw=%04x", FpuCw()); }
+void BallrainIO::OnPostLoadLevel() { Dbg("PostLoadLevel idx=%u cw=%04x", (unsigned) m_FrameIndex, FpuCw()); }
+void BallrainIO::OnPostExitLevel() { Dbg("PostExitLevel cw=%04x", FpuCw()); }
+
+void BallrainIO::OnPostStartMenu() {
+    Dbg("PostStartMenu cw=%04x", FpuCw());
+    if (!m_Active || !VerifyPhysicsDll())
+        return;
+    if (m_AutoLoadArmed && m_LoadIndex < m_Loads && m_Level >= 1) {
+        m_AutoLoadArmed = false;
+        if (m_LoadIndex == 0)
+            ScheduleAutoLoad();
+        else
+            m_WaitQuiet = true;   // reload: OnProcess schedules the autoload once the menu is quiet
+    }
+}
+
+static bool SameNames(std::vector<std::string> a, std::vector<std::string> b) {
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+    return a == b;
+}
+
+std::vector<std::string> BallrainIO::BehaviorObjectNames() const {
+    std::vector<std::string> names;
+    CKBehaviorManager *bm = m_BML->GetCKContext()->GetBehaviorManager();
+    for (int k = 0; bm && k < bm->GetObjectsCount(); ++k) {
+        CKBeObject *o = bm->GetObject(k);
+        names.emplace_back(o && o->GetName() ? o->GetName() : "-");
+    }
+    return names;
+}
+
+void BallrainIO::ScheduleAutoLoad() {
+    // Reference OnPostStartMenu :294-309 (the 2-tick timer and the same messages).
+    const int level = m_Level;
+    m_BML->AddTimer(2ul, [this, level]() {
+        Dbg("autoload timer fires cw=%04x", FpuCw());
+        if (m_Loads > 1 && m_LoadIndex == 0) {
+            m_ColdMenuObjects = BehaviorObjectNames();
+            CaptureScripts();
+        } else if (m_LoadIndex > 0) {
+            RestoreScripts();
+            ReorderBehaviorObjects();
+        }
+        if (m_Dbg) {
+            std::string list;
+            for (const std::string &n : BehaviorObjectNames())
+                list += " " + n;
+            Dbg("autoload behavior objects:%s", list.c_str());
+        }
+        if (!m_CurLevel || !m_ExitMain) {
+            GetLogger()->Error("auto-load: CurrentLevel array or Menu_Main Exit not found");
             return;
-        auto* timeManager = static_cast<CKTimeManager*>(man);
-        timeManager->SetLastDeltaTime(DEFAULT_INPUT_DT);
+        }
+        m_CurLevel->SetElementValue(0, 0, (void *) &level);
+
+        CKContext *ctx = m_BML->GetCKContext();
+        CKMessageManager *mm = ctx->GetMessageManager();
+        CKMessageType loadLevel = mm->AddMessageType((CKSTRING) "Load Level");
+        CKMessageType loadMenu = mm->AddMessageType((CKSTRING) "Menu_Load");
+
+        mm->SendMessageSingle(loadLevel, ctx->GetCurrentLevel());
+        mm->SendMessageSingle(loadMenu, m_BML->GetGroupByName("All_Sound"));
+        m_BML->Get2dEntityByName("M_BlackScreen")->Show(CKHIDE);
+        m_ExitMain->ActivateInput(0);
+        m_ExitMain->Activate();
     });
 }
 
-void BallrainIO::OnUnload() {}
+// ---------------------------------------------------------------- start / stop
 
-void BallrainIO::OnModifyConfig(const char* category, const char* key, IProperty* prop) {}
-
-void BallrainIO::OnLoadObject(const char* filename, CKBOOL isMap, const char* masterName, CK_CLASSID filterClass,
-    CKBOOL addToScene, CKBOOL reuseMeshes, CKBOOL reuseMaterials, CKBOOL dynamic,
-    XObjectArray* objArray, CKObject* masterObj) {
-    if (strcmp(filename, "3D Entities\\Gameplay.nmo") == 0) {
-        m_currentLevelArray = m_BML->GetArrayByName("CurrentLevel");
-        m_inGameParameterArray = m_BML->GetArrayByName("IngameParameter");
-    } else if (strcmp(filename, "3D Entities\\Balls.nmo") == 0) {
-        InitBallInfo();
-    } else if (isMap) {
-        if (m_config->Get<bool>("OnlyPhysicalized")) {
-            CKGroup* physGroups[] = { m_BML->GetGroupByName("Phys_Floors"), m_BML->GetGroupByName("Phys_FloorRails") };
-            const auto IsPhysicalized = [&physGroups](CK3dObject* obj) -> bool {
-                for (auto* group : physGroups) {
-                    if (!group) continue;
-                    if (obj->IsInGroup(group))
-                        return true;
+static void DumpState(CKContext *ctx, CKBaseManager *ipion, const std::string &path) {
+    FILE *f = std::fopen(path.c_str(), "w");
+    if (!f)
+        return;
+    std::vector<char> buf(1 << 16);
+    const CK_CLASSID classes[] = {CKCID_DATAARRAY, CKCID_BEHAVIOR, CKCID_3DENTITY, CKCID_2DENTITY, CKCID_GROUP,
+                                  CKCID_PARAMETER, CKCID_MESH, CKCID_SCENE, CKCID_LEVEL, CKCID_WAVESOUND};
+    for (CK_CLASSID cid : classes)
+        std::fprintf(f, "count class %d %d\n", (int) cid, ctx->GetObjectsCountByClassID(cid));
+    auto *mgr = reinterpret_cast<unsigned char *>(ipion);
+    for (int off = 0x20; off < 0xD4; off += 4)
+        std::fprintf(f, "ipion +%02x %08x\n", off, *reinterpret_cast<unsigned *>(mgr + off));
+    {
+        const int n = ctx->GetObjectsCountByClassID(CKCID_DATAARRAY);
+        CK_ID *ids = ctx->GetObjectsListByClassID(CKCID_DATAARRAY);
+        for (int k = 0; k < n; ++k) {
+            auto *a = (CKDataArray *) ctx->GetObject(ids[k]);
+            if (!a)
+                continue;
+            std::fprintf(f, "array %s %dx%d\n", a->GetName() ? a->GetName() : "-", a->GetRowCount(), a->GetColumnCount());
+            for (int r = 0; r < a->GetRowCount(); ++r)
+                for (int c = 0; c < a->GetColumnCount(); ++c) {
+                    buf[0] = 0;
+                    if (a->GetElementStringValue(r, c, nullptr) < (int) buf.size())
+                        a->GetElementStringValue(r, c, buf.data());
+                    std::fprintf(f, "  [%d,%d] %s\n", r, c, buf.data());
                 }
-                return false;
-            };
-
-            for (int i = 0; i < objArray->Size(); ++i) {
-                auto* obj = CK3dObject::Cast(m_BML->GetCKContext()->GetObject((*objArray)[i]));
-                if (!obj) continue;
-                obj->Show(IsPhysicalized(obj) ? CKSHOW : CKHIDE);
-            }
-        }
-
-        // Sector
-        m_sectorPositions.clear();
-
-        VxVector pos;
-        auto* fourFlamesObj = m_BML->Get3dObjectByName("PS_FourFlames_01");
-        fourFlamesObj->GetPosition(&pos);
-        m_sectorPositions.emplace_back(pos);
-
-        char name[64];
-        int sectorCount = 1;
-        for (; sectorCount <= 999; ++sectorCount) { // ExtraSector mod allows loading up to 999 sectors
-            // checks if the next sector exists
-            int sector = sectorCount + 1; // assume we have at least 1 sector (map fails to load otherwise)
-            snprintf(name, sizeof(name), "Sector_%02d", sector);
-            if (m_BML->GetGroupByName(sector == 9 ? "Sector_9" : name) == nullptr) // see pull request #1
-                break;
-        }
-
-        for (int i = 1; i <= sectorCount - 1; ++i) {
-            // we could write `i < sectorCount` here but it's better to be explicit
-            snprintf(name, sizeof(name), "PC_TwoFlames_%02d", i);
-            auto* twoFlamesObj = m_BML->Get3dObjectByName(name);
-            if (twoFlamesObj == nullptr)
-                break;
-
-            twoFlamesObj->GetPosition(&pos);
-            m_sectorPositions.emplace_back(pos);
-        }
-        // NOTE: if we break before finding all sector's corresponding checkpoints
-        //     it means the map can't be completed although it will load fine
-        //     commonly seen with unfinished custom maps
-        // TODO: display some warning about unable to finish here, instead of crashing
-        assert(m_sectorPositions.size() == sectorCount);
-
-        auto* balloonObj = m_BML->Get3dObjectByName("PE_Balloon_01");
-        balloonObj->GetPosition(&pos);
-        m_sectorPositions.emplace_back(pos);
-
-        // Floors
-        auto* script = m_BML->GetScriptByName("Gameplay_Refresh");
-
-        auto* floorGroup = m_BML->GetGroupByName("Phys_Floors");
-        int floorCount = floorGroup->GetObjectCount();
-        for (auto i = 0; i < floorCount; ++i) {
-            auto* floor = reinterpret_cast<CK3dObject*>(floorGroup->GetObjectA(i));
-            auto& box = floor->GetBoundingBox();
-            GetLogger()->Info("%s, box: (%.2f, %.2f, %.2f) (%.2f, %.2f, %.2f)", 
-                floor->GetName(),
-                box.Min.x, box.Min.y, box.Min.z,
-                box.Max.x, box.Max.y, box.Max.z
-            );
-            m_floorBoxes.emplace_back(box);
-            //floor->AddPostRenderCallBack(BallrainIO::ShowBoundingBoxRenderCallBack, m_showBoxBB);
         }
     }
+    {
+        const int n = ctx->GetObjectsCountByClassID(CKCID_BEHAVIOR);
+        CK_ID *ids = ctx->GetObjectsListByClassID(CKCID_BEHAVIOR);
+        for (int k = 0; k < n; ++k) {
+            auto *b = (CKBehavior *) ctx->GetObject(ids[k]);
+            if (!b)
+                continue;
+            CKBehavior *owner = b->GetOwnerScript();
+            std::fprintf(f, "beh %s/%s active=%d flags=%08x\n", owner && owner->GetName() ? owner->GetName() : "-",
+                         b->GetName() ? b->GetName() : "-", (int) b->IsActive(), (unsigned) b->GetFlags());
+            for (int p = 0; p < b->GetLocalParameterCount(); ++p) {
+                CKParameter *param = b->GetLocalParameter(p);
+                if (!param)
+                    continue;
+                buf[0] = 0;
+                if (param->GetStringValue(nullptr) < (int) buf.size())
+                    param->GetStringValue(buf.data());
+                std::fprintf(f, "  local %s = %s\n", param->GetName() ? param->GetName() : "-", buf.data());
+            }
+        }
+    }
+    {
+        const int n = ctx->GetObjectsCountByClassID(CKCID_3DENTITY);
+        CK_ID *ids = ctx->GetObjectsListByClassID(CKCID_3DENTITY);
+        for (int k = 0; k < n; ++k) {
+            auto *e = (CK3dEntity *) ctx->GetObject(ids[k]);
+            if (!e)
+                continue;
+            const VxMatrix &m = e->GetWorldMatrix();
+            std::fprintf(f, "ent %s vis=%d pos=%.9g %.9g %.9g\n", e->GetName() ? e->GetName() : "-", (int) e->IsVisible(),
+                         m[3][0], m[3][1], m[3][2]);
+        }
+    }
+    std::fclose(f);
 }
 
-CKBOOL
-BallrainIO::ShowBoundingBoxRenderCallBack(CKRenderContext* rc, CKRenderObject* obj, void* arg)
-{
-    CKBehavior* beh = (CKBehavior*)arg;
-    CK3dEntity* ent = (CK3dEntity*)obj;
-    if (!beh || !ent)
-        return FALSE;
+void BallrainIO::DbgGate(const char *where) {
+    if (!m_Dbg)
+        return;
+    auto *mgr = reinterpret_cast<CKBYTE *>(m_IpionManager);
+    auto *env = *reinterpret_cast<CKBYTE **>(mgr + 0xC0);
+    auto *base = reinterpret_cast<CKBYTE *>(::GetModuleHandleA("physics_RT.dll"));
+    Dbg("GATE %s idx=%u env120=%a env128=%a env130=%a c8=%08x cc=%08x d0=%08x rand=%08x colldist=%08x", where,
+        (unsigned) m_FrameIndex, env ? *reinterpret_cast<double *>(env + 0x120) : -1.0,
+        env ? *reinterpret_cast<double *>(env + 0x128) : -1.0, env ? *reinterpret_cast<double *>(env + 0x130) : -1.0,
+        *reinterpret_cast<unsigned *>(mgr + 0xC8), *reinterpret_cast<unsigned *>(mgr + 0xCC),
+        *reinterpret_cast<unsigned *>(mgr + 0xD0), base ? *reinterpret_cast<unsigned *>(base + 0x685b4) : 0u,
+        base ? *reinterpret_cast<unsigned *>(base + 0x75edc) : 0u);
+}
 
-    // Projection Trick
-    VxMatrix& projmat = (VxMatrix&)rc->GetProjectionTransformationMatrix();
-    float oldproj = projmat[3].z;
-    projmat[3].z = oldproj * 1.008f; // to disable Z buffer fighting
-    rc->SetProjectionTransformationMatrix(projmat);
+// CKBehaviorManager keeps its active objects in an XObjectPointerArray sorted by priority with qsort,
+// so objects of equal priority run in an order that depends on the array's history. A reload puts the
+// same objects in the order the cold process had at its autoload. The array is found by its content.
+void BallrainIO::ReorderBehaviorObjects() {
+    CKBehaviorManager *bm = m_BML->GetCKContext()->GetBehaviorManager();
+    const int n = bm ? bm->GetObjectsCount() : 0;
+    if (n == 0 || BehaviorObjectNames().size() != m_ColdMenuObjects.size()) {
+        GetLogger()->Error("reload: behavior objects differ from the cold autoload (%d)", n);
+        return;
+    }
+    auto *raw = reinterpret_cast<CKBYTE *>(bm);
+    CKBeObject **arr = nullptr;
+    for (int off = 0; off < 0x200 && !arr; off += 4) {
+        auto **begin = *reinterpret_cast<CKBeObject ***>(raw + off);
+        auto **end = *reinterpret_cast<CKBeObject ***>(raw + off + 4);
+        if (!begin || end != begin + n || ::IsBadReadPtr(begin, n * sizeof(void *)))
+            continue;
+        bool match = true;
+        for (int k = 0; k < n && match; ++k)
+            match = begin[k] == bm->GetObject(k);
+        if (match)
+            arr = begin;
+    }
+    if (!arr) {
+        GetLogger()->Error("reload: behavior manager object array not found");
+        return;
+    }
+    std::vector<CKBeObject *> cur(arr, arr + n), sorted;
+    for (const std::string &name : m_ColdMenuObjects)
+        for (CKBeObject *&o : cur)
+            if (o && o->GetName() && name == o->GetName()) {
+                sorted.push_back(o);
+                o = nullptr;
+                break;
+            }
+    if ((int) sorted.size() != n) {
+        GetLogger()->Error("reload: behavior objects differ from the cold autoload (names)");
+        return;
+    }
+    std::copy(sorted.begin(), sorted.end(), arr);
+    if (BehaviorObjectNames() != m_ColdMenuObjects)
+        GetLogger()->Error("reload: behavior object order not restored");
+}
 
-    CKBOOL DrawBBox;
-    beh->GetInputParameterValue(0, &DrawBBox);
+// Process-global state that a level load starts from and that the previous run leaves changed.
+// Captured at the first (cold) PreLoadLevel, written back at every later one (LOADS > 1 only).
+static unsigned *PhysicsRandSeed() {   // IVP_RAND_SEED of the 2002 physics_RT.dll (RVA 0x685b4)
+    auto *base = reinterpret_cast<CKBYTE *>(::GetModuleHandleA("physics_RT.dll"));
+    return base ? reinterpret_cast<unsigned *>(base + 0x685b4) : nullptr;
+}
 
-    CKBOOL Local;
-    CKBOOL Hierachical;
-    beh->GetInputParameterValue(2, &Local);
-    beh->GetInputParameterValue(3, &Hierachical);
+// Scripts that are not running at the cold autoload. A reload resets each of them that is not running
+// at its own autoload either (the engine's script reset: sub-behaviors off, IOs and link delays reset),
+// so sub-behaviors the previous level left flagged active do not run on when the script is started
+// again without a reset. The gameplay scripts also get their parameter values (locals, outputs) back
+// as the cold process had them: e.g. Gameplay_Ingame otherwise enables Ball Navigation at the first
+// key press of the camera intro. Also the gameplay arrays a finished level leaves filled.
+static void CollectParameters(CKBehavior *b, std::vector<CKObject *> &out) {
+    if (!b)
+        return;
+    for (int i = 0; i < b->GetOutputParameterCount(); ++i)
+        out.push_back(b->GetOutputParameter(i));
+    for (int i = 0; i < b->GetLocalParameterCount(); ++i)
+        out.push_back(b->GetLocalParameter(i));
+    for (int i = 0; i < b->GetParameterOperationCount(); ++i)
+        if (CKParameterOperation *op = b->GetParameterOperation(i))
+            out.push_back(op->GetOutParameter());
+    for (int i = 0; i < b->GetSubBehaviorCount(); ++i)
+        CollectParameters(b->GetSubBehavior(i), out);
+}
 
-    // Bounding Box
-    if (DrawBBox)
-    {
-        VxColor color;
-        beh->GetInputParameterValue(1, &color);
+void BallrainIO::CaptureScripts() {
+    CKContext *ctx = m_BML->GetCKContext();
+    const int n = ctx->GetObjectsCountByClassID(CKCID_BEHAVIOR);
+    CK_ID *ids = ctx->GetObjectsListByClassID(CKCID_BEHAVIOR);
+    size_t params = 0;
+    for (int k = 0; k < n; ++k) {
+        auto *b = (CKBehavior *) ctx->GetObject(ids[k]);
+        if (!b || b->GetType() != CKBEHAVIORTYPE_SCRIPT || b->GetParent() || b->IsActive())
+            continue;
+        ScriptState st;
+        st.script = b->GetID();
+        if (b->GetName() && !strncmp(b->GetName(), "Gameplay_", 9)) {
+            std::vector<CKObject *> objs;
+            CollectParameters(b, objs);
+            for (CKObject *o : objs)
+                if (o)
+                    st.chunks.emplace_back(o->GetID(), CKSaveObjectState(o));
+            params += st.chunks.size();
+        }
+        m_ColdScripts.push_back(std::move(st));
+    }
+    static const char *const kArrays[] = {"IngameParameter", "Energy", "LifeBalls"};
+    for (const char *name : kArrays)
+        if (CKDataArray *a = m_BML->GetArrayByName(name))
+            m_ColdArrays.emplace_back(a->GetID(), CKSaveObjectState(a));
+    Dbg("captured %u idle scripts, %u parameters, %u arrays", (unsigned) m_ColdScripts.size(), (unsigned) params,
+        (unsigned) m_ColdArrays.size());
+}
 
-        const VxBbox& Box = Hierachical ? ent->GetHierarchicalBox(Local) : ent->GetBoundingBox(Local);
+void BallrainIO::RestoreScripts() {
+    CKContext *ctx = m_BML->GetCKContext();
+    unsigned scripts = 0, params = 0, skipped = 0, arrays = 0;
+    for (const ScriptState &st : m_ColdScripts) {
+        auto *b = (CKBehavior *) ctx->GetObject(st.script);
+        if (!b || b->IsActive()) {
+            ++skipped;
+            Dbg("reload: script %s is running, not reset", b && b->GetName() ? b->GetName() : "-");
+            continue;
+        }
+        ++scripts;
+        b->Activate(FALSE, TRUE);
+        for (const auto &c : st.chunks)
+            if (CKObject *o = ctx->GetObject(c.first)) {
+                CKReadObjectState(o, c.second);
+                ++params;
+            }
+    }
+    for (const auto &c : m_ColdArrays)
+        if (CKObject *a = ctx->GetObject(c.first)) {
+            CKReadObjectState(a, c.second);
+            ++arrays;
+        }
+    Dbg("reload: reset %u scripts (%u parameters), %u running, %u arrays", scripts, params, skipped, arrays);
+}
 
-        rc->SetTexture(NULL);
+void BallrainIO::FreeColdState() {
+    for (ScriptState &st : m_ColdScripts)
+        for (auto &c : st.chunks)
+            DeleteCKStateChunk(c.second);
+    m_ColdScripts.clear();
+    for (auto &c : m_ColdArrays)
+        DeleteCKStateChunk(c.second);
+    m_ColdArrays.clear();
+}
 
-        if (Local)
-            rc->SetWorldTransformationMatrix(ent->GetWorldMatrix());
+void BallrainIO::CaptureColdState() {
+    auto *mgr = reinterpret_cast<CKBYTE *>(m_IpionManager);
+    m_ColdTimeFactor = *reinterpret_cast<unsigned *>(mgr + 0xD0);
+    if (unsigned *seed = PhysicsRandSeed())
+        m_ColdRandSeed = *seed;
+    m_ColdActiveBall = 0;
+    if (m_ActiveBall)
+        m_ActiveBall->GetValue(&m_ColdActiveBall);
+}
+
+void BallrainIO::RestoreColdState() {
+    auto *mgr = reinterpret_cast<CKBYTE *>(m_IpionManager);
+    *reinterpret_cast<unsigned *>(mgr + 0xD0) = m_ColdTimeFactor;   // physics time factor
+    if (unsigned *seed = PhysicsRandSeed())
+        *seed = m_ColdRandSeed;
+    if (m_ActiveBall)
+        m_ActiveBall->SetValue(&m_ColdActiveBall);   // no ball until this load's level start sets it
+    DbgGate("Restored");
+}
+
+void BallrainIO::OnPreLoadLevel() {
+    DbgGate("PreLoadLevel");
+    Dbg("PreLoadLevel cw=%04x playing=%d ball=%p", FpuCw(), (int) m_Playing, (void *) GetActiveBall());
+    if (m_Dbg)
+        DumpState(m_BML->GetCKContext(), m_IpionManager,
+                  GetEnv("BALLRAIN_DEBUG") + ".dump" + std::to_string(m_LoadIndex + 1));
+    Start();
+}
+
+void BallrainIO::Start() {
+    // Reference OnStart :406-436.
+    if (!m_Active || !VerifyPhysicsDll() || m_LoadIndex >= m_Loads)
+        return;
+    if (m_Playing) {   // a level load while a run plays: the run goes on (no second start)
+        GetLogger()->Warn("level load during run %d at frame %u: ignored", m_LoadIndex, (unsigned) m_FrameIndex);
+        return;
+    }
+    if (m_Loads > 1) {   // LOADS=1 never touches any of this
+        if (m_LoadIndex == 0)
+            CaptureColdState();
         else
-            rc->SetWorldTransformationMatrix(VxMatrix::Identity());
+            RestoreColdState();
+    }
+    ++m_LoadIndex;
+    m_ReloadWaiting = false;
 
-        // Data
-        VxDrawPrimitiveData* data = rc->GetDrawPrimitiveStructure(CKRST_DP_TR_CL_VC, 10);
+    m_BML->AddTimer(1ul, [this]() { ResetPhysicsTime(); });
 
-        // Colors
-#if CKVERSION == 0x13022002 || CKVERSION == 0x05082002
-        CKDWORD* colors = (CKDWORD*)data->ColorPtr;
-        CKDWORD col = RGBAFTOCOLOR(&color);
-        VxFillStructure(10, colors, data->ColorStride, 4, &col);
-
-        // Positions
-        VxVector Min = Box.Min, Max = Box.Max;
-        ((VxVector4*)data->PositionPtr)[0] = Min;
-        ((VxVector4*)data->PositionPtr)[1].Set(Max.x, Min.y, Min.z, 1.0f);
-        ((VxVector4*)data->PositionPtr)[2].Set(Max.x, Max.y, Min.z, 1.0f);
-        ((VxVector4*)data->PositionPtr)[3].Set(Min.x, Max.y, Min.z, 1.0f);
-
-        ((VxVector4*)data->PositionPtr)[4].Set(Min.x, Min.y, Max.z, 1.0f);
-        ((VxVector4*)data->PositionPtr)[5].Set(Max.x, Min.y, Max.z, 1.0f);
-        ((VxVector4*)data->PositionPtr)[6] = Max;
-        ((VxVector4*)data->PositionPtr)[7].Set(Min.x, Max.y, Max.z, 1.0f);
-#else
-        CKDWORD* colors = (CKDWORD*)data->Colors.Ptr;
-        CKDWORD col = RGBAFTOCOLOR(&color);
-        VxFillStructure(10, colors, data->Colors.Stride, 4, &col);
-
-        // Positions
-        VxVector Min = Box.Min, Max = Box.Max;
-        ((VxVector4*)data->Positions.Ptr)[0] = Min;
-        ((VxVector4*)data->Positions.Ptr)[1].Set(Max.x, Min.y, Min.z, 1.0f);
-        ((VxVector4*)data->Positions.Ptr)[2].Set(Max.x, Max.y, Min.z, 1.0f);
-        ((VxVector4*)data->Positions.Ptr)[3].Set(Min.x, Max.y, Min.z, 1.0f);
-
-        ((VxVector4*)data->Positions.Ptr)[4].Set(Min.x, Min.y, Max.z, 1.0f);
-        ((VxVector4*)data->Positions.Ptr)[5].Set(Max.x, Min.y, Max.z, 1.0f);
-        ((VxVector4*)data->Positions.Ptr)[6] = Max;
-        ((VxVector4*)data->Positions.Ptr)[7].Set(Min.x, Max.y, Max.z, 1.0f);
-#endif
-        // Indices
-        CKWORD indices[24] = { 0, 1, 0, 3, 2, 1, 2, 3, 2, 6, 6, 7, 6, 5, 5, 1, 5, 4, 4, 7, 4, 0, 7, 3 };
-        rc->DrawPrimitive(VX_LINELIST, indices, 24, data);
+    // The reference adds both post-callbacks here and clears them in OnStop. Here they are added once,
+    // at the first start, and are inert while no run plays: the same per-frame effect, without clearing
+    // a callback list from inside one of its own callbacks (OnStop runs inside them at record end).
+    if (!m_CallbacksRegistered) {
+        CKTimeManagerHook::AddPostCallback([this](CKBaseManager *) { OnPreProcessTime(); });
+        CKInputManagerHook::AddPostCallback([this](CKBaseManager *) { OnPreProcessInput(); });
+        m_CallbacksRegistered = true;
     }
 
-    CKBOOL vNormal = FALSE;
-    beh->GetInputParameterValue(4, &vNormal);
+    AcquireKeyBindings();
 
-    CKMesh* mesh = ent->GetCurrentMesh();
-
-    // Vertices Normals
-    if (vNormal && mesh)
-    {
-        VxColor color;
-        beh->GetInputParameterValue(5, &color);
-
-        float size = 1.0f;
-        beh->GetInputParameterValue(6, &size);
-
-        CKMaterial* mat = (CKMaterial*)beh->GetLocalParameterObject(0);
-
-        int vcount = mesh->GetVertexCount();
-
-        rc->SetTexture(NULL);
-
-        rc->SetWorldTransformationMatrix(ent->GetWorldMatrix());
-
-        CKDWORD flags = CKRST_DP_TR_CL_VC;
-        if (mat)
-            flags = CKRST_DP_TR_CL_VNT & ~CKRST_DP_STAGES0;
-
-        // Data
-        VxDrawPrimitiveData* data = rc->GetDrawPrimitiveStructure((CKRST_DPFLAGS)flags, vcount * 2);
-
-        CKDWORD pS;
-        CKBYTE* positions = (CKBYTE*)mesh->GetPositionsPtr(&pS);
-        CKDWORD nS;
-        CKBYTE* normals = (CKBYTE*)mesh->GetNormalsPtr(&nS);
-
-#if CKVERSION == 0x13022002 || CKVERSION == 0x05082002
-        XPtrStrided<VxVector> dpp(data->PositionPtr, data->PositionStride);
-        XPtrStrided<VxVector> dpn(data->NormalPtr, data->NormalStride);
-#else
-        XPtrStrided<VxVector> dpp(data->Positions.Ptr, data->Positions.Stride);
-        XPtrStrided<VxVector> dpn(data->Normals.Ptr, data->Normals.Stride);
-#endif
-        for (int i = 0; i < vcount; ++i, positions += pS, normals += nS)
-        {
-            VxVector* v = (VxVector*)positions;
-            VxVector* n = (VxVector*)normals;
-            dpp[i * 2] = *v;
-            dpp[i * 2 + 1] = *v + size * (*n);
-            if (mat)
-            {
-                dpn[i * 2] = Normalize(*n);
-                dpn[i * 2 + 1] = dpn[i * 2];
-            }
-        }
-
-        if (!mat)
-        {
-            // Colors
-#if CKVERSION == 0x13022002 || CKVERSION == 0x05082002
-            CKDWORD* colors = (CKDWORD*)data->ColorPtr;
-            CKDWORD col = RGBAFTOCOLOR(&color);
-            VxFillStructure(vcount * 2, colors, data->ColorStride, 4, &col);
-#else
-            CKDWORD* colors = (CKDWORD*)data->Colors.Ptr;
-            CKDWORD col = RGBAFTOCOLOR(&color);
-            VxFillStructure(vcount * 2, colors, data->Colors.Stride, 4, &col);
-#endif
-        }
-
-        if (vcount)
-        {
-            if (mat)
-                mat->SetAsCurrent(rc);
-
-            rc->DrawPrimitive(VX_LINELIST, NULL, vcount * 2, data);
-        }
-    }
-
-    CKBOOL fNormal = FALSE;
-    beh->GetInputParameterValue(7, &fNormal);
-
-    // Faces Normals
-    if (fNormal && mesh)
-    {
-        VxColor color;
-        beh->GetInputParameterValue(8, &color);
-
-        float size = 1.0f;
-        beh->GetInputParameterValue(9, &size);
-
-        CKMaterial* mat = (CKMaterial*)beh->GetLocalParameterObject(1);
-
-        int fcount = mesh->GetFaceCount();
-        int vcount = mesh->GetVertexCount();
-
-        rc->SetTexture(NULL);
-
-        rc->SetWorldTransformationMatrix(ent->GetWorldMatrix());
-
-        CKDWORD flags = CKRST_DP_TR_CL_VC;
-        if (mat)
-            flags = CKRST_DP_TR_CL_VNT & ~CKRST_DP_STAGES0;
-
-        // Data
-        VxDrawPrimitiveData* data = rc->GetDrawPrimitiveStructure((CKRST_DPFLAGS)flags, fcount * 2);
-
-        CKDWORD pS;
-        CKBYTE* positions = (CKBYTE*)mesh->GetPositionsPtr(&pS);
-
-#if CKVERSION == 0x13022002 || CKVERSION == 0x05082002
-        XPtrStrided<VxVector> dpp(data->PositionPtr, data->PositionStride);
-        XPtrStrided<VxVector> dpn(data->NormalPtr, data->NormalStride);
-#else
-        XPtrStrided<VxVector> dpp(data->Positions.Ptr, data->Positions.Stride);
-        XPtrStrided<VxVector> dpn(data->Normals.Ptr, data->Normals.Stride);
-#endif
-
-        for (int i = 0; i < fcount; ++i)
-        {
-            VxVector n = mesh->GetFaceNormal(i);
-            VxVector v = (mesh->GetFaceVertex(i, 0) + mesh->GetFaceVertex(i, 1) + mesh->GetFaceVertex(i, 2)) * 0.33333f;
-            dpp[i * 2] = v;
-            dpp[i * 2 + 1] = v + size * n;
-
-            if (mat)
-            {
-                dpn[i * 2] = v;
-                dpn[i * 2 + 1] = v;
-            }
-        }
-
-        if (!mat)
-        {
-            // Colors
-#if CKVERSION == 0x13022002 || CKVERSION == 0x05082002
-            CKDWORD* colors = (CKDWORD*)data->ColorPtr;
-            CKDWORD col = RGBAFTOCOLOR(&color);
-            VxFillStructure(fcount * 2, colors, data->ColorStride, 4, &col);
-#else
-            CKDWORD* colors = (CKDWORD*)data->Colors.Ptr;
-            CKDWORD col = RGBAFTOCOLOR(&color);
-            VxFillStructure(fcount * 2, colors, data->Colors.Stride, 4, &col);
-#endif
-        }
-
-        if (fcount)
-        {
-            if (mat)
-                mat->SetAsCurrent(rc);
-
-            rc->DrawPrimitive(VX_LINELIST, NULL, fcount * 2, data);
-        }
-    }
-
-    CKBOOL showSphere = FALSE;
-    beh->GetInputParameterValue(10, &showSphere);
-
-    if (showSphere && mesh)
-    {
-
-        rc->SetTexture(NULL);
-
-        rc->SetWorldTransformationMatrix(ent->GetWorldMatrix());
-
-        VxColor color;
-        beh->GetInputParameterValue(11, &color);
-
-        int count = 32;
-
-        // Data
-        VxDrawPrimitiveData* data = rc->GetDrawPrimitiveStructure(CKRST_DP_TR_CL_VC, count);
-
-        VxVector center;
-        mesh->GetBaryCenter(&center);
-
-        float radius = mesh->GetRadius();
-
-        int axis0 = 0;
-        int axis1 = 1;
-        for (int i = 0; i < 3; ++i)
-        {
-#if CKVERSION == 0x13022002 || CKVERSION == 0x05082002
-            XPtrStrided<VxVector> positions(data->PositionPtr, data->PositionStride);
-#else
-            XPtrStrided<VxVector> positions(data->Positions.Ptr, data->Positions.Stride);
-#endif
-            // Positions
-            float delta = PI * 2.0f / (count - 1);
-            float t = 0.0f;
-            for (int j = 0; j < count; ++j, t += delta)
-            {
-                positions[j] = center;
-                positions[j][axis0] += radius * cosf(t);
-                positions[j][axis1] += radius * sinf(t);
-            }
-
-            // Colors
-            CKDWORD col = RGBAFTOCOLOR(&color);
-#if CKVERSION == 0x13022002 || CKVERSION == 0x05082002
-            VxFillStructure(count, data->ColorPtr, data->ColorStride, 4, &col);
-#else
-            VxFillStructure(count, data->Colors.Ptr, data->Colors.Stride, 4, &col);
-#endif
-
-            // Drawing
-            rc->DrawPrimitive(VX_LINESTRIP, NULL, count, data);
-
-            ++axis0;
-            ++axis1;
-            if (axis1 == 3)
-                axis1 = 0;
-        }
-    }
-
-    projmat[3].z = oldproj; // restore projection matrix
-    rc->SetProjectionTransformationMatrix(projmat);
-
-    return TRUE;
+    m_FrameIndex = 0;
+    m_TraceLines = 0;
+    m_GameOverPending = false;
+    m_DeltaFrame = SIZE_MAX;
+    m_FrameLog.clear();
+    m_FrameLog.reserve(m_Frames.size());
+    OpenOutputs();
+    m_StartTime = std::chrono::steady_clock::now();
+    m_Playing = true;
+    Event("PreLoadLevel");
+    GetLogger()->Info("run %d/%d started", m_LoadIndex, m_Loads);
 }
 
-void BallrainIO::OnLoadScript(const char* filename, CKBehavior* script) {
-    if (strcmp(script->GetName(), "Gameplay_Events") == 0) {
-        m_escBeh = ScriptHelper::FindFirstBB(script, "Key Event");
+void BallrainIO::Stop(StopReason reason) {
+    // Reference OnStop :438-474 (playing branch).
+    if (!m_Playing)
+        return;
+    if (reason == StopReason::RecordEnd)
+        Event("RecordEnd");
+    m_Playing = false;
+    m_GameOverPending = false;
+    if (m_InputHook)
+        ResetKeyboardState(m_InputHook->GetKeyboardState());
+
+    const auto wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - m_StartTime).count();
+    CloseOutputs(wallMs);
+    GetLogger()->Info("run %d/%d ended at frame %u", m_LoadIndex, m_Loads, (unsigned) m_FrameIndex);
+
+    if (m_LoadIndex < m_Loads) {
+        // Back to the start menu through the game's own pause-menu message ("Exit Level" to Level and
+        // All_Balls), then the next PostStartMenu runs the same auto-load. Not done when the level is
+        // already being exited. Sent from OnProcess, not from inside a PreProcess callback.
+        m_SendExitLevel = reason != StopReason::ExitLevel;
+        m_AutoLoadArmed = true;
+        m_ReloadWaiting = true;
+        m_ReloadDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        return;
     }
-    else if (strcmp(script->GetName(), "Menu_Pause") == 0) {
-        m_restartBeh = ScriptHelper::FindFirstBB(script, "Restart Level");
+    if (m_ExitWhenDone)
+        m_BML->ExitGame();   // reference :458-461 (ExitOnFinish)
+}
+
+void BallrainIO::OnPreResetLevel() { Stop(StopReason::ResetLevel); }   // reference :335
+void BallrainIO::OnPreExitLevel() { Stop(StopReason::ExitLevel); }     // reference :337
+
+void BallrainIO::OnLevelFinish() {   // reference :339-347
+    Event("LevelFinish");
+    Stop(StopReason::LevelFinish);
+}
+
+void BallrainIO::OnGameOver() {
+    // Contract: a game over ends the run (the reference plays on). The stop is deferred to the next
+    // Time callback, the point where the reference stops when its record runs out: this frame's trace
+    // line is still written, so the frame log replayed as a legacy record by the real TASSupport gives
+    // the identical trace, terminal frame included.
+    Event("GameOver");
+    if (m_Playing)
+        m_GameOverPending = true;
+}
+
+void BallrainIO::OnStartLevel() {
+    Dbg("StartLevel idx=%u cw=%04x ball=%p", (unsigned) m_FrameIndex, FpuCw(), (void *) GetActiveBall());
+    DbgGate("StartLevel");
+    if (m_Dbg)
+        DumpState(m_BML->GetCKContext(), m_IpionManager,
+                  GetEnv("BALLRAIN_DEBUG") + ".dumpS" + std::to_string(m_LoadIndex));
+    Event("StartLevel");
+}
+void BallrainIO::OnCamNavActive() { Event("CamNavActive"); }
+void BallrainIO::OnBallNavActive() { Event("BallNavActive"); }
+void BallrainIO::OnBallNavInactive() { Event("BallNavInactive"); }
+void BallrainIO::OnBallOff() { Event("BallOff"); }
+void BallrainIO::OnPreCheckpointReached() { Event("PreCheckpoint"); }
+void BallrainIO::OnPostCheckpointReached() { Event("PostCheckpoint"); }
+void BallrainIO::OnPreLifeUp() { Event("PreLifeUp"); }
+
+// ---------------------------------------------------------------- per frame
+
+const Frame *BallrainIO::GetFrame(size_t index) const {
+    return index < m_Frames.size() ? &m_Frames[index] : nullptr;
+}
+
+void BallrainIO::OnPreProcessTime() {
+    // Reference :506-513. The index is not advanced here.
+    if (m_Dbg && (!m_Playing || m_FrameIndex < 140))
+        Dbg("T idx=%u play=%d cw=%04x d=%.9g abs=%.9g", (unsigned) m_FrameIndex, (int) m_Playing, FpuCw(),
+            m_TimeManager->GetLastDeltaTime(), m_TimeManager->GetAbsoluteTime());
+    if (!m_Playing)
+        return;
+    if (m_GameOverPending) {
+        Stop(StopReason::GameOver);
+        return;
     }
-    /*else if (strcmp(script->GetName(), "Gameplay_Ingame") == 0) {
-        CKBehavior* ballMgr = ScriptHelper::FindFirstBB(script, "BallManager");
-        CKBehavior* newBall = ScriptHelper::FindFirstBB(ballMgr, "New Ball");
-        dynamic_pos = ScriptHelper::FindNextBB(script, ballMgr, "TT Set Dynamic Position");
-        phy_new_ball = ScriptHelper::FindFirstBB(newBall, "physicalize new Ball");
-    }*/
+    const Frame *frame = GetFrame(m_FrameIndex);
+    if (!frame) {
+        Stop(StopReason::RecordEnd);
+        return;
+    }
+    m_TimeManager->SetLastDeltaTime(frame->deltaTime);
+    m_InjectedDelta = frame->deltaTime;
+    m_DeltaFrame = m_FrameIndex;
+}
+
+void BallrainIO::OnPreProcessInput() {
+    // Reference :481-490: write the keys, then advance the frame.
+    if (m_Dbg && (!m_Playing || m_FrameIndex < 140))
+        Dbg("I idx=%u play=%d", (unsigned) m_FrameIndex, (int) m_Playing);
+    if (!m_Playing)
+        return;
+    if (m_GameOverPending) {
+        Stop(StopReason::GameOver);
+        return;
+    }
+    const Frame *frame = GetFrame(m_FrameIndex);
+    if (!frame) {
+        Stop(StopReason::RecordEnd);
+        return;
+    }
+    SetKeyboardState(m_InputHook->GetKeyboardState(), frame->keys);
+    float delta = m_InjectedDelta;
+    if (m_DeltaFrame != m_FrameIndex) {   // the Time callback did not run first in this frame
+        delta = m_TimeManager->GetLastDeltaTime();
+        GetLogger()->Error("frame %u: input before time; logged the game's own delta", (unsigned) m_FrameIndex);
+    }
+    m_FrameLog.push_back(Frame{delta, frame->keys});
+    ++m_FrameIndex;
 }
 
 void BallrainIO::OnProcess() {
-    if (m_BML->IsIngame()) {
-        // UI
-        if (ImGui::Begin("BallrainIO Inspector", nullptr,
-                ImGuiWindowFlags_AlwaysAutoResize |
-                ImGuiWindowFlags_NoResize)) {
-            if (ImGui::TreeNode("State")) {
-                ImGui::Text("Ball Type: %d", gameState.ballType);
-                ImGui::Text("Position: (%3.2f, %3.2f, %3.2f)", gameState.position.x, gameState.position.y, gameState.position.z);
-                ImGui::Text("Quaternion: (%3.2f, %3.2f, %3.2f, %3.2f)", gameState.quaternion.x, gameState.quaternion.y, gameState.quaternion.z, gameState.quaternion.w);
-                ImGui::Text("Now at sector #%d", gameState.currentSector);
-                ImGui::Text("Next Sector: (%.2f, %.2f, %.2f)", gameState.nextSectorPosition.x, gameState.nextSectorPosition.y, gameState.nextSectorPosition.z);
-                ImGui::Text("Last Sector: (%.2f, %.2f, %.2f)", gameState.lastSectorPosition.x, gameState.lastSectorPosition.y, gameState.lastSectorPosition.z);
-                ImGui::TreePop();
-            }
-            if (ImGui::TreeNode("Action")) {
-                ImGui::Text("%s %s %s %s",
-                    currentkeyState.states[KeyState::BR_UP] ? "U" : " ",
-                    currentkeyState.states[KeyState::BR_DOWN] ? "D" : " ",
-                    currentkeyState.states[KeyState::BR_LEFT] ? "L" : " ",
-                    currentkeyState.states[KeyState::BR_RIGHT] ? "R" : " ");
-                ImGui::TreePop();
-            }
-        }
-        ImGui::End();
-    }
-
-    if (!m_ballNavActive)
+    if (!m_Active)
         return;
 
-    auto* ball = GetCurrentBall();
-    gameState.ballType = GetBallID(ball);
-    ball->GetPosition(&gameState.position);
-    ball->GetQuaternion(&gameState.quaternion);
-    gameState.currentSector = GetCurrentSector();
-    gameState.nextSectorPosition = GetNextSectorPosition(gameState.currentSector);
-    gameState.lastSectorPosition = GetLastSectorPosition(gameState.currentSector);
-
-    if (!m_tcpClient->Connected())
-        return;
-    //GetLogger()->Info("next: %d, last: %d", nextSector->GetName(), lastSector->GetName());
-    //nextSector->GetPosition(&gameState.nextSectorPosition);
-    //lastSector->GetPosition(&gameState.lastSectorPosition);
-    auto sentsz = m_tcpClient->SendMsg(MessageType::BRM_GameState, &gameState);
-    assert(sentsz == sizeof(MessageType) + sizeof(MsgGameState));
-    //GetLogger()->Info("GameState");
-
-    sentsz = m_tcpClient->SendMsg(MessageType::BRM_DepthImage, depthImage.image.data());
-    assert(sentsz == sizeof(MessageType) + depthImage.image.size() * 1);
-    //GetLogger()->Info("DepthImage");
-
-    sentsz = m_tcpClient->SendMsg(MessageType::BRM_Tick);
-    assert(sentsz == sizeof(MessageType));
-    //GetLogger()->Info("Tick");
-
-    MessageType msgType = m_tcpClient->ReceiveMsg();
-    if (msgType == MessageType::BRM_ResetInput) {
-        RestartLevel();
-        return;
+    if (m_SendExitLevel) {
+        m_SendExitLevel = false;
+        CKContext *ctx = m_BML->GetCKContext();
+        CKMessageManager *mm = ctx->GetMessageManager();
+        const CKMessageType exitLevel = mm->AddMessageType((CKSTRING) "Exit Level");
+        int sent = 0;
+        for (const char *target : {"Level", "All_Balls"}) {
+            auto *obj = (CKBeObject *) ctx->GetObjectByNameAndParentClass((CKSTRING) target, CKCID_BEOBJECT, nullptr);
+            if (obj && mm->SendMessageSingle(exitLevel, obj))
+                ++sent;
+        }
+        if (sent != 2)
+            GetLogger()->Error("reload: \"Exit Level\" reached %d of Level/All_Balls", sent);
     }
-    else if (msgType == MessageType::BRM_KbdInput) {
-        auto* msg = m_tcpClient->GetMessageFromBuf<MsgKbdInput>();
-        currentkeyState = msg->keyState;
-        m_inputSystem->Process(msg->keyState);
-    }
-}
-
-void BallrainIO::OnRender(CK_RENDER_FLAGS flags) {
-    if (m_ballNavActive) {
-        VxImageDescEx image;
-        int size = m_BML->GetRenderContext()->DumpToMemory(nullptr, VXBUFFER_ZBUFFER, image);
-        //GetLogger()->Info("size: %d", size);
-        if (size > 0) {
-            image.Image = (XBYTE*)depthImage.image.data();
-            m_BML->GetRenderContext()->DumpToMemory(nullptr, VXBUFFER_ZBUFFER, image);
-
-            /*static int cnt = 0;
-            static char buf[100];
-            sprintf(buf, "zdumps/d%06d.zdp", cnt++);
-            std::ofstream of(buf, std::ios::binary);
-            of.write((char*)depthImage.image.data(), size);
-            of.flush();
-            of.close();*/
+    if (m_WaitQuiet && m_Dbg) {
+        static std::vector<std::string> last;
+        std::vector<std::string> now = BehaviorObjectNames();
+        if (now != last) {
+            std::string list;
+            for (const std::string &n : now)
+                list += " " + n;
+            Dbg("waiting, behavior objects:%s", list.c_str());
+            last = now;
         }
     }
-}
-
-void BallrainIO::OnCheatEnabled(bool enable) {}
-
-void BallrainIO::OnPhysicalize(CK3dEntity* target, CKBOOL fixed, float friction, float elasticity, float mass,
-    const char* collGroup, CKBOOL startFrozen, CKBOOL enableColl, CKBOOL calcMassCenter,
-    float linearDamp, float rotDamp, const char* collSurface, VxVector massCenter,
-    int convexCnt, CKMesh** convexMesh, int ballCnt, VxVector* ballCenter, float* ballRadius,
-    int concaveCnt, CKMesh** concaveMesh) {
-}
-
-void BallrainIO::OnUnphysicalize(CK3dEntity* target) {}
-
-void BallrainIO::OnPreCommandExecute(ICommand* command, const std::vector<std::string>& args) {}
-
-void BallrainIO::OnPostCommandExecute(ICommand* command, const std::vector<std::string>& args) {}
-
-void BallrainIO::OnPreStartMenu() {}
-void BallrainIO::OnPostStartMenu() {}
-
-void BallrainIO::OnExitGame() {}
-
-void BallrainIO::OnPreLoadLevel() {}
-void BallrainIO::OnPostLoadLevel() {}
-
-void BallrainIO::OnStartLevel() {
-    for (auto bbShowInfo : m_bbShowInformation) {
-    bbShowInfo->ActivateInput(0);
-    bbShowInfo->Execute(0);
-  }
-}
-
-void BallrainIO::OnPreResetLevel() {}
-void BallrainIO::OnPostResetLevel() {}
-
-void BallrainIO::OnPauseLevel() {}
-void BallrainIO::OnUnpauseLevel() {}
-
-void BallrainIO::OnPreExitLevel() {}
-void BallrainIO::OnPostExitLevel() {}
-
-void BallrainIO::OnPreNextLevel() {}
-void BallrainIO::OnPostNextLevel() {}
-
-void BallrainIO::OnDead() {}
-
-void BallrainIO::OnPreEndLevel() {}
-void BallrainIO::OnPostEndLevel() {}
-
-void BallrainIO::OnCounterActive() {}
-void BallrainIO::OnCounterInactive() {}
-
-void BallrainIO::OnBallNavActive() {
-    MsgSceneRep msg;
-    msg.floorBoxes = m_floorBoxes;
-    m_tcpClient->SendMsg(MessageType::BRM_MsgSceneRep, &msg);
-    m_tcpClient->SendMsg(MessageType::BRM_BallNavActive);
-    m_ballNavActive = true;
-}
-
-void BallrainIO::OnBallNavInactive() {
-    m_tcpClient->SendMsg(MessageType::BRM_BallNavInactive);
-    m_ballNavActive = false;
-}
-
-void BallrainIO::OnCamNavActive() {}
-void BallrainIO::OnCamNavInactive() {}
-
-void BallrainIO::OnBallOff() {
-    m_tcpClient->SendMsg(MessageType::BRM_BallOff);
-  m_ballNavActive = false;
-}
-
-void BallrainIO::OnPreCheckpointReached() {}
-void BallrainIO::OnPostCheckpointReached() {
-    
-}
-
-void BallrainIO::OnLevelFinish() {}
-
-void BallrainIO::OnGameOver() {}
-
-void BallrainIO::OnExtraPoint() {}
-
-void BallrainIO::OnPreSubLife() {}
-void BallrainIO::OnPostSubLife() {}
-
-void BallrainIO::OnPreLifeUp() {}
-void BallrainIO::OnPostLifeUp() {}
-
-CK3dObject* BallrainIO::GetCurrentBall()
-{
-    if (!m_currentLevelArray)
-        return nullptr;
-    return static_cast<CK3dObject*>(m_currentLevelArray->GetElementObject(0, 1));
-}
-
-int BallrainIO::GetBallID(CK3dObject* ball)
-{
-    if (ball == nullptr)
-        return -1;
-
-    for (int i = 0; i < m_ballNames.size(); ++i) {
-        if (m_ballNames[i] == ball->GetName()) {
-            return i;
-        }
+    if (m_WaitQuiet && SameNames(BehaviorObjectNames(), m_ColdMenuObjects)) {
+        // The previous level's leftovers (e.g. Ball_ResetPieces_* on All_Balls) have finished: the
+        // behavior manager runs the same objects as at the cold autoload, so the level-load scripts
+        // execute in the same order (equal-priority objects are qsorted, order depends on the set).
+        m_WaitQuiet = false;
+        Dbg("reload: menu quiet");
+        ScheduleAutoLoad();
     }
-    return -1;
-}
-
-int BallrainIO::GetCurrentSector()
-{
-    // Get sector index (1-indexed)
-    int sector = -1;
-    if (!m_inGameParameterArray)
-        return sector;
-
-    m_inGameParameterArray->GetElementValue(0, 1, &sector);
-    return sector;
-}
-
-VxVector BallrainIO::GetNextSectorPosition(int sector)
-{
-    return m_sectorPositions[sector];
-}
-
-VxVector BallrainIO::GetLastSectorPosition(int sector)
-{
-    return m_sectorPositions[sector - 1];
-}
-
-void BallrainIO::RestartLevel()
-{
-    if (!m_BML->IsIngame())
+    if (m_ReloadWaiting && std::chrono::steady_clock::now() > m_ReloadDeadline) {
+        GetLogger()->Error("reload: no level load within 30 s after run %d; giving up", m_LoadIndex);
+        m_ReloadWaiting = false;
+        m_Loads = m_LoadIndex;
+        if (m_ExitWhenDone)
+            m_BML->ExitGame();
         return;
+    }
 
-    m_ballNavActive = false;
-    m_escBeh->GetOutput(0)->Activate();
-    m_BML->AddTimer(CKDWORD(3), [this]() {
-        // std::thread([this] {
-        CKMessageManager* mm = m_BML->GetMessageManager();
-        // std::this_thread::sleep_for(std::chrono::milliseconds(120));
-
-        CKMessageType reset_level_msg = mm->AddMessageType("Reset Level");
-        mm->SendMessageSingle(reset_level_msg, static_cast<CKBeObject*>(m_BML->GetCKContext()->GetObjectByNameAndParentClass("Level", CKCID_BEOBJECT, nullptr)));
-        mm->SendMessageSingle(reset_level_msg, static_cast<CKBeObject*>(m_BML->GetCKContext()->GetObjectByNameAndParentClass("All_Balls", CKCID_BEOBJECT, nullptr)));
-
-        auto* output = m_restartBeh->GetOutput(0);
-        output->Activate();
-    });
-}
-
-CKBehavior* BallrainIO::CreateShowObjectInformation(CKBehavior* script, CK3dEntity* target, CKBOOL showBoundingBox)
-{
-    CKBehavior* beh = ScriptHelper::CreateBB(script, VT_VISUALS_SHOWOBJECTINFORMATION, true);
-    beh->GetTargetParameter()->SetDirectSource(
-        ScriptHelper::CreateParamObject(script, "Target", CKPGUID_3DENTITY, target));
-    beh->GetInputParameter(0)->SetDirectSource(
-        ScriptHelper::CreateParamValue(script, "Show Bounding Box", CKPGUID_BOOL, showBoundingBox));
-    //beh->ActivateInput(0);
-    //beh->Execute(0);
-    return beh;
-}
-
-void BallrainIO::ShowBoundingBox(CK3dEntity* target, CKBOOL show)
-{
-    //ScriptHelper::SetParamObject(m_bbShowObjectInfo->GetTargetParameter()->GetDirectSource(), target);
-    //ScriptHelper::SetParamValue(m_bbShowObjectInfo->GetInputParameter(0)->GetDirectSource(), show);
-   // m_bbShowObjectInfo->ActivateInput(0);
- //   m_bbShowObjectInfo->Execute(0);
-}
-
-void BallrainIO::InitBallInfo()
-{
-    auto* phBallArray = m_BML->GetArrayByName("Physicalize_GameBall");
-    
-    auto ballTypeCount = phBallArray->GetRowCount();
-    m_ballNames.clear();
-    m_ballNames.reserve(ballTypeCount);
-    for (int i = 0; i < ballTypeCount; ++i) {
-        std::string ballName;
-        ballName.resize(phBallArray->GetElementStringValue(i, 0, nullptr), '\0');
-        phBallArray->GetElementStringValue(i, 0, ballName.data());
-        ballName.pop_back();
-        m_ballNames.emplace_back(ballName);
-
-        //CK3dObject* ball;
-        //ball = m_BML->Get3dObjectByName(ballName.data());
-        /*CKDependencies dep;
-        dep.Resize(40); dep.Fill(0);
-        dep.m_Flags = CK_DEPENDENCIES_CUSTOM;
-        dep[CKCID_OBJECT] = CK_DEPENDENCIES_COPY_OBJECT_NAME | CK_DEPENDENCIES_COPY_OBJECT_UNIQUENAME;
-        dep[CKCID_MESH] = CK_DEPENDENCIES_COPY_MESH_MATERIAL;
-        dep[CKCID_3DENTITY] = CK_DEPENDENCIES_COPY_3DENTITY_MESH;
-        ball = static_cast<CK3dObject*>(m_BML->GetCKContext()->CopyObject(ball, &dep, "_Peer_"));
-        if (!ball) {
-            m_BML->SendIngameMessage(std::format("Failed to init ball: {}", i).c_str());
-            continue;
+    if (m_Dbg && (!m_Playing || m_FrameIndex < 140)) {
+        CK3dEntity *ball = GetActiveBall();
+        double physTime = -1;
+        if (auto *env = *reinterpret_cast<CKBYTE **>(reinterpret_cast<CKBYTE *>(m_IpionManager) + 0xC0))
+            physTime = *reinterpret_cast<double *>(env + 0x120);
+        int cl = -1;
+        if (m_CurLevel)
+            m_CurLevel->GetElementValue(0, 0, &cl);
+        auto *mgr = reinterpret_cast<CKBYTE *>(m_IpionManager);
+        Dbg("P idx=%u play=%d cw=%04x ball=%p:%s id=%d curlevel=%d phys=%.9g c4=%08x c8=%.9g cc=%.9g d0=%.9g ts=%.9g",
+            (unsigned) m_FrameIndex, (int) m_Playing, FpuCw(), (void *) ball,
+            ball && ball->GetName() ? ball->GetName() : "-", ball ? (int) ball->GetID() : 0, cl, physTime,
+            *reinterpret_cast<unsigned *>(mgr + 0xC4), *reinterpret_cast<float *>(mgr + 0xC8),
+            *reinterpret_cast<float *>(mgr + 0xCC), *reinterpret_cast<float *>(mgr + 0xD0),
+            m_TimeManager->GetTimeScaleFactor());
+    }
+    if (m_Dbg && m_Playing && m_FrameIndex <= 120) {
+        if (!m_Act || m_ActLoad != m_LoadIndex) {
+            if (m_Act)
+                std::fclose(m_Act);
+            m_Act = std::fopen((GetEnv("BALLRAIN_DEBUG") + ".act" + std::to_string(m_LoadIndex)).c_str(), "w");
+            m_ActLoad = m_LoadIndex;
         }
-        assert(ball->GetMeshCount() == 1);
-        for (int j = 0; j < ball->GetMeshCount(); j++) {
-            CKMesh* mesh = ball->GetMesh(j);
-            assert(mesh->GetMaterialCount() >= 1);
-            for (int k = 0; k < mesh->GetMaterialCount(); k++) {
-                CKMaterial* mat = mesh->GetMaterial(k);
-                mat->EnableAlphaBlend();
-                mat->SetSourceBlend(VXBLEND_SRCALPHA);
-                mat->SetDestBlend(VXBLEND_INVSRCALPHA);
-                VxColor color = mat->GetDiffuse();
-                mat->SetDiffuse(color);
-                m_BML->SetIC(mat);
+        if (m_Act && m_FrameIndex >= 3 && m_FrameIndex <= 10) {
+            CKBehaviorManager *bm = m_BML->GetCKContext()->GetBehaviorManager();
+            for (int k = 0; bm && k < bm->GetObjectsCount(); ++k) {
+                CKBeObject *o = bm->GetObject(k);
+                std::fprintf(m_Act, "BEO %u %d %s id=%d pri=%d scripts=%d\n", (unsigned) m_FrameIndex, k,
+                             o && o->GetName() ? o->GetName() : "-", o ? (int) o->GetID() : 0,
+                             o ? o->GetPriority() : 0, o ? o->GetScriptCount() : 0);
             }
         }
-        m_balls.emplace_back(ball);*/
+        if (m_Act) {
+            CKContext *ctx = m_BML->GetCKContext();
+            const int n = ctx->GetObjectsCountByClassID(CKCID_BEHAVIOR);
+            CK_ID *ids = ctx->GetObjectsListByClassID(CKCID_BEHAVIOR);
+            for (int k = 0; k < n; ++k) {
+                auto *b = (CKBehavior *) ctx->GetObject(ids[k]);
+                if (!b || !b->IsActive())
+                    continue;
+                CKBehavior *owner = b->GetOwnerScript();
+                std::fprintf(m_Act, "%u %s/%s %08x\n", (unsigned) m_FrameIndex,
+                             owner && owner->GetName() ? owner->GetName() : "-", b->GetName() ? b->GetName() : "-",
+                             (unsigned) b->GetFlags());
+            }
+            std::fflush(m_Act);
+        }
     }
+    if (!m_Playing)
+        return;
+
+    // Reference :208-252: the trace line, frame index after the Input callback advanced it, flushed
+    // after every line as the reference does.
+    if (m_Trace) {
+        if (CK3dEntity *ball = GetActiveBall()) {
+            const VxMatrix &m = ball->GetWorldMatrix();
+            std::fprintf(m_Trace, "%u %s", (unsigned) m_FrameIndex, ball->GetName() ? ball->GetName() : "-");
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 3; ++c)
+                    std::fprintf(m_Trace, " %.9g", m[r][c]);
+            std::fputc('\n', m_Trace);
+            std::fflush(m_Trace);
+            if (m_Dbg && m_TraceLines < 3)
+                DbgGate("Trace");
+            ++m_TraceLines;
+        }
+    }
+    // Reference :254-255 with SkipRenderUntil beyond the record.
+    if (m_SkipRender)
+        m_BML->SkipRenderForNextTick();
+}
+
+// ---------------------------------------------------------------- game state helpers
+
+void BallrainIO::AcquireKeyBindings() {   // reference :694-703
+    if (m_Keyboard) {
+        m_Keyboard->GetElementValue(0, 0, &m_KeyUp);
+        m_Keyboard->GetElementValue(0, 1, &m_KeyDown);
+        m_Keyboard->GetElementValue(0, 2, &m_KeyLeft);
+        m_Keyboard->GetElementValue(0, 3, &m_KeyRight);
+        m_Keyboard->GetElementValue(0, 4, &m_KeyShift);
+        m_Keyboard->GetElementValue(0, 5, &m_KeySpace);
+    } else {
+        GetLogger()->Error("Keyboard array not found: default key bindings");
+    }
+}
+
+void BallrainIO::ResetPhysicsTime() {
+    // Reference :705-706, 747-780: the retail (2002) DLL layout. VerifyPhysicsDll gates every run.
+    if (m_PhysicsOk <= 0)
+        return;
+    GetLogger()->Info("x87 control word at the reset: %08x (precision bits %x)", _controlfp(0, 0),
+                      _controlfp(0, 0) & _MCW_PC);
+    Dbg("ResetPhysicsTime idx=%u cw=%04x", (unsigned) m_FrameIndex, FpuCw());
+    auto *mgr = reinterpret_cast<CKBYTE *>(m_IpionManager);
+    auto *env = *reinterpret_cast<CKBYTE **>(mgr + 0xC0);   // IVP_Environment
+    if (!env) {
+        GetLogger()->Error("ResetPhysicsTime: no IVP_Environment");
+        return;
+    }
+    *reinterpret_cast<double *>(*reinterpret_cast<CKBYTE **>(env + 0x4) + 0x18) = 0;   // time_manager->base_time
+    *reinterpret_cast<double *>(env + 0x120) = 0;                                       // current_time
+    auto &time_of_last_psi = *reinterpret_cast<double *>(env + 0x130);
+    time_of_last_psi = 0;
+    *reinterpret_cast<double *>(env + 0x128) = time_of_last_psi + 1.0 / 66;             // time_of_next_psi
+    *reinterpret_cast<float *>(mgr + 0xC8) = m_TimeManager->GetLastDeltaTime();         // smoothed delta
+}
+
+void BallrainIO::SetKeyboardState(unsigned char *dest, uint32_t keys) const {
+    // Reference SetKeyboardState :868-878 (same order), legacy bits as TASRecord.cpp:486-488. Raw 0/1 only.
+    if (!dest)
+        return;
+    dest[m_KeyUp] = keys & 1u;
+    dest[m_KeyDown] = keys >> 1 & 1u;
+    dest[m_KeyLeft] = keys >> 2 & 1u;
+    dest[m_KeyRight] = keys >> 3 & 1u;
+    dest[CKKEY_Q] = keys >> 6 & 1u;
+    dest[m_KeyShift] = keys >> 4 & 1u;
+    dest[m_KeySpace] = keys >> 5 & 1u;
+    dest[CKKEY_ESCAPE] = keys >> 7 & 1u;
+    dest[CKKEY_RETURN] = keys >> 8 & 1u;
+}
+
+void BallrainIO::ResetKeyboardState(unsigned char *dest) const {
+    // Reference :880-891 (RETURN is not reset there either).
+    if (!dest)
+        return;
+    dest[m_KeyUp] = KS_IDLE;
+    dest[m_KeyDown] = KS_IDLE;
+    dest[m_KeyLeft] = KS_IDLE;
+    dest[m_KeyRight] = KS_IDLE;
+    dest[CKKEY_Q] = KS_IDLE;
+    dest[m_KeyShift] = KS_IDLE;
+    dest[m_KeySpace] = KS_IDLE;
+    dest[CKKEY_ESCAPE] = KS_IDLE;
+}
+
+CK3dEntity *BallrainIO::GetActiveBall() const {
+    return m_ActiveBall ? (CK3dEntity *) m_ActiveBall->GetValueObject() : nullptr;
+}
+
+// ---------------------------------------------------------------- outputs
+
+std::string BallrainIO::OutputPath(const std::string &base) const {
+    if (base.empty() || m_LoadIndex <= 1)
+        return base;
+    return base + "." + std::to_string(m_LoadIndex);
+}
+
+void BallrainIO::OpenOutputs() {
+    // Text mode like the reference's fopen(path, "w") (CRLF line ends, as in the reference traces).
+    if (!m_TracePath.empty() && !(m_Trace = std::fopen(OutputPath(m_TracePath).c_str(), "w")))
+        GetLogger()->Error("cannot open trace %s", OutputPath(m_TracePath).c_str());
+    if (!m_EventsPath.empty() && !(m_Events = std::fopen(OutputPath(m_EventsPath).c_str(), "w")))
+        GetLogger()->Error("cannot open events %s", OutputPath(m_EventsPath).c_str());
+}
+
+void BallrainIO::CloseOutputs(long long wallMs) {
+    if (m_Events) {
+        std::fprintf(m_Events, "%u Summary frames=%u wall_ms=%lld\n", (unsigned) m_FrameIndex, (unsigned) m_FrameIndex,
+                     wallMs);
+        std::fclose(m_Events);
+        m_Events = nullptr;
+    }
+    if (m_Trace) {
+        std::fclose(m_Trace);
+        m_Trace = nullptr;
+    }
+    if (!m_FrameLogPath.empty()) {
+        const std::string path = OutputPath(m_FrameLogPath);
+        FILE *log = std::fopen(path.c_str(), "wb");
+        if (!log || std::fwrite(m_FrameLog.data(), sizeof(Frame), m_FrameLog.size(), log) != m_FrameLog.size())
+            GetLogger()->Error("cannot write frame log %s", path.c_str());
+        if (log)
+            std::fclose(log);
+    }
+}
+
+void BallrainIO::Event(const char *name) {
+    Dbg("Event %s idx=%u play=%d", name, (unsigned) m_FrameIndex, (int) m_Playing);
+    if (m_Playing && m_Events)
+        std::fprintf(m_Events, "%u %s\n", (unsigned) m_FrameIndex, name), std::fflush(m_Events);
 }

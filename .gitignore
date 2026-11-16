@@ -1,5 +1,5 @@
 # python cache
-/__pycache__/
+__pycache__/
 
 # uv virtual environment
 /.venv/
@@ -14,3 +14,5 @@
 
 # build output
 /BallrainIO/build/
+# dedicated game copies (proprietary game files, never committed)
+/runtime/

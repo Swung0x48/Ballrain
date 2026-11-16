@@ -1,37 +1,28 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
 
-project(BallrainIO)
+project(BallrainIO LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_subdirectory(3rdparty)
+if (NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(FATAL_ERROR "BallrainIO is a mod for the 32-bit game: configure with an x86 toolchain")
+endif ()
 
-set(BML_DIR "${CMAKE_CURRENT_LIST_DIR}/3rdparty/BMLPlus/lib/cmake/BML")
-message(STATUS "BML_DIR=${BML_DIR}")
+# Machine paths come from the cache (e.g. a gitignored build .bat or CMakeUserPresets.json):
+#   BML_DIR          = <BML+ 0.3.12 SDK>/lib/cmake/BML        (Release only)
+#   VirtoolsSDK_DIR  = <Virtools SDK 2.1>/CMake               (needed by BMLConfig's find_dependency)
+set(BML_DIR "" CACHE PATH "Directory holding BMLConfig.cmake (BML+ 0.3.12 SDK)")
+set(VirtoolsSDK_DIR "" CACHE PATH "Directory holding VirtoolsSDKConfig.cmake")
 find_package(BML REQUIRED)
 
+add_subdirectory(3rdparty)
+
 add_library(BallrainIO SHARED
-			src/BallrainIO.h
-			src/BallrainIO.cpp
-			src/Config.h
-			src/InputSystem.h
-			src/InputSystem.cpp
-			src/TimeSystem.h
-			src/TimeSystem.cpp
-			src/Hook.h
-			src/TASHook.cpp
-			src/TASHook.h
-			src/TCPClient.cpp
-			src/TCPClient.h
-			src/MessageTypes.cpp
-			src/MessageTypes.h
+        src/BallrainIO.h
+        src/BallrainIO.cpp
+        src/Hook.h
+        src/TASHook.h
 )
 
-target_include_directories(BallrainIO PRIVATE ${BML_INCLUDE_DIRS})
-target_link_libraries(BallrainIO
-						PUBLIC
-						BML
-						PRIVATE
-						minhook)
-set_target_properties(BallrainIO PROPERTIES OUTPUT_NAME "BallrainIO")
-set_target_properties(BallrainIO PROPERTIES SUFFIX ".bmodp")
+target_link_libraries(BallrainIO PRIVATE BML minhook bcrypt)
+set_target_properties(BallrainIO PROPERTIES OUTPUT_NAME "BallrainIO" SUFFIX ".bmodp")

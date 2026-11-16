@@ -1,0 +1,177 @@
+diff --git a/TASSupport/TASRecord.cpp b/TASSupport/TASRecord.cpp
+index a5ebd42..a6895f2 100644
+--- a/TASSupport/TASRecord.cpp
++++ b/TASSupport/TASRecord.cpp
+@@ -1,3 +1,4 @@
++#include <cstring>
+ #include "TASRecord.h"
+ 
+ #include <sstream>
+@@ -472,12 +473,21 @@ void TASRecord::Load() {
+ 
+         VectorInputStream memStream(decompressedData);
+ 
++        // SIM1 patch: a legacy frame is <f32 delta><u32 key bits> (Gamepiaynmo's KeyState bitfield: up, down,
++        // left, right, shift, space, q, esc, enter), not this version's 9-byte InputState.
+         size_t frameCount = decompressedData.size() / (sizeof(float) + sizeof(uint32_t));
+         m_Frames.resize(frameCount);
+-        for (auto &frame : m_Frames) {
+-            if (!frame.Deserialize(memStream)) {
+-                throw std::runtime_error("Failed to deserialize a frame");
+-            }
++        for (size_t i = 0; i < frameCount; ++i) {
++            float delta;
++            uint32_t bits;
++            std::memcpy(&delta, decompressedData.data() + i * 8, 4);
++            std::memcpy(&bits, decompressedData.data() + i * 8 + 4, 4);
++            auto &frame = m_Frames[i];
++            frame.deltaTime = delta;
++            auto &in = frame.inputState;
++            in.keyUp = bits & 1u; in.keyDown = bits >> 1 & 1u; in.keyLeft = bits >> 2 & 1u; in.keyRight = bits >> 3 & 1u;
++            in.keyShift = bits >> 4 & 1u; in.keySpace = bits >> 5 & 1u; in.keyQ = bits >> 6 & 1u; in.keyEsc = bits >> 7 & 1u;
++            in.keyEnter = bits >> 8 & 1u;
+         }
+     }
+ 
+diff --git a/TASSupport/TASSupport.cpp b/TASSupport/TASSupport.cpp
+index 65e3bfd..f088b90 100644
+--- a/TASSupport/TASSupport.cpp
++++ b/TASSupport/TASSupport.cpp
+@@ -1,3 +1,13 @@
++#include <float.h>
++#include <cstdlib>
++#include "physics_rt_api.h"
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <Windows.h>
+ #include "TASSupport.h"
+ 
+ #include <cstdio>
+@@ -195,6 +205,51 @@ void TASSupport::OnProcess() {
+         if (m_ShowMenu)
+             OnDrawMenu();
+ 
++        // SIM1 patch: the per-frame ball trace (BMMO_TAS_TRACE=<path>).
++        static FILE *trace = [] {
++            const char *path = std::getenv("BMMO_TAS_TRACE");
++            return path ? std::fopen(path, "w") : nullptr;
++        }();
++        if (trace && IsPlaying() && m_CurrentRecord) {
++            CK3dEntity *ball = GetActiveBall();
++            if (ball) {
++                const VxMatrix &m = ball->GetWorldMatrix();
++                std::fprintf(trace, "%u %s", (unsigned) m_CurrentRecord->GetFrameIndex(), ball->GetName() ? ball->GetName() : "-");
++                static unsigned last_pc = ~0u;
++                if ((_controlfp(0, 0) & _MCW_PC) != last_pc) {
++                    last_pc = _controlfp(0, 0) & _MCW_PC;
++                    GetLogger()->Info("x87 precision bits now %x (frame %u)", last_pc, (unsigned) m_CurrentRecord->GetFrameIndex());
++                }
++                for (int r = 0; r < 4; ++r)
++                    for (int c = 0; c < 3; ++c)
++                        std::fprintf(trace, " %.9g", m[r][c]);
++                static int core_offsets[2] = {-1, -1};
++                if (core_offsets[0] < 0) {
++                    const char *v = std::getenv("BMMO_TAS_CORE");
++                    if (!v || std::sscanf(v, "%d,%d", &core_offsets[0], &core_offsets[1]) != 2) core_offsets[0] = 0;
++                }
++                if (core_offsets[0] > 0) {
++                    typedef XNHashTable<PhysicsObject, CK_ID> Table;
++                    auto *table = reinterpret_cast<Table *>(reinterpret_cast<CKBYTE *>(m_IpionManager) + core_offsets[0]);
++                    Table::Iterator it = table->Find(ball->GetID());
++                    if (it != table->End()) {
++                        auto *real = *reinterpret_cast<IVP_Real_Object **>(reinterpret_cast<CKBYTE *>(&*it) + core_offsets[1]);
++                        IVP_Core *core = real ? real->physical_core : nullptr;
++                        if (core) {
++                            std::fprintf(trace, " | %a", core->time_of_last_psi.get_seconds());
++                            for (float x : core->rot_speed.k) std::fprintf(trace, " %a", x);
++                            for (float x : core->speed.k) std::fprintf(trace, " %a", x);
++                            for (double x : core->pos_world_f_core_last_psi.k) std::fprintf(trace, " %a", x);
++                            for (float x : core->delta_world_f_core_psis.k) std::fprintf(trace, " %a", x);
++                            const IVP_U_Quat *qs[2] = {&core->q_world_f_core_last_psi, &core->q_world_f_core_next_psi};
++                            for (const IVP_U_Quat *q : qs) std::fprintf(trace, " %a %a %a %a", q->x, q->y, q->z, q->w);
++                        }
++                    }
++                }
++                std::fputc('\n', trace);
++                std::fflush(trace);
++            }
++        }
+         if (IsPlaying()) {
+             if (m_CurrentRecord->GetFrameIndex() < (size_t) m_SkipRender->GetInteger())
+                 m_BML->SkipRenderForNextTick();
+@@ -222,8 +277,7 @@ void TASSupport::OnPostStartMenu() {
+             std::string tasPath = BML_TAS_PATH + tasFile + ".tas";
+             struct stat buf = {0};
+             if (stat(tasPath.c_str(), &buf) == 0) {
+-                m_RecordOnStartup.SetName(tasFile);
+-                m_RecordOnStartup.SetPath(tasPath);
++                m_RecordOnStartup = TASRecord(tasFile, tasPath, m_Legacy);   // the list's legacy flag (SIM1 patch)
+                 m_CurrentRecord = &m_RecordOnStartup;
+ 
+                 m_BML->SendIngameMessage(("Loading TAS Record: " + tasFile + ".tas").c_str());
+@@ -442,6 +496,13 @@ void TASSupport::OnPreProcessInput() {
+ }
+ 
+ void TASSupport::OnPreProcessTime() {
++    static const int forced_pc = [] {
++        const char *v = std::getenv("BMMO_TAS_PC");
++        return v ? std::atoi(v) : 0;
++    }();
++    if (forced_pc == 24) _controlfp(_PC_24, _MCW_PC);
++    else if (forced_pc == 53) _controlfp(_PC_53, _MCW_PC);
++    else if (forced_pc == 64) _controlfp(_PC_64, _MCW_PC);
+     if (IsPlaying()) {
+         if (m_CurrentRecord->IsPlaying()) {
+             const float delta = m_CurrentRecord->GetFrames().deltaTime;
+@@ -642,6 +703,47 @@ void TASSupport::AcquireKeyBindings() {
+ }
+ 
+ void TASSupport::ResetPhysicsTime() {
++    GetLogger()->Info("x87 control word at the reset: %08x (precision bits %x)", _controlfp(0, 0), _controlfp(0, 0) & _MCW_PC);
++    // SIM1 patch: BallanceMMO's physics_RT (another layout) - the same reset through its bridge.
++    static const bmmo_physics_api_v2 *bmmo = [] {
++        auto fn = (bmmo_physics_api_fn) ::GetProcAddress(::GetModuleHandleA("physics_RT.dll"), BMMO_PHYSICS_API_SYMBOL);
++        // The bridge answers its own version only; the table is append-only and this mod uses early entries
++        // (the clock state), so any later version of it serves (the x87-soft branch is at v35).
++        const bmmo_physics_api_v2 *api = nullptr;
++        for (uint32_t v = BMMO_PHYSICS_API_VERSION; fn && !api && v < BMMO_PHYSICS_API_VERSION + 8; ++v) api = fn(v);
++        return api;
++    }();
++    if (bmmo) {
++        bmmo_physics_clock_state clock = {};
++        char error[256] = {};
++        if (!bmmo->get_clock_state(m_IpionManager, &clock, error, sizeof(error))) {
++            GetLogger()->Error("bmmo get_clock_state: %s", error);
++            return;
++        }
++        clock.base_time = 0;
++        clock.current_time = 0;
++        clock.time_of_last_psi = 0;
++        clock.time_of_next_psi = 1.0 / 66;
++        if (!bmmo->set_clock_state(m_IpionManager, &clock, error, sizeof(error)))
++            GetLogger()->Error("bmmo set_clock_state: %s", error);
++        *reinterpret_cast<float *>(reinterpret_cast<CKBYTE *>(m_IpionManager) + 132) = m_TimeManager->GetLastDeltaTime();
++        GetLogger()->Info("Physics time reset through the BallanceMMO bridge (delta %f)", m_TimeManager->GetLastDeltaTime());
++        return;
++    }
++    if (const char *offsets = std::getenv("BMMO_TAS_OFFSETS")) {
++        int o[7] = {};
++        if (std::sscanf(offsets, "%d,%d,%d,%d,%d,%d,%d", &o[0], &o[1], &o[2], &o[3], &o[4], &o[5], &o[6]) == 7) {
++            auto *mgr = reinterpret_cast<CKBYTE *>(m_IpionManager);
++            auto *env = *reinterpret_cast<CKBYTE **>(mgr + o[0]);
++            *reinterpret_cast<double *>(*reinterpret_cast<CKBYTE **>(env + o[5]) + o[6]) = 0;
++            *reinterpret_cast<double *>(env + o[2]) = 0;
++            *reinterpret_cast<double *>(env + o[4]) = 0;
++            *reinterpret_cast<double *>(env + o[3]) = 1.0 / 66;
++            *reinterpret_cast<float *>(mgr + o[1]) = m_TimeManager->GetLastDeltaTime();
++            GetLogger()->Info("Physics time reset at the offsets %s (delta %f)", offsets, m_TimeManager->GetLastDeltaTime());
++            return;
++        }
++    }
+     // Reset physics time in order to sync with TAS records
+     // IVP_Environment
+     auto *env = *reinterpret_cast<CKBYTE **>(reinterpret_cast<CKBYTE *>(m_IpionManager) + 0xC0);

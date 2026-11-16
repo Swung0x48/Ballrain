@@ -99,10 +99,5 @@ HookInterceptor<typename PreProcessHook<Class>::MethodType> *PreProcessHook<Clas
 using CKTimeManagerHook = PreProcessHook<CKTimeManager>;
 using CKInputManagerHook = PreProcessHook<CKInputManager>;
 
-// Make physics engine deterministic
-bool HookPhysicsRT();
-void UnhookPhysicsRT();
-
-// Make random building block deterministic
-bool HookRandom();
-bool UnhookRandom();
+// Legacy-mode playback installs no physics (qh_rand, movement check) or Random building-block hooks
+// (reference TASSupport.cpp InitHooks: only when !m_Legacy), so none are declared here.
