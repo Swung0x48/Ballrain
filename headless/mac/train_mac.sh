@@ -9,7 +9,8 @@ D=${MAC_DIR:-$HOME/ballrain}
 RUN=$1; shift
 UV=${UV:-$(command -v uv || echo "$HOME/Library/Python/3.9/bin/uv")}
 export BALLRAIN_RUNTIME=${BALLRAIN_RUNTIME:-$D/repo/runtime}
-export BALLRAIN_HL_BIN=${BALLRAIN_HL_BIN:-$D/hl/work-exact/build/BallanceMMOServer/BallanceMMOSimTool}
+# the engine: BALLRAIN_HL_BIN, else the build setup_mac.sh recorded in $D/hl/ENGINE (fixed for the run at its start)
+export BALLRAIN_HL_BIN=${BALLRAIN_HL_BIN:-$(cat "$D/hl/ENGINE")}
 export BALLRAIN_HL_ROOT=${BALLRAIN_HL_ROOT:-$D/game}
 export PYTHONPATH=$D/repo
 mkdir -p "$BALLRAIN_RUNTIME/m2-train/$RUN"

@@ -19,7 +19,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 git ls-files -z --cached --others --exclude-standard | grep -zv -e '^runtime/' -e '^\.claude/' | tar cf - --null -T - \
-  | "${SSH[@]}" "mkdir -p $D/repo && tar xf - -C $D/repo && find $D/repo -name __pycache__ -prune -exec rm -rf {} +"
+  | "${SSH[@]}" "mkdir -p $D/repo && rm -rf $D/repo/headless/patches && tar xf - -C $D/repo && find $D/repo -path $D/repo/.venv -prune -o -name __pycache__ -prune -exec rm -rf {} +"
 files=()
 for rec in "${recs[@]}"; do
   src=runtime/datasets/tas-v1/$rec

@@ -49,7 +49,9 @@ socket EOF：游戏已结束时是"结束"（`wait_obs` 返回 None），否则�
 5. 第 0 帧执行完、它的观测之前做物理时钟复位（TASSupport OnStart 的 1 tick 定时器）：IVP 时间 0、下一个 PSI 1/66 s、平滑 delta，
    再加上 Player.exe 在那一刻的 IVP 状态：`next_movement_check = 4`、IVP 随机种子 3560118427（= 75^21）（x87-soft 会话测得，3 关 / 多次运行相同）。
 6. 加载关卡时**不**重置 x87 精度（`set_keep_precision`）：2002 进程只在第一个凸包（启动时 Init Ballpieces 建的）之前是 24 位，之后一直 64 位。
-7. 确定性：CRT `rand()` 固定种子 1（CKStartUp 原来按 `time()` 播种）；球-球接触对按 CK id 排序（`patches/0003`；原来按堆地址，逐次运行会变）。
+7. 确定性：CRT `rand()` 固定种子 1（CKStartUp 原来按 `time()` 播种）；球-球接触对按 CK id 排序（hx1c；原来按堆地址，逐次运行会变）。
+   物理管理器的平滑 delta（m = (m·3 + delta)/4）按 2002 DLL 的 x87 方式算（hx1c 的 `CKIpionManager::SetDeltaTime`）：帧时间不变时与 float 写法相同，
+   一变就不同——课程交接（TAS 的 3.79 ms → agent 的 7.58 ms）之后 5–6 帧就会分开，这一项修好之前所有交接都偏离零售。
    同一构建、同一组帧，轨迹逐位相同（§8）。
 8. SR、尾帧、GameOver / LevelFinish / 帧数上限 / STOP / 超时的结束方式、前缀回放（含 `BALLRAIN_PREFIX_EVENTS` 的确认）都按 `Agent.cpp` 移植：
    SR = BML+ 0.3.12 规则的 double 和（本帧事件之后加本帧 delta），LevelFinish 后跑尾帧到 CounterInactive（最多 `BALLRAIN_SR_TAIL`），尾帧不进帧日志。
@@ -102,7 +104,10 @@ Python 侧：`BALLRAIN_HL_BIN`（SimTool 路径）、`BALLRAIN_HL_ROOT`（游戏
 全部 OBS1 段逐字段（CK id 按名字映射；§5 的不可用字段单列为"approximated"）、关卡消息（全量 + 增量）、两边各自用 GameTracker 按真实会话的方式喂出来的 f5 特征向量、
 事件、帧日志、SREN（SR double 和、float32 和、尾帧、HS 快照）。
 
-### 7.1 结果（2026-11-16，默认构建 = 补丁 0001–0004，M6；报告 JSON 在 `runtime/headless-results/gate/`）
+### 7.1 结果（2026-11-16，M6；报告 JSON 在 `runtime/headless-results/gate/`）
+
+先在 hx1 构建（hx1c 之前的同内容游戏数学 + 球序）上做了全量比较；hx1c 构建上 7 条记录各 3 次的轨迹哈希与之完全相同，
+SR01_1_14_457_264、HS01_4736_1_32_258、SR06 的逐字段比较复跑结果见 §7.2。
 
 每条记录跑 5 次（全部段，K = 1），轨迹哈希 5 次全同：
 
@@ -135,11 +140,21 @@ Python 侧：`BALLRAIN_HL_BIN`（SimTool 路径）、`BALLRAIN_HL_ROOT`（游戏
 同一构建下 TraceHash 与动作块大小和 obs_mask 无关（SR01_1_14_457_264：K = 1 全部段、K = 4、K = 1000 且关掉全部可选段，哈希都是 `3bf0b490e7cf7acb`）。
 7 条数据集分别录在 train-00 / 01 / 02 / 05 / 07 上，复位状态（4 / 75^21）在这些拷贝上都给出逐位相同的轨迹，可以看作它们的 Player.exe 复位状态一致的证据。
 
-逐次运行的确定性：0003 之后 SR01_1_14_457_264 和 SR06 各 12 次、上表 7 条各 5 次，轨迹全同（0003 之前 SR01 约 25% 的运行在第 7490 / 19307 帧分开）。
+逐次运行的确定性：球序修好之后 SR01_1_14_457_264 和 SR06 各 12 次、上表 7 条各 5 次，轨迹全同（球序修好之前 SR01 约 25% 的运行在第 7490 / 19307 帧分开）。
+
+### 7.2 离线路线（off-route）：随机输入的零售参照
+
+hx1c 构建（`hx1c-96c0cc01-ce6afc34`）上用 agent 模式回放，与零售参照（参考 TASSupport 回放，3 次相同）逐帧比较球轨迹：
+
+- M1-B 的 13 个用例（L1–L4、L6、L9、L11：随机、抖动、Esc 暂停 / collect、死亡、GameOver、TAS 前缀到 LevelFinish）：**13/13 全部帧相同**；
+- M2 的 3 个导出（SR01 前缀 + agent 尾段，课程交接）：**3/3 相同**。同样的 3 个在 hx1c 之前的构建上于交接后 5–6 帧分开（15544、12337、20555）。
+- 第 5、7、8、10、12、13 关的新参照（`scripts/offroute_refs.py`，零售 train-12..15，参考 TASSupport 3 次，`runtime/offroute-refs/L<nn>/<case>/`）：
+  每关 3 个（random：死亡到 GameOver；hs_esc_random：Esc 暂停 / 解除 + 死亡；jitter：8000 帧上限），共 18 个，合计 61 次死亡、599 次暂停、12 次 GameOver。
+  每个都是参考 TASSupport 3 次回放逐字节相同且等于 BallrainIO agent 轨迹；hx1c 无头 agent 模式回放 **18/18 全部帧相同**。
 
 ## 8. 确定性
 
-同一构建、同一组帧，每次运行的轨迹必须逐位相同。`patches/0003` 之前不是：SR01_1_14_457_264 在约 25% 的运行里于第 7490 帧（Ball_Wood 碰 P_Ball_Wood_MF，
+同一构建、同一组帧，每次运行的轨迹必须逐位相同。球序修好（hx1c）之前不是：SR01_1_14_457_264 在约 25% 的运行里于第 7490 帧（Ball_Wood 碰 P_Ball_Wood_MF，
 接触对按 CK3dEntity 的堆地址排序）或第 19307 帧分开，Mac 和 Windows 构建都有（x87-soft 会话定位，修法是按 CK id 排序；零售 Player.exe 同样按地址排，
 偶尔分叉的来源可能就是这里）。检测手段：元数据的 `trace_hash`（§5 HASH）——同一 .tas 在同一构建上重放，哈希必须相同。
 
@@ -197,7 +212,7 @@ headless/mac/push_repo.sh -r SR01_1_14_457_264 [-c runtime/m2-train/r2/latest.pt
 headless/mac/pull_run.sh r3 300        # 每 5 分钟把 Mac 上的 runtime/m2-train/r3 拉回 PC 的 runtime/m2-train-mac/r3（TensorBoard 读这里）
 ```
 
-Mac 侧（`$MAC_DIR` 默认 `~/ballrain`：`repo/` 是推过去的工作树，`hl/work-exact/` 是引擎构建，`game/` 是游戏目录）：
+Mac 侧（`$MAC_DIR` 默认 `~/ballrain`：`repo/` 是推过去的工作树，`hl/hx1c-<补丁哈希>-<agent 哈希>/` 是引擎构建（`hl/ENGINE` 记着当前那个；运行中的训练用启动时的路径，新构建不会覆盖它），`game/` 是游戏目录）：
 
 ```sh
 headless/mac/setup_mac.sh [src.tar]    # uv python install 3.12 + uv sync；没有引擎时用 src.tar 编译
