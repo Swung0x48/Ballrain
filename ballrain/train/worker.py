@@ -47,6 +47,11 @@ class WorkerSpec:
     cap_extra_s: float = 10.0
     stall_s: float = 10.0
     stall_terminal: bool = False  # a stall ends the episode as a failure (terminal, death penalty + refund) instead of a truncation
+    stall_extra: float = 0.0  # added to the stall penalty
+    # stall_compensate: divide the stall penalty by gamma ** (stall window in steps): the penalty arrives a stall window
+    # after the decision to stop, so undiscounted it is cheaper than dying now (the "stall because of death_refund" hole)
+    stall_compensate: bool = False
+    gamma: float = 0.997
     respawn_stall_s: float | None = None  # stall limit of respawn lives (ball at rest at the checkpoint); None = stall_s
     stall_progress: float = 5.0
     prune: str = "finish"  # "finish" | "none"
@@ -225,10 +230,25 @@ class Worker:
             if self.env.curriculum is not None:
                 self.env.set_start_state(self.curriculum_state)
 
+    @staticmethod
+    def parent_alive() -> bool:
+        """False once the process that started this worker (the learner, or a remote bridge) is gone (e.g. killed with
+        -9): the worker must not keep launching game processes on its own."""
+        import multiprocessing as mp
+        p = mp.parent_process()
+        return p is None or p.is_alive()
+
     def _drain(self, block=False):
         try:
             if block:
-                self._apply(self.ctrl_q.get())
+                while True:
+                    try:
+                        self._apply(self.ctrl_q.get(timeout=5.0))
+                        break
+                    except queue.Empty:
+                        if not self.parent_alive():
+                            self.stop = True
+                            return
             while True:
                 self._apply(self.ctrl_q.get_nowait())
         except queue.Empty:
@@ -239,6 +259,9 @@ class Worker:
         from .ppo import normalize
         sp = self.spec
         self._drain(block=True)
+        if self.stop:
+            self.env.close()
+            return
         n_obs = self.env.observation_space.shape[0]
         obs, info = self._reset()
         ep = _Episode(info, self.env, self.version, self._cap_frames(info))
@@ -294,7 +317,10 @@ class Worker:
                         trunc, end = True, "stall"
                         if sp.stall_terminal:  # stuck = a failure like a death: penalty + the sector's progress back
                             rc = self.env.reward.cfg
-                            pen = -(rc.death_penalty + rc.death_refund * max(self.env.reward.sector_paid, 0.0))
+                            pen = -(rc.death_penalty + rc.death_refund * max(self.env.reward.sector_paid, 0.0) + sp.stall_extra)
+                            if sp.stall_compensate:
+                                win = stall_rsp if ep.d["kind"] == "respawn" else stall_all
+                                pen /= sp.gamma ** (win / max(sp.env.action_repeat, 1))
                             r += pen
                             ep.ret += pen
                             ep.terms["stall_penalty"] = ep.terms.get("stall_penalty", 0.0) + pen
@@ -321,8 +347,13 @@ class Worker:
             self.pending_runs, self.errors = [], []
             self.data_q.put(buf)
             self._drain()
+            if not self.parent_alive():
+                self.stop = True
         self.env.close()
         self._collect_runs()
+        if not self.parent_alive():  # nobody reads the queue any more: do not block the exit on it
+            self.data_q.cancel_join_thread()
+            return
         self.data_q.put({"wid": sp.wid, "closed": True, "runs": self.pending_runs, "errors": self.errors})
 
 

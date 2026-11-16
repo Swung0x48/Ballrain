@@ -197,6 +197,13 @@ class CurriculumConfig:
     advance_at: float = 0.5  # success rate needed to move back
     min_episodes: int = 20  # outcomes in the band before a decision
     p_level_start: float = 0.1  # probability of k = 0 once the frontier is at the first control frame
+    # failure-weighted starts: this fraction of the draws (after the k = 0 draw) picks a bin of bin_frames record frames in
+    # [frontier, end] with probability floor + (1 - n_bins * floor) * fail_b / sum(fail) (fail_b = the trainer's recent
+    # failure rate of episodes started in bin b, set_bin_fail; bins without data count as 1), then a frame in the bin
+    # uniformly. Counters forgetting: mastered bins keep the floor share, failing bins get the rest
+    weighted: float = 0.0
+    bin_frames: int = 2000
+    bin_floor: float = 0.05
     seed: int | None = None
 
 
@@ -212,6 +219,7 @@ class ReverseCurriculum:
         self.outcomes: deque = deque(maxlen=max(self.cfg.min_episodes, 1))
         self.rng = np.random.default_rng(self.cfg.seed)
         self.history: list = []  # (frontier, success rate) at each move
+        self.bin_fail: dict = {}  # bin index -> recent failure rate (set_bin_fail; failure-weighted starts)
 
     def _snap(self, k: int) -> int:
         i = int(np.clip(np.searchsorted(self.valid, k), 0, len(self.valid) - 1))
@@ -221,11 +229,37 @@ class ReverseCurriculum:
     def at_start(self) -> bool:
         return self.frontier <= int(self.valid[0])
 
+    def bin_of(self, k: int) -> int:
+        """Bin of a start frame for the failure-weighted draws (bins of bin_frames from the first valid frame)."""
+        return int((k - int(self.valid[0])) // max(self.cfg.bin_frames, 1))
+
+    def set_bin_fail(self, fail: dict) -> None:
+        self.bin_fail = {int(b): float(v) for b, v in fail.items()}
+
+    def bin_probs(self) -> tuple[np.ndarray, np.ndarray]:
+        """(bins, probabilities) of the failure-weighted draw over the bins of [frontier, end]."""
+        b0, b1 = self.bin_of(self.frontier), self.bin_of(int(self.valid[-1]))
+        bins = np.arange(b0, b1 + 1)
+        fail = np.array([self.bin_fail.get(int(b), 1.0) for b in bins], np.float64)
+        n = len(bins)
+        floor = min(self.cfg.bin_floor, 1.0 / n)
+        tot = fail.sum()
+        rest = (fail / tot) if tot > 0 else np.full(n, 1.0 / n)
+        return bins, floor + (1 - n * floor) * rest
+
     def sample(self, rng=None) -> int:
         rng = rng or self.rng
         if self.at_start and rng.random() < self.cfg.p_level_start:
             return 0
         lo = int(np.searchsorted(self.valid, self.frontier))
+        if self.cfg.weighted and rng.random() < self.cfg.weighted:
+            bins, p = self.bin_probs()
+            b = int(bins[rng.choice(len(bins), p=p)])
+            base = int(self.valid[0])
+            blo = int(np.searchsorted(self.valid, max(self.frontier, base + b * self.cfg.bin_frames)))
+            bhi = int(np.searchsorted(self.valid, base + (b + 1) * self.cfg.bin_frames, side="left"))
+            if bhi > blo:
+                return int(self.valid[rng.integers(blo, bhi)])
         if rng.random() < self.cfg.recent:
             hi = int(np.searchsorted(self.valid, self.frontier + self.cfg.band, side="right"))
         else:
@@ -256,7 +290,7 @@ class ReverseCurriculum:
 
     def state_dict(self) -> dict:
         return {"frontier": int(self.frontier), "config": asdict(self.cfg), "outcomes": list(self.outcomes),
-                "history": list(self.history)}
+                "history": list(self.history), "bin_fail": dict(self.bin_fail)}
 
     def load_state_dict(self, state: dict) -> None:
         self.frontier = self._snap(int(state["frontier"]))
@@ -267,6 +301,7 @@ class ReverseCurriculum:
             self.cfg.seed = seed
             self.outcomes = deque(state.get("outcomes", []), maxlen=max(self.cfg.min_episodes, 1))
         self.history = list(state.get("history", []))
+        self.bin_fail = {int(b): float(v) for b, v in (state.get("bin_fail") or {}).items()}
 
 
 def vector_outcomes(infos) -> list:

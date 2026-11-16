@@ -16,7 +16,8 @@ from . import geometry as G
 from .path import PathFollower, ReferencePath, load_tas_path
 from .state import G_RAILS, G_STOPPER, GameTracker
 
-FEATURE_VERSION = "f5"  # f5: edge fan referenced to the floor under the ball when airborne / in side contact
+FEATURE_VERSION = "f6"  # f6: optional look-ahead block (far_waypoints, ref_speed_at; off by default = the f5 layout)
+# f5: edge fan referenced to the floor under the ball when airborne / in side contact
 # f4: TAS reference line + continuity projection, arc waypoints, slope-robust edge fan
 # f3: transforming from the ball (un)physicalize events; HS block (followers, pause)
 
@@ -57,6 +58,12 @@ class FeatureConfig:
     path_reacquire: float = 5.0  # switch to the sector-wide nearest point when it is closer by more than this
     waypoints: int = 3
     waypoint_spacing: float = 5.0  # waypoint j (1..waypoints) is the line point j * spacing units of arc ahead
+    # f6 look-ahead (appended at the end of the vector, so a policy can be extended with zero weights):
+    # far_waypoints: line points this many units of arc ahead, relative to the ball (frame of the directional features);
+    # ref_speed_at: the reference trajectory's speed along the line at arc s + offset (units / s / vel_scale; 0 without
+    # reference times, e.g. the checkpoint polyline)
+    far_waypoints: tuple = ()
+    ref_speed_at: tuple = ()
     bodies: int = 4
     body_radius: float = 60.0
     dynamic_geometry: bool = True  # include moving bodies in the height grid / fan
@@ -279,6 +286,10 @@ class FeatureExtractor:
         if c.hs_block:
             L += [("followers", 1), ("follower_sources", c.follower_sources), ("follower_near", 1), ("paused", 1),
                   ("since_checkpoint", 1)]
+        if c.far_waypoints:
+            L.append(("far_waypoints", 3 * len(c.far_waypoints)))
+        if c.ref_speed_at:
+            L.append(("ref_speed", len(c.ref_speed_at)))
         return L
 
     def layout(self) -> list:
@@ -375,6 +386,13 @@ class FeatureExtractor:
                 if c.waypoints:
                     wp = path.points_ahead(pr["s"], c.waypoints, c.waypoint_spacing) - pos
                     F["waypoints"][:] = (to_frame(wp, right, fwd) / c.pos_scale).ravel()
+                if c.far_waypoints:
+                    fw = path.points_at(pr["s"], c.far_waypoints) - pos
+                    F["far_waypoints"][:] = (to_frame(fw, right, fwd) / c.pos_scale).ravel()
+                if c.ref_speed_at:
+                    for j, o in enumerate(c.ref_speed_at):
+                        v = path.speed_at(pr["s"] + float(o))
+                        F["ref_speed"][j] = (v or 0.0) / c.vel_scale
             if c.bodies:
                 self._bodies(tracker, F, pos, vel, right, fwd)
         if c.counters:

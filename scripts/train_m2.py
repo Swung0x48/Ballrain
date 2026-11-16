@@ -139,6 +139,8 @@ def parse(argv=None):
     p.add_argument("--device", default="cpu")
     p.add_argument("--action-repeat", type=int, default=4)
     p.add_argument("--hs-block", action="store_true", help="keep the HS feature block (off for SR)")
+    p.add_argument("--far-waypoints", default="", help="f6: line points this far ahead in arc units, e.g. 20,30,45")
+    p.add_argument("--ref-speed-at", default="", help="f6: reference speed at these arc offsets, e.g. 0,15,30")
     p.add_argument("--world-actions", action="store_true",
                    help="world-frame directional features (FeatureConfig camera=world) and world-direction actions")
     p.add_argument("--reward", default="{}", help="RewardConfig overrides as JSON")
@@ -148,11 +150,18 @@ def parse(argv=None):
     p.add_argument("--stall-s", type=float, default=10.0)
     p.add_argument("--stall-terminal", action="store_true",
                    help="a stall is a terminal failure (death penalty + sector refund) instead of a bootstrapped truncation")
+    p.add_argument("--stall-extra", type=float, default=0.0, help="with --stall-terminal: extra penalty on top of a death's")
+    p.add_argument("--stall-compensate", action="store_true",
+                   help="with --stall-terminal: divide the stall penalty by gamma ** window steps (never cheaper than dying now)")
     p.add_argument("--respawn-stall-s", type=float, default=None, help="stall limit of respawn lives (default --stall-s)")
     p.add_argument("--success", choices=("cp", "finish"), default="cp")
     p.add_argument("--finish-gate", type=float, default=0.0,
                    help="the frontier also needs this LevelFinish rate over the band episodes (with --success cp)")
     p.add_argument("--set-frontier", type=int, default=None, help="move the curriculum frontier to this frame (resume)")
+    p.add_argument("--cu-weighted", type=float, default=0.0,
+                   help="fraction of the starts drawn by failure-weighted bins (ReverseCurriculum weighted)")
+    p.add_argument("--cu-bin-floor", type=float, default=0.05)
+    p.add_argument("--cu-bin-frames", type=int, default=2000)
     p.add_argument("--start-back", type=int, default=1500)
     p.add_argument("--cu-step", type=int, default=1000)
     p.add_argument("--cu-band", type=int, default=1500)
@@ -218,7 +227,9 @@ def make_env_config(a, out_root: Path):
     from ballrain.features import FeatureConfig
     from ballrain.rewards import RewardConfig
     rc = RewardConfig(mode="sr", **json.loads(a.reward))
-    fc = FeatureConfig(hs_block=a.hs_block, camera="world" if a.world_actions else "orient_ref")
+    fl = lambda x: tuple(float(v) for v in x.split(",") if v.strip()) if x else ()  # noqa: E731
+    fc = FeatureConfig(hs_block=a.hs_block, camera="world" if a.world_actions else "orient_ref",
+                       far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at))
     cu = {"start_back": a.start_back, "step": a.cu_step, "band": a.cu_band, "recent": a.cu_recent,
           "advance_at": a.advance_at, "min_episodes": a.min_episodes, "p_level_start": a.p_level_start}
     hl = None
@@ -275,6 +286,8 @@ def main(argv=None) -> int:
     (run_dir / ("config.json" if not a.resume else f"config.resume-{time.strftime('%Y%m%d-%H%M%S')}.json")).write_text(
         json.dumps(vars(a), indent=1), encoding="utf-8")
     log = Logger(run_dir, a.resume)
+    log.tb.add_text("config", "    " + json.dumps(vars(a), indent=1).replace("\n", "\n    "),
+                    global_step=int(ck["counters"]["steps"]) if ck is not None else 0)
     torch.set_num_threads(a.torch_threads)
     torch.manual_seed(a.seed)
     np.random.seed(a.seed)
@@ -302,22 +315,44 @@ def main(argv=None) -> int:
     counters = {"update": 0, "steps": 0, "frames": 0, "episodes": 0, "runs": 0, "wall_s": 0.0, "finish_runs": 0,
                 "dropped_chunks": 0, "worker_restarts": 0}
     best = {"sr_ms_k0": None, "sr_ms_any": None}
+    def load_policy(src: dict) -> bool:
+        """Model + observation statistics from a checkpoint; a checkpoint with fewer observation entries (the f6
+        look-ahead block appended at the end) is extended with zero input weights and neutral statistics (mean 0,
+        var 1), so the policy and value are unchanged at the switch. Returns True when it was extended."""
+        sd, n_old = src["model"], int(src["n_obs"])
+        st = src["rms"]
+        if n_old == n_obs:
+            model.load_state_dict(sd)
+            rms.load_state_dict(st)
+            return False
+        if n_old > n_obs:
+            raise SystemExit(f"checkpoint has {n_old} observation entries, this config {n_obs}")
+        sd = dict(sd)
+        for k in ("pi.0.weight", "v.0.weight"):
+            w = sd[k]
+            sd[k] = torch.cat([w, torch.zeros(w.shape[0], n_obs - n_old, dtype=w.dtype)], 1)
+        model.load_state_dict(sd)
+        rms.load_state_dict({"mean": np.r_[np.asarray(st["mean"]), np.zeros(n_obs - n_old)],
+                             "var": np.r_[np.asarray(st["var"]), np.ones(n_obs - n_old)], "count": st["count"]})
+        log.msg(f"policy extended from {n_old} to {n_obs} observation entries (zero input weights)")
+        return True
+
     if ck is not None:
-        model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["opt"])
+        extended = load_policy(ck)
+        if not extended:
+            opt.load_state_dict(ck["opt"])
         for g in opt.param_groups:
             g["lr"] = a.lr
-        rms.load_state_dict(ck["rms"])
         cu.load_state_dict(ck["curriculum"])
         counters.update(ck["counters"])
         best.update(ck.get("best", {}))
         log.msg(f"resumed from {ckpt_path} at update {counters['update']}, frontier {cu.frontier}")
     elif a.init_from:
         ck0 = torch.load(a.init_from, weights_only=False)
-        model.load_state_dict(ck0["model"])
-        rms.load_state_dict(ck0["rms"])
+        extended = load_policy(ck0)
         if a.init_full:
-            opt.load_state_dict(ck0["opt"])
+            if not extended:
+                opt.load_state_dict(ck0["opt"])
             for g in opt.param_groups:
                 g["lr"] = a.lr
             cu.load_state_dict(ck0["curriculum"])
@@ -327,7 +362,8 @@ def main(argv=None) -> int:
                                                      if a.init_full else ""))
     # the command line is authoritative for the curriculum parameters (a resumed state carries the old ones)
     for k, v in (("step", a.cu_step), ("band", a.cu_band), ("recent", a.cu_recent), ("advance_at", a.advance_at),
-                 ("min_episodes", a.min_episodes)):
+                 ("min_episodes", a.min_episodes), ("weighted", a.cu_weighted), ("bin_floor", a.cu_bin_floor),
+                 ("bin_frames", a.cu_bin_frames)):
         setattr(cu.cfg, k, v)
     cu.outcomes = deque(cu.outcomes, maxlen=max(cu.cfg.min_episodes, 1))
     cu.finishes = deque(cu.finishes, maxlen=max(cu.cfg.min_episodes, 1))
@@ -364,12 +400,16 @@ def main(argv=None) -> int:
         return WorkerSpec(wid=i, copy=names[i], env=cfg, seed=seed, chunk=a.chunk, hidden=hidden,
                           activation=a.activation, cap_mult=a.cap_mult, stall_s=a.stall_s,
                           respawn_stall_s=a.respawn_stall_s, stall_terminal=a.stall_terminal, prune=a.prune,
+                          stall_extra=a.stall_extra, stall_compensate=a.stall_compensate, gamma=a.gamma,
                           trace_sample=a.trace_sample,
                           launcher_factory=FakeLauncher if a.fake else None)
 
     hub = None
+    cu_bins = defaultdict(lambda: deque(maxlen=100))  # curriculum bin -> recent LevelFinish outcomes (failure-weighted starts)
 
     def broadcast(qs=None, with_model=True):
+        if cu.cfg.weighted:
+            cu.set_bin_fail({b: 1.0 - float(np.mean(v)) for b, v in cu_bins.items() if len(v) >= 10})
         msg = {"version": counters["update"], "rms": rms.state_dict(), "curriculum": cu.state_dict()}
         if with_model:
             msg["model"] = {k: v.detach().cpu().numpy() for k, v in model.state_dict().items()}
@@ -396,7 +436,9 @@ def main(argv=None) -> int:
         template = {"env": tcfg, "seed": a.seed, "run": a.run,
                     "worker": {"chunk": a.chunk, "hidden": hidden, "activation": a.activation, "cap_mult": a.cap_mult,
                                "stall_s": a.stall_s, "respawn_stall_s": a.respawn_stall_s,
-                               "stall_terminal": a.stall_terminal, "prune": a.prune, "trace_sample": a.trace_sample}}
+                               "stall_terminal": a.stall_terminal, "stall_extra": a.stall_extra,
+                               "stall_compensate": a.stall_compensate, "gamma": a.gamma, "prune": a.prune,
+                               "trace_sample": a.trace_sample}}
         hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):
@@ -448,6 +490,8 @@ def main(argv=None) -> int:
                 cu.cfg.p_level_start = a.p_level_start
             b = 0 if k == 0 else 1 + (k - 936) // 2000
             by_bin[b].append((e["success_cp"], e["finish"]))
+            if k:
+                cu_bins[cu.bin_of(k)].append(bool(e["finish"]))
             by_sector[e["start_sector"]].append((e["success_cp"], e["finish"]))
 
     def handle_run(r):
@@ -536,8 +580,13 @@ def main(argv=None) -> int:
                 counters[f"steps_{be}"] = counters.get(f"steps_{be}", 0) + len(m["rewards"])
                 counters["frames"] += m["frames"]
                 reset_frac.append(m["t_reset"] / max(m["t_chunk"], 1e-9))
+                if m["raw"].shape[1] != n_obs:  # a worker still on an older observation layout (remote, before its restart)
+                    counters["dropped_chunks"] += 1
+                    continue
                 if counters["update"] - m["version"] > (a.max_stale_remote if m.get("remote") else a.max_stale):
                     counters["dropped_chunks"] += 1
+                    counters[f"dropped_{be}"] = counters.get(f"dropped_{be}", 0) + 1
+                    counters[f"dropped_steps_{be}"] = counters.get(f"dropped_steps_{be}", 0) + len(m["rewards"])
                     continue
                 chunks.append(m)
                 n += len(m["rewards"])
@@ -640,6 +689,9 @@ def main(argv=None) -> int:
                         log.tb.add_scalar(f"train_{be}/finish_tas", float(np.mean([e["finish"] for e in be_tas])),
                                           counters["steps"])
                     log.tb.add_scalar(f"train_{be}/deaths", sum(e["end"] == "BallOff" for e in be_eps), counters["steps"])
+                    log.tb.add_scalar(f"train_{be}/dropped_chunks", counters.get(f"dropped_{be}", 0), counters["steps"])
+                    log.tb.add_scalar(f"train_{be}/dropped_step_frac",
+                                      counters.get(f"dropped_steps_{be}", 0) / max(counters.get(sk, 0), 1), counters["steps"])
                 if hub is not None:
                     log.tb.add_scalar("remote/connections", len([c for c in hub.conns.values()]), counters["steps"])
                     log.tb.add_scalar("remote/chunks", hub.stats["chunks"], counters["steps"])

@@ -72,8 +72,12 @@ class ReferencePath:
     """Polyline P (n,3) with a sector label per point. Segment i (P[i] -> P[i+1]) belongs to sector
     seg_sector[i] = point_sector[i+1]."""
 
-    def __init__(self, points, point_sector=None, source: str = "custom", meta: dict | None = None):
+    def __init__(self, points, point_sector=None, source: str = "custom", meta: dict | None = None, t_ms=None):
         self.P = np.asarray(points, np.float64).reshape(-1, 3)
+        # game time (ms from the first control frame) at which the source trajectory passed each point (TAS lines,
+        # f6 reference speed); None for polylines and assets built before it
+        self.t_ms = None if t_ms is None else np.asarray(t_ms, np.float64).reshape(-1)
+        self._speed = None
         if len(self.P) < 2:
             raise ValueError("a reference path needs at least two points")
         self.point_sector = (np.r_[1, np.arange(1, len(self.P))] if point_sector is None
@@ -113,13 +117,15 @@ class ReferencePath:
     def load(cls, path) -> "ReferencePath":
         z = np.load(path, allow_pickle=False)
         meta = json.loads(str(z["meta"]))
-        return cls(z["points"].astype(np.float64), z["sector"].astype(np.int64), source="tas", meta=meta)
+        t = z["t_ms"].astype(np.float64) if "t_ms" in z.files else None
+        return cls(z["points"].astype(np.float64), z["sector"].astype(np.int64), source="tas", meta=meta, t_ms=t)
 
     def save(self, path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        extra = {} if self.t_ms is None else {"t_ms": self.t_ms.astype(np.float64)}
         np.savez_compressed(path, points=self.P.astype(np.float32), sector=self.point_sector.astype(np.uint8),
-                            meta=np.array(json.dumps(self.meta, sort_keys=True)))
+                            meta=np.array(json.dumps(self.meta, sort_keys=True)), **extra)
 
     def _tangents(self, span: float) -> np.ndarray:
         n = len(self.seg)
@@ -192,6 +198,19 @@ class ReferencePath:
         i = int(np.clip(np.searchsorted(self.cum, s, side="right") - 1, 0, len(self.seg) - 1))
         t = (s - self.cum[i]) / self.seg_len[i] if self.seg_len[i] > 0 else 0.0
         return self.P[i] + self.seg[i] * t
+
+    def speed_at(self, s: float, half: float = 2.5) -> float | None:
+        """Speed (units / s) of the source trajectory along the line at arc s: arc over game time across
+        [s - half, s + half]. None without t_ms."""
+        if self.t_ms is None:
+            return None
+        a, b = max(0.0, s - half), min(self.length, s + half)
+        ta, tb = np.interp([a, b], self.cum, self.t_ms)
+        return float((b - a) / max(tb - ta, 1e-6) * 1000.0)
+
+    def points_at(self, s: float, offsets) -> np.ndarray:
+        """Points at arc s + offset for each offset (clamped to the line)."""
+        return np.array([self.point_at(s + float(o)) for o in offsets]).reshape(-1, 3)
 
     def points_ahead(self, s: float, k: int, spacing: float) -> np.ndarray:
         """k points at arc length s + spacing, s + 2 spacing, ... (the end point repeated past the end)."""
@@ -288,11 +307,12 @@ def build_tas_path(pos, sector, delta_ms, spacing: float = 0.5, time_sigma_ms: f
     if cum[-1] - s_new[-1] > 1e-6:
         s_new = np.r_[s_new, cum[-1]]
     P = np.stack([np.interp(s_new, cum, pos[:, k]) for k in range(3)], 1)
+    t_new = np.interp(s_new, cum, t[keep] - t[0])  # game time at each resampled point (f6 reference speed)
     idx = np.clip(np.searchsorted(cum, s_new, side="right") - 1, 0, len(cum) - 1)
     sec = np.maximum.accumulate(sector[idx])  # sectors never go back along the line
     m = dict(meta or {})
     m.update(version=REFPATH_VERSION, spacing=spacing, time_sigma_ms=time_sigma_ms, tangent_span=tangent_span)
-    return ReferencePath(P, sec, source="tas", meta=m)
+    return ReferencePath(P, sec, source="tas", meta=m, t_ms=t_new)
 
 
 def sha256_file(path) -> str:

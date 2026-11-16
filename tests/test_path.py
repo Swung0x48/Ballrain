@@ -170,3 +170,20 @@ def test_tas_assets_match_their_levels_and_reference_lateral():
             lat.append(r["dist"])
             s.append(r["s"])
         assert max(lat) < 1.0 and np.min(np.diff(s)) > -0.5 and s[-1] > path.length - 2
+
+
+def test_reference_speed_and_lookahead_points():
+    import numpy as np
+    from ballrain.features import FeatureConfig, FeatureExtractor
+    from ballrain.path import ReferencePath, build_tas_path
+    # a straight line at 10 units/s for 2 s, then 20 units/s for 1 s (frames of 10 ms)
+    t = np.arange(301) * 10.0
+    x = np.where(t <= 2000, t / 100, 20 + (t - 2000) / 50)
+    pos = np.stack([x, np.zeros_like(x), np.zeros_like(x)], 1)
+    p = build_tas_path(pos, np.ones(len(x), np.int64), np.full(len(x), 10.0), time_sigma_ms=0)
+    assert abs(p.speed_at(10.0) - 10.0) < 0.2 and abs(p.speed_at(30.0) - 20.0) < 0.3
+    assert np.allclose(p.points_at(5.0, [10, 100])[:, 0], [15.0, p.length])
+    assert ReferencePath(p.P).speed_at(1.0) is None  # no reference times
+    base = FeatureExtractor(FeatureConfig(hs_block=False)).size
+    f6 = FeatureExtractor(FeatureConfig(hs_block=False, far_waypoints=(20, 30, 45), ref_speed_at=(0, 15, 30)))
+    assert f6.size == base + 12 and [n for n, _ in f6.layout()][-2:] == ["far_waypoints", "ref_speed"]

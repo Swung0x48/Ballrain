@@ -178,3 +178,24 @@ def test_trainer_loop_through_a_vector_env(tmp_path, fake_record):
     assert outcomes and all(not s for _, s in outcomes)  # truncated episodes are failures, but counted
     assert cu.frontier < f0
     assert CU.vector_outcomes([{"start": {"kind": "tas", "frame": 5}, "episode_end": "LevelFinish"}, {}]) == [(5, True)]
+
+
+def test_failure_weighted_starts_keep_a_floor_per_bin():
+    import numpy as np
+    from ballrain.curriculum import CurriculumConfig, ReverseCurriculum
+    cu = ReverseCurriculum(valid=np.arange(936, 20587), config=CurriculumConfig(
+        weighted=1.0, bin_frames=2000, bin_floor=0.05, p_level_start=0.1, seed=3))
+    cu.frontier = 936
+    bins, p = cu.bin_probs()
+    assert len(bins) == 10 and abs(p.sum() - 1) < 1e-9 and np.allclose(p, 0.1)  # no data: every bin counts as failing
+    cu.set_bin_fail({b: 0.0 for b in range(10)} | {5: 1.0})
+    _, p = cu.bin_probs()
+    assert abs(p[5] - 0.55) < 1e-9 and np.allclose(np.delete(p, 5), 0.05)
+    ks = np.array([cu.sample() for _ in range(20000)])
+    assert 0.07 < np.mean(ks == 0) < 0.13  # k = 0 draws are kept at the start
+    inb = np.mean([(cu.bin_of(k) == 5) for k in ks[ks > 0]])
+    assert 0.5 < inb < 0.6
+    st = cu.state_dict()
+    cu2 = ReverseCurriculum(valid=np.arange(936, 20587))
+    cu2.load_state_dict(st)
+    assert cu2.bin_fail == cu.bin_fail and cu2.cfg.weighted == 1.0

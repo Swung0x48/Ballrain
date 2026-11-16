@@ -58,7 +58,7 @@ def evaluate(a, ck_path: Path) -> dict:
     copies = a.copies.split(",")
     jobs = [{"i": j * 1000 + i, "seed": a.seed + i + 1000 * j, "greedy": a.greedy, "temperature": a.temperature,
              "start_frame": k} for j, k in enumerate(starts) for i in range(a.runs)]
-    out_root = Path(a.out) / f"episodes-{a.backend}"
+    out_root = Path(a.out) / "episodes" / a.backend
     hl = json.loads(a.headless) if a.headless else None
     specs = [{"ckpt": str(ck_path), "copy": c, "out_root": str(out_root), "start_frame": 0, "max_frames": a.max_frames,
               "stall_s": a.stall_s, "backend": a.backend, "headless": hl, "jobs": jobs[i::len(copies)]}
@@ -84,19 +84,20 @@ def evaluate(a, ck_path: Path) -> dict:
 def log_eval(a, res: dict):
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    with open(out / f"sim2real_{a.backend}.jsonl", "a", encoding="utf-8") as f:
+    with open(out / f"sim2real_{res['backend']}.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps(res, default=str) + "\n")
     if a.tb:
         from torch.utils.tensorboard import SummaryWriter
         w = SummaryWriter(a.tb)
+        step = res["update"] if getattr(a, "tb_step", "steps") == "update" else res["steps"]
         for k, v in res["per_start"].items():
-            tag = f"eval/{a.backend}_k{k}"
-            w.add_scalar(f"{tag}_success", v["success"], res["steps"])
-            w.add_scalar(f"{tag}_deaths_per_run", v["deaths_per_run"], res["steps"])
+            tag = f"eval/{res['backend']}_k{k}"
+            w.add_scalar(f"{tag}_success", v["success"], step)
+            w.add_scalar(f"{tag}_deaths_per_run", v["deaths_per_run"], step)
             for s, n in v["deaths_by_sector"].items():
-                w.add_scalar(f"{tag}_deaths_s{s}", n, res["steps"])
+                w.add_scalar(f"{tag}_deaths_s{s}", n, step)
             if v["sr_ms_median"] is not None:
-                w.add_scalar(f"{tag}_sr_ms_median", v["sr_ms_median"], res["steps"])
+                w.add_scalar(f"{tag}_sr_ms_median", v["sr_ms_median"], step)
         w.close()
     print(json.dumps({k: v for k, v in res.items() if k != "rows"}), flush=True)
 
@@ -112,17 +113,93 @@ def cmd_eval(a) -> int:
             import torch
             u = torch.load(local, weights_only=False)["counters"]["update"]
             if u != last:
-                log_eval(a, evaluate(a, local))
+                try:
+                    log_eval(a, evaluate(a, local))
+                except Exception as e:  # noqa: BLE001  keep watching
+                    import traceback
+                    print(f"eval failed: {type(e).__name__}: {e}", traceback.format_exc(), sep="\n", flush=True)
                 last = u
+        if not a.watch:
+            return 0
+        time.sleep(60 * (a.watch if last is not None else min(a.watch, 2.0)))  # poll until the first checkpoint
+
+
+def cmd_pair(a) -> int:
+    """Exact pairs: take the newest local copy of the run's latest.pt, copy it to the Mac, evaluate the same file on
+    both backends at once (retail here on --copies, headless on the Mac via ssh on --mac-copies), same starts, seeds
+    and temperature; both results are logged under the checkpoint's update number (tensorboard step = update).
+    ssh target from $BALLRAIN_MAC / $BALLRAIN_MAC_SSH (shell environment only)."""
+    import os
+    import shlex
+    import subprocess
+    import threading
+    import torch
+    mac = os.environ["BALLRAIN_MAC"]
+    exe = os.environ.get("BALLRAIN_SSH_EXE", "ssh")  # on Windows Git's ssh.exe (the system OpenSSH rejects key ACLs)
+    ssh = [exe, "-o", "BatchMode=yes"] + shlex.split(os.environ.get("BALLRAIN_MAC_SSH", "")) + [mac]
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    a.tb_step = "update"
+    last = None
+    while True:
+        src = Path(a.ckpt)
+        if src.is_file():
+            u = torch.load(src, weights_only=False)["counters"]["update"]
+            if u != last:
+                try:
+                    local = out / f"ckpt_{u:06d}.pt"
+                    shutil.copyfile(src, local)
+                    rdir = f"{a.mac_dir}/repo/{a.mac_out}"
+                    rfile = f"{rdir}/ckpt_{u:06d}.pt"
+                    subprocess.run(ssh + [f"mkdir -p {rdir}"], check=True)
+                    with open(local, "rb") as fh:
+                        subprocess.run(ssh + [f"cat > {rfile}"], stdin=fh, check=True)
+                    common = (f"--runs {a.runs} --starts {a.starts} --seed {a.seed} --temperature {a.temperature} "
+                              f"--max-frames {a.max_frames} --stall-s {a.stall_s}" + (" --greedy" if a.greedy else ""))
+                    rcmd = (f"cd {a.mac_dir}/repo && export BALLRAIN_RUNTIME=$HOME/{a.mac_dir}/repo/runtime "
+                            f"BALLRAIN_HL_BIN={a.hl_bin} BALLRAIN_HL_ROOT=$HOME/{a.mac_dir}/game PYTHONPATH=$HOME/{a.mac_dir}/repo && "
+                            f"nice -n 10 {a.mac_uv} run --offline python scripts/sim2real_m2.py eval --ckpt {a.mac_out}/ckpt_{u:06d}.pt "
+                            f"--backend headless --copies {a.mac_copies} --out {a.mac_out} {common}")
+                    box = {}
+
+                    def remote():
+                        r = subprocess.run(ssh + [rcmd], capture_output=True, text=True)
+                        lines = [x for x in r.stdout.splitlines() if x.startswith('{"t":')]
+                        box["res"] = json.loads(lines[-1]) if lines else None
+                        box["err"] = r.stderr[-2000:]
+                    th = threading.Thread(target=remote)
+                    th.start()
+                    ns = argparse.Namespace(**vars(a))
+                    ns.backend = "retail"
+                    try:
+                        res_r = evaluate(ns, local)
+                        log_eval(ns, res_r)
+                    except Exception as e:  # noqa: BLE001
+                        import traceback
+                        print(f"retail eval failed: {type(e).__name__}: {e}", traceback.format_exc(), sep="\n", flush=True)
+                    th.join()
+                    if box.get("res"):
+                        box["res"]["rows"] = []
+                        log_eval(ns, box["res"])
+                    else:
+                        print(f"headless eval failed: {box.get('err')}", flush=True)
+                    last = u
+                except Exception as e:  # noqa: BLE001  (ssh / network): retry in 2 minutes
+                    import traceback
+                    print(f"pair failed: {type(e).__name__}: {e}", traceback.format_exc(), sep="\n", flush=True)
+                    time.sleep(120)
+                    continue
         if not a.watch:
             return 0
         time.sleep(60 * a.watch)
 
 
-def spot_one(run_dir: Path, copy: str, div_root: Path) -> dict:
+def spot_one(run_dir: Path, copy: str, div_root: Path, label: str = "", after: float = 0.0) -> dict | None:
     from ballrain import instances, trace
     meta_p = next(run_dir.glob("L*.json"))
     m = json.loads(meta_p.read_text(encoding="utf-8"))
+    if float(m.get("started_at") or 0) < after:
+        return None  # a run of an older engine build (--after)
     agent_trace = run_dir / "trace.txt"
     tas_p = run_dir / m["tas_path"]
     out = run_dir.parent.parent.parent / "spotcheck-replays" / run_dir.name
@@ -130,12 +207,37 @@ def spot_one(run_dir: Path, copy: str, div_root: Path) -> dict:
     rep = Path(r["loads"][0]["trace"]) if r["loads"] else None
     res = {"run": str(run_dir), "run_id": m.get("run_id"), "end_reason": m.get("end_reason"),
            "lives": len(m.get("lives") or []), "frames": m.get("frames"), "backend": m.get("backend"),
+           "build": m.get("mod_version"), "start_frame": (m.get("start_state") or {}).get("frame"),
+           "started_at": m.get("started_at"),
            "agent_sha": instances.sha256_file(agent_trace), "replay_sha": instances.sha256_file(rep) if rep and rep.is_file() else None}
     res["equal"] = res["agent_sha"] == res["replay_sha"]
+    if not res["equal"] and rep and rep.is_file():
+        # the headless engine writes LF, the retail mod CRLF: compare the lines without their line ends
+        la = [trace._strip_eol(x) for x in trace.read_lines(agent_trace)]
+        lb = [trace._strip_eol(x) for x in trace.read_lines(rep)]
+        res["equal"] = la == lb
+        res["eol_only"] = res["equal"]
+    res["label"] = label
     if not res["equal"] and res["replay_sha"]:
-        d = trace.compare(agent_trace, rep)
-        res["first_diff_frame"] = getattr(d, "first_diff_frame_a", None)
-        res["diff"] = str(d)[:500]
+        la = [trace._strip_eol(x) for x in trace.read_lines(agent_trace)]
+        lb = [trace._strip_eol(x) for x in trace.read_lines(rep)]
+        i = next((j for j in range(min(len(la), len(lb))) if la[j] != lb[j]), min(len(la), len(lb)))
+        res["first_diff_frame"] = trace.frame_of(la[i]) if i < len(la) else None
+        res["first_diff_line"] = i
+        res["diff"] = f"headless: {la[i][:160] if i < len(la) else b''!r} | retail: {lb[i][:160] if i < len(lb) else b''!r}"
+        # classify (gates.export_diagnosis style): replay the same .tas on retail twice more; if the retail replays
+        # disagree with each other the game itself diverged on these inputs (known, docs/observations.md 5.1)
+        reps = [lb]
+        for j in (2, 3):
+            r2 = instances.run_ballrain(tas_p, int(m.get("level", 1)), out.with_name(out.name + f"_r{j}"), loads=1,
+                                        timeout=300, copy=copy)
+            t2 = Path(r2["loads"][0]["trace"]) if r2["loads"] else None
+            reps.append([trace._strip_eol(x) for x in trace.read_lines(t2)] if t2 and t2.is_file() else None)
+        res["retail_replays_equal"] = [x == lb for x in reps[1:]]
+        res["retail_repeat_equals_headless"] = [x == la for x in reps[1:]]
+        n_h = 1 + sum(res["retail_repeat_equals_headless"])
+        n_r = sum(1 for x in reps if x == lb)
+        res["kind"] = ("retail_outlier" if n_h >= 2 else "systematic" if n_r == 3 else "retail_split")
         dst = div_root / run_dir.name
         dst.mkdir(parents=True, exist_ok=True)
         for f in (tas_p, agent_trace, meta_p):
@@ -162,9 +264,11 @@ def cmd_spotcheck(a) -> int:
             if not any(rd.glob("L*.json")):
                 continue  # still running
             try:
-                res = spot_one(rd, a.copy, div_root)
+                res = spot_one(rd, a.copy, div_root, a.label, a.after)
             except Exception as e:  # noqa: BLE001
-                res = {"run": str(rd), "error": f"{type(e).__name__}: {e}"}
+                res = {"run": str(rd), "error": f"{type(e).__name__}: {e}", "label": a.label}
+            if res is None:
+                continue
             results.append(res)
             with open(log_p, "a", encoding="utf-8") as f:
                 f.write(json.dumps(res) + "\n")
@@ -172,11 +276,12 @@ def cmd_spotcheck(a) -> int:
         if a.tb and results:
             from torch.utils.tensorboard import SummaryWriter
             allr = [json.loads(x) for x in log_p.read_text(encoding="utf-8").splitlines() if x.strip()]
-            ok = [r for r in allr if "equal" in r]
+            ok = [r for r in allr if "equal" in r and r.get("label", "") == a.label]
             w = SummaryWriter(a.tb)
-            w.add_scalar("eval/spotcheck_divergence_rate", 1 - float(np.mean([r["equal"] for r in ok])) if ok else 0.0,
+            tag = f"_{a.label}" if a.label else ""
+            w.add_scalar(f"eval/spotcheck{tag}_divergence_rate", 1 - float(np.mean([r["equal"] for r in ok])) if ok else 0.0,
                          len(ok))
-            w.add_scalar("eval/spotcheck_checked", len(ok), len(ok))
+            w.add_scalar(f"eval/spotcheck{tag}_checked", len(ok), len(ok))
             w.close()
         if not a.watch:
             return 0
@@ -201,14 +306,27 @@ def main(argv=None) -> int:
     e.add_argument("--out", required=True, help="output directory (jsonl, episodes, local checkpoint copy)")
     e.add_argument("--tb", default=None)
     e.add_argument("--watch", type=float, default=0, help="minutes between checks (0 = once)")
+    q = sub.add_parser("pair", help="the same checkpoint on retail (here) and headless (the Mac, via ssh)")
+    for n, kw in (("--ckpt", {"required": True}), ("--copies", {"required": True}), ("--runs", {"type": int, "default": 4}),
+                  ("--starts", {"default": "0,frontier,frontier+400"}), ("--temperature", {"type": float, "default": 0.3}),
+                  ("--seed", {"type": int, "default": 777}), ("--max-frames", {"type": int, "default": 40000}),
+                  ("--stall-s", {"type": float, "default": 15.0}), ("--out", {"required": True}), ("--tb", {"default": None}),
+                  ("--watch", {"type": float, "default": 0}), ("--mac-dir", {"default": "ballrain"}),
+                  ("--mac-out", {"default": "runtime/m2-train/r3/sim2real-pairs"}), ("--mac-copies", {"default": "hl-50,hl-51"}),
+                  ("--mac-uv", {"default": "$HOME/Library/Python/3.9/bin/uv"}), ("--hl-bin", {"required": True})):
+        q.add_argument(n, **kw)
+    q.add_argument("--greedy", action="store_true")
+    q.add_argument("--headless", default=None)
     s = sub.add_parser("spotcheck")
     s.add_argument("--runs-dir", required=True)
     s.add_argument("--copy", default="train-11")
     s.add_argument("--max", type=int, default=6, help="runs per pass (newest first)")
     s.add_argument("--tb", default=None)
     s.add_argument("--watch", type=float, default=0)
+    s.add_argument("--label", default="", help="engine build label written to each record (rates are per label)")
+    s.add_argument("--after", type=float, default=0.0, help="only runs started after this unix time (a build switch)")
     a = p.parse_args(argv)
-    return cmd_eval(a) if a.cmd == "eval" else cmd_spotcheck(a)
+    return {"eval": cmd_eval, "pair": cmd_pair, "spotcheck": cmd_spotcheck}[a.cmd](a)
 
 
 if __name__ == "__main__":

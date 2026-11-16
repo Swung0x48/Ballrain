@@ -38,6 +38,11 @@ def parse_addr(s: str) -> tuple[str, int]:
 class RemoteHub:
     def __init__(self, addr, authkey: bytes, data_q, template: dict, log=print, wid_base: int = 100, wid_block: int = 100):
         self.addr, self.authkey, self.data_q, self.template, self.log = addr, authkey, data_q, template, log
+        # identity of the template for the remote side (a bridge running older code may compare dataclasses by its own,
+        # older field list and miss a change)
+        import hashlib
+        import pickle
+        self.template_id = hashlib.sha256(pickle.dumps(template)).hexdigest()
         self._latest = None
         self._cond = threading.Condition()
         self._next_base = wid_base
@@ -82,6 +87,8 @@ class RemoteHub:
     def _serve(self, conn):
         host = "?"
         try:
+            if not conn.poll(30):
+                raise ConnectionError("no hello within 30 s")
             hello = conn.recv()
             if hello.get("type") != "hello" or hello.get("protocol") != PROTOCOL:
                 conn.send({"type": "error", "error": f"bad hello {hello!r}"})
@@ -91,7 +98,7 @@ class RemoteHub:
             base = known["wid_base"] if known else self._next_base
             if not known:
                 self._next_base += self._block
-            conn.send({"type": "config", "template": self.template, "wid_base": base})
+            conn.send({"type": "config", "template": self.template, "template_id": self.template_id, "wid_base": base})
             info = {"conn": conn, "wid_base": base, "host": hello.get("host"), "backend": hello.get("backend"),
                     "connected": time.time(), "chunks": 0}
             self.conns[hello.get("host")] = info
@@ -163,6 +170,7 @@ class RemoteBridge:
         self.session = 0
         self.conn = None
         self.template = None
+        self.template_id = None
         self.wid_base = None
         self.procs, self.ctrl_qs, self.specs = [], [], []
         self.stop = False
@@ -174,19 +182,42 @@ class RemoteBridge:
         t0 = time.time()
         while not self.stop:
             try:
-                c = Client(self.addr, authkey=self.authkey)
+                # the whole handshake in a thread with a deadline: Client() (auth challenge) and the first recv block
+                # forever when the hub's process is going down mid-handshake (seen at a learner restart)
+                box: dict = {}
+
+                def attempt():
+                    try:
+                        cc = Client(self.addr, authkey=self.authkey)
+                        cc.send({"type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session + 1,
+                                 "backend": self.backend, "n_workers": len(self.copies)})
+                        if not cc.poll(30):
+                            raise ConnectionError("no config within 30 s")
+                        box["conn"], box["msg"] = cc, cc.recv()
+                    except BaseException as e:  # noqa: BLE001
+                        box["error"] = e
+                th = threading.Thread(target=attempt, daemon=True, name="bridge-connect")
+                th.start()
+                th.join(45)
+                if th.is_alive():
+                    raise ConnectionError("handshake timed out")
+                if "error" in box:
+                    raise box["error"]
+                c, m = box["conn"], box["msg"]
                 self.session += 1
-                c.send({"type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session,
-                        "backend": self.backend, "n_workers": len(self.copies)})
-                m = c.recv()
                 if m.get("type") != "config":
                     raise ConnectionError(f"hub refused: {m}")
-                self.conn = c
+                if self.template is not None and m.get("template_id") != self.template_id:
+                    # the learner was restarted with another configuration: restart the workers on the new template
+                    self.log("bridge: the learner's worker template changed; restarting the workers")
+                    self.template, self.wid_base, self.template_id = m["template"], m["wid_base"], m.get("template_id")
+                    self._restart_all = True
                 if self.template is None:
-                    self.template, self.wid_base = m["template"], m["wid_base"]
+                    self.template, self.wid_base, self.template_id = m["template"], m["wid_base"], m.get("template_id")
+                self.conn = c
                 self.log(f"bridge: connected to {self.addr} (session {self.session}, wid base {m['wid_base']})")
                 return True
-            except (OSError, EOFError, ConnectionError) as e:
+            except Exception as e:  # noqa: BLE001  (refused, timed out, auth)
                 if timeout_s is not None and time.time() - t0 > timeout_s:
                     return False
                 self.log(f"bridge: connect failed ({type(e).__name__}: {e}); retrying")
@@ -266,6 +297,23 @@ class RemoteBridge:
         threading.Thread(target=self._recv_loop, daemon=True, name="bridge-recv").start()
         restarts = [0] * len(self.copies)
         while not self.stop and not should_stop():
+            if getattr(self, "_restart_all", False):
+                self._restart_all = False
+                for i, p in enumerate(self.procs):
+                    self.ctrl_qs[i].put({"cmd": "stop"})
+                t_end = time.time() + 120
+                while time.time() < t_end and any(p.is_alive() for p in self.procs):
+                    try:  # keep reading: a worker cannot exit while its last messages sit in a full pipe
+                        data_q.get(timeout=0.5)
+                    except queue.Empty:
+                        pass
+                for i, p in enumerate(self.procs):
+                    if p.is_alive():
+                        p.terminate()
+                    if on_fatal:
+                        on_fatal(self.copies[i])
+                    restarts[i] += 1
+                    self._start_worker(i, self.copies[i], restarts[i])
             try:
                 m = data_q.get(timeout=2.0)
             except queue.Empty:

@@ -67,7 +67,7 @@ def build_level(level: int, record: str, ds: Path, spacing: float) -> ReferenceP
     path.meta["length"] = path.length
     path.meta["sector_range"] = {str(k): list(v) for k, v in path.sector_range.items()}
     path.meta["points"] = len(path.P)
-    return ReferencePath(path.P, path.point_sector, source="tas", meta=path.meta)
+    return ReferencePath(path.P, path.point_sector, source="tas", meta=path.meta, t_ms=path.t_ms)
 
 
 def lateral_report(path: ReferencePath, ds: Path, records: list, level: int, global_check: bool = True) -> dict:
