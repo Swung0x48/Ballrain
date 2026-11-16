@@ -208,7 +208,7 @@ SR01 全程平均 5.8 → 1.4 ms，HS01 6.7 → 1.5 ms（每 4 帧取 1 帧，`t
 **投影**（`PathFollower`，每个回合一个状态，`env.reset()` 时清零：新进程、复活、TAS 交接都算回合开始）：
 在上一次投影的弧长 s_prev 附近的窗口 [s_prev − 10, s_prev + 30] 里找最近点，窗口限制在当前扇区的弧长范围内（两端各放宽 20）。
 后备：没有 s_prev（回合开始）、窗口为空、或整个扇区范围内的最近点比窗口内的最近点近 5 以上（球离开了这段线，例如掉到下层路面）时，用扇区范围内的最近点，
-并标记 `jump`（`info["path"]["mode"]` = init / window_empty / reacquire）。`jump` 那一步 SR 进度奖励按 0 计（只移动参考点，`Reward.step(rebase=True)`）。
+并标记 `jump`（`info["path"]["mode"]` = init / window_empty / reacquire）。`jump` 那一步的 Δs 默认照常付（经过 `hold_unsupported`，见 §4 `pay_jumps`）；`pay_jumps=False` 时按 0 计（只移动参考点，旧行为）。
 路线在同一扇区里绕圈或交叉时，窗口保证投影沿着走过的分支前进：参考记录自己的投影与"扇区内最近点"不同的帧数，L5 1013、L7 1459、L10 951、L6 0，
 用连续性投影的横向距离最大值仍是 1.2 / 1.4 / 2.6（`scripts/build_refpaths.py --check`；`tests/test_path.py` 有自交的 8 字形用例）。
 
@@ -237,7 +237,11 @@ HS01 的最大值是绕去吃分数球的岔路。所有 L1 记录在 TAS 线上
 
 **SR 模式**（`mode="sr"`），每步：
 
-- 进度 `progress_weight · Δs`（s 为参考路径弧长；后退乘 `backward_scale`；投影 `jump` 的那一步 Δs 记 0；势函数整形项不受影响，`shaping_weight` 默认 0）；
+- 进度 `progress_weight · Δs`（s 为参考路径弧长；后退乘 `backward_scale`；势函数整形项不受影响，`shaping_weight` 默认 0）；
+- **投影跳变照常付**（`pay_jumps`，默认开，M2 起）：投影 re-acquire（`jump`）那一步的 Δs 和其它步一样计入（先进 `held`，有支撑时付清，BallOff 时作废）。
+  原因（用户）：只要不死、到达下一个检查点 / 飞艇，任何路线都合法，例如从 L1 上层螺旋弯道落到下层路面。旧行为（`pay_jumps=False`）跳变那一步记 0，
+  捷径跳过的那段弧长永远不付，等于惩罚捷径；落回前面走过的路段也不扣，再走一遍还能再拿一次进度。现在一个回合付出的进度 = 0.1 ×（s_末 − s_初），
+  前跳（落在线上更远处）按跳过的弧长付，后跳照扣。窗口之外的落点靠 re-acquire（整个扇区范围内的最近点比窗口内近 5 以上）找回，投影仍限制在当前扇区 ±20 内。
 - 时间 `−time_weight · ΔIGT(秒)`；
 - 势函数整形 `γ·Φ(s') − Φ(s)`，`Φ = shaping_weight · s`，终止状态 Φ = 0；
 - 检查点 `checkpoint_bonus`（默认 0）；
@@ -283,12 +287,46 @@ HS01 的最大值是绕去吃分数球的岔路。所有 L1 记录在 TAS 线上
   这些帧都进入帧日志。可以用 `prefix`（`BALLRAIN_PREFIX`，mod 先按回放方式注入）从 TAS 前缀交接；TAS 起点见 §5.1。
 - **动作**：`Discrete(9)`（无键、四个方向、四个斜向），`camera_actions=True` 时再加 shift+左 / shift+右。每步注入 `action_repeat` 帧，
   delta 固定为 `delta_ms`（默认 f32(1000/132)，每帧一个 PSI），遇 BallOff / LevelFinish / GameOver 提前停止，未执行的帧作废。
+- **世界方向动作**（`world_actions`，默认关；M2 训练用 `--world-actions`）：9 个动作是世界方向（上 = +z，右 = +x，与 `FeatureConfig(camera="world")` 的方向特征同一个系），
+  env 每一步按当前 `Cam_OrientRef` 的 (right, forward)（`features.yaw_basis`）换成方向键：`world_to_camera_keys`，`Cam_OrientRef` 是 90° 的整数倍，分量恰好是 −1 / 0 / 1。
+  原因：方向键按相机朝向推球，相机系的特征 + 相机系的动作在另一个相机朝向下看到的是旋转过的关卡。L1 的 SR01_1_14_457_264 在第 141 帧（拿到控制之前）和第 6276 帧各转一次相机，
+  `Cam_OrientRef` 的 yaw 依次是 0 →（第 103 帧）−90 →（112）90 →（208）180 →（6344）90；k = 0 的开局只按 Q、动作里没有转相机，整关都是 90。
+  所以课程起点在 [936, 6344) 的回合（相机 180）和 k = 0 的回合在同一段路上的相机差 90°。世界系的策略与相机朝向无关；相机 yaw 特征（`cam_yaw_ref`、`cam_yaw`）仍在观测里。
+  运行元数据新增 `env_options`（action repeat、camera / world actions、stale-key 重按、delta）。
+- **选键**（`world_to_camera_keys`）：按 `Cam_OrientRef` 的实际行向量算每个方向键的推力方向（上 / 下 = ±z 行、右 / 左 = ±x 行，投影到水平面再归一化，`key_push_dirs`；
+  两个键是两个独立的力，相加），在 8 种组合里取与目标世界方向余弦最大的一个（并列时单键优先）。静止时 `Cam_OrientRef` 在四分之一圈上（SR01 回放里偏差最大 1.1e-6 rad，
+  正常转相机的 250 ms 动画期间也不变，到动画结束那一帧才跳到新朝向，动画的是 `Cam_Orient`），这就是动作的精确旋转；偏离四分之一圈时（转到一半被打断等）取能推出的 8 个方向里最近的一个。
+  测试用了加 1.3e-5 噪声的矩阵和每 5° 一个的中间朝向（`tests/test_world_actions.py`）。
+- **按键推力模型**（BallanceMMO 会话读 Gameplay_Ingame 脚本 dump 后的结论，与下面的实测一致）：推力 = Force Value（纸 0.065、木 0.43、石 0.92）×
+  归一化的 `Cam_OrientRef` 对应行向量，取**最近一次 Create** 时的值。Create 发生在：每次按下（逐帧边沿，没有去抖）；以及每次转相机结束时——`Cam Navigation.Update`
+  把 Ball Navigation 关掉再打开，这个 Nop 关掉所有 SetPhysicsForce 控制器并切换 Key Events，而 Key Event 在键按着时被打开会触发 Pressed，于是按着的方向键都按新的
+  `Cam_OrientRef` 重新建力（转相机键本身还按着时是否也如此未核对）。两次转相机之间力保持锁定（已有控制器的块上再 Create 不起作用）。斜向是两个独立的力相加。
+  死亡、通关、暂停 / 菜单同样经过 Nop 关掉所有力。`Cam_OrientRef` 本身不做动画：`Cam_Orient` 用 250 ms 动画转过去，转完时 `Cam_OrientRef` 被设成 `Cam_Orient`，
+  所以 Ref 在动画结束那一帧跳到新朝向（SR01：第 6344 帧）；Ref 只有在"打断转相机"的技巧（或地图自身的基准朝向）下才会偏离四分之一圈，这正是相机守卫检查的量。
+- **按键方向锁定的处理**（`repress_stale_keys`，默认跟 `world_actions`，保留开启）：env 记录每个方向键按下时的相机（四分之一圈），某一步要按的键里有
+  "按下之后相机变过"或"之后游戏关过力"（复活、解除暂停）的，这一步的第 1 帧先松开这些键、第 2 帧起再按下（action repeat 4 时 1 + 3 帧，`info["repressed"]`）。
+  TAS 交接时，前缀最后一帧按着的键按记录里按下那一帧的相机算（`TasStarts.camera_quarters()`，缓存在记录目录的 `camera.npz`）。
+  按上面的模型这是保守的：转相机结束和控制恢复时游戏自己会重建按着的键的力，所以重按通常不改变推力，只少推 1 帧；只在 TAS 刚转完相机就交接时触发。
+  默认配置下复活快进和暂停期间注入的都是空键（`idle_keys`、`pause_keys` 为 0），控制恢复后的第一次按键本来就是新的按下。
+  **实测**（`tools/analysis/m2_key_checks.py`、`runtime/analysis/m2_key_checks.json`，真游戏）：
+  - k = 6350 交接（前缀按着下 + 右，分别在第 6338、6342 帧、相机 180 时按下，第 6344 帧相机变成 90）：选按键正好是这两个键的世界动作，
+    推力（减去空动作对照的位移）与世界动作的余弦，有重按时每步都是 1.000，不重按时也是 0.987 → 1.000（与旧相机方向的余弦 0.16 → 0.01）。
+  - k = 1000（相机 180）按住上 40 帧，按住上的同时 shift + 左转相机，再一直按住 120 帧（A），与转完后松开 1 帧再按（B）、不转相机（C）比较：
+    转完之后 50 帧的速度变化 A (−5.11, −6.53, 2.55)、B (−5.21, −6.53, 2.55)、C (0.06, −6.34, −2.31)：一直按着的键在转完后按新相机方向推，A 与 B 只差 B 少推的那 1 帧，
+    与"转相机结束时重建按着的键的力"一致。
+  - 复活：k = 15000 起推下路面死亡，复活后按住指向参考线切向的世界方向 30 步，球水平移动 8.97（同样输入下空动作 0.16）：复活后的新按键有力。
 - **Esc**（`esc_action`，HS 模式默认开，SR 模式默认关）：一次按下 = 第 1 帧 Esc、之后松开，共 `esc_frames`（默认 4，至少 3）帧。
   游戏在按下的那一帧还跑物理，之后冻结，直到下一次按下（含该帧），再下一帧恢复；PauseLevel / UnpauseLevel 事件在按下后 2 帧到达，
   `paused` 只看这两个事件（HS 记录里有 2/147 次按键没有切换）。没有控制时（不是暂停中，且 BallNav 不活动、死亡、变球、通关）Esc 被屏蔽为空帧（`esc_requires_control`）。
   暂停中方向键按 `mask_keys_while_paused` 换成 `pause_keys`（默认 0）。
 - **collect 宏**（`collect_action`，默认关）：有小球在跟随时，Esc → 每 `collect_chunk` 帧检查一次，直到没有跟随的小球或等满 `collect_max_frames` 帧 → Esc；
   否则是一个空动作。`info["collect"]` 给出前后的跟随数和等待帧数。最佳做法（用户）：飞艇和每个检查点之前按 Esc 收集。
+- **相机守卫**（始终开启，用户规则）：不允许非 90° 的视角（例如转相机被打断造成的偏离朝向）。`Cam_OrientRef` 偏离最近的四分之一圈超过 `camera_quarter_tol`（1e-4 rad；
+  零售版静止时的偏差在 1.1e-6 以内）、并且距离上一次 shift + 左 / 右按下已超过 `camera_turn_grace_ms`（400 ms 游戏时间，转相机动画约 250 ms）时，env 立即结束回合，
+  `episode_end = "camera_off_quarter"`，按终止处理（不 bootstrap），这一步的奖励改成让整个回合的回报等于 −`death_penalty`（不给这个回合任何奖励），
+  进程结束，元数据 `invalid = "camera_off_quarter"`：这个 run 永远不作为结果导出，SR 不计入（训练日志的 `invalid_runs`、`camera_off_quarter` 计数，tensorboard 同名曲线）。
+  TAS 起点同样过滤：`TasStarts` 去掉静止时相机偏离四分之一圈的帧（记录的转相机按键之后 400 ms 内除外；SR01_1_14_457_264 一帧也没有去掉）。
+  我们的 agent 没有转相机的动作，所以这个守卫在 r2 里不应触发；加入相机动作以后才有意义。
 - 所有 Esc 和暂停帧都是普通注入帧：进入帧日志和导出的 .tas，参考 TASSupport 回放时暂停也会重现（M1-B 的 HS 用例）。
 - **超时**：mod 等动作的超时 `timeout_ms` 默认 30 分钟，避免 PPO 更新期间触发。
 
@@ -433,6 +471,43 @@ random = 随机粘滞动作（2–39 步换一次），curr = 从课程抽的 TA
 - `edge_mesh` 只用静态网格：球在运动体（飞艇平台、移动板）上时它不是到"脚下这块"边界的距离。射线扇用了运动体，两者在那里不一致。
 - 纸球法向现在由 Python 按几何定向；mod 若导出球是 mindist 的第几个 synapse，就可以直接定向（需要改 mod 和重跑 M1-A）。
 - 同样输入的轨迹分叉（§5.1）：原因未查。
+- **计划：保留变球块**（用户）：TAS 回放（legacy 脚本修改）会去掉变球块，因为它们曾让 TAS 不可复现；训练环境也一样（L1 没有变球，M2 不受影响）。
+  最终模型要能在正常游戏（有变球块）里工作，所以以后加一个 env 选项（默认关，保持与 TAS 兼容）：不执行 legacy 的 Set Position 删除，用于鲁棒性训练和评估。
+  这样的 run 不能导出给 legacy TASSupport。变球之后按着的键是否还有力未核对（死亡 / 暂停会关掉力，见 §5"按键方向锁定"），遇到有变球的关卡时再测。
+
+## 9. M2 训练（`scripts/train_m2.py`、`ballrain/train/`）
+
+- **结构**：learner（本进程，PPO 更新）+ 每个游戏拷贝一个 rollout worker 进程（`ballrain/train/worker.py`），不用锁步的向量环境：
+  gymnasium / SB3 的向量环境每一步等所有拷贝，任何一个拷贝开新进程（3–5 s）都会让其它拷贝停下。实测（L1 课程起点，随机粘滞策略，8 个拷贝）：
+  AsyncVectorEnv 锁步 80 决策步/秒，8 个独立进程 222 步/秒（§7.1）。每个 worker 自己 step 自己的 `BallanceEnv`（含 reset），每 `chunk` 步把一段轨迹
+  （归一化后的观测、原始观测、动作、行为策略的 log-prob 和 value、奖励、terminated / truncated、截断时末观测的 value、段尾 bootstrap value）发给 learner；
+  learner 凑够 `batch_steps` 后做 GAE 和 PPO 更新，再把新权重、观测统计量和课程状态广播给 worker，worker 在下一个段边界换上（最多落后一次更新，
+  超过 `max_stale` 的段丢弃；PPO 的比值用段里存的行为 log-prob）。
+- **网络 / PPO**：策略和 value 各一个 MLP（默认 256-256 tanh），离散 9 动作；观测按运行均值 / 方差归一化（裁剪 ±10，第一批只拟合统计量）；
+  GAE（γ 0.997、λ 0.95，132 fps × 4 帧一步时 γ 的视野约 10 s 游戏时间）；奖励乘 `reward_scale`（0.1）；BallOff / LevelFinish / GameOver 是终止（bootstrap 0），
+  帧数上限、停滞、崩溃是截断（bootstrap 末观测的 value）。
+- **回合上限**（worker 侧截断）：帧数上限 = `cap_mult`（2.5）×（TAS 从回合起点到 LevelFinish 剩下的游戏时间；复活回合从该扇区在 TAS 里的第一帧算）+ 10 s；
+  停滞 = 参考线弧长 `stall_s`（10 s 游戏时间）内没有增加 5 单位（复活回合用 `--respawn-stall-s`）。截断结束这个游戏进程（`env.reset()` 在一条命中途会开新进程）。
+  `--stall-terminal`（r2 从第 162 次更新起）：停滞按失败处理，终止（不 bootstrap），奖励加上 −(`death_penalty` + `death_refund` × 本扇区已付进度)，与死亡相同（项名 `stall_penalty`）。
+  原因：L1 末段（参考线 s ≈ 1600–1700，TAS 在这里随运动体以 vy ≈ +2.8 上升）策略掉回下层后卡住，截断时只损失 −4 的进度加上 bootstrap 的时间价值，
+  比死亡（约 −27）便宜得多，卡住成了便宜的失败。
+- **复活回合**：`--no-respawn`（`EnvConfig.per_life=False`）时 BallOff 结束进程，下一条命是新的课程起点。r2 前期用它（策略接近均匀时复活回合几乎都停在检查点不动，
+  占了 2/3 的步数），策略熵降到 1.4 以下后恢复复活回合：验收是从关卡加载开始的整关，死亡后要从检查点静止起步，复活回合正好是这些状态。
+  日志 `rsp_cp_sec1..4` = 从各扇区检查点静止起步、到达下一个检查点（或 LevelFinish）的比例。
+- **课程成功**（`--success cp`，默认）：一个 TAS 起点的回合（`start.kind == "tas"`，含 k = 0）在这条命里到达下一个检查点（扇区号变大）或 LevelFinish 即成功；
+  `--success finish` 只认 LevelFinish。复活回合不计入课程。learner 持有唯一的 `ReverseCurriculum`，用 `update(k, success)` 更新，
+  前沿后退的规则见 §5.1（band 内最近 `min_episodes` 个回合成功率 ≥ `advance_at`）；前沿到达第一个控制帧后 k = 0 的概率改为 `--p-level-start`（0.3）。
+- **日志**（`runtime/m2-train/<run>/`）：`updates.csv`（每 `log_every` 次更新一行：步数、步/秒、前沿及其扇区、band 成功率、各起点扇区和各 2000 帧起点区间的
+  成功率 / 通关率、回合回报、死亡 / 停滞 / 上限次数、按扇区的死亡数、通关进程的 SR、起点分位数、损失、熵、KL、explained variance）、
+  `episodes.csv`（每个回合：起点、结束原因、回报和各奖励项、步数、游戏时间、平均前进速度、跳变次数、动作分布）、`runs.csv`（每个游戏进程：结束原因、正式 SR、死亡数）、
+  `tb/`（tensorboard，含起点分布直方图）、`train.log`、`ckpt_*.pt` / `latest.pt`（模型、优化器、观测统计量、课程状态、计数器；`--resume` 续训）。
+  种子：learner `--seed`，worker i 用 `seed·1000 + i`（worker 重启时加 100 × 重启次数，续训时加 7919 × 已完成的更新数），写在 `config.json`。异步采集本身不可逐位复现。
+- **磁盘**：每个进程目录约 1.8 MB（主要是 level.msg）。worker 读完元数据后删掉没有通关的进程目录，通关的只留 `.json`、`.tas`、`events.txt`（`--prune none` 全留）。
+- **停止**：在 run 目录下建 `STOP` 文件；learner 通知 worker 关闭游戏进程，之后按路径（`instances.running_in_copy`）停掉所用拷贝里还在运行的 Player.exe。
+- **评估与导出**（`scripts/eval_m2.py`）：从关卡加载（k = 0，脚本化的 Q）闭环运行，argmax 或低温采样（每个 run 一个种子），死亡后同进程复活；
+  `--export n` 把最快的 n 个通关 run 的 .tas 交给真 TASSupport 回放 3 次、BallrainIO 回放 1 次，用 `gates.export_diagnosis` 判定。
+- **CPU / GPU**：PPO 一次更新（4096 步 × 4 轮，minibatch 1024）CPU 4 线程 0.19 s，cuda:0 / cuda:1 0.11 s（GPU 同时被其它程序占满），
+  而采集 4096 步约 9 s 且与更新并行，GPU 端到端最多快 1%：用 CPU。
 
 ## 附录：线格式中 `agent-protocol.md` 没写明的约定
 

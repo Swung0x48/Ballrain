@@ -26,6 +26,7 @@ next process is drawn when that process is pre-launched, i.e. one process ahead 
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from collections import deque
@@ -34,9 +35,11 @@ from pathlib import Path
 
 import numpy as np
 
-from . import dataset, instances
+from . import dataset, instances, tas
 
 STARTS_VERSION = 1
+CAMERA_QUARTER_TOL = 1e-4  # radians; retail Cam_OrientRef at rest is within ~1.1e-6 of a quarter turn (SR01 replay)
+CAMERA_TURN_GRACE_MS = 400.0  # a shift-turn animates ~250 ms (Cam_Orient); Cam_OrientRef may be off a quarter meanwhile
 
 
 def dataset_dir() -> Path:
@@ -46,8 +49,12 @@ def dataset_dir() -> Path:
 class TasStarts:
     """Frames and valid start frames of one dataset record."""
 
-    def __init__(self, record: str, root=None):
-        """record: a dataset record name (in root, default <runtime>/datasets/tas-v1) or a record directory."""
+    def __init__(self, record: str, root=None, camera_tol: float | None = CAMERA_QUARTER_TOL,
+                 camera_grace_ms: float = CAMERA_TURN_GRACE_MS):
+        """record: a dataset record name (in root, default <runtime>/datasets/tas-v1) or a record directory.
+        camera_tol: drop start frames whose Cam_OrientRef is off a quarter turn by more than this (radians) outside
+        camera_grace_ms after a camera turn press of the record (the env's camera guard; None = keep all)."""
+        self._camera_filter = (camera_tol, camera_grace_ms)
         self.record = Path(record).name if Path(record).is_dir() else Path(record).stem
         self.dir = Path(record) if Path(record).is_dir() else Path(root or dataset_dir()) / self.record
         if not (self.dir / "raw.npz").is_file():
@@ -78,6 +85,17 @@ class TasStarts:
         os.replace(tmp, cache)  # several workers may build it at once
         self._set(c)
 
+    def _apply_camera_filter(self):
+        tol, grace_ms = self._camera_filter
+        if tol is None:
+            return
+        d = self.frames["delta"]
+        ms = float(np.median(d)) if len(d) else 1000 / 264
+        ok = self.camera_ok(tol, int(grace_ms / ms))
+        self.camera_dropped = int((~ok).sum())
+        if self.camera_dropped:
+            self.restrict(ok)
+
     def _set(self, c):
         self.valid = np.asarray(c["frames_done"], np.int64)  # observation after k frames = state at frame k
         self.sector = np.asarray(c["sector"])
@@ -87,6 +105,63 @@ class TasStarts:
         lf = int(c["levelfinish_frame"])
         self.levelfinish_frame = None if lf < 0 else lf
         self.sr_final = float(c["sr_final"])
+        self.camera_dropped = 0
+        self._apply_camera_filter()
+
+    def camera(self) -> dict:
+        """Cam_OrientRef of the replayed record per frames_done (the state after that many frames): "quarter" (yaw in
+        quarter turns 0..3, -1 before the first CAMS section) and "dev" (radians off the nearest quarter turn, 0 there).
+        Cached in camera.npz in the record directory."""
+        if getattr(self, "_cam", None) is not None:
+            return self._cam
+        cache = self.dir / "camera.npz"
+        if cache.is_file():
+            with np.load(cache) as z:
+                self._cam = {"quarter": z["quarter"], "dev": z["dev"]}
+            return self._cam
+        from .features import yaw_of
+        fds, qs, ds = [], [], []
+        for o in dataset.load_observations(self.dir / "raw.npz"):
+            if o.cams is None:
+                continue
+            y = yaw_of(o.cams["cams"][0]["matrix"])
+            fds.append(int(o.frames_done))
+            qs.append(int(round(y / (np.pi / 2))) % 4)
+            ds.append(abs(math.remainder(y, np.pi / 2)))
+        n = (max(fds) + 1) if fds else 0
+        q, d = np.full(n, -1, np.int8), np.zeros(n, np.float32)
+        q[np.asarray(fds, np.int64)], d[np.asarray(fds, np.int64)] = qs, ds
+        for i in range(1, n):  # frames without a stored observation keep the last known camera
+            if q[i] < 0 and q[i - 1] >= 0:
+                q[i], d[i] = q[i - 1], d[i - 1]
+        tmp = cache.with_name(f"camera.{os.getpid()}.{threading.get_ident()}.tmp.npz")
+        np.savez(tmp, quarter=q, dev=d)
+        os.replace(tmp, cache)
+        self._cam = {"quarter": q, "dev": d}
+        return self._cam
+
+    def camera_quarters(self) -> np.ndarray:
+        return self.camera()["quarter"]
+
+    def camera_ok(self, tol: float, grace_frames: int) -> np.ndarray:
+        """Per valid start frame: Cam_OrientRef within tol of a quarter turn, or within grace_frames after a camera turn
+        press (shift + left / right) of the record (ballrain.env camera guard)."""
+        dev = self.camera()["dev"]
+        keys = self.frames["keys"]
+        turn = ((keys & tas.KEY_SHIFT) != 0) & ((keys & (tas.KEY_LEFT | tas.KEY_RIGHT)) != 0)
+        edge = turn & ~np.r_[False, turn[:-1]]
+        last = np.maximum.accumulate(np.where(edge, np.arange(len(keys)), -10 ** 9))
+        k = self.valid
+        d = dev[np.clip(k, 0, len(dev) - 1)] if len(dev) else np.zeros(len(k))
+        recent = (k - last[np.clip(k - 1, 0, len(last) - 1)]) <= grace_frames
+        return (d <= tol) | recent
+
+    def restrict(self, mask: np.ndarray) -> None:
+        """Keep only the valid start frames where mask is True."""
+        mask = np.asarray(mask, bool)
+        self.valid, self.sector, self.sr_double = self.valid[mask], self.sector[mask], self.sr_double[mask]
+        self.points, self.lives, self.pos, self.checkpoints = (self.points[mask], self.lives[mask], self.pos[mask],
+                                                               self.checkpoints[mask])
 
     def index_of(self, k: int) -> int | None:
         i = int(np.searchsorted(self.valid, k))

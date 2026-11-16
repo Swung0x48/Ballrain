@@ -185,6 +185,7 @@ def replay_record(record, out_dir, copy: str = instances.TRAINING_COPY, level: i
         "hs_followers_at_hook": t.followers_at_hook, "hs_points_end": t.points_at_finish,
         "hs_lives_end": t.lives_at_finish, "followers_check": fol, "transforming_windows": trafo,
         "mod_version": (sess.hello or {}).get("mod_version"),
+        "backend": sess.backend,  # "retail" | "headless" (docs/headless.md)
         "prefix_frames": int(prefix_frames), "prefix_events": bool(prefix_events), "prefix_observations": sess.n_prefix_obs,
         "observation_gaps": gaps, "steps": steps, "start_s": t_start, "wall_s": wall,
         "python_framelog_equals_mod": bool(len(framelog) == sess.n_logged

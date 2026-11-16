@@ -253,6 +253,9 @@ mod 拒绝运行的情况：physics_RT.dll 的 sha256 不是 2002 版；共享�
 
 ### 8.2 每帧段（OBS1）
 
+无头后端（`docs/headless.md`）用同一布局，另加：观测头 flags bit4 `OBS_HEADLESS`、段头 `sec_flags` bit15（该段有无头引擎给不了的字段，§5 of headless.md）、
+最后一条观测里的 `HASH` 段（u64 运行指纹 + u32 帧数）。BallrainIO 不写这些。
+
 | 段 | 长度 | 布局（偏移: 类型 字段） |
 |---|---|---|
 | TIME | 69 | 0 f64 env current_time，8 f64 time_of_next_psi，16 f64 time_of_last_psi，24 f32 管理器 +0xC8，28 f32 +0xCC，32 f32 +0xD0，36 f32 本帧 GetLastDeltaTime，40 f64 SR（double 和），48 f32 GetSRScore()，52 u8 SR 计时中，53 u32 本条覆盖帧数（构造状态时）；**追加**：57 f32 float32 和，61 u32 原始帧计数（含尾帧），65 u32 尾帧数 |

@@ -70,6 +70,10 @@ class RunMeta:
     mode: str = ""
     seed: int | None = None
     copy: str = ""
+    # "retail" (Player.exe + BallrainIO) | "headless" (the approximate x87-soft engine, docs/headless.md):
+    # a headless run is never evidence about the retail game
+    backend: str = "retail"
+    trace_hash: str | None = None  # headless: run fingerprint (same frames + same engine build => same hash)
     started_at: float = 0.0
     wall_s: float = 0.0
     prefix: dict | None = None
@@ -79,6 +83,8 @@ class RunMeta:
     feature_version: str = ""
     feature_config: dict | None = None
     reward_config: dict | None = None
+    env_options: dict | None = None
+    invalid: str | None = None  # why the run must not be used as a result (e.g. "camera_off_quarter")  # action repeat, camera / world actions, stale-key re-press (ballrain.env)
     frames: int = 0
     end_reason: str | None = None
     levelfinish_frame: int | None = None

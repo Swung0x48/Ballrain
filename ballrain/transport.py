@@ -7,6 +7,13 @@ transport code is exercised without the game.
 Strict lock-step: the mod writes an observation, bumps mod_seq, sets <name>.obs; Python reads it,
 writes an action, bumps py_seq, sets <name>.act. Payload first, then seq, then SetEvent (SetEvent is
 a full barrier on Windows).
+
+The socket transport (`SocketChannel` / `SocketModChannel`, docs/headless.md) carries the same OBS1 / ACT1
+messages for the headless backend, which runs on any OS: Python listens (unix socket or TCP, the legacy
+prototype's convention: Python is the server, port base 27787), the game connects, Python pings, the game
+pongs with its hello. Frames are u32 type + u32 length + payload, little-endian; the header fields the
+shared memory carries (mod_state, end_reason, frames_done, last_error, mod_seq) travel with every
+observation and in STATE messages.
 """
 from __future__ import annotations
 
@@ -14,10 +21,16 @@ import ctypes
 import mmap
 import os
 import secrets
+import select
+import socket
 import struct
 import sys
+import tempfile
+import threading
 import time
-from ctypes import wintypes
+
+if sys.platform == "win32":
+    from ctypes import wintypes
 
 from . import protocol as P
 
@@ -248,7 +261,8 @@ class PyChannel:
 
 
 class ModChannel:
-    """The mod's end (fake game / tests): opens the mapping and events created by PyChannel."""
+    """The mod's end (fake game / tests): opens the mapping and events created by PyChannel.
+    (The socket transport's mod end is SocketModChannel.)"""
 
     def __init__(self, name: str):
         self.name = name
@@ -319,3 +333,285 @@ class ModChannel:
             if h:
                 _k32.CloseHandle(h)
         self.ev_obs = self.ev_act = None
+
+
+# ------------------------------------------------------------------------------------ socket transport
+
+BR_PING, BR_PONG, BR_STATE, BR_OBS, BR_ACT = 0x100, 0x101, 0x102, 0x103, 0x104
+FRAME_HDR = struct.Struct("<II")  # type, payload length
+OBS_HDR = struct.Struct("<IIIIQ")  # mod_state, end_reason, frames_done, last_error, mod_seq
+STATE_HDR = struct.Struct("<IIII")  # mod_state, end_reason, frames_done, last_error
+PONG = struct.Struct("<III180s")  # pid, obs version bitmap, mod_state, version string
+DEFAULT_TCP_PORT = 27787  # the legacy TCP prototype's port (legacy/comm_protocol.md); 0 = any free port
+SOCKET_MAX_ACTION_FRAMES = 1 << 20
+_SOCK_COUNTER = iter(range(1 << 62))
+
+
+def default_socket_kind() -> str:
+    return "unix" if hasattr(socket, "AF_UNIX") and sys.platform != "win32" else "tcp"
+
+
+def _recv_exact(sock, n: int) -> bytes | None:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+
+class SocketChannel:
+    """Python's end of the socket transport: listens, accepts the game's connection, then the same calls as
+    PyChannel (header, wait_hello, wait_obs, send_action, close). EOF on the socket is PeerGone (the game
+    process is gone) unless the game had ended; process_handle arguments are accepted and ignored."""
+
+    env_var = "BALLRAIN_SOCK"
+
+    def __init__(self, kind: str | None = None, host: str = "127.0.0.1", port: int = 0, path: str | None = None):
+        self.kind = kind or default_socket_kind()
+        self._path = None
+        if self.kind == "unix":
+            # macOS limits sun_path to 104 bytes: a short name in the temp directory
+            self._path = path or os.path.join(tempfile.gettempdir(),
+                                              f"brl-{os.getpid()}-{next(_SOCK_COUNTER)}-{secrets.token_hex(2)}.sock")
+            if os.path.exists(self._path):
+                os.unlink(self._path)
+            self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.listener.bind(self._path)
+            self.name = f"unix:{self._path}"
+        elif self.kind == "tcp":
+            self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.listener.bind((host, port))
+            self.name = f"tcp:{host}:{self.listener.getsockname()[1]}"
+        else:
+            raise ValueError(f"unknown socket kind {kind!r}")
+        self.listener.listen(1)
+        self.conn = None
+        self._hdr = {"magic": 0, "version": P.PROTOCOL_VERSION, "size": 0, "obs_off": 0, "obs_cap": 0, "act_off": 0,
+                     "act_cap": 0, "mod_seq": 0, "py_seq": 0, "mod_state": P.ModState.INIT, "end_reason": 0,
+                     "mod_pid": 0, "py_pid": os.getpid(), "frames_done": 0, "last_error": 0, "obs_versions": 0,
+                     "mod_version": ""}
+        self.last_mod_seq = 0
+        self.py_seq = 0
+        self._closed_peer = False
+
+    @property
+    def max_action_frames(self) -> int:
+        return SOCKET_MAX_ACTION_FRAMES
+
+    def header(self) -> dict:
+        return dict(self._hdr)
+
+    def _accept(self, deadline: float | None) -> None:
+        if self.conn is not None:
+            return
+        left = None if deadline is None else max(0.0, deadline - time.monotonic())
+        self.listener.settimeout(left)
+        try:
+            conn, _ = self.listener.accept()
+        except (socket.timeout, TimeoutError):
+            raise Timeout("the game did not connect") from None
+        conn.settimeout(None)
+        if self.kind == "tcp":
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.conn = conn
+
+    def _recv(self, deadline: float | None):
+        """(type, payload), or None on EOF. Raises Timeout."""
+        if self._closed_peer:
+            return None
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            raise Timeout("no message from the game")
+        r, _, _ = select.select([self.conn], [], [], left)
+        if not r:
+            raise Timeout("no message from the game")
+        try:
+            hdr = _recv_exact(self.conn, FRAME_HDR.size)
+            if hdr is None:
+                self._closed_peer = True
+                return None
+            typ, n = FRAME_HDR.unpack(hdr)
+            payload = _recv_exact(self.conn, n) if n else b""
+        except OSError:
+            self._closed_peer = True
+            return None
+        if payload is None:
+            self._closed_peer = True
+            return None
+        return typ, payload
+
+    def _apply_state(self, payload: bytes) -> None:
+        st, end, frames, err = STATE_HDR.unpack_from(payload, 0)
+        self._hdr.update(mod_state=st, end_reason=end, frames_done=frames, last_error=err)
+
+    def wait_hello(self, timeout_s: float, process_handle=None) -> dict:
+        deadline = time.monotonic() + timeout_s
+        self._accept(deadline)
+        self._send(BR_PING, b"")
+        while True:
+            m = self._recv(deadline)
+            if m is None:
+                raise PeerGone("game process exited before hello")
+            typ, payload = m
+            if typ == BR_STATE:
+                self._apply_state(payload)
+                if self._hdr["mod_state"] == P.ModState.ERROR:
+                    raise TransportError(f"game refused to run (last_error {self._hdr['last_error']}, see its log)")
+            elif typ == BR_PONG:
+                pid, vers, st, ver = PONG.unpack_from(payload, 0)
+                self._hdr.update(mod_pid=pid, obs_versions=vers, mod_state=st,
+                                 mod_version=ver.split(b"\0", 1)[0].decode("latin-1"))
+                return self.header()
+
+    def wait_obs(self, timeout_s: float | None, process_handle=None, poll_s: float = 0.25,
+                 final_grace_s: float = 2.0) -> bytes | None:
+        """Next observation's bytes; None when the game ended (or failed) without a new one."""
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        if self.conn is None:
+            self._accept(deadline)
+        while True:
+            m = self._recv(deadline)
+            if m is None:
+                if self._hdr["mod_state"] in (P.ModState.ENDED, P.ModState.ERROR):
+                    return None
+                raise PeerGone("game process closed the connection")
+            typ, payload = m
+            if typ == BR_STATE:
+                self._apply_state(payload)
+            elif typ == BR_OBS:
+                st, end, frames, err, seq = OBS_HDR.unpack_from(payload, 0)
+                self._hdr.update(mod_state=st, end_reason=end, frames_done=frames, last_error=err, mod_seq=seq)
+                self.last_mod_seq = seq
+                return payload[OBS_HDR.size:]
+
+    def _send(self, typ: int, payload: bytes) -> None:
+        try:
+            self.conn.sendall(FRAME_HDR.pack(typ, len(payload)) + payload)
+        except OSError as e:
+            raise PeerGone(f"send failed: {e}") from None
+
+    def send_action(self, action: P.Action) -> int:
+        if len(action.frames) > self.max_action_frames:
+            raise ValueError(f"{len(action.frames)} frames exceed {self.max_action_frames}")
+        self.py_seq += 1
+        self._send(BR_ACT, P.encode_action(action, self.py_seq))
+        self._hdr["py_seq"] = self.py_seq
+        return self.py_seq
+
+    def close(self):
+        for s in (self.conn, self.listener):
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        self.conn = None
+        if self._path and os.path.exists(self._path):
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+        self._path = None
+
+
+class SocketModChannel:
+    """The game's end of the socket transport, for the fake game and tests (the real one is
+    headless/src/ballrain_agent.cpp). Same calls as ModChannel."""
+
+    def __init__(self, name: str, connect_timeout_s: float = 30.0):
+        self.name = name
+        if name.startswith("unix:"):
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            addr = name[5:]
+        elif name.startswith("tcp:"):
+            host, port = name[4:].rsplit(":", 1)
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            addr = (host, int(port))
+        else:
+            raise TransportError(f"bad socket address {name!r}")
+        self.sock.settimeout(connect_timeout_s)
+        self.sock.connect(addr)
+        self.sock.settimeout(None)
+        self.state, self.end_reason, self.frames_done, self.last_error = 0, 0, 0, 0
+        self.mod_seq = 0
+        self.last_py_seq = 0
+        self._lock = threading.Lock()
+        self._pinged = False
+
+    def _send(self, typ, payload):
+        with self._lock:
+            self.sock.sendall(FRAME_HDR.pack(typ, len(payload)) + payload)
+
+    def _recv(self, timeout_s):
+        r, _, _ = select.select([self.sock], [], [], timeout_s)
+        if not r:
+            return "timeout"
+        try:
+            hdr = _recv_exact(self.sock, FRAME_HDR.size)
+            if hdr is None:
+                return None
+            typ, n = FRAME_HDR.unpack(hdr)
+            payload = _recv_exact(self.sock, n) if n else b""
+        except OSError:
+            return None
+        return None if payload is None else (typ, payload)
+
+    def hello(self, version: str, pid: int | None = None, obs_versions: int = 1 << 1) -> None:
+        if not self._pinged:
+            m = self._recv(30.0)
+            if not isinstance(m, tuple) or m[0] != BR_PING:
+                raise TransportError("no ping from the client")
+            self._pinged = True
+        self.state = P.ModState.HELLO
+        self._send(BR_PONG, PONG.pack(pid or os.getpid(), obs_versions, self.state,
+                                      version.encode("latin-1")[:179]))
+
+    def set_state(self, state: int, end_reason: int | None = None, frames_done: int | None = None):
+        if end_reason is not None:
+            self.end_reason = end_reason
+        if frames_done is not None:
+            self.frames_done = frames_done
+        self.state = state
+        try:
+            self._send(BR_STATE, STATE_HDR.pack(self.state, self.end_reason, self.frames_done, self.last_error))
+        except OSError:
+            pass
+
+    def write_obs(self, data: bytes, frames_done: int, signal: bool = True) -> None:
+        self.frames_done = frames_done
+        self.mod_seq += 1
+        self._send(BR_OBS, OBS_HDR.pack(self.state, self.end_reason, frames_done, self.last_error, self.mod_seq)
+                   + bytes(data))
+
+    def signal(self):
+        pass
+
+    def wait_action(self, timeout_s: float | None, cancel=None) -> P.Action | None:
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        while True:
+            if cancel is not None and cancel.is_set():
+                return None
+            left = 0.25 if deadline is None else min(0.25, deadline - time.monotonic())
+            if left <= 0:
+                return None
+            m = self._recv(left)
+            if m == "timeout":
+                continue
+            if m is None:
+                return None  # client gone: the real game ends as on a timeout
+            typ, payload = m
+            if typ != BR_ACT:
+                continue
+            a, seq = P.decode_action(payload, 0)
+            if seq != (self.last_py_seq + 1) & 0xFFFFFFFF:
+                raise TransportError(f"action py_seq {seq} != {self.last_py_seq + 1}")
+            self.last_py_seq = seq
+            return a
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass

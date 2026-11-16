@@ -10,13 +10,16 @@
 | 路径 | 内容 |
 |---|---|
 | `BallrainIO/` | C++ BML+ 0.3.12 mod。回放模式（M0）复现 TASSupport legacy 回放；agent 模式按 `docs/agent-protocol.md` 与 Python 锁步 |
+| `headless/` | 无头后端（近似环境）：BallanceMMO x87-soft 无头引擎上的 agent 模式，同一套线格式，socket 传输；补丁集、源码提交、Mac 编译与训练脚本（`docs/headless.md`） |
 | `ballrain/` | Python 包（见下表） |
 | `scripts/m0_gates.py` | M0 保真门禁 G0–G5（启动游戏） |
 | `scripts/make_copies.py` | 创建 / 校验训练拷贝 `runtime/train-01..07`，同步新编译的 mod |
 | `scripts/build_tas_dataset.py` | 用 agent 模式回放全部 TAS，保存逐帧原始状态（启动游戏） |
 | `scripts/build_refpaths.py` | 从 TAS 数据集生成各关的 TAS 参考线 `benchmarks/refpaths/L<nn>.npz`（离线） |
 | `scripts/m2_start_states.py` | TAS 起点的开销、吞吐、导出验收（启动游戏，结果在 `runtime/m2-results/`） |
-| `docs/` | `benchmarks.md` 基准，`state-spec.md` 游戏状态清单，`agent-protocol.md` IPC 契约，`observations.md` 观测 / 奖励 / 录制 |
+| `scripts/train_m2.py` | M2 训练：PPO + 反向课程，L1 SR（启动游戏，输出在 `runtime/m2-train/<run>/`，见 `docs/observations.md` §9） |
+| `scripts/eval_m2.py` | M2 评估（从关卡加载闭环运行）与导出验收（真 TASSupport 回放 3 次） |
+| `docs/` | `benchmarks.md` 基准，`state-spec.md` 游戏状态清单，`agent-protocol.md` IPC 契约，`observations.md` 观测 / 奖励 / 录制，`headless.md` 无头后端 |
 | `tests/` | `uv run pytest`；不启动游戏（`BALLRAIN_LIVE=1` 时才跑 `test_live.py`） |
 | `reference/TASSupport/` | 参考 TASSupport 源码 |
 | `legacy/` | 早期 TCP 原型（`BallanceEnv.py`、`TCPServer.py`、`Message.py`、`main.py`、`validate_image.py`、`comm_protocol.md`），已不再使用，只作参考 |
@@ -35,8 +38,10 @@
 | `rewards.py`、`recording.py` | 奖励；每个进程的 .tas + 元数据（SR 按 BML+ 0.3.12 规则） |
 | `env.py`、`vecenv.py` | gymnasium 环境（每条命一个回合，可从 TAS 第 k 帧起步，可预启动下一个进程）、N 个拷贝的向量环境 |
 | `curriculum.py` | TAS 起点与反向课程 |
+| `train/` | M2 训练：`ppo.py`（网络、观测归一化、GAE、PPO 更新）、`worker.py`（每个拷贝一个异步 rollout 进程） |
 | `dataset.py` | TAS 数据集构建 |
 | `fakegame.py` | 模拟 mod（同一套传输和线格式），用于测试和离线开发 |
+| `headless.py` | 无头后端的启动器（`EnvConfig(backend="headless")`），见 `docs/headless.md` |
 
 ## 环境准备
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import math
 import os
 import threading
 import time
@@ -45,6 +46,8 @@ ARROWS9 = (0, tas.KEY_UP, tas.KEY_DOWN, tas.KEY_LEFT, tas.KEY_RIGHT, tas.KEY_UP 
 CAMERA_ACTIONS = (tas.KEY_SHIFT | tas.KEY_LEFT, tas.KEY_SHIFT | tas.KEY_RIGHT)
 ESC, COLLECT = "esc", "collect"  # special actions (see the module docstring)
 EPISODE_STOP = ("BallOff", "LevelFinish", "GameOver")
+ARROW_BITS = (tas.KEY_UP, tas.KEY_DOWN, tas.KEY_LEFT, tas.KEY_RIGHT)
+ARROW_MASK = tas.KEY_UP | tas.KEY_DOWN | tas.KEY_LEFT | tas.KEY_RIGHT
 _RUN_COUNTER = itertools.count()
 
 
@@ -57,6 +60,20 @@ class EnvConfig:
     delta_ms: float = float(np.float32(1000 / 132))
     action_repeat: int = 1  # frames per env step (each frame enters the .tas)
     camera_actions: bool = False  # add shift+left / shift+right
+    # arrow actions are world directions (UP = +z, RIGHT = +x, as FeatureConfig(camera="world")), mapped to the arrow keys
+    # of the current Cam_OrientRef basis at every step (world_to_camera_keys); with camera-relative keys a policy trained
+    # under one camera orientation sees a rotated level under another (L1: the TAS turns the camera, a k = 0 run does not)
+    world_actions: bool = False
+    # an arrow key's force takes Cam_OrientRef at its latest Create: each press, and for held keys the end of each camera
+    # turn (the game re-creates them); death and pause shut all forces down (docs/observations.md 5). True (conservative):
+    # a key held since before a Cam_OrientRef change, a respawn or an unpause is released for the first frame of the step
+    # and pressed again on the second (costs one frame of that key's push). None = on with world_actions
+    repress_stale_keys: bool | None = None
+    # camera guard (always on, user rule): Cam_OrientRef off a quarter turn by more than camera_quarter_tol radians while
+    # no camera turn is in progress (more than camera_turn_grace_ms of game time since the last shift + left / right
+    # press) ends the episode ("camera_off_quarter"), marks the run invalid and takes back the episode's reward
+    camera_quarter_tol: float = 1e-4
+    camera_turn_grace_ms: float = 400.0
     esc_action: bool | None = None  # add the Esc (pause / unpause) action; None: on in HS mode, off in SR mode
     collect_action: bool = False  # add the "collect" macro (Esc, wait for the followers, Esc)
     esc_frames: int = 4  # frames of one Esc action: Esc down on the first, released after
@@ -93,11 +110,55 @@ class EnvConfig:
     trace: bool = False
     seed: int | None = None
     launch: str = "direct"  # instances.LAUNCH_RECIPES key
+    # "retail" (Player.exe + BallrainIO, the authority) | "headless" (the approximate x87-soft engine,
+    # ballrain.headless; headless = HeadlessConfig fields as a dict, {} / None for the environment defaults)
+    backend: str = "retail"
+    headless: dict | None = None
     features: FeatureConfig = field(default_factory=FeatureConfig)
     reward: RewardConfig | None = None
 
     def reward_config(self) -> RewardConfig:
         return self.reward if self.reward is not None else RewardConfig(mode=self.mode)
+
+
+def key_push_dirs(cam_matrix) -> dict:
+    """Horizontal world direction each arrow key pushes the ball under the camera reference cam_matrix (Cam_OrientRef,
+    CK rows x, y, z axis, pos): UP / DOWN along +- the z row, RIGHT / LEFT along +- the x row, each projected on the
+    horizontal plane and normalised (the actual rows: off a quarter turn they are not axis-aligned)."""
+    m = np.asarray(cam_matrix, np.float64)
+    out = {}
+    for bit, row, sign in ((tas.KEY_UP, 2, 1.0), (tas.KEY_DOWN, 2, -1.0), (tas.KEY_RIGHT, 0, 1.0), (tas.KEY_LEFT, 0, -1.0)):
+        v = sign * m[row].copy()
+        v[1] = 0.0
+        n = np.linalg.norm(v)
+        out[bit] = v / n if n > 1e-9 else np.zeros(3)
+    return out
+
+
+_KEY_SETS = tuple(k for k in ARROWS9 if k)  # the 8 non-empty arrow combinations (each pair of keys is a sum of forces)
+
+
+def world_to_camera_keys(keys: int, cam_matrix) -> int:
+    """Arrow keys whose push best realises the world direction of `keys` (UP = +z, DOWN = -z, RIGHT = +x, LEFT = -x)
+    under the camera reference cam_matrix: of the 8 arrow combinations, the one whose summed push (key_push_dirs; two
+    keys are two independent forces) has the largest cosine with the wanted direction (ties: the first in ARROWS9 order,
+    single keys before diagonals). At rest Cam_OrientRef is a quarter turn and this is the exact rotation of the action;
+    off a quarter turn (mid-turn or after an interrupted turn) it is the nearest of the 8 directions the keys can push.
+    Other bits pass through."""
+    if not keys & ARROW_MASK:
+        return keys
+    w = np.array([bool(keys & tas.KEY_RIGHT) - bool(keys & tas.KEY_LEFT), 0.0,
+                  bool(keys & tas.KEY_UP) - bool(keys & tas.KEY_DOWN)], np.float64)
+    w /= np.linalg.norm(w)
+    dirs = key_push_dirs(cam_matrix)
+    best, best_c = 0, -np.inf
+    for ks in _KEY_SETS:
+        v = sum(dirs[b] for b in ARROW_BITS if ks & b)
+        n = np.linalg.norm(v)
+        c = float(v @ w) / n if n > 1e-9 else -np.inf
+        if c > best_c + 1e-9:
+            best, best_c = ks, c
+    return (keys & ~ARROW_MASK) | best
 
 
 class BallanceEnv(gym.Env):
@@ -107,6 +168,14 @@ class BallanceEnv(gym.Env):
         self.cfg = config or EnvConfig()
         for k, v in overrides.items():
             setattr(self.cfg, k, v)
+        if self.cfg.backend not in ("retail", "headless"):
+            raise ValueError(f"unknown backend {self.cfg.backend!r}")
+        if launcher is None and self.cfg.backend == "headless":
+            from .headless import HeadlessConfig, HeadlessLauncher
+            launcher = HeadlessLauncher(HeadlessConfig(**(self.cfg.headless or {})))
+        if launcher is not None and getattr(launcher, "backend", "retail") != self.cfg.backend:
+            raise ValueError(f"launcher backend {getattr(launcher, 'backend', 'retail')!r} != EnvConfig.backend "
+                             f"{self.cfg.backend!r}")
         self.launcher = launcher
         self.fx = FeatureExtractor(self.cfg.features)
         self.reward = Reward(self.cfg.reward_config())
@@ -133,7 +202,8 @@ class BallanceEnv(gym.Env):
         c = self.cfg
         if c.start_record and c.prefix:
             raise ValueError("start_record and prefix are exclusive")
-        self.starts = TasStarts(c.start_record) if c.start_record else None
+        self.starts = (TasStarts(c.start_record, camera_tol=c.camera_quarter_tol, camera_grace_ms=c.camera_turn_grace_ms)
+                       if c.start_record else None)
         if self.starts is not None and self.starts.level != c.level:
             raise ValueError(f"start record {c.start_record} is level {self.starts.level}, not {c.level}")
         self.curriculum = None
@@ -146,6 +216,11 @@ class BallanceEnv(gym.Env):
         self._copy_i = 0
         self._warm = None  # (thread, result box) of the pre-launched process
         self._start: dict = {}  # how the current episode started (info["start"])
+        self._held = 0  # arrow keys down in the last injected frame (repress_stale_keys)
+        self._press_q: dict = {}  # arrow bit -> Cam_OrientRef quarter turn when it went down
+        self._repress = c.world_actions if c.repress_stale_keys is None else bool(c.repress_stale_keys)
+        self._ms_since_turn = float("inf")  # game ms since the last camera turn press (camera guard)
+        self.camera_violations = 0
 
     # ------------------------------------------------------------------------------ process
     def _out_root(self) -> Path:
@@ -231,7 +306,11 @@ class BallanceEnv(gym.Env):
             data = prefix.read_bytes()
             prefix_meta = {"path": prefix.name if k else str(prefix), "frames": len(data) // tas.FRAME_SIZE,
                            "sha256": hashlib.sha256(data).hexdigest()}
+        env_options = {"action_repeat": c.action_repeat, "camera_actions": c.camera_actions,
+                       "world_actions": c.world_actions, "repress_stale_keys": self._repress, "delta_ms": c.delta_ms}
         rec = RunRecorder(run_dir, run_id, c.level, mode=c.mode, seed=c.seed, copy=copy, prefix=prefix_meta,
+                          backend=c.backend,
+                          env_options=env_options,
                           start_state=start_meta, feature_version=self.cfg.features.version,
                           feature_config=self.cfg.features.to_dict(), reward_config=self.cfg.reward_config().to_dict())
         t0 = time.perf_counter()
@@ -275,6 +354,7 @@ class BallanceEnv(gym.Env):
         self.run_dir = prepared["run_dir"]
         self._start = prepared["start"]
         self._copy_i = self._copies.index(prepared["start"]["copy"])
+        self._init_held(prepared["start"])
         if c.warm_pool:
             self._launch_warm()
 
@@ -351,6 +431,7 @@ class BallanceEnv(gym.Env):
         if rec.lives and rec.lives[-1].end_frame is None:
             rec.end_life(s.frames_done, reason or s.end_reason_name or "stopped", s.tracker)
         rec.meta.sr_mod_at_levelfinish = s.sr_at_levelfinish
+        rec.meta.trace_hash = s.trace_hash
         meta = rec.finish(s.tracker, s.end_reason_name, s.mod_framelog(), s.final_time, s.sren)
         self.finished_runs.append(meta)
         self.last_run_ok = rec.meta.framelog_match is not False
@@ -372,8 +453,12 @@ class BallanceEnv(gym.Env):
         s = self.session
         if s is not None and not s.ended and self._after_death and not fresh:
             # per-life episodes: fast-forward the death and respawn with explicit idle frames
+            f0 = s.frames_done
             s.run_until(self.cfg.idle_keys, ["BallNavActive", "GameOver", "LevelFinish"], self.delta,
                         limit=self.cfg.respawn_limit_frames)
+            self._ms_since_turn += (s.frames_done - f0) * float(self.delta)
+            self._set_held(self.cfg.idle_keys)
+            self._invalidate_held()  # the game shuts every key force down at death: a held key needs a new press
             self._after_death = False
             if s.ended or not s.tracker.flags.ball_nav:
                 self._finish_process()
@@ -421,6 +506,8 @@ class BallanceEnv(gym.Env):
         extra: dict = {}
         paused0 = s.tracker.flags.paused
         try:
+            if not isinstance(a, int):
+                self._held, self._press_q = 0, {}  # Esc / collect end with the arrows released
             if a == ESC:
                 if self._esc_allowed():
                     extra["esc"] = self._esc()
@@ -431,11 +518,33 @@ class BallanceEnv(gym.Env):
                 extra["collect"] = self._collect()
             else:
                 keys = a
+                if self.cfg.world_actions and a in ARROWS9:
+                    cams = s.tracker.obs.cams if s.tracker.obs is not None else None
+                    if cams is not None:
+                        keys = world_to_camera_keys(a, cams["cams"][0]["matrix"])
                 if s.tracker.flags.paused and self.cfg.mask_keys_while_paused:
                     keys = self.cfg.pause_keys
-                s.act(tas.make_frames([self.delta], [keys]), repeat=self.cfg.action_repeat, stop=EPISODE_STOP)
+                if a in CAMERA_ACTIONS:
+                    self._ms_since_turn = -float(self.delta) * self.cfg.action_repeat  # counts from the press
+                stale = self._stale(keys) if self._repress else 0
+                if stale and self.cfg.action_repeat > 1:
+                    extra["repressed"] = int(stale)
+                    R = self.cfg.action_repeat
+                    s.act(tas.make_frames([self.delta] * R, [keys & ~stale] + [keys] * (R - 1)), repeat=1,
+                          stop=EPISODE_STOP)
+                    done = s.frames_done - n0
+                    if done >= 1:
+                        self._set_held(keys & ~stale)
+                    if done >= 2:
+                        self._set_held(keys)
+                else:
+                    s.act(tas.make_frames([self.delta], [keys]), repeat=self.cfg.action_repeat, stop=EPISODE_STOP)
+                    if s.frames_done > n0:
+                        self._set_held(keys)
             if paused0 or s.tracker.flags.paused:
                 self._ep_pause_frames += s.frames_done - n0
+            if paused0 and not s.tracker.flags.paused:
+                self._invalidate_held()  # pausing shuts the key forces down
             cap = self.cfg.max_pause_frames
             if not s.ended and s.tracker.flags.paused and (
                     (cap is not None and s.tracker.paused_frames() >= cap) or self._pause_budget_spent()):
@@ -457,16 +566,32 @@ class BallanceEnv(gym.Env):
         if not terminated and (s.ended or (self.cfg.max_episode_frames is not None
                                            and self._ep_frames >= self.cfg.max_episode_frames)):
             truncated = True
+        self._ms_since_turn += (s.frames_done - n0) * float(self.delta)
+        cam_bad = not terminated and not s.ended and self._camera_off_quarter()
+        if cam_bad:
+            terminated, truncated = True, False
         obs, finfo = self.fx.compute(s.tracker)
         p = finfo.get("path")
         r, terms = self.reward.step(s.tracker, self._arc(finfo), died, finished, terminated,
                                     rebase=bool(p and p.get("jump")), supported=finfo.get("supported", False))
+        if cam_bad:  # no credit for the episode: its return becomes -death_penalty
+            pen = -self.reward.total - self.reward.cfg.death_penalty
+            terms = dict(terms, camera_off_quarter=pen)
+            r += pen
+            self.reward.total += pen
+            self.camera_violations += 1
         info = self._info(finfo, new, terms)
         info.update(extra)
         if error:
             info["error"] = error
         if terminated or truncated:
-            reason = "BallOff" if died else "LevelFinish" if finished else "GameOver" if game_over else "truncated"
+            reason = ("camera_off_quarter" if cam_bad else "BallOff" if died else "LevelFinish" if finished
+                      else "GameOver" if game_over else "truncated")
+            if cam_bad:
+                self.recorder.meta.invalid = "camera_off_quarter"
+                self.recorder.meta.notes.append(f"camera_off_quarter at frame {s.frames_done}: Cam_OrientRef "
+                                                f"{self._camera_dev():.3g} rad off a quarter turn, no turn in progress")
+                info["camera_off_quarter"] = True
             self.recorder.end_life(s.frames_done, reason, s.tracker, self._ep_steps, self.reward.total)
             info["episode_end"] = reason
             self._after_death = died and self.cfg.per_life and not s.ended
@@ -474,6 +599,81 @@ class BallanceEnv(gym.Env):
                 info["run_meta"] = str(self._finish_process(reason))
                 info["framelog_match"] = self.last_run_ok
         return obs, float(r), terminated, truncated, info
+
+    # ------------------------------------------------------------------------------ held arrow keys
+    def _cam_quarter(self) -> int | None:
+        """Cam_OrientRef yaw in quarter turns (0..3), None without a CAMS section."""
+        o = self.session.tracker.obs if self.session is not None else None
+        cams = o.cams if o is not None else None
+        if cams is None:
+            return None
+        from .features import yaw_of
+        return int(round(yaw_of(cams["cams"][0]["matrix"]) / (np.pi / 2))) % 4
+
+    def _camera_dev(self) -> float:
+        o = self.session.tracker.obs if self.session is not None else None
+        cams = o.cams if o is not None else None
+        if cams is None:
+            return 0.0
+        from .features import yaw_of
+        return abs(math.remainder(yaw_of(cams["cams"][0]["matrix"]), math.pi / 2))
+
+    def _camera_off_quarter(self) -> bool:
+        """Camera guard: Cam_OrientRef off a quarter turn (camera_quarter_tol) with no turn in progress."""
+        return (self._camera_dev() > self.cfg.camera_quarter_tol
+                and self._ms_since_turn > self.cfg.camera_turn_grace_ms)
+
+    def _invalidate_held(self) -> None:
+        """Control returns after the game shut the key forces down (death, pause): every held arrow key is stale."""
+        for b in ARROW_BITS:
+            if self._held & b:
+                self._press_q[b] = None
+
+    def _set_held(self, keys: int) -> None:
+        """The arrow keys of the frame just injected; a key that went down takes the current camera."""
+        keys = int(keys) & ARROW_MASK
+        q = self._cam_quarter()
+        for b in ARROW_BITS:
+            if keys & b and not self._held & b:
+                self._press_q[b] = q
+            elif not keys & b:
+                self._press_q.pop(b, None)
+        self._held = keys
+
+    def _stale(self, keys: int) -> int:
+        """Arrow keys of `keys` that are held since before the last Cam_OrientRef change."""
+        q = self._cam_quarter()
+        out = 0
+        for b in ARROW_BITS:
+            if keys & b and self._held & b and q is not None and self._press_q.get(b, q) != q:
+                out |= b
+        return out
+
+    def _init_held(self, start: dict) -> None:
+        """Held arrow keys at the start of a process: none from level load; after a TAS prefix, the keys of its last
+        frame, each with the record's camera when it went down (TasStarts.camera_quarters)."""
+        self._held, self._press_q = 0, {}
+        self._ms_since_turn = float("inf")
+        k = int(start.get("frame") or 0)
+        if start.get("kind") != "tas" or k <= 0 or self.starts is None:
+            return
+        fr = self.starts.frames[:k]
+        turn = ((fr["keys"] & tas.KEY_SHIFT) != 0) & ((fr["keys"] & (tas.KEY_LEFT | tas.KEY_RIGHT)) != 0)
+        if turn.any():
+            e = int(np.flatnonzero(turn & ~np.r_[False, turn[:-1]])[-1])
+            self._ms_since_turn = float(np.sum(fr["delta"][e:], dtype=np.float64))
+        keys = self.starts.frames["keys"][:k]
+        last = int(keys[-1]) & ARROW_MASK
+        if not last:
+            return
+        cq = self.starts.camera_quarters()
+        for b in ARROW_BITS:
+            if last & b:
+                j = k - 1
+                while j > 0 and keys[j - 1] & b:
+                    j -= 1
+                self._press_q[b] = int(cq[j]) if j < len(cq) and cq[j] >= 0 else None  # state before frame j
+        self._held = last
 
     # ------------------------------------------------------------------------------ Esc / pause
     def _pause_budget_spent(self) -> bool:

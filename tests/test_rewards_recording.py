@@ -73,6 +73,23 @@ def test_sr_progress_without_support_is_held_until_landing_and_dropped_at_death(
     assert terms["progress"] == -5 and terms["death_refund"] == 0  # net held -5 is charged
 
 
+def test_sr_jumps_are_paid_through_the_hold_rule():
+    # a shortcut: the projection re-acquires 50 units ahead while the ball is airborne, paid at the landing
+    cfg = RewardConfig(mode="sr", progress_weight=1.0, time_weight=0.0, finish_bonus=0, death_penalty=5)
+    t = FakeTracker()
+    r = Reward(cfg)
+    r.begin(t, 0.0)
+    assert r.step(t, 50.0, False, False, False, rebase=True, supported=False)[0] == 0 and r.held == 50
+    assert r.step(t, 51.0, False, False, False, supported=True)[0] == 51
+    # a fall back onto an earlier part of the route is charged
+    assert r.step(t, 31.0, False, False, False, rebase=True, supported=True)[0] == -20
+    # the old behaviour: a jump step pays nothing
+    r = Reward(RewardConfig(mode="sr", progress_weight=1.0, time_weight=0.0, pay_jumps=False))
+    r.begin(t, 0.0)
+    assert r.step(t, 50.0, False, False, False, rebase=True, supported=True)[0] == 0
+    assert r.step(t, 51.0, False, False, False, supported=True)[0] == 1
+
+
 def test_sr_death_refund_only_covers_the_current_sector():
     cfg = RewardConfig(mode="sr", progress_weight=0.1, time_weight=0.0, death_penalty=5)
     t = FakeTracker()

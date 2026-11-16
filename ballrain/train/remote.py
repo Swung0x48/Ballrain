@@ -1,0 +1,314 @@
+"""Remote rollout workers: worker processes on another machine feeding the learner over the LAN.
+
+Learner side (scripts/train_m2.py --remote-listen HOST:PORT): a RemoteHub runs a listener thread; every connection
+(one per remote machine, scripts/remote_worker_m2.py) gets a receive thread and a send thread:
+- hello -> the hub answers with the worker template (EnvConfig with the remote backend, WorkerSpec fields, run name)
+  and a block of worker ids;
+- the receive thread puts the remote chunks / episode records into the learner's data queue exactly like a local
+  worker's (tagged with backend, host and the offset worker id), so the learner's staleness check (max_stale / the
+  remote limit) and statistics apply unchanged;
+- the send thread sends the newest parameter message (weights, observation statistics, curriculum state) whenever
+  publish() was called with a newer version; older unsent versions are skipped. publish() only swaps a reference,
+  so the learner never waits on the network.
+A disconnect ends both threads; the remote side reconnects and gets the latest parameters again.
+
+Remote side (RemoteBridge, scripts/remote_worker_m2.py): local worker processes (ballrain.train.worker, unchanged)
+on the local game copies; the bridge forwards their chunks to the hub and fans the parameters out to them. While
+disconnected it drops their chunks (they would be stale) and keeps reconnecting; the workers keep their last
+weights. Transport: multiprocessing.connection (pickle + HMAC authkey; LAN use only).
+"""
+from __future__ import annotations
+
+import copy as _copy
+import queue
+import socket
+import threading
+import time
+import traceback
+from multiprocessing.connection import Client, Listener
+
+PROTOCOL = 1
+
+
+def parse_addr(s: str) -> tuple[str, int]:
+    host, _, port = s.rpartition(":")
+    return host or "0.0.0.0", int(port)
+
+
+class RemoteHub:
+    def __init__(self, addr, authkey: bytes, data_q, template: dict, log=print, wid_base: int = 100, wid_block: int = 100):
+        self.addr, self.authkey, self.data_q, self.template, self.log = addr, authkey, data_q, template, log
+        self._latest = None
+        self._cond = threading.Condition()
+        self._next_base = wid_base
+        self._block = wid_block
+        self.conns: dict = {}  # host -> info
+        self.stats = {"connects": 0, "disconnects": 0, "chunks": 0, "bytes_params": 0}
+        self._stop = False
+        self._listener = Listener(addr, authkey=authkey)
+        self._th = threading.Thread(target=self._accept, name="remote-hub", daemon=True)
+        self._th.start()
+
+    def publish(self, msg: dict) -> None:
+        with self._cond:
+            self._latest = msg
+            self._cond.notify_all()
+
+    def close(self):
+        self._stop = True
+        with self._cond:
+            self._cond.notify_all()
+        try:
+            self._listener.close()
+        except Exception:  # noqa: BLE001
+            pass
+        for info in list(self.conns.values()):
+            try:
+                info["conn"].close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _accept(self):
+        while not self._stop:
+            try:
+                conn = self._listener.accept()
+            except Exception as e:  # noqa: BLE001
+                if not self._stop:
+                    self.log(f"remote hub: accept failed: {type(e).__name__}: {e}")
+                    time.sleep(1.0)
+                continue
+            threading.Thread(target=self._serve, args=(conn,), daemon=True, name="remote-conn").start()
+
+    def _serve(self, conn):
+        host = "?"
+        try:
+            hello = conn.recv()
+            if hello.get("type") != "hello" or hello.get("protocol") != PROTOCOL:
+                conn.send({"type": "error", "error": f"bad hello {hello!r}"})
+                return
+            host = f"{hello.get('host', '?')}#{hello.get('session', 0)}"
+            known = self.conns.get(hello.get("host"))
+            base = known["wid_base"] if known else self._next_base
+            if not known:
+                self._next_base += self._block
+            conn.send({"type": "config", "template": self.template, "wid_base": base})
+            info = {"conn": conn, "wid_base": base, "host": hello.get("host"), "backend": hello.get("backend"),
+                    "connected": time.time(), "chunks": 0}
+            self.conns[hello.get("host")] = info
+            self.stats["connects"] += 1
+            self.log(f"remote hub: {host} connected ({hello.get('n_workers')} workers, backend {hello.get('backend')}, "
+                     f"wid {base}..)")
+            alive = {"ok": True}
+            snd = threading.Thread(target=self._sender, args=(conn, alive), daemon=True, name="remote-send")
+            snd.start()
+            while alive["ok"] and not self._stop:
+                m = conn.recv()
+                if m.get("type") == "data":
+                    d = m["msg"]
+                    d["wid"] = base + int(d.get("wid", 0))
+                    for e in d.get("episodes", []) or []:
+                        e["host"] = hello.get("host")
+                    d["host"] = hello.get("host")
+                    d["remote"] = True
+                    self.data_q.put(d)
+                    if "obs" in d:
+                        info["chunks"] += 1
+                        self.stats["chunks"] += 1
+                elif m.get("type") == "bye":
+                    break
+        except (EOFError, OSError, ConnectionError):
+            pass
+        except Exception as e:  # noqa: BLE001
+            self.log(f"remote hub: {host}: {type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}")
+        finally:
+            self.stats["disconnects"] += 1
+            self.log(f"remote hub: {host} disconnected")
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            alive_flag = locals().get("alive")
+            if alive_flag:
+                alive_flag["ok"] = False
+            with self._cond:
+                self._cond.notify_all()
+
+    def _sender(self, conn, alive):
+        sent = None
+        try:
+            while alive["ok"] and not self._stop:
+                with self._cond:
+                    while alive["ok"] and not self._stop and (self._latest is None or self._latest is sent):
+                        self._cond.wait(timeout=5.0)
+                    msg = self._latest
+                if not alive["ok"] or self._stop or msg is None or msg is sent:
+                    continue
+                conn.send({"type": "params", "msg": msg})
+                sent = msg
+        except (EOFError, OSError, ConnectionError):
+            pass
+        finally:
+            alive["ok"] = False
+
+
+class RemoteBridge:
+    """Remote side: connects to the hub, runs local workers from its template, forwards chunks and parameters."""
+
+    def __init__(self, addr, authkey: bytes, copies: list, backend: str, out_root_fn, log=print, worker_overrides=None,
+                 host: str | None = None, max_queue: int = 64):
+        self.addr, self.authkey, self.copies, self.backend = addr, authkey, copies, backend
+        self.out_root_fn, self.log = out_root_fn, log
+        self.overrides = worker_overrides or {}
+        self.host = host or socket.gethostname()
+        self.session = 0
+        self.conn = None
+        self.template = None
+        self.wid_base = None
+        self.procs, self.ctrl_qs, self.specs = [], [], []
+        self.stop = False
+        self.counts = {"forwarded": 0, "dropped": 0, "params": 0, "reconnects": 0}
+        self.max_queue = max_queue
+
+    # --------------------------------------------------------------------------------- connection
+    def connect(self, timeout_s: float | None = None) -> bool:
+        t0 = time.time()
+        while not self.stop:
+            try:
+                c = Client(self.addr, authkey=self.authkey)
+                self.session += 1
+                c.send({"type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session,
+                        "backend": self.backend, "n_workers": len(self.copies)})
+                m = c.recv()
+                if m.get("type") != "config":
+                    raise ConnectionError(f"hub refused: {m}")
+                self.conn = c
+                if self.template is None:
+                    self.template, self.wid_base = m["template"], m["wid_base"]
+                self.log(f"bridge: connected to {self.addr} (session {self.session}, wid base {m['wid_base']})")
+                return True
+            except (OSError, EOFError, ConnectionError) as e:
+                if timeout_s is not None and time.time() - t0 > timeout_s:
+                    return False
+                self.log(f"bridge: connect failed ({type(e).__name__}: {e}); retrying")
+                time.sleep(3.0)
+        return False
+
+    # --------------------------------------------------------------------------------- workers
+    def start_workers(self, ctx, data_q):
+        from .worker import WorkerSpec, worker_main
+        t = self.template
+        self.data_q = data_q
+        self.ctx = ctx
+        for i, name in enumerate(self.copies):
+            self._start_worker(i, name, 0)
+
+    def _spec(self, i, name, restart):
+        from .worker import WorkerSpec
+        t = self.template
+        cfg = _copy.deepcopy(t["env"])
+        cfg.copy = name
+        cfg.backend = self.backend
+        cfg.out_root = str(self.out_root_fn(name))
+        seed = t["seed"] * 1000 + self.wid_base + i + 100 * restart + 7919 * self.session
+        cfg.seed = seed
+        if cfg.curriculum is not None:
+            cfg.curriculum = dict(cfg.curriculum, seed=seed)
+        kw = dict(t["worker"])
+        kw.update(self.overrides)
+        return WorkerSpec(wid=i, copy=name, env=cfg, seed=seed, **kw)
+
+    def _start_worker(self, i, name, restart):
+        from .worker import worker_main
+        q = self.ctx.Queue()
+        s = self._spec(i, name, restart)
+        p = self.ctx.Process(target=worker_main, args=(s, q, self.data_q), daemon=True, name=f"ballrain-rw{i}")
+        p.start()
+        if i < len(self.procs):
+            self.procs[i], self.ctrl_qs[i], self.specs[i] = p, q, s
+        else:
+            self.procs.append(p), self.ctrl_qs.append(q), self.specs.append(s)
+        if getattr(self, "_last_params", None) is not None:
+            q.put(self._last_params)
+
+    # --------------------------------------------------------------------------------- loop
+    def _recv_loop(self):
+        while not self.stop:
+            c = self.conn
+            if c is None:
+                time.sleep(0.5)
+                continue
+            try:
+                m = c.recv()
+            except (EOFError, OSError, ConnectionError):
+                self._lost(c)
+                continue
+            if m.get("type") == "params":
+                self._last_params = m["msg"]
+                self.counts["params"] += 1
+                for q in self.ctrl_qs:
+                    q.put(m["msg"])
+
+    def _lost(self, c):
+        if self.conn is c:
+            self.conn = None
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.log("bridge: disconnected; reconnecting")
+            self.counts["reconnects"] += 1
+            threading.Thread(target=self.connect, daemon=True).start()
+
+    def run(self, ctx, data_q, should_stop=lambda: False, on_fatal=None):
+        if not self.connect():
+            return
+        self.start_workers(ctx, data_q)
+        threading.Thread(target=self._recv_loop, daemon=True, name="bridge-recv").start()
+        restarts = [0] * len(self.copies)
+        while not self.stop and not should_stop():
+            try:
+                m = data_q.get(timeout=2.0)
+            except queue.Empty:
+                continue
+            if "fatal" in m:
+                i = m["wid"]
+                restarts[i] += 1
+                self.log(f"bridge: worker {i} fatal (restart {restarts[i]}): {m['fatal'][-800:]}")
+                self.procs[i].join(timeout=30)
+                if on_fatal:
+                    on_fatal(self.copies[i])
+                self._start_worker(i, self.copies[i], restarts[i])
+                m = {"wid": i, "errors": [f"fatal (restarted): {m['fatal'][-800:]}"]}
+            m["backend"] = self.backend
+            c = self.conn
+            if c is None:
+                self.counts["dropped"] += 1
+                continue
+            try:
+                c.send({"type": "data", "msg": m})
+                self.counts["forwarded"] += 1
+            except (OSError, EOFError, ConnectionError, ValueError):
+                self.counts["dropped"] += 1
+                self._lost(c)
+
+    def shutdown(self, wait_s: float = 120.0):
+        self.stop = True
+        for q in self.ctrl_qs:
+            try:
+                q.put({"cmd": "stop"})
+            except Exception:  # noqa: BLE001
+                pass
+        t_end = time.time() + wait_s
+        for p in self.procs:
+            p.join(timeout=max(1.0, t_end - time.time()))
+            if p.is_alive():
+                p.terminate()
+        c = self.conn
+        if c is not None:
+            try:
+                c.send({"type": "bye"})
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+        for q in self.ctrl_qs:
+            q.cancel_join_thread()

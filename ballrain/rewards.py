@@ -37,6 +37,11 @@ class RewardConfig:
     hold_unsupported: bool = True  # hold progress made without floor support until landing / finish, drop it at BallOff
     death_refund: float = 1.0  # at BallOff take back this fraction of the progress paid since the sector started
     checkpoint_bonus: float = 0.0
+    # pay the arc a re-acquired projection moves (ballrain.path jump=True) like any other step (through
+    # hold_unsupported): a shortcut that lands further along the line (dropping from an upper turn onto a lower
+    # part of the route) is paid for the arc it skips, a fall back onto an earlier part is charged, and the progress
+    # of an episode telescopes to s_end - s_start. False = the old behaviour (a jump step pays 0, s only moves)
+    pay_jumps: bool = True
     # HS
     score_scale: float = 0.01  # reward per score point
     hs_death_lifebonus: bool = True  # penalise one LifeBonus at BallOff
@@ -85,14 +90,15 @@ class Reward:
     def step(self, tracker: GameTracker, s: float | None, died: bool, finished: bool, terminal: bool,
              rebase: bool = False, supported: bool | None = None) -> tuple[float, dict]:
         """s: arc length of the ball's projection (None when unknown). rebase: the projection was re-acquired
-        this step (ballrain.path, jump=True): no progress reward for it, s only moves the reference.
+        this step (ballrain.path, jump=True): paid like any step when pay_jumps (default), otherwise no progress
+        reward for it and s only moves the reference.
         supported: the ball has floor support after this step (features info["supported"]); None = unknown,
         treated as supported. Returns (reward, terms)."""
         c = self.cfg
         terms = {}
         sr = tracker.sr_ms if tracker.sr_ms is not None else self.sr
         dt_s = (sr - self.sr) / 1000.0 if self.sr is not None else 0.0
-        ds = (s - self.s) if (s is not None and self.s is not None and not rebase) else 0.0
+        ds = (s - self.s) if (s is not None and self.s is not None and (c.pay_jumps or not rebase)) else 0.0
         if ds < 0:
             ds *= c.backward_scale
         r = 0.0

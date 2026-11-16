@@ -5,7 +5,10 @@ message files, a GameTracker and a RunRecorder-compatible frame log. One session
 one run; RL episodes (lives) are layered on top by ballrain.env.
 
 Launchers: GameLauncher starts Player.exe of a runtime copy (ballrain.instances safety rules);
-ballrain.fakegame.FakeLauncher runs a simulated mod in a thread over the same transport.
+ballrain.fakegame.FakeLauncher runs a simulated mod in a thread over the same transport;
+ballrain.headless.HeadlessLauncher starts the headless engine (docs/headless.md). A launcher may provide
+make_channel(cfg) (its transport: the headless backend uses the socket transport) and a `backend` name
+("retail" when absent), which decides what the hello must name.
 """
 from __future__ import annotations
 
@@ -20,6 +23,8 @@ from . import instances, protocol as P, tas
 from .protocol import Action, Ev
 from .state import GameTracker
 from .transport import PeerGone, PyChannel, Timeout, TransportError, make_name
+
+HEADLESS_HELLO = "headless"  # every headless hello names it (headless/src/ballrain_agent.cpp)
 
 DEFAULT_DELTA = np.float32(1000 / 132)
 
@@ -56,14 +61,15 @@ class SessionConfig:
                 "events": d / "events.txt"}
 
 
-def agent_env(cfg: SessionConfig, shm_name: str) -> dict:
-    """Environment of an agent-mode launch; every managed variable is set or explicitly cleared."""
+def agent_env(cfg: SessionConfig, shm_name: str, channel_var: str = "BALLRAIN_SHM") -> dict:
+    """Environment of an agent-mode launch; every managed variable is set or explicitly cleared.
+    channel_var: the variable that names the channel (BALLRAIN_SHM, or BALLRAIN_SOCK for the socket transport)."""
     p = cfg.paths()
     env = {k: None for k in instances.MANAGED_VARS}
     env.update({
         "BALLRAIN_MODE": "agent",
         "BALLRAIN_LEVEL": str(instances._check_level(cfg.level)),
-        "BALLRAIN_SHM": shm_name,
+        channel_var: shm_name,
         "BALLRAIN_PARENT_PID": str(os.getpid()),
         "BALLRAIN_TIMEOUT_MS": str(int(cfg.timeout_ms)),
         "BALLRAIN_LEVELMSG": str(p["levelmsg"]),
@@ -129,6 +135,7 @@ class AgentSession:
         self.final_time = None  # TIME section of the last observation
         self.sren = None  # SREN section (final SR / HS block of the mod), when sent
         self.sr_at_levelfinish = None
+        self.trace_hash = None  # headless backend: FNV-1a over the exported frames' ball matrices (final observation)
         self.log_chunks: list = []
         self.n_logged = 0
         self._level_loaded = False
@@ -138,6 +145,7 @@ class AgentSession:
         self.prefix_obs_mask = 0  # obs_mask sent with the prefix acknowledgements
         self.n_prefix_obs = 0
         self.timing: dict = {}  # perf_counter stamps: launch, spawned, hello, first_obs
+        self.backend = getattr(self.launcher, "backend", "retail")  # "retail" | "headless"
 
     # lifecycle ----------------------------------------------------------------------------
     def start(self) -> P.Observation:
@@ -149,8 +157,9 @@ class AgentSession:
                     p.unlink()
         if self.cfg.prefix is not None:
             self.prefix_frames = tas.load_raw(self.cfg.prefix)
-        self.chan = PyChannel(make_name(self.cfg.copy))
-        env = agent_env(self.cfg, self.chan.name)
+        make_channel = getattr(self.launcher, "make_channel", None)
+        self.chan = make_channel(self.cfg) if make_channel is not None else PyChannel(make_name(self.cfg.copy))
+        env = agent_env(self.cfg, self.chan.name, getattr(self.chan, "env_var", "BALLRAIN_SHM"))
         try:
             self.timing["launch"] = time.perf_counter()
             self.handle = self.launcher.start(env)
@@ -158,9 +167,12 @@ class AgentSession:
             wh = self._wait_handle()
             self.hello = self.chan.wait_hello(self.cfg.hello_timeout_s, wh)
             self.timing["hello"] = time.perf_counter()
-            want = instances.PHYSICS_RT_SHA256[:16]
-            if want not in self.hello["mod_version"]:
-                raise SessionError(f"mod hello {self.hello['mod_version']!r} does not name physics_RT {want}")
+            if self.backend == "retail":
+                want = instances.PHYSICS_RT_SHA256[:16]
+                if want not in self.hello["mod_version"]:
+                    raise SessionError(f"mod hello {self.hello['mod_version']!r} does not name physics_RT {want}")
+            elif HEADLESS_HELLO not in self.hello["mod_version"]:
+                raise SessionError(f"{self.backend} backend: hello {self.hello['mod_version']!r} is not a headless one")
             obs = self._next_obs()
         except Exception:
             self.close(kill=True)
@@ -209,6 +221,8 @@ class AgentSession:
             self.final_time = obs.time
         if obs.sren is not None:
             self.sren = obs.sren
+        if obs.hash is not None:  # headless backend: run fingerprint
+            self.trace_hash = f"{int(obs.hash['trace_hash']):016x}"
         # level message and increments first: the tracker resolves this observation's Physicalize /
         # Unphysicalize events through their records (ball transformations, state.GameTracker.transforming)
         if obs.has_event(Ev.StartLevel) or not self._level_loaded:

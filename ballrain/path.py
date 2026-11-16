@@ -18,7 +18,8 @@ length around the previous projection, restricted to the arc range of the curren
 Fallback ("reacquire"): when the best point of the whole sector range is closer than the windowed best by
 more than reacquire units (the ball left the line, e.g. fell to a lower part of the route), or when there is
 no previous projection (episode start, respawn, TAS hand-over) or the window is empty, the sector-range best
-is used and the result is flagged jump=True (the SR progress reward pays nothing for that step).
+is used and the result is flagged jump=True (the SR progress reward pays the jump like any step by default,
+RewardConfig.pay_jumps; with pay_jumps=False it pays nothing for that step).
 """
 from __future__ import annotations
 

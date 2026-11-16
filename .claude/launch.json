@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tensorboard",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "tensorboard", "--logdir", "runtime/m2-train", "--port", "6006", "--reload_interval", "15"],
+      "port": 6006
+    }
+  ]
+}

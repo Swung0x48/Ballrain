@@ -1,0 +1,27 @@
+Determinism (base layer): the order of a ball-ball contact pair outside a physics session comes from a host hook
+(ivp_ball_order_key_hook; NULL = the retail rule, the client_data heap addresses, which vary run to run). The
+headless agent installs the CK object id (ballrain_agent.cpp). From the x87-soft session's
+tas-bisect/hx1/patch_ballorder.py (sha256 6aec00b8735f4b2e), IVP part only.
+Pristine file sha256 8c9028320cd4b713, patched 7530ee49b05f7ace.
+
+--- a/submodule/Ballanced/Source/BuildingBlocks/physics_RT/ivp/ivp_physics/ivp_mindist.cxx
++++ b/submodule/Ballanced/Source/BuildingBlocks/physics_RT/ivp/ivp_physics/ivp_mindist.cxx
+@@ -345,6 +345,7 @@
+ // simulating the same world computes alike: the nocoll group ident first (a
+ // networked ball carries its player's group on every peer), the object name
+ // as the tie-break.  Negative when a sorts before b.
++unsigned int (*ivp_ball_order_key_hook)(void *client_data) = 0;   // hx1
+ static int ivp_ball_pair_order(const IVP_Real_Object *a, const IVP_Real_Object *b)
+ {
+     int order = strcmp(a->nocoll_group_ident, b->nocoll_group_ident);
+@@ -381,7 +382,9 @@
+ #ifdef IVP_PORTABLE_BMMO
+             // Only inside a physics session (IVP_Environment::bmmo_physics); outside one the retail address order.
+             if (pop0->get_environment()->bmmo_physics ? ivp_ball_pair_order(pop0, pop1) < 0
+-                                                                   : pop0->client_data < pop1->client_data)
++                                                                   : (ivp_ball_order_key_hook
++                                                                          ? ivp_ball_order_key_hook(pop0->client_data) < ivp_ball_order_key_hook(pop1->client_data)
++                                                                          : pop0->client_data < pop1->client_data))
+ #else
+             if (pop0->client_data < pop1->client_data)
+ #endif

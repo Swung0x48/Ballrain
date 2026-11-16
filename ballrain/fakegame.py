@@ -26,7 +26,7 @@ import numpy as np
 
 from . import protocol as P, tas
 from .protocol import Ev
-from .transport import ModChannel
+from .transport import ModChannel, SocketChannel, SocketModChannel
 
 ROAD_HALF_WIDTH = 5.0
 ROAD_LENGTH = 200.0
@@ -76,10 +76,12 @@ def box_mesh(half):
 
 class FakeGame:
     def __init__(self, env: dict, lives: int = 3, cam_forward=(0.0, 0.0, -1.0), final_delay_s: float = 0.0,
-                 score_ball_2=None):
+                 score_ball_2=None, hello: str = "FakeGame 0.1 e72e4afcfa5c33a7"):
         self.final_delay_s = final_delay_s
         self.env = env
-        self.chan = ModChannel(env["BALLRAIN_SHM"])
+        self.hello_text = hello
+        # the shared-memory transport (BALLRAIN_SHM) or the socket transport of the headless backend (BALLRAIN_SOCK)
+        self.chan = SocketModChannel(env["BALLRAIN_SOCK"]) if env.get("BALLRAIN_SOCK") else ModChannel(env["BALLRAIN_SHM"])
         self.level = int(env.get("BALLRAIN_LEVEL") or 1)
         self.timeout_s = int(env.get("BALLRAIN_TIMEOUT_MS") or 60000) / 1000
         self.max_frames = int(env["BALLRAIN_MAX_FRAMES"]) if env.get("BALLRAIN_MAX_FRAMES") else None
@@ -481,13 +483,17 @@ class FakeGame:
             secs.append(("ARRS", P.pack_arrs(cells)))
         if evs:
             secs.append(("EVTS", P.pack_list("EVTS", np.array(evs, P.EVT_DT))))
+        if final and "headless" in self.hello_text:  # the headless backend's run fingerprint (toy: over the frame log)
+            import hashlib
+            h = int.from_bytes(hashlib.blake2b(np.asarray(self.log, np.float64).tobytes(), digest_size=8).digest(), "little")
+            secs.append(("HASH", P.pack_fixed(P.HASH_DT, trace_hash=h, frames=self.frames_done)))
         secs.append(("ZZZZ", b"future section"))  # unknown tags must be skipped
         return P.build_message(P.OBS_MAGIC, self.frames_done, secs, flags=P.OBS_FINAL if final else 0)
 
     # main loop --------------------------------------------------------------------------------
     def run(self) -> None:
         ch = self.chan
-        ch.hello("FakeGame 0.1 e72e4afcfa5c33a7")
+        ch.hello(self.hello_text)
         self._ev(Ev.PreLoadLevel)
         ch.set_state(P.ModState.LOADING)
         ev_from = 0
@@ -614,12 +620,27 @@ class FakeHandle:
 
 
 class FakeLauncher:
-    """Drop-in for client.GameLauncher."""
+    """Drop-in for client.GameLauncher. transport="socket" (with backend="headless", the default for it) speaks the
+    headless backend's socket transport (ballrain.transport.SocketChannel) and hello."""
 
-    def __init__(self, **game_kwargs):
+    def __init__(self, transport: str = "shm", backend: str | None = None, socket_kind: str | None = None,
+                 **game_kwargs):
+        if transport not in ("shm", "socket"):
+            raise ValueError(transport)
+        self.transport = transport
+        self.backend = backend or ("headless" if transport == "socket" else "retail")
+        self.socket_kind = socket_kind
+        if self.backend == "headless":
+            game_kwargs.setdefault("hello", "FakeGame 0.1 headless")
         self.game_kwargs = game_kwargs
         self.handles: list = []
         self.envs: list = []
+
+    def make_channel(self, cfg):
+        if self.transport == "socket":
+            return SocketChannel(self.socket_kind)
+        from .transport import PyChannel, make_name
+        return PyChannel(make_name(cfg.copy))
 
     def start(self, env: dict):
         self.envs.append(dict(env))

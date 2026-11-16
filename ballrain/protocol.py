@@ -195,6 +195,10 @@ SREN_DT = np.dtype([("sr_double", "<f8"), ("sr_f32sum", "<f4"), ("sr_bml", "<f4"
 # observation (end of the SR tail), frames of the diagnostic post-finish window (BALLRAIN_POST_FINISH).
 SCOR_EXT_DT = np.dtype([("followers", "<u2"), ("sources", "<u2")])
 SREN_EXT_DT = np.dtype([("followers_at_finish", "<u2"), ("followers_end", "<u2"), ("post_frames", "<u4")])
+# Headless backend extension (headless/src/ballrain_agent.cpp, docs/headless.md): the run fingerprint in the final
+# observation, FNV-1a 64 over every exported frame's (frame number, ball CK matrix); the same frames on the same engine
+# build give the same hash.
+HASH_DT = np.dtype([("trace_hash", "<u8"), ("frames", "<u4")])
 EVT_DT = np.dtype([("frame", "<u4"), ("code", "<u2"), ("param", "<u2")])
 WTCH_DT = np.dtype([("ckid", "<u4"), ("visible", "u1"), ("pos", "<f4", 3)])
 TRAC_DT = np.dtype([("frame", "<u4"), ("matrix",) + M12])
@@ -212,7 +216,8 @@ LIST_SECTIONS = {  # tag -> (count format, item dtype)
     "FRIC": ("<H", FRIC_DT), "MIND": ("<H", MIND_DT), "BODY": ("<H", BODY_DT),
     "EVTS": ("<H", EVT_DT), "WTCH": ("<H", WTCH_DT), "TRAC": ("<I", TRAC_DT),
 }
-FIXED_SECTIONS = {"TIME": TIME_DT, "BALL": BALL_DT, "CAMS": CAMS_DT, "GLCT": GLCT_DT, "SCOR": SCOR_DT, "SREN": SREN_DT}
+FIXED_SECTIONS = {"TIME": TIME_DT, "BALL": BALL_DT, "CAMS": CAMS_DT, "GLCT": GLCT_DT, "SCOR": SCOR_DT, "SREN": SREN_DT,
+                  "HASH": HASH_DT}
 _EXTENSIONS = {"SCOR": (SCOR_EXT_DT, "scor_ext"), "SREN": (SREN_EXT_DT, "sren_ext")}  # appended fields
 
 # OBS1 header flags (BallrainIO Agent.cpp)
@@ -220,6 +225,8 @@ OBS_FINAL = 1  # last observation of the run
 OBS_PREFIX = 2  # written during the prefix replay (BALLRAIN_PREFIX_EVENTS)
 OBS_DROPPED = 4  # a section did not fit into the obs area and was left out
 OBS_MINIMAL = 8  # only TIME / EVTS (e.g. the first observation at PreLoadLevel)
+OBS_HEADLESS = 16  # written by the headless backend (an approximate engine, docs/headless.md), never by BallrainIO
+SECF_APPROX = 0x8000  # section flag (headless): the section has fields the engine cannot give (docs/headless.md)
 
 MSG_HDR = struct.Struct("<IHHIIII")  # magic, version, flags, byte_len, frames_done, section_count, reserved
 SEC_HDR = struct.Struct("<IHHI")  # tag, sec_version, sec_flags, payload_len
@@ -319,6 +326,7 @@ class Observation:
     sren: np.void | None = None
     scor_ext: np.void | None = None  # BallrainIO >= 0.3.1
     sren_ext: np.void | None = None  # BallrainIO >= 0.3.1
+    hash: np.void | None = None  # headless backend: run fingerprint (final observation)
     arrs: list = field(default_factory=list)
     events: np.ndarray = field(default_factory=lambda: np.zeros(0, EVT_DT))
     wtch: np.ndarray = field(default_factory=lambda: np.zeros(0, WTCH_DT))

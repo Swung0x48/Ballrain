@@ -1,0 +1,69 @@
+diff -ruN a/BallanceMMOServer/sim/headless_engine.cpp b/BallanceMMOServer/sim/headless_engine.cpp
+--- a/BallanceMMOServer/sim/headless_engine.cpp
++++ b/BallanceMMOServer/sim/headless_engine.cpp
+@@ -344,16 +344,17 @@
+                 return false;
+             }
+         }
++        const float frame_ms = frame_ms_ > 0.0f ? frame_ms_ : bmmo::session::TICK_DELTA_MS;
+         time_->SetTimeScaleFactor(1.0f);
+-        time_->SetMinimumDeltaTime(bmmo::session::TICK_DELTA_MS);
+-        time_->SetMaximumDeltaTime(bmmo::session::TICK_DELTA_MS);
++        time_->SetMinimumDeltaTime(frame_ms);
++        time_->SetMaximumDeltaTime(frame_ms);
+         // Re-patch the "Random" block instances while a level is still
+         // loading (design 9.10): base.cmo's own instances are already caught
+         // by finish_load, this catches whatever a level's file adds, before
+         // its scripts get a chance to draw from it.  Stops once
+         // Gameplay_Ingame is active so a long session does not keep scanning
+         // every object every tick.
+-        if (!bmmo::game::script_active(context_, "Gameplay_Ingame")) {
++        if (random_patch_ && !bmmo::game::script_active(context_, "Gameplay_Ingame")) {
+             const int patched = bmmo::physics::install_random_block(context_);
+             if (patched > 0) log("random block: " + std::to_string(patched) + " instances patched");
+         }
+@@ -363,7 +364,7 @@
+             error = "CKContext::Process failed: " + std::to_string(processed);
+             return false;
+         }
+-        if (std::fabs(time_->GetLastDeltaTime() - bmmo::session::TICK_DELTA_MS) > 1.0e-4f) {
++        if (std::fabs(time_->GetLastDeltaTime() - frame_ms) > 1.0e-4f) {
+             error = "behaviour delta drifted from the fixed tick: "
+                   + std::to_string(time_->GetLastDeltaTime());
+             return false;
+@@ -535,7 +536,8 @@
+ 
+     bool headless_engine::load_level(int level, std::string& error) {
+         error.clear();
+-        if (CKIpionManager* manager = physics()) manager->ResetGamePrecision();   // TASX, as request_level
++        if (!keep_precision_)   // Ballrain: the 2002 process is 24-bit until its first hull (boot), then 64 for good
++            if (CKIpionManager* manager = physics()) manager->ResetGamePrecision();   // TASX, as request_level
+         if (!options_.map_file.empty() && !redirect_level_file(level, error)) return false;
+         CKDataArray* current_level = data_array("CurrentLevel");
+         if (!current_level) {
+diff -ruN a/BallanceMMOServer/sim/headless_engine.hpp b/BallanceMMOServer/sim/headless_engine.hpp
+--- a/BallanceMMOServer/sim/headless_engine.hpp
++++ b/BallanceMMOServer/sim/headless_engine.hpp
+@@ -71,6 +71,12 @@
+         // Verbatim 256-byte keyboard buffer (a recorded retail frame).
+         void set_keyboard_state(const unsigned char* keys);
+         void clear_keys();
++        // Ballrain (headless/README.md): the behaviour delta of the next ticks (0 = the fixed tick), and
++        // whether tick() re-patches the Random blocks while a level loads (default on, as before).
++        void set_frame_ms(float ms) { frame_ms_ = ms; }
++        void set_random_patch(bool on) { random_patch_ = on; }
++        // keep the x87 precision state at load_level (the 2002 game resets it only at process start)
++        void set_keep_precision(bool on) { keep_precision_ = on; }
+ 
+         uint64_t ticks() const { return ticks_; }
+         CKContext* context() const { return context_; }
+@@ -95,6 +101,9 @@
+         CKRenderContext* render_ = nullptr;
+         void* game_info_ = nullptr;
+         uint64_t ticks_ = 0;
++        float frame_ms_ = 0.0f;
++        bool random_patch_ = true;
++        bool keep_precision_ = false;
+         bool startup_acquired_ = false;
+         bmmo::game::level_request level_request_;
+         bool map_redirect_pending_ = false;   // step CMAP: a custom map's request not redirected yet
