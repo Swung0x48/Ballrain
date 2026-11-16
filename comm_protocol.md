@@ -35,6 +35,7 @@ class MsgType(Enum):
     ResetInput = 5         # No body
     BallOff = 6            # No body
     SceneRep = 7           # Variable length body
+    DepthImage = 8         # 76800-byte body (320 x 240 x 1)
 ```
 
 ```cpp
@@ -48,6 +49,7 @@ enum class MessageType : int {
     BRM_ResetInput,
     BRM_BallOff,
     BRM_MsgSceneRep,
+    BRM_DepthImage,
     BRM_InvalidType
 };
 ```
@@ -90,7 +92,17 @@ enum class MessageType : int {
 **Body size**: 0 bytes
 **Purpose**: Signal that game state has been sent and game is waiting for next input
 
-### 5. Control Messages
+### 5. DepthImage Message (Type 8)
+**Direction**: C++ → Python
+**Body size**: 76800 bytes (320 × 240 × 1 byte per pixel)
+
+**Format**: Single-channel 8-bit depth buffer, row-major from the top-left pixel.
+
+**Purpose**: Gives the Python environment a per-frame view of the geometry around the ball (floor edges, gaps, obstacles), which is used to derive the `dist_to_edge` and `edge_depth_val` parts of the observation.
+
+**Note**: The depth image is only produced when the game runs with a specific modified build of **CKDX11Rasterizer**. The plugin dumps the Z-buffer through `DumpToMemory(..., VXBUFFER_ZBUFFER, ...)`, and the unmodified rasterizer does not provide usable depth data, so with a stock installation the message carries no valid depth image.
+
+### 6. Control Messages
 - **BallNavActive (0)**: Signals that game is ready to receive control commands
 - **BallNavInactive (1)**: Signals that game is no longer accepting control
 - **ResetInput (5)**: Request from Python to reset the level
@@ -108,11 +120,12 @@ enum class MessageType : int {
 Each game tick follows this pattern:
 
 1. **C++ sends GameState**: Current ball position, rotation, and sector information
-2. **C++ sends Tick**: Signals that game state is available and waiting for input
-3. **Python receives messages**: Processes state and determines next action
-4. **Python sends KbdInput**: Sends 4-bit control command (up/down/left/right)
-5. **C++ receives and applies input**: Updates game state accordingly
-6. **Repeat** for next frame
+2. **C++ sends DepthImage**: The current frame's depth buffer (requires the modified CKDX11Rasterizer, see above)
+3. **C++ sends Tick**: Signals that game state is available and waiting for input
+4. **Python receives messages**: Processes state and determines next action
+5. **Python sends KbdInput**: Sends 4-bit control command (up/down/left/right)
+6. **C++ receives and applies input**: Updates game state accordingly
+7. **Repeat** for next frame
 
 ### Level Reset Flow
 1. Python sends ResetInput message
@@ -130,6 +143,7 @@ Each game tick follows this pattern:
 
 ### Scene Understanding
 - Floor geometry is communicated via SceneRep message
+- The per-frame depth buffer is communicated via DepthImage message (320 × 240, 8-bit), giving a local view of floor edges, gaps and obstacles around the ball
 - Allows Python environment to understand level layout
 - Enables more sophisticated decision making based on spatial information
 

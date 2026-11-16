@@ -1,0 +1,11 @@
+[project]
+name = "ballrain"
+version = "0.1.0"
+description = "A reinforcement learning environment for the game Ballance"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gymnasium==1.2.1",
+    "stable-baselines3==2.7.0",
+    "pywin32==311; sys_platform == 'win32'",
+]

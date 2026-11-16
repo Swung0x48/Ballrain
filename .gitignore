@@ -1,5 +1,8 @@
-﻿# python cache
+# python cache
 /__pycache__/
+
+# uv virtual environment
+/.venv/
 
 # IDE settings
 /.idea/

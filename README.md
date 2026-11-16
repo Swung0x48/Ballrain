@@ -1,47 +1,50 @@
 # Ballrain
 
-Ballrain 是一个基于 Ballance 游戏的强化学习环境，通过 TCP 通信将 Python 强化学习框架与 C++ 游戏插件连接，用于训练球体导航和关卡完成的智能体。
+Ballrain is a reinforcement learning environment for the game Ballance. It connects a Python reinforcement learning framework to a C++ game plugin over TCP, and is used to train agents for ball navigation and level completion.
 
-## 架构
+## Architecture
 
-项目分为两个主要部分：
+The project is split into two main parts:
 
-### Python 部分
-- **TCPServer.py**: TCP 服务器，处理与游戏 Mod 的通信
-- **BallanceEnv.py**: 基于 Gymnasium 的强化学习环境
-- **Message.py**: 定义消息类型和数据格式
+### Python side
+- **TCPServer.py**: TCP server that handles communication with the game mod
+- **BallanceEnv.py**: Gymnasium-based reinforcement learning environment
+- **Message.py**: Defines message types and data formats
 
-### C++ 部分 (BallrainIO)
-- **TCPClient**: TCP 客户端，连接到 Python 服务器
-- **BallrainIO.cpp**: Ballance 游戏插件，处理游戏逻辑和状态传输
-- **MessageTypes.h**: 定义 C++ 端的消息类型结构
+### C++ side (BallrainIO)
+- **TCPClient**: TCP client that connects to the Python server
+- **BallrainIO.cpp**: Ballance game plugin that handles game logic and state transfer
+- **MessageTypes.h**: Defines the message type structures on the C++ side
 
-## 安装和使用
+## Installation and Usage
 
-### 环境要求
-- Python 3.x, Conda (可以是 Miniconda)
-- Ballance 游戏
+### Requirements
+- Python 3.x, uv
+- Ballance game
+- A build of the game using a specific modified CKDX11Rasterizer (required for the `DepthImage` message to carry valid depth data)
 - BML (Ballance Mod Loader)
-- Visual Studio 2022，安装桌面C++工作负载
+- Visual Studio 2022 with the Desktop development with C++ workload
 
-### 安装步骤
+### Installation steps
 
-1. 克隆项目:
+1. Clone the project:
 ```bash
 git clone <repository_url>
 cd Ballrain
 ```
 
-2. 创建 Conda 虚拟环境并安装 Python 依赖:
+2. Create the virtual environment and install the Python dependencies with uv:
 ```bash
-conda env create -f environment.yml
+uv sync
 ```
 
-3. 编译 C++ 插件 (BallrainIO):
+`uv sync` creates a `.venv` directory, resolves the dependencies declared in `pyproject.toml`, records them in `uv.lock`, and installs them into the environment.
 
-需要事先下载 BMLPlus 0.3.10 开发 Debug 包，解压到 `3rdparty/BMLPlus`。
+3. Build the C++ plugin (BallrainIO):
 
-需要事先克隆 doyagu 的 Virtools SDK 2.1 仓库。
+You need to download the BMLPlus 0.3.10 Debug development package beforehand and extract it to `3rdparty/BMLPlus`.
+
+You also need to clone doyagu's Virtools SDK 2.1 repository beforehand:
 
 ```bash
 git clone https://github.com/doyaGu/Virtools-SDK-2.1
@@ -52,45 +55,48 @@ cd BallrainIO
 cmake . -B build -A Win32 -DVirtoolsSDK_DIR="/path/to/Virtools-SDK-2.1/CMake"
 ```
 
-打开 `BallrainIO/build` 目录中的 `Ballrain.sln` 编译，或使用命令行编译：
+Open `Ballrain.sln` in the `BallrainIO/build` directory and build it, or build from the command line:
 
 ```bash
 cmake --build . --config Release
 ```
 
-4. 安装编译后的 C++ Mod 到 Ballance 游戏目录
+4. Install the compiled C++ mod into the Ballance game directory
 
-### 使用方法
+### Usage
 
-1. 启动 Python 服务器: （注意服务器需先于游戏启动）
-```python
-python main.py
+1. Start the Python server: (the server must be started before the game)
+```bash
+uv run main.py
 ```
 
-2. 在 Ballance 游戏中加载插件
+2. Load the plugin in the Ballance game
 
-3. 连接建立后，请手动进入一关。游戏会自动开始接受来自 Python 环境的控制，并开始训练。
+3. Once the connection is established, manually enter a level. The game then automatically starts accepting control from the Python environment and begins training.
 
-## 消息协议
+## Message protocol
 
-项目使用基于 TCP 的二进制消息协议，支持以下消息类型：
+The project uses a TCP-based binary message protocol that supports the following message types:
 
-- `BallNavActive` (0): 游戏导航激活
-- `BallNavInactive` (1): 游戏导航停用
-- `GameState` (2): 游戏状态信息 (60 字节)
-- `KbdInput` (3): 键盘输入指令 (4 字节)
-- `Tick` (4): 游戏时钟信号
-- `ResetInput` (5): 重置游戏
-- `BallOff` (6): 掉球信号
-- `SceneRep` (7): 场景表示信息 (可变长度)
+- `BallNavActive` (0): game navigation activated
+- `BallNavInactive` (1): game navigation deactivated
+- `GameState` (2): game state information (60 bytes)
+- `KbdInput` (3): keyboard input command (4 bytes)
+- `Tick` (4): game clock signal
+- `ResetInput` (5): reset the game
+- `BallOff` (6): ball fell off the track signal
+- `SceneRep` (7): scene representation information (variable length)
+- `DepthImage` (8): depth image (320 × 240, 1 byte per pixel)
 
-## 通信流程
+> The `DepthImage` message is only produced when the game runs with a specific modified build of CKDX11Rasterizer; with a stock rasterizer no valid depth image is available.
 
-1. Python 服务器启动并监听端口 27787
-2. C++ 插件连接并进行 ping-pong 握手验证
-3. C++ 发送场景表示数据 `SceneRep` 和导航激活信号 `BallNavActive`
-4. 进入游戏循环：
-   - C++ 发送游戏状态 `GameState` 和时钟信号 `Tick`
-   - Python 接收状态并计算动作
-   - Python 发送键盘输入指令 `KbdInput`
-   - C++ 应用输入并更新游戏状态
+## Communication flow
+
+1. The Python server starts and listens on port 27787
+2. The C++ plugin connects and performs a ping-pong handshake for validation
+3. C++ sends the scene representation `SceneRep` and the navigation activation signal `BallNavActive`
+4. The game loop begins:
+   - C++ sends the game state `GameState`, the depth image `DepthImage` and the clock signal `Tick`
+   - Python receives the state and computes an action
+   - Python sends the keyboard input command `KbdInput`
+   - C++ applies the input and updates the game state
