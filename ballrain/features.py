@@ -13,13 +13,16 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 
 from . import geometry as G
-from .path import ReferencePath
+from .path import PathFollower, ReferencePath, load_tas_path
 from .state import G_RAILS, G_STOPPER, GameTracker
 
-FEATURE_VERSION = "f3"  # f3: transforming from the ball (un)physicalize events; HS block (followers, pause)
+FEATURE_VERSION = "f5"  # f5: edge fan referenced to the floor under the ball when airborne / in side contact
+# f4: TAS reference line + continuity projection, arc waypoints, slope-robust edge fan
+# f3: transforming from the ball (un)physicalize events; HS block (followers, pause)
 
 GEOM_EPS = 0.05  # state-spec.md 3.5: geometric contact threshold on the gap
 NO_CONTACT_GAP = 2.0  # value used for "no mindist"
+SUPPORT_GAP = 1.0  # a floor-facing mindist within this gap is the ball's support (edge-fan reference)
 SURFACE_SLOTS = ("none", "stone", "wood", "metal", "other")
 
 
@@ -38,10 +41,22 @@ class FeatureConfig:
     fan_dirs: int = 8  # edge distance per direction (ray fan, 0 = off)
     fan_step: float = 0.25
     fan_max: float = 8.0
-    fan_drop: float = 1.0  # a sample lower than the contact height by this is "off the road"
+    fan_rule: str = "step"  # "step" (f4): drop between consecutive samples | "contact" (f3): below the contact
+    fan_step_drop: float = 0.75  # "step": a sample lower than the previous one (the contact for the first) by more
+    #                              than this (per fan_step; 0.75 per 0.25 = a 72 degree descent) is the edge
+    fan_drop: float = 1.0  # "contact": a sample lower than the contact height by this is "off the road"
+    fan_up: float = 1.0  # fan rays start this far above the ball centre
     mesh_edge: bool = True  # distance from the contact point to the walkable boundary (mesh method)
     rail_radius: float = 6.0
+    path_source: str = "tas"  # "tas" (committed TAS line, polyline fallback) | "checkpoints" (polyline)
+    path_dir: str | None = None  # directory of the L<nn>.npz assets (default benchmarks/refpaths)
+    path_lateral_scale: float = 10.0  # path_lateral = distance to the line / this
+    path_back: float = 10.0  # projection window behind the previous arc length
+    path_ahead: float = 30.0  # ... and ahead of it
+    path_margin: float = 20.0  # the window may leave the current sector's arc range by this much
+    path_reacquire: float = 5.0  # switch to the sector-wide nearest point when it is closer by more than this
     waypoints: int = 3
+    waypoint_spacing: float = 5.0  # waypoint j (1..waypoints) is the line point j * spacing units of arc ahead
     bodies: int = 4
     body_radius: float = 60.0
     dynamic_geometry: bool = True  # include moving bodies in the height grid / fan
@@ -100,22 +115,106 @@ def level_geometry(tracker: GameTracker, cache_size: int = 4) -> LevelGeometry:
     return g
 
 
-def dynamic_triangles(tracker: GameTracker, center, radius: float) -> G.TriangleSet:
-    """Moving bodies of the BODY section near center, posed at the last PSI."""
+_MESH_BOUND: dict = {}  # id(mesh) -> (mesh, max |local vertex|)
+
+
+def _mesh_bound(m) -> float:
+    e = _MESH_BOUND.get(id(m))
+    if e is None or e[0] is not m:
+        if len(_MESH_BOUND) > 4096:
+            _MESH_BOUND.clear()
+        v = np.asarray(m.vertices, np.float64)
+        e = (m, float(np.sqrt((v * v).sum(1).max())) if len(v) else 0.0)
+        _MESH_BOUND[id(m)] = e
+    return e[1]
+
+
+def dynamic_triangles(tracker: GameTracker, center, radius: float, xz_box=None) -> G.TriangleSet:
+    """Moving bodies of the BODY section near center (body position within radius), posed at the last PSI.
+    xz_box = (lo (2,), hi (2,)): keep only what can be hit by a vertical ray inside that (x, z) box (the footprint
+    of the terrain rays): a mesh is skipped when its bounding sphere (|local vertex| + |shift| around the body
+    position; rotations keep lengths) misses the box, a triangle when its (x, z) bounds miss it. Exact for rays
+    inside the box; brute-force ray casts against ~1000 triangles of nearby platforms cost 10-35 ms per frame."""
     obs = tracker.obs
     items = []
+    if xz_box is not None:
+        blo = np.asarray(xz_box[0], np.float64) - 1e-6
+        bhi = np.asarray(xz_box[1], np.float64) + 1e-6
     if obs is not None:
         lvl = tracker.level
         for b in obs.body:
             ck = int(b["ckid"])
             if lvl.in_group(ck, G_STOPPER) or not lvl.is_physicalized(ck):
                 continue
-            if np.linalg.norm(b["pos"] - center) > radius:
+            bp = np.asarray(b["pos"], np.float64)
+            if np.linalg.norm(bp - center) > radius:
                 continue
             for m in lvl.meshes_of(ck):
+                if xz_box is not None:
+                    r = _mesh_bound(m) + float(np.linalg.norm(np.asarray(b["shift"], np.float64)))
+                    if (bp[0] + r < blo[0] or bp[0] - r > bhi[0] or bp[2] + r < blo[1] or bp[2] - r > bhi[1]):
+                        continue
                 V = G.body_to_world(m.vertices, b["pos"], b["q"], b["q_cfo"], b["shift"])
-                items.append((ck, V, m.faces))
+                F = np.asarray(m.faces, np.int64).reshape(-1, 3)
+                if xz_box is not None and len(F):
+                    X, Z = V[F, 0], V[F, 2]
+                    keep = ((X.max(1) >= blo[0]) & (X.min(1) <= bhi[0]) & (Z.max(1) >= blo[1])
+                            & (Z.min(1) <= bhi[1]))
+                    F = F[keep]
+                items.append((ck, V, F))
     return G.TriangleSet.from_meshes(items, grid_cell=None)
+
+
+IVP_ST_BALL = 3  # synapse status of a sphere (IVP_ST_POINT 0, EDGE 1, TRIANGLE 2, BALL 3)
+
+
+def _closest_on(tracker: GameTracker, ck: int, p, r: float):
+    """Closest point to p on the collision mesh of entity ck (static: the level geometry; moving: its BODY pose),
+    or None when nothing is within r."""
+    lvl = tracker.level
+    if lvl.is_fixed(ck):
+        geo = level_geometry(tracker)
+        idx = geo.tris.candidates(p, r)
+        idx = idx[geo.tris.owner[idx] == ck] if len(idx) else idx
+        if not len(idx):
+            return None
+        A, B, C = geo.tris.A[idx], geo.tris.B[idx], geo.tris.C[idx]
+    else:
+        body = next((b for b in tracker.obs.body if int(b["ckid"]) == ck), None) if tracker.obs is not None else None
+        if body is None:
+            return None
+        items = [(ck, G.body_to_world(m.vertices, body["pos"], body["q"], body["q_cfo"], body["shift"]), m.faces)
+                 for m in lvl.meshes_of(ck)]
+        ts = G.TriangleSet.from_meshes(items, grid_cell=None)
+        if not len(ts):
+            return None
+        A, B, C = ts.A, ts.B, ts.C
+    Q, _ = G.closest_point_triangles(p, A, B, C)
+    d = np.linalg.norm(Q - p, axis=1)
+    k = int(np.argmin(d))
+    return Q[k] if d[k] <= r else None
+
+
+def mind_normals(tracker: GameTracker, pos, mind) -> np.ndarray:
+    """Contact normals of the MIND entries (n, 3), oriented from the partner's surface towards the ball.
+    The mindist plane has that orientation whenever the ball's synapse is a sphere (self_status 3: wood and stone
+    balls). For the paper ball (a polyhedron: point / edge / triangle synapses) the plane's sign depends on the
+    synapse order inside the mindist and is reversed in most of its entries (checked against the geometry: SR11 351 of 481, SR06 107 of 188);
+    those normals are oriented with the geometry: n . (ball centre - closest point of the partner) > 0."""
+    N = np.array(mind["plane"][:, :3], np.float64)
+    fix = np.flatnonzero(mind["self_status"] != IVP_ST_BALL)
+    if not len(fix):
+        return N
+    p = np.asarray(pos, np.float64)
+    near: dict = {}
+    for j in fix:
+        ck = int(mind["partner"][j])
+        if ck not in near:
+            near[ck] = _closest_on(tracker, ck, p, float(mind["gap"][j]) + 4.0)
+        q = near[ck]
+        if q is not None and float(N[j] @ (p - q)) < 0:
+            N[j] = -N[j]
+    return N
 
 
 # ------------------------------------------------------------------------------------- frames
@@ -150,6 +249,7 @@ class FeatureExtractor:
         self._layout = self._make_layout()
         self.size = sum(n for _, n in self._layout)
         self.path: ReferencePath | None = None
+        self.follower: PathFollower | None = None
         self._path_key = None
 
     # layout -------------------------------------------------------------------------------
@@ -193,11 +293,31 @@ class FeatureExtractor:
 
     # helpers ------------------------------------------------------------------------------
     def reference_path(self, tracker: GameTracker) -> ReferencePath | None:
+        """TAS line of the level when path_source is "tas" and the asset matches the level (start and
+        checkpoint positions), else the checkpoint polyline. Re-chosen when the level data changes; the
+        follower (projection state) is reset when the path object changes."""
         key = (id(tracker), tracker.level.version, tracker.arrays.rows("Checkpoints"))
         if key != self._path_key:
-            self.path = ReferencePath.from_tracker(tracker)
+            path = None
+            if self.cfg.path_source == "tas":
+                path = load_tas_path(tracker.level_no, tracker, self.cfg.path_dir)
+            if path is None:
+                path = ReferencePath.from_tracker(tracker)
+            new_tracker = self._path_key is None or key[0] != self._path_key[0]
+            same_line = (path is not None and self.path is not None and path.source == self.path.source
+                         and path.P.shape == self.path.P.shape and np.array_equal(path.P, self.path.P))
+            if new_tracker or not same_line:  # keep the projection state when only the level data version moved
+                self.follower = None if path is None else PathFollower(
+                    path, back=self.cfg.path_back, ahead=self.cfg.path_ahead, margin=self.cfg.path_margin,
+                    reacquire=self.cfg.path_reacquire)
+            self.path = path
             self._path_key = key
         return self.path
+
+    def reset_episode(self) -> None:
+        """Forget the projection state (call at every episode start: new process, respawn, TAS hand-over)."""
+        if self.follower is not None:
+            self.follower.reset()
 
     def frame(self, tracker: GameTracker):
         obs = tracker.obs
@@ -239,19 +359,21 @@ class FeatureExtractor:
                 F["pos_world"][:] = pos / c.pos_scale
             radius = float(ball["extra_radius"]) or 2.0
             self._contacts(tracker, F, info, pos, vel, radius, right, fwd)
+            info["supported"] = "support_point" in info  # floor-facing contact within SUPPORT_GAP (SR reward hold)
             self._terrain(tracker, F, info, pos, radius, right, fwd)
             if path is not None:
-                pr = path.project(pos, tracker.sector)
+                pr = self.follower.update(pos, tracker.sector)
                 info["path"] = pr
+                info["path_source"] = path.source
                 F["path_progress"][0] = pr["s"] / max(path.length, 1e-9)
                 F["path_remaining"][0] = (path.length - pr["s"]) / (20 * c.pos_scale)
-                F["path_lateral"][0] = pr["dist"] / c.pos_scale
+                F["path_lateral"][0] = pr["dist"] / c.path_lateral_scale
                 tc = to_frame(pr["tangent"], right, fwd)
                 F["path_tangent_cam"][:] = (tc[0], tc[2])
                 pr_r = np.array([pr["tangent"][2], 0, -pr["tangent"][0]])
                 F["vel_path"][:] = to_frame(vel, pr_r, pr["tangent"]) / c.vel_scale
                 if c.waypoints:
-                    wp = path.next_nodes(pr["seg"], c.waypoints) - pos
+                    wp = path.points_ahead(pr["s"], c.waypoints, c.waypoint_spacing) - pos
                     F["waypoints"][:] = (to_frame(wp, right, fwd) / c.pos_scale).ravel()
             if c.bodies:
                 self._bodies(tracker, F, pos, vel, right, fwd)
@@ -260,7 +382,7 @@ class FeatureExtractor:
             F["points"][0] = tracker.points / 1000
             sr = tracker.sr_ms
             F["sr_s"][0] = (sr or 0.0) / 100000.0
-            npath = (len(path.P) - 1) if path is not None else 1
+            npath = path.n_sectors if path is not None else 1
             F["sector"][0] = tracker.sector / max(npath, 1)
             F["transforming"][0] = float(tracker.transforming)
             F["ball_nav"][0] = float(tracker.flags.ball_nav)
@@ -293,14 +415,23 @@ class FeatureExtractor:
         F["fric_contact"][0] = float(len(fric) > 0)
         partner = None
         if len(mind):
+            N = mind_normals(tracker, pos, mind)
+            info["mind_normals"] = N
             k = int(np.argmin(mind["gap"]))
             gap = float(mind["gap"][k])
-            normal = np.asarray(mind["plane"][k][:3], np.float64)
+            normal = N[k]
             F["min_gap"][0] = min(gap, NO_CONTACT_GAP)
             F["geom_contact"][0] = float(gap <= GEOM_EPS)
             F["normal_cam"][:] = to_frame(normal, right, fwd)
             partner = int(mind["partner"][k])
             info.update(gap=gap, normal=normal, contact_point=pos - normal * (radius + gap))
+            # floor support (edge fan reference, f5): the nearest mindist whose plane faces up (n_y >= 0.5)
+            up = np.flatnonzero(N[:, 1] >= G.UP_WALKABLE)
+            if len(up):
+                j = int(up[np.argmin(mind["gap"][up])])
+                gj = float(mind["gap"][j])
+                if gj <= SUPPORT_GAP:
+                    info.update(support_gap=gj, support_point=pos - N[j] * (radius + gj))
         else:
             F["min_gap"][0] = NO_CONTACT_GAP
         if len(fric):
@@ -325,10 +456,34 @@ class FeatureExtractor:
     def _terrain(self, tracker, F, info, pos, radius, right, fwd):
         c = self.cfg
         geo = level_geometry(tracker)
-        dyn = dynamic_triangles(tracker, pos, c.body_radius) if c.dynamic_geometry else None
         bottom = pos[1] - radius
         contact = info.get("contact_point")
-        h_ref = contact[1] if contact is not None and info.get("gap", 9) <= 1.0 else bottom
+        # edge-fan reference (f5): the floor support (a floor-facing mindist within SUPPORT_GAP: base = its contact
+        # point, the same as f4 whenever the nearest contact faces up); otherwise (airborne, or only side / overhead
+        # contacts: walls, pushable boxes, prop balls) the floor under the ball centre (base = the first hit of a
+        # vertical ray at the centre, from fan_up above it), or no reference when there is none (over the void)
+        support = info.get("support_point")
+        # every ray of this frame first (centre, height grid, fan), so that moving bodies are culled to the footprint
+        Pg = Pf = None
+        if c.height_grid:
+            g = c.height_grid
+            o = (np.arange(g) - (g - 1) / 2) * c.height_spacing
+            gx, gz = np.meshgrid(o, o, indexing="ij")  # gx: right, gz: forward
+            off = gx[..., None] * right + gz[..., None] * fwd
+            Pg = (pos + off).reshape(-1, 3)
+            Pg[:, 1] = pos[1] + c.height_up
+        if c.fan_dirs:
+            ang = np.arange(c.fan_dirs) * (2 * math.pi / c.fan_dirs)
+            dirs = np.cos(ang)[:, None] * fwd + np.sin(ang)[:, None] * right  # 0 = forward, then clockwise
+            steps = np.arange(c.fan_step, c.fan_max + 1e-9, c.fan_step)
+            base = support if support is not None else pos
+            Pf = (base + steps[None, :, None] * dirs[:, None, :]).reshape(-1, 3)
+            Pf[:, 1] = pos[1] + c.fan_up
+        dyn = None
+        allp = [q for q in (Pg, Pf) if q is not None] + [pos[None, :]]  # pos: the centre ray of the fan reference
+        if c.dynamic_geometry and allp:
+            xz = np.concatenate(allp)[:, [0, 2]]
+            dyn = dynamic_triangles(tracker, pos, c.body_radius, (xz.min(0), xz.max(0)))
 
         def rays(P):
             y, t = geo.tris.ray_down(P)
@@ -337,27 +492,19 @@ class FeatureExtractor:
                 y, _, _ = G.merge_ray(y, t, y2, t2)
             return y
 
-        if c.height_grid:
-            g = c.height_grid
-            o = (np.arange(g) - (g - 1) / 2) * c.height_spacing
-            gx, gz = np.meshgrid(o, o, indexing="ij")  # gx: right, gz: forward
-            off = gx[..., None] * right + gz[..., None] * fwd
-            P = (pos + off).reshape(-1, 3)
-            P[:, 1] = pos[1] + c.height_up
-            y = rays(P)
+        if Pg is not None:
+            y = rays(Pg)
             hit = ~np.isnan(y)
             F["heights"][:] = np.where(hit, np.clip(y - bottom, -c.height_clip, c.height_clip), -c.height_clip) / c.height_clip
             F["height_hit"][:] = hit
-        if c.fan_dirs:
-            ang = np.arange(c.fan_dirs) * (2 * math.pi / c.fan_dirs)
-            dirs = np.cos(ang)[:, None] * fwd + np.sin(ang)[:, None] * right  # 0 = forward, then clockwise
-            steps = np.arange(c.fan_step, c.fan_max + 1e-9, c.fan_step)
-            base = contact if contact is not None else pos
-            P = (base + steps[None, :, None] * dirs[:, None, :]).reshape(-1, 3)
-            P[:, 1] = pos[1] + 1.0
-            y = rays(P).reshape(c.fan_dirs, len(steps))
-            drop = np.isnan(y) | (y < h_ref - c.fan_drop)
-            first = np.where(drop.any(1), steps[np.argmax(drop, 1)], c.fan_max)
+        if Pf is not None:
+            if support is not None:
+                h_ref, info["fan_ref"] = float(support[1]), "support"
+            else:
+                yc = rays(np.array([[pos[0], pos[1] + c.fan_up, pos[2]]]))[0]
+                h_ref, info["fan_ref"] = (float(yc), "below") if not np.isnan(yc) else (float("nan"), "none")
+            y = rays(Pf).reshape(c.fan_dirs, len(steps))
+            first = fan_edges(y, h_ref, steps, c)
             F["edge_fan"][:] = first / c.fan_max
             info["edge_fan"] = first
         if c.mesh_edge:
@@ -402,6 +549,26 @@ class FeatureExtractor:
                 m = pos[1] - float(hi[1])
                 best = m if best is None else min(best, m)
         return best if best is not None else 20 * self.cfg.pos_scale
+
+
+def fan_edges(y, h_ref: float, steps, cfg: FeatureConfig) -> np.ndarray:
+    """Edge distance per fan direction from the sampled heights y (dirs x steps, nan = no hit).
+    "step" (f4): the first sample with no hit, or lower than the previous sample (the reference height h_ref for
+    the first: the support height, or the floor under the ball centre; nan = no reference, only misses count) by
+    more than fan_step_drop. Slope-robust: a slope descends by tan(angle) * fan_step per sample
+    (0.08 per 0.25 at 18 degrees), a cliff by >= 1 at once (docs/observations.md, edge fan histogram).
+    "contact" (f3): no hit, or lower than h_ref by more than fan_drop (reads long gentle descents as edges).
+    Directions without an edge get fan_max."""
+    y = np.asarray(y, np.float64)
+    if cfg.fan_rule == "contact":
+        drop = np.isnan(y) | (y < h_ref - cfg.fan_drop)
+    elif cfg.fan_rule == "step":
+        prev = np.concatenate([np.full((len(y), 1), h_ref), y[:, :-1]], 1)
+        with np.errstate(invalid="ignore"):
+            drop = np.isnan(y) | (prev - y > cfg.fan_step_drop)
+    else:
+        raise ValueError(f"unknown fan_rule {cfg.fan_rule!r}")
+    return np.where(drop.any(1), np.asarray(steps)[np.argmax(drop, 1)], cfg.fan_max)
 
 
 def feature_names(extractor: FeatureExtractor) -> list:

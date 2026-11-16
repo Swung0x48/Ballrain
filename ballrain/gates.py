@@ -283,6 +283,37 @@ def majority_verdict(ref_shas, agent_sha) -> tuple[bool, str]:
     return True, f"PASS (reference majority {major[1]}/{len(ref_shas)})"
 
 
+def export_diagnosis(ref_shas, agent_sha, replay_sha=None) -> tuple[bool, str, str]:
+    """M2 export check: majority_verdict plus what a failure means. The game is not always deterministic for the
+    same inputs (docs/observations.md 5.1: one TAS-prefix replay in BallrainIO and one reference replay in M0
+    diverged), so a failing export is classified before it is called a fidelity bug. replay_sha is the trace of
+    the exported .tas replayed by BallrainIO (replay mode) on a training copy. Returns (pass, verdict, kind):
+      pass / pass_ref_majority  the agent trace equals all / the majority of the reference traces;
+      ref_split                 no reference majority: replay the reference again;
+      agent_outlier             the BallrainIO replay equals the reference majority: the agent-mode run itself
+                                diverged (nondeterminism); the .tas is still judged by the reference outcome;
+      systematic                the BallrainIO replay equals the agent trace: BallrainIO and TASSupport differ on
+                                these inputs (a fidelity bug);
+      replay_differs            the replay matches neither; unclassified       no replay given."""
+    ok, why = majority_verdict(ref_shas, agent_sha)
+    if ok:
+        return True, why, "pass" if why == "PASS" else "pass_ref_majority"
+    shas = [x for x in ref_shas if x]
+    counts: dict = {}
+    for x in shas:
+        counts[x] = counts.get(x, 0) + 1
+    major = max(counts.items(), key=lambda kv: kv[1]) if counts else (None, 0)
+    if major[1] * 2 <= len(ref_shas):
+        return False, why, "ref_split"
+    if not replay_sha:
+        return False, why, "unclassified"
+    if replay_sha == major[0]:
+        return False, why, "agent_outlier"
+    if replay_sha == agent_sha:
+        return False, why, "systematic"
+    return False, why, "replay_differs"
+
+
 def identical_files(a, b) -> bool:
     """Byte equality of two files (False if either is missing)."""
     a, b = Path(a), Path(b)

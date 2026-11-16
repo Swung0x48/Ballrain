@@ -67,14 +67,19 @@ def _m44(pos):
     return m
 
 
-def obs_at(t, pos, vel=(0, 0, 0), gap=None, partner=FLOOR, normal=(0, 1, 0), fric=False, bodies=(), radius=2.0, btype=0):
+def obs_at(t, pos, vel=(0, 0, 0), gap=None, partner=FLOOR, normal=(0, 1, 0), fric=False, bodies=(), radius=2.0, btype=0,
+           mind=None):
+    """mind: extra MIND entries [(partner, gap, normal, self_status)]; gap / partner / normal give one entry of a
+    sphere (self_status 3)."""
     o = P.Observation(frames_done=100)
     b = np.zeros(1, P.BALL_DT)[0]
     b["pos"], b["speed"], b["found"], b["type"], b["extra_radius"] = pos, vel, 1, btype, radius
     o.ball = b
-    if gap is not None:
-        m = np.zeros(1, P.MIND_DT)
-        m["partner"], m["gap"], m["plane"] = partner, gap, (*normal, 0)
+    rows = ([(partner, gap, normal, FX.IVP_ST_BALL)] if gap is not None else []) + list(mind or [])
+    if rows:
+        m = np.zeros(len(rows), P.MIND_DT)
+        for k, (pk, gk, nk, st) in enumerate(rows):
+            m["partner"][k], m["gap"][k], m["plane"][k], m["self_status"][k] = pk, gk, (*nk, 0), st
         o.mind = m
     if fric:
         f = np.zeros(1, P.FRIC_DT)
@@ -248,3 +253,67 @@ def test_transforming_follows_the_ball_unphysicalize_physicalize_window():
     t.update(_events_obs(80, (E.Physicalize, 15), (E.BallNavActive, 0)))
     t.update(_events_obs(90, (E.LevelFinish, 0), (E.BallNavInactive, 0)))
     assert not t.transforming
+
+
+def test_edge_fan_reference_airborne_side_contact_and_void():
+    """f5: the fan is referenced to the floor support, else the floor under the ball centre, else nothing."""
+    t = make_tracker()
+    fx = FX.FeatureExtractor(FX.FeatureConfig(fan_dirs=4, height_grid=0, bodies=0))
+    ground = [8.0, 2.25, 8.0, 8.0]  # rolling at x = 3: the road edge (x = 5) to the right
+    obs_at(t, (3, 2.01, 10), gap=0.01)
+    _, info = fx.compute(t)
+    assert info["fan_ref"] == "support" and info["edge_fan"].tolist() == ground and info["supported"]
+    # airborne 4 above the road (no mindist): f4 compared the samples with the ball bottom (all 0.25)
+    obs_at(t, (3, 6.0, 10))
+    _, info = fx.compute(t)
+    assert info["fan_ref"] == "below" and info["edge_fan"].tolist() == ground and not info["supported"]
+    # nearest contact is a wall on the left (normal +x), the floor is touched too: the floor is the support
+    obs_at(t, (3, 2.01, 10), gap=0.005, partner=BOX, normal=(1, 0, 0), mind=[(FLOOR, 0.01, (0, 1, 0), 3)])
+    _, info = fx.compute(t)
+    assert info["normal"].tolist() == [1, 0, 0] and info["fan_ref"] == "support"
+    assert info["support_point"] == pytest.approx([3, 0, 10], abs=1e-6) and info["edge_fan"].tolist() == ground
+    # only a side contact (pushed against a box): the floor under the centre
+    obs_at(t, (3, 2.01, 10), gap=0.01, partner=BOX, normal=(1, 0, 0))
+    _, info = fx.compute(t)
+    assert info["fan_ref"] == "below" and info["edge_fan"].tolist() == ground and not info["supported"]
+    # over the void (z < 0, the road starts at z = 0): no reference, only misses count
+    obs_at(t, (0, 2.0, -3))
+    _, info = fx.compute(t)
+    assert info["fan_ref"] == "none" and info["edge_fan"].tolist() == [0.25] * 4
+
+
+def test_fan_edges_without_reference_counts_only_misses():
+    cfg = FX.FeatureConfig(fan_dirs=2)
+    steps = np.array([0.25, 0.5, 0.75])
+    y = np.array([[-3.0, -3.0, np.nan], [-3.0, -5.0, -5.0]])
+    assert FX.fan_edges(y, float("nan"), steps, cfg).tolist() == [0.75, 0.5]  # the -2 drop still counts
+    assert FX.fan_edges(y, 0.0, steps, cfg).tolist() == [0.25, 0.25]
+
+
+def test_paper_ball_mindist_normals_are_oriented_towards_the_ball():
+    """The paper ball (polyhedron synapses) gets reversed mindist planes; a sphere's plane is kept as it is."""
+    t = make_tracker()
+    fx = FX.FeatureExtractor(FX.FeatureConfig(fan_dirs=4, height_grid=0, bodies=0))
+    obs_at(t, (3, 2.01, 10), radius=0.0, btype=1, mind=[(FLOOR, 0.01, (0, -1, 0), 1)])
+    v, info = fx.compute(t)
+    assert info["normal"].tolist() == [0, 1, 0] and info["fan_ref"] == "support"
+    assert v[fx.slices()["normal_cam"]].tolist() == pytest.approx([0, 1, 0])
+    assert info["edge_fan"].tolist() == [8.0, 2.25, 8.0, 8.0]
+    # a sphere under a ceiling keeps its downward normal (no flip for self_status 3)
+    o = obs_at(t, (3, 2.01, 10), gap=0.01, normal=(0, -1, 0))
+    assert FX.mind_normals(t, o.ball["pos"], o.mind)[0].tolist() == [0, -1, 0]
+
+
+def test_dynamic_triangles_footprint_cull_is_exact():
+    t = make_tracker()
+    near = (BOX, 1, (4.5, 0.5, 12.0), (0, 0, 0, 1), (0, 0, 0, 1), (0, 0, 0), (1, 0, 0), (0, 0, 0), np.zeros((4, 3)))
+    far = (BOX, 1, (30.0, 0.5, 12.0), (0, 0, 0, 1), (0, 0, 0, 1), (0, 0, 0), (1, 0, 0), (0, 0, 0), np.zeros((4, 3)))
+    obs_at(t, (0, 2.01, 10), bodies=[near, far])
+    pos = np.array([0, 2.01, 10.0])
+    full = FX.dynamic_triangles(t, pos, 60.0)
+    box = (np.array([-4.0, 6.0]), np.array([4.0, 14.0]))
+    cut = FX.dynamic_triangles(t, pos, 60.0, box)
+    assert len(full) == 24 and 0 < len(cut) < 12  # the far box is skipped, the near one (x 3.5..5.5) loses its +x face
+    g = np.stack(np.meshgrid(np.linspace(-4, 4, 33), np.linspace(6, 14, 33)), -1).reshape(-1, 2)
+    P = np.c_[g[:, 0], np.full(len(g), 5.0), g[:, 1]]
+    assert np.array_equal(full.ray_down(P)[0], cut.ray_down(P)[0], equal_nan=True)

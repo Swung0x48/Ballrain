@@ -205,6 +205,76 @@ def replay_record(record, out_dir, copy: str = instances.TRAINING_COPY, level: i
     return meta
 
 
+class OfflineReplay:
+    """Feeds a dataset record's stored observations to a GameTracker in the order of
+    client.AgentSession._ingest: the full level message at StartLevel, then every .inc message written up to
+    the current frame whenever an observation carries physicalize records (and at StartLevel)."""
+
+    def __init__(self, record_dir, level: int | None = None):
+        from .state import GameTracker
+        self.dir = Path(record_dir)
+        self.tracker = GameTracker(level or level_of(self.dir.name))
+        self.full, _ = P.parse_level_message((self.dir / "level.msg").read_bytes())
+        inc = self.dir / "level.msg.inc"
+        self.inc = P.parse_level_stream(inc.read_bytes())[0] if inc.exists() else []
+        self.inc_i = 0
+        self.loaded = False
+        z = np.load(self.dir / "raw.npz")
+        self.blob, self.off = z["obs_bytes"].tobytes(), z["obs_offsets"]
+        self.n = len(self.off) - 1
+
+    def obs(self, i: int) -> P.Observation:
+        return P.parse_observation(self.blob[self.off[i]:self.off[i + 1]])
+
+    def ingest(self, o: P.Observation) -> None:
+        start = o.has_event(P.Ev.StartLevel)
+        if start or (not self.loaded and o.frames_done >= self.full.frames_done):
+            self.tracker.merge_level(self.full)
+            self.loaded = True
+        if self.loaded and (len(o.phys) or start):
+            while self.inc_i < len(self.inc) and self.inc[self.inc_i].frames_done <= o.frames_done:
+                self.tracker.merge_level(self.inc[self.inc_i])
+                self.inc_i += 1
+        self.tracker.update(o)
+
+    def __iter__(self):
+        """Yields (index, observation, tracker) after ingesting each observation."""
+        for i in range(self.n):
+            o = self.obs(i)
+            self.ingest(o)
+            yield i, o, self.tracker
+
+
+def record_trajectory(record_dir, level: int | None = None) -> dict:
+    """Per stored observation: frames_done, ball position (nan without an IVP ball), delta, sector, and the
+    control flags (control_valid, ball_nav, paused, transforming, cam_nav), plus the event list and the
+    level anchors (start / checkpoints / airship) of the final tracker state."""
+    from .path import level_anchors
+    rep = OfflineReplay(record_dir, level)
+    n = rep.n
+    out = {"frames_done": np.zeros(n, np.int64), "pos": np.full((n, 3), np.nan), "delta_ms": np.zeros(n),
+           "sector": np.zeros(n, np.int64), "control": np.zeros(n, bool), "ball_nav": np.zeros(n, bool),
+           "paused": np.zeros(n, bool), "transforming": np.zeros(n, bool), "cam_nav": np.zeros(n, bool),
+           "checkpoints": np.zeros(n, np.int64), "sr_double": np.full(n, np.nan), "points": np.zeros(n, np.int64),
+           "lives": np.zeros(n, np.int64)}
+    for i, o, t in rep:
+        out["frames_done"][i] = o.frames_done
+        if o.ball is not None and o.ball["found"]:
+            out["pos"][i] = o.ball["pos"]
+        if o.time is not None:
+            out["delta_ms"][i] = o.time["delta_ms"]
+            out["sr_double"][i] = o.time["sr_double"]
+        out["sector"][i] = t.sector
+        out["control"][i] = t.control_valid() and not t.flags.paused
+        out["ball_nav"][i], out["paused"][i] = t.flags.ball_nav, t.flags.paused
+        out["transforming"][i], out["cam_nav"][i] = t.transforming, t.flags.cam_nav
+        out["checkpoints"][i], out["points"][i], out["lives"][i] = t.checkpoints, t.points, t.lives
+    out["events"] = list(rep.tracker.events)
+    out["anchors"] = level_anchors(rep.tracker)
+    out["levelfinish_frame"] = rep.tracker.levelfinish_frame
+    return out
+
+
 def load_observations(npz_path):
     """Yield the parsed Observation of every stored message."""
     z = np.load(npz_path)

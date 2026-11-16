@@ -3,6 +3,12 @@
 make_vec_env(config, n) returns a gymnasium.vector env (async: one worker process per copy, so
 feature computation runs in parallel; sync: everything in this process). make_sb3_vec_env returns a
 stable-baselines3 SubprocVecEnv / DummyVecEnv. Copies must exist (instances.create_training_copies).
+
+With config.warm_pool every sub-env owns two copies (train-2i, train-2i+1) and pre-launches its next game
+process on the idle one (ballrain.env), so n envs need 2n copies (8 copies: n = 4).
+TAS start states / curriculum (ballrain.curriculum): the trainer keeps one ReverseCurriculum, feeds it the
+outcomes (curriculum.episode_outcome(info) of every finished episode) and pushes its state to the envs:
+venv.call("set_start_state", state) (gymnasium) or venv.env_method("set_start_state", state) (SB3).
 """
 from __future__ import annotations
 
@@ -15,9 +21,14 @@ from . import instances
 from .env import BallanceEnv, EnvConfig
 
 
-def _make(config: EnvConfig, copy_name: str, launcher_factory=None, seed=None):
+def _make(config: EnvConfig, copy_name, launcher_factory=None, seed=None):
     cfg = _copy.deepcopy(config)
-    cfg.copy = copy_name
+    if isinstance(copy_name, tuple):  # warm pool: (copy, warm_copy)
+        cfg.copy, cfg.warm_copy = copy_name
+    else:
+        cfg.copy = copy_name
+    if seed is not None and cfg.curriculum is not None:
+        cfg.curriculum = dict(cfg.curriculum, seed=seed)
     if seed is not None:
         cfg.seed = seed
     launcher = launcher_factory() if launcher_factory is not None else None
@@ -25,9 +36,12 @@ def _make(config: EnvConfig, copy_name: str, launcher_factory=None, seed=None):
 
 
 def env_fns(config: EnvConfig, n: int, copies=None, launcher_factory=None, seed: int | None = None):
-    names = list(copies) if copies is not None else instances.training_copy_names(n)
-    if len(names) != n or len(set(names)) != n:
-        raise ValueError(f"need {n} distinct copies, got {names}")
+    per = 2 if config.warm_pool else 1
+    names = list(copies) if copies is not None else instances.training_copy_names(per * n)
+    if len(names) != per * n or len(set(names)) != per * n:
+        raise ValueError(f"need {per * n} distinct copies, got {names}")
+    if per == 2:
+        names = [(names[2 * i], names[2 * i + 1]) for i in range(n)]
     return [partial(_make, config, name, launcher_factory, None if seed is None else seed + i)
             for i, name in enumerate(names)]
 

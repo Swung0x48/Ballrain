@@ -2,7 +2,11 @@
 
 SR mode: progress along the reference path per in-game time, finish bonus, death penalty and
 potential-based shaping F = gamma * Phi(s') - Phi(s) with Phi = shaping_weight * arc length and
-Phi(terminal) = 0.
+Phi(terminal) = 0. Progress made while the ball has no floor support (airborne: falls, jumps, flying off the road)
+is held and paid at the next supported step (a landing) or at LevelFinish, and dropped at BallOff
+(hold_unsupported), so flying into the void earns nothing (the projection of a falling ball can advance by up to the
+window's 30 units of arc per step across a bend). At BallOff the progress paid since the sector started (in this
+episode) is taken back (death_refund): the respawn is at the last checkpoint, so a death undoes it.
 HS mode: delta of the score potential Points + Lifes * LifeBonus (time decay, +100 when a score ball
 is touched, +20 per small ball reaching the player ball, life balls), at finish the level bonus plus
 20 x small balls still following (the official readout, docs/benchmarks.md), a death penalty of one
@@ -30,6 +34,8 @@ class RewardConfig:
     death_penalty: float = 5.0
     shaping_weight: float = 0.0  # Phi = shaping_weight * arc length
     backward_scale: float = 1.0  # multiplier for negative progress
+    hold_unsupported: bool = True  # hold progress made without floor support until landing / finish, drop it at BallOff
+    death_refund: float = 1.0  # at BallOff take back this fraction of the progress paid since the sector started
     checkpoint_bonus: float = 0.0
     # HS
     score_scale: float = 0.01  # reward per score point
@@ -54,6 +60,8 @@ class Reward:
 
     def reset_state(self):
         self.s = None
+        self.held = 0.0  # progress made without support, not paid yet
+        self.sector_paid = 0.0  # progress paid since the episode start or the last checkpoint
         self.sr = None
         self.score = None
         self.checkpoints = None
@@ -74,18 +82,33 @@ class Reward:
         self.terms[name] = self.terms.get(name, 0.0) + v
         return v
 
-    def step(self, tracker: GameTracker, s: float | None, died: bool, finished: bool, terminal: bool) -> tuple[float, dict]:
-        """s: arc length of the ball's projection (None when unknown). Returns (reward, terms)."""
+    def step(self, tracker: GameTracker, s: float | None, died: bool, finished: bool, terminal: bool,
+             rebase: bool = False, supported: bool | None = None) -> tuple[float, dict]:
+        """s: arc length of the ball's projection (None when unknown). rebase: the projection was re-acquired
+        this step (ballrain.path, jump=True): no progress reward for it, s only moves the reference.
+        supported: the ball has floor support after this step (features info["supported"]); None = unknown,
+        treated as supported. Returns (reward, terms)."""
         c = self.cfg
         terms = {}
         sr = tracker.sr_ms if tracker.sr_ms is not None else self.sr
         dt_s = (sr - self.sr) / 1000.0 if self.sr is not None else 0.0
-        ds = (s - self.s) if (s is not None and self.s is not None) else 0.0
+        ds = (s - self.s) if (s is not None and self.s is not None and not rebase) else 0.0
         if ds < 0:
             ds *= c.backward_scale
         r = 0.0
+        if tracker.checkpoints > self.checkpoints:
+            self.sector_paid = 0.0
         if c.mode == "sr":
-            terms["progress"] = c.progress_weight * ds
+            pay = ds
+            if c.hold_unsupported:
+                self.held += ds
+                pay = 0.0
+                if died:  # forfeited; backward moves are never forgiven
+                    pay, self.held = min(self.held, 0.0), 0.0
+                elif finished or supported is None or supported:
+                    pay, self.held = self.held, 0.0
+            terms["progress"] = c.progress_weight * pay
+            self.sector_paid += c.progress_weight * pay
             terms["time"] = -c.time_weight * dt_s
             if c.shaping_weight and s is not None and self.s is not None:
                 phi0 = c.shaping_weight * self.s
@@ -97,6 +120,8 @@ class Reward:
                 terms["finish"] = c.finish_bonus
             if died:
                 terms["death"] = -c.death_penalty
+                if c.death_refund:
+                    terms["death_refund"] = -c.death_refund * max(self.sector_paid, 0.0)
         else:
             score = tracker.hs_partial()
             terms["score"] = c.score_scale * (score - self.score)

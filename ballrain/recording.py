@@ -23,7 +23,7 @@ from . import protocol as P
 from . import tas
 from .protocol import Ev
 
-META_VERSION = 2  # 2: hs = official end-screen readout (was the LevelFinish-hook snapshot); hs_parts reworked
+META_VERSION = 3  # 3: start_state (TAS start states), timing; 2: hs = official end-screen readout
 
 
 def sr_timer(frames, events) -> dict:
@@ -73,6 +73,8 @@ class RunMeta:
     started_at: float = 0.0
     wall_s: float = 0.0
     prefix: dict | None = None
+    start_state: dict | None = None  # TAS start state: record, record_sha256, frame (the prefix = its first frames)
+    timing: dict | None = None  # process start: launch_s, handover_s (prefix replay), intro_s, total_s
     mod_version: str = ""
     feature_version: str = ""
     feature_config: dict | None = None

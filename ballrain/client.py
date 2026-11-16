@@ -10,6 +10,7 @@ ballrain.fakegame.FakeLauncher runs a simulated mod in a thread over the same tr
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -136,6 +137,7 @@ class AgentSession:
         self.on_prefix_obs = None  # callable(Observation) for each prefix-frame observation
         self.prefix_obs_mask = 0  # obs_mask sent with the prefix acknowledgements
         self.n_prefix_obs = 0
+        self.timing: dict = {}  # perf_counter stamps: launch, spawned, hello, first_obs
 
     # lifecycle ----------------------------------------------------------------------------
     def start(self) -> P.Observation:
@@ -150,9 +152,12 @@ class AgentSession:
         self.chan = PyChannel(make_name(self.cfg.copy))
         env = agent_env(self.cfg, self.chan.name)
         try:
+            self.timing["launch"] = time.perf_counter()
             self.handle = self.launcher.start(env)
+            self.timing["spawned"] = time.perf_counter()
             wh = self._wait_handle()
             self.hello = self.chan.wait_hello(self.cfg.hello_timeout_s, wh)
+            self.timing["hello"] = time.perf_counter()
             want = instances.PHYSICS_RT_SHA256[:16]
             if want not in self.hello["mod_version"]:
                 raise SessionError(f"mod hello {self.hello['mod_version']!r} does not name physics_RT {want}")
@@ -160,6 +165,7 @@ class AgentSession:
         except Exception:
             self.close(kill=True)
             raise
+        self.timing["first_obs"] = time.perf_counter()
         if obs is None:
             raise SessionError(f"game ended before the first observation (header {self.chan.header()})")
         if self.prefix_frames is not None:
@@ -176,6 +182,8 @@ class AgentSession:
         the mod waits for that acknowledgement before it runs the next prefix frame)."""
         while True:
             data = self.chan.wait_obs(self.cfg.obs_timeout_s, self._wait_handle())
+            if "first_obs_raw" not in self.timing:
+                self.timing["first_obs_raw"] = time.perf_counter()  # before parsing / level message load
             if data is None:
                 self._mark_ended()
                 h = self.chan.header()

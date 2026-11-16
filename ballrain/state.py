@@ -107,7 +107,8 @@ class LevelData:
         self.ent_groups: dict = {}
         self.phys: dict = {}  # seq -> PhysRecord
         self.phys_by_ent: dict = {}  # ckid -> latest PhysRecord
-        self.meshes: dict = {}  # (ckid, mesh) -> Mesh
+        self.meshes: dict = {}  # (ckid, mesh) -> Mesh (the last merged export)
+        self.phys_meshes: dict = {}  # (ckid, mesh) -> (frames_done, Mesh) exported with a Physicalize record
         self.ivp: dict = {}
         self.depth: list = []
         self.watch: list = []
@@ -135,8 +136,16 @@ class LevelData:
             cur = self.phys_by_ent.get(p.ckid)
             if cur is None or p.seq >= cur.seq:
                 self.phys_by_ent[p.ckid] = p
+        # meshes exported in the same frame as a Physicalize record of their entity (an increment; the full
+        # message re-exports every mesh with the matrix of its StartLevel snapshot)
+        physicalized = {p.ckid for p in lm.phys if not p.unphysicalize and p.frame == lm.frames_done}
         for m in lm.meshes:
             self.meshes[(m.ckid, m.mesh)] = m
+            if m.ckid in physicalized:
+                # exported together with the entity's Physicalize record: where it collides
+                old = self.phys_meshes.get((m.ckid, m.mesh))
+                if old is None or lm.frames_done >= old[0]:
+                    self.phys_meshes[(m.ckid, m.mesh)] = (lm.frames_done, m)
         for o in lm.ivp:
             self.ivp[o.ckid] = o
         if lm.depth:
@@ -185,10 +194,45 @@ class LevelData:
         return h.hexdigest()
 
     def entity_position(self, name: str):
+        """Position of the entity's ENTS world matrix. Caution: ENTS is a snapshot at StartLevel; objects the
+        level script moves afterwards (or parks at that moment) are not where they collide. For those use
+        physical_position."""
         k = self.by_name.get(name)
         if k is None:
             return None
         return np.asarray(self.entities[k].matrix[3], np.float64)
+
+    def mesh_world_bbox(self, ckid: int):
+        """(lo, hi) of the entity's collision meshes in world space, each mesh transformed by the world matrix
+        exported with it. Exports that came with a Physicalize record of the entity are preferred (the full
+        level message re-exports every mesh with the StartLevel matrix); None without meshes."""
+        ms = [m for (c, _), (_, m) in self.phys_meshes.items() if c == int(ckid)] or self.meshes_of(ckid)
+        lo, hi = None, None
+        for m in ms:
+            if len(m.vertices) == 0:
+                continue
+            M = np.asarray(m.matrix, np.float64)
+            V = np.asarray(m.vertices, np.float64) @ M[:3, :3] + M[3, :3]
+            a, b = V.min(0), V.max(0)
+            lo = a if lo is None else np.minimum(lo, a)
+            hi = b if hi is None else np.maximum(hi, b)
+        return None if lo is None else (lo, hi)
+
+    def physical_position(self, name: str):
+        """Where the entity collides: the world bbox centre of its collision meshes as exported at its
+        Physicalize (MESH records carry the world matrix at export); falls back to entity_position when the
+        entity has no meshes. Independent of the merge order of the full message and its increments.
+        The airship platform (PE_Balloon_*) is the case this exists for: in every tas-v1 level message the
+        StartLevel ENTS snapshot has it at the origin (the balloon assembly is parked there between its first
+        Physicalize at frame ~22 and the re-Physicalize when the last sector starts), while its meshes were
+        exported at the level end (docs/observations.md)."""
+        k = self.by_name.get(name)
+        if k is None:
+            return None
+        bb = self.mesh_world_bbox(k)
+        if bb is None:
+            return self.entity_position(name)
+        return 0.5 * (bb[0] + bb[1])
 
 
 @dataclass

@@ -48,6 +48,50 @@ def test_sr_reward_terms_and_shaping_telescopes():
     assert terms["death"] == -5 and terms["progress"] == pytest.approx(-0.4)
 
 
+def test_sr_progress_without_support_is_held_until_landing_and_dropped_at_death():
+    cfg = RewardConfig(mode="sr", progress_weight=1.0, time_weight=0.0, finish_bonus=0, death_penalty=5)
+    t = FakeTracker()
+    r = Reward(cfg)
+    r.begin(t, 0.0)
+    assert r.step(t, 10.0, False, False, False, supported=True)[0] == 10
+    # a jump: 30 units in the air, paid at the landing
+    assert r.step(t, 25.0, False, False, False, supported=False)[0] == 0
+    assert r.step(t, 40.0, False, False, False, supported=False)[0] == 0 and r.held == 30
+    assert r.step(t, 41.0, False, False, False, supported=True)[0] == 31 and r.held == 0
+    # flying into the void: nothing is paid, the sector's progress (41) is taken back at BallOff
+    r.step(t, 60.0, False, False, False, supported=False)
+    rew, terms = r.step(t, 80.0, died=True, finished=False, terminal=True, supported=False)
+    assert terms["progress"] == 0 and terms["death"] == -5 and terms["death_refund"] == -41
+    assert r.total == pytest.approx(-5)
+    # a held backward move is never forgiven; progress held at LevelFinish is paid
+    r.begin(t, 100.0)
+    r.step(t, 90.0, False, False, False, supported=False)
+    assert r.step(t, 120.0, False, True, True, supported=False)[1]["progress"] == 20
+    r.begin(t, 100.0)
+    r.step(t, 90.0, False, False, False, supported=False)
+    rew, terms = r.step(t, 95.0, True, False, True, supported=False)
+    assert terms["progress"] == -5 and terms["death_refund"] == 0  # net held -5 is charged
+
+
+def test_sr_death_refund_only_covers_the_current_sector():
+    cfg = RewardConfig(mode="sr", progress_weight=0.1, time_weight=0.0, death_penalty=5)
+    t = FakeTracker()
+    r = Reward(cfg)
+    r.begin(t, 0.0)
+    r.step(t, 100.0, False, False, False, supported=True)
+    t.checkpoints = 1  # a checkpoint: the respawn point moves, the 10 earned so far are kept
+    r.step(t, 150.0, False, False, False, supported=True)
+    rew, terms = r.step(t, 160.0, True, False, True, supported=True)
+    # the step that crossed the checkpoint counts for sector 2; the dying step's own progress is not paid
+    assert terms["progress"] == 0 and terms["death_refund"] == pytest.approx(-5.0)
+    assert r.total == pytest.approx(15 - 5 - 5)
+    off = Reward(RewardConfig(mode="sr", progress_weight=0.1, time_weight=0.0, hold_unsupported=False, death_refund=0))
+    t.checkpoints = 0
+    off.begin(t, 0.0)
+    off.step(t, 30.0, False, False, False, supported=False)
+    assert off.step(t, 40.0, True, False, True, supported=False)[1] == {"progress": 1.0, "time": 0.0, "death": -5}
+
+
 def test_hs_reward_score_balls_lives_and_finish():
     r = Reward(RewardConfig(mode="hs", score_scale=1.0))
     t = FakeTracker()
@@ -110,10 +154,13 @@ def test_reference_path_projection_and_sector_window():
     pr = p.project([1, 5, 50])
     assert pr["s"] == pytest.approx(50) and pr["seg"] == 0 and pr["tangent"].tolist() == [0, 0, 1]
     # restricted to sector 3 (segment 2), the projection cannot jump to another part of the path
-    pr = p.project([90, 0, 5], sector=3, window=0)
+    pr = p.project([90, 0, 5], sector=3, margin=0)
     assert pr["seg"] == 2 and pr["s"] == pytest.approx(300 - 5)
+    pr = p.project([90, 0, 5], sector=1, margin=0)  # sector 1 = segment 0 only
+    assert pr["seg"] == 0 and pr["s"] == pytest.approx(5)
     assert p.point_at(150).tolist() == [50, 0, 100]
     assert p.next_nodes(2, 2).tolist() == [[100, 0, 0], [100, 0, 0]]
+    assert p.points_ahead(290, 2, 5.0).tolist() == [[100, 0, 5], [100, 0, 0]]
 
 
 def _ev(*pairs):

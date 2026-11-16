@@ -292,3 +292,14 @@ def test_m1_identical_files_and_events(tmp_path):
     e = tmp_path / "events.txt"
     e.write_text("3 StartLevel\n13205 LevelFinish\n13205 Summary frames=13205 wall_ms=1908\n")
     assert gates.events_without_summary(e) == ["3 StartLevel", "13205 LevelFinish"]
+
+
+def test_export_diagnosis_classifies_failures():
+    from ballrain.gates import export_diagnosis
+    assert export_diagnosis(["a", "a", "a"], "a", "a") == (True, "PASS", "pass")
+    assert export_diagnosis(["a", "a", "b"], "a")[2] == "pass_ref_majority"
+    assert export_diagnosis(["a", "b", "c"], "a", "a")[2] == "ref_split"
+    assert export_diagnosis(["a", "a", "a"], "x", "a")[:3:2] == (False, "agent_outlier")
+    assert export_diagnosis(["a", "a", "a"], "x", "x")[2] == "systematic"
+    assert export_diagnosis(["a", "a", "a"], "x", "y")[2] == "replay_differs"
+    assert export_diagnosis(["a", "a", "a"], "x")[2] == "unclassified"

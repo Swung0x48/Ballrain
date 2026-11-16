@@ -26,6 +26,14 @@ are only ever started in `runtime/<copy>/Bin` through `ballrain.instances`.
 - `post_finish_credit.py`: reads `post.log` files of `probe/post_finish.py`; when the small balls
   still following at LevelFinish are credited, when the end-screen drain starts, and the HS readout
   (`docs/benchmarks.md`, "HS readout").
+- `edge_fan_rule.py`: the f3 / f4 edge-fan rules on the TAS dataset (histogram of consecutive ray-fan
+  height differences on floor contact, per-rule distributions and agreement with edge_mesh;
+  `docs/observations.md` section 2). `uv run python tools/analysis/edge_fan_rule.py SR01_1_14_457_264 ...`;
+  `--references` compares the f4 and f5 fan references on all control frames (floor support / airborne /
+  side or overhead contact / rail / moving partner).
+- `sr_reward_check.py`: the SR reward on the TAS dataset with env-like steps, old (no hold, no death refund)
+  against the defaults per life (`records`), and void probes along a level's reference line (`probes`;
+  `docs/observations.md` section 4). `uv run python tools/analysis/sr_reward_check.py records SR03_1_46_066_240`
 - `hs_followers/`: follower rule and timing on the TAS dataset (`runtime/datasets/tas-v1`, built by
   `scripts/m1_gates.py --gates D`): `rule2.py` (visible small balls of a hidden score ball = followers;
   final count = name-score gap on every HS record), `align.py` (Points / visibility / ExtraPoint timing),

@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import json
 import os
+import threading
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -31,6 +33,7 @@ import numpy as np
 
 from . import instances, protocol as P, tas
 from .client import AgentSession, SessionConfig
+from .curriculum import CurriculumConfig, ReverseCurriculum, TasStarts
 from .features import FeatureConfig, FeatureExtractor
 from .protocol import Ev
 from .recording import RunRecorder
@@ -70,6 +73,16 @@ class EnvConfig:
     idle_keys: int = 0  # keys injected while the player has no control
     skip_tutorial: bool = True  # level 1: pulse Q until CamNavActive
     prefix: str | None = None  # headerless frames replayed by the mod before hand-over
+    # TAS start states (ballrain.curriculum, docs/observations.md "TAS 起点"): each new process starts at frame k
+    # of this dataset record (the record's first k frames are the BALLRAIN_PREFIX); k from the curriculum
+    # (curriculum = CurriculumConfig fields as a dict, {} for the defaults) or the fixed start_frame
+    start_record: str | None = None
+    start_frame: int | None = None
+    curriculum: dict | None = None
+    warm_pool: bool = False  # pre-launch the next process on warm_copy while the current one runs
+    warm_copy: str | None = None  # second runtime copy of this env (vecenv.make_vec_env pairs train-2i, train-2i+1)
+    start_check: bool = True  # compare the hand-over state with the dataset; relaunch on a mismatch
+    start_retries: int = 3  # relaunches after a mismatching hand-over before giving up
     timeout_ms: int = 30 * 60 * 1000
     obs_timeout_s: float = 300.0
     hello_timeout_s: float = 120.0
@@ -117,39 +130,189 @@ class BallanceEnv(gym.Env):
         self._ep_start = 0
         self._after_death = False  # the last episode ended with BallOff and the process continues
         self._last_info: dict = {}
+        c = self.cfg
+        if c.start_record and c.prefix:
+            raise ValueError("start_record and prefix are exclusive")
+        self.starts = TasStarts(c.start_record) if c.start_record else None
+        if self.starts is not None and self.starts.level != c.level:
+            raise ValueError(f"start record {c.start_record} is level {self.starts.level}, not {c.level}")
+        self.curriculum = None
+        if self.starts is not None and c.curriculum is not None:
+            self.curriculum = ReverseCurriculum(self.starts, CurriculumConfig(**c.curriculum))
+        self._start_rng = np.random.default_rng(c.seed)
+        self._copies = [c.copy] + ([c.warm_copy] if c.warm_pool else [])
+        if c.warm_pool and (not c.warm_copy or c.warm_copy == c.copy):
+            raise ValueError("warm_pool needs a second runtime copy (warm_copy)")
+        self._copy_i = 0
+        self._warm = None  # (thread, result box) of the pre-launched process
+        self._start: dict = {}  # how the current episode started (info["start"])
 
     # ------------------------------------------------------------------------------ process
     def _out_root(self) -> Path:
         return Path(self.cfg.out_root) if self.cfg.out_root else instances.runtime_dir() / "episodes"
 
-    def _start_process(self):
+    def _draw_start(self) -> int | None:
+        """Start frame of the next process: None (no TAS start states), 0 (from level load) or a valid frame
+        of the start record (curriculum draw, or the fixed start_frame snapped to the nearest valid one)."""
+        if self.starts is None:
+            return None
+        if self.curriculum is not None:
+            return self.curriculum.sample(self._start_rng)
+        k = self.cfg.start_frame or 0
+        return self.starts.nearest_valid(k) if k > 0 else 0
+
+    def _handover_check(self, sess: AgentSession, k: int) -> dict | None:
+        """The hand-over state against the dataset's replay of the start record at frame k (ball position
+        bit-exact, sector, checkpoints, lives, points, SR double sum). None when it matches. The game does not
+        always replay the same inputs the same way: 1 of 354 prefix replays of SR01_1_14_457_264 kept on disk reached
+        the first checkpoint one frame late (7818 instead of 7817) with byte-identical inputs, and one M0 reference
+        replay diverged too; cause unknown (docs/observations.md 5.1). Only the prefix is checked: frames the agent
+        plays (all of a k = 0 run) have no reference, so an agent run can diverge unnoticed; the export check
+        (gates.export_diagnosis) tells that apart from a fidelity bug."""
+        exp = self.starts.expected(k)
+        t = sess.tracker
+        o = sess.obs
+        if exp is None or o is None or o.ball is None or sess.ended:
+            return {"reason": "no state", "ended": sess.ended}
+        got = {"frame": int(sess.frames_done), "sector": int(t.sector), "checkpoints": int(t.checkpoints),
+               "points": int(t.points), "lives": int(t.lives), "sr_double": float(t.sr_ms or 0.0),
+               "pos": np.asarray(o.ball["pos"], np.float64).tolist()}
+        return None if got == exp else {"got": got, "expected": exp}
+
+    def _prepare(self, copy: str, k: int | None) -> dict:
+        """_launch with the hand-over check (start_check): a process whose prefix replay did not reach the
+        recorded state is stopped (its run directory is kept, marked by a start_mismatch.json) and relaunched."""
+        mismatches = []
+        for _ in range(max(1, self.cfg.start_retries + 1)):
+            p = self._launch(copy, k)
+            if not k or not self.cfg.start_check:
+                break
+            bad = self._handover_check(p["session"], k)
+            if bad is None:
+                break
+            mismatches.append(bad)
+            s = p["session"]
+            try:
+                s.stop()
+            finally:
+                s.close()
+            (p["run_dir"] / "start_mismatch.json").write_text(json.dumps(bad, default=str), encoding="utf-8")
+        else:
+            raise RuntimeError(f"hand-over at frame {k} of {self.starts.record} differs from the dataset "
+                               f"{len(mismatches)} times: {mismatches[-1]}")
+        p["start"]["handover_mismatches"] = len(mismatches)
+        p["recorder"].meta.start_state = dict(p["recorder"].meta.start_state or {},
+                                              handover_mismatches=len(mismatches))
+        return p
+
+    def _launch(self, copy: str, k: int | None) -> dict:
+        """Launch one game process on `copy` and bring it to the player's control: the TAS prefix (k > 0) is
+        replayed by the mod, then the intro (StartLevel, the level-1 Q press while CamNav is not active,
+        BallNavActive) runs as from level load. Thread-safe (the warm pool calls it in a worker thread)."""
         c = self.cfg
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        run_id = f"L{c.level:02d}-{c.mode}-{c.copy}-{stamp}-{os.getpid()}-{next(_RUN_COUNTER)}"
-        self.run_dir = self._out_root() / c.copy / run_id
-        sc = SessionConfig(level=c.level, out_dir=self.run_dir, copy=c.copy, timeout_ms=c.timeout_ms,
+        run_id = f"L{c.level:02d}-{c.mode}-{copy}-{stamp}-{os.getpid()}-{next(_RUN_COUNTER)}"
+        run_dir = self._out_root() / copy / run_id
+        prefix = Path(c.prefix) if c.prefix else None
+        start_meta = None
+        if k:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            prefix = run_dir / "prefix.bin"
+            tas.save_raw(prefix, self.starts.prefix(k))
+        if self.starts is not None:
+            start_meta = {"kind": "tas", "record": self.starts.record,
+                          "record_sha256": self.starts.meta.get("record_sha256"), "frame": int(k or 0)}
+        sc = SessionConfig(level=c.level, out_dir=run_dir, copy=copy, timeout_ms=c.timeout_ms,
                            max_frames=c.max_process_frames, body_radius=c.body_radius, sr_tail=c.sr_tail,
-                           skip_render=c.skip_render, prefix=Path(c.prefix) if c.prefix else None, trace=c.trace,
+                           skip_render=c.skip_render, prefix=prefix, trace=c.trace,
                            obs_timeout_s=c.obs_timeout_s, hello_timeout_s=c.hello_timeout_s, launch=c.launch)
         prefix_meta = None
-        if c.prefix:
-            data = Path(c.prefix).read_bytes()
-            prefix_meta = {"path": str(c.prefix), "frames": len(data) // tas.FRAME_SIZE,
+        if prefix is not None:
+            data = prefix.read_bytes()
+            prefix_meta = {"path": prefix.name if k else str(prefix), "frames": len(data) // tas.FRAME_SIZE,
                            "sha256": hashlib.sha256(data).hexdigest()}
-        self.recorder = RunRecorder(self.run_dir, run_id, c.level, mode=c.mode, seed=c.seed, copy=c.copy,
-                                    prefix=prefix_meta, feature_version=self.cfg.features.version,
-                                    feature_config=self.cfg.features.to_dict(),
-                                    reward_config=self.cfg.reward_config().to_dict())
-        self.session = AgentSession(sc, self.launcher)
-        self.session.start()
-        self.recorder.meta.mod_version = (self.session.hello or {}).get("mod_version", "")
-        self._intro()
+        rec = RunRecorder(run_dir, run_id, c.level, mode=c.mode, seed=c.seed, copy=copy, prefix=prefix_meta,
+                          start_state=start_meta, feature_version=self.cfg.features.version,
+                          feature_config=self.cfg.features.to_dict(), reward_config=self.cfg.reward_config().to_dict())
+        t0 = time.perf_counter()
+        sess = AgentSession(sc, self.launcher)
+        sess.start()  # closes (kills) its process on failure
+        t1 = time.perf_counter()
+        rec.meta.mod_version = (sess.hello or {}).get("mod_version", "")
+        try:
+            self._intro(sess)
+        except BaseException:
+            sess.close(kill=True)
+            raise
+        t2 = time.perf_counter()
+        st = sess.timing
+        timing = {"k": int(k or 0), "launch_s": st.get("hello", t1) - st.get("launch", t0),
+                  "handover_s": st.get("first_obs_raw", t1) - st.get("hello", t0),
+                  "handover_python_s": t1 - st.get("first_obs_raw", t1), "intro_s": t2 - t1, "total_s": t2 - t0,
+                  "handover_frames": int(len(sess.prefix_frames)) if sess.prefix_frames is not None else 0,
+                  "control_frame": int(sess.frames_done)}
+        rec.meta.timing = timing
+        start = dict(start_meta or {"kind": "level", "frame": 0})
+        start.update(sr_ms=sess.tracker.sr_ms, control_frame=int(sess.frames_done), new_process=True,
+                     copy=copy, timing=timing)
+        return {"session": sess, "recorder": rec, "run_dir": run_dir, "start": start}
+
+    def _start_process(self):
+        c = self.cfg
+        if self._warm is not None:
+            th, box = self._warm
+            tj = time.perf_counter()
+            th.join()
+            self._warm = None
+            if "prepared" in box:
+                box["prepared"]["start"]["adopt_wait_s"] = time.perf_counter() - tj
+            if "error" in box:
+                raise box["error"]
+            prepared = box["prepared"]
+        else:
+            prepared = self._prepare(self._copies[self._copy_i], self._draw_start())
+        self.session, self.recorder = prepared["session"], prepared["recorder"]
+        self.run_dir = prepared["run_dir"]
+        self._start = prepared["start"]
+        self._copy_i = self._copies.index(prepared["start"]["copy"])
+        if c.warm_pool:
+            self._launch_warm()
+
+    def _launch_warm(self):
+        """Pre-launch the next process on the other copy while this one runs (its start frame is drawn now,
+        one process ahead of curriculum updates)."""
+        nxt = self._copies[(self._copy_i + 1) % len(self._copies)]
+        k = self._draw_start()
+        box: dict = {}
+
+        def run():
+            try:
+                box["prepared"] = self._prepare(nxt, k)
+            except BaseException as e:  # re-raised when the process is adopted
+                box["error"] = e
+
+        th = threading.Thread(target=run, name=f"ballrain-warm-{nxt}", daemon=True)
+        th.start()
+        self._warm = (th, box)
+
+    def _drop_warm(self):
+        if self._warm is None:
+            return
+        th, box = self._warm
+        th.join()
+        self._warm = None
+        p = box.get("prepared")
+        if p is not None:
+            s = p["session"]
+            try:
+                s.stop()
+            finally:
+                s.close()
 
     def _idle(self):
         return tas.make_frames([self.delta], [self.cfg.idle_keys])
 
-    def _intro(self):
-        s = self.session
+    def _intro(self, s: AgentSession):
         if not s.tracker.flags.started:
             s.run_until(self.cfg.idle_keys, ["StartLevel"], self.delta)
         if self.cfg.level == 1 and self.cfg.skip_tutorial and not s.tracker.flags.cam_nav and not s.ended:
@@ -160,6 +323,20 @@ class BallanceEnv(gym.Env):
                 s.act(pulse, repeat=1, stop=["CamNavActive", "BallNavActive", "GameOver"])
         if not s.tracker.flags.ball_nav and not s.ended:
             s.run_until(self.cfg.idle_keys, ["BallNavActive", "GameOver", "LevelFinish"], self.delta)
+
+    # ------------------------------------------------------------------------------ start states
+    def set_start_state(self, state: dict) -> None:
+        """Curriculum state from the trainer (ReverseCurriculum.state_dict()); see ballrain.curriculum."""
+        if self.curriculum is None:
+            raise RuntimeError("no curriculum configured (EnvConfig.start_record + curriculum)")
+        self.curriculum.load_state_dict(state)
+
+    def get_start_state(self) -> dict | None:
+        return self.curriculum.state_dict() if self.curriculum is not None else None
+
+    def set_start_frame(self, k: int | None) -> None:
+        """Fixed start frame for the next processes (without a curriculum); 0 / None = from level load."""
+        self.cfg.start_frame = k
 
     def _finish_process(self, reason: str | None = None):
         s, rec = self.session, self.recorder
@@ -211,10 +388,18 @@ class BallanceEnv(gym.Env):
             self._start_process()
             if self.session.ended or not self.session.tracker.flags.ball_nav:
                 raise RuntimeError(f"run ended before the player got control ({self.session.end_reason_name})")
+        else:  # a respawn in the same process (per-life episodes)
+            prev = self._start
+            self._start = {"kind": "respawn", "frame": int(self.session.frames_done),
+                           "sr_ms": self.session.tracker.sr_ms, "new_process": False, "copy": prev.get("copy"),
+                           "record": prev.get("record"), "process_start_frame": prev.get("process_start_frame")}
+        if self._start.get("new_process"):
+            self._start["process_start_frame"] = self._start.get("frame")
         s = self.session
         self.recorder.begin_life(s.frames_done)
         self._ep_steps = self._ep_frames = self._ep_pause_frames = 0
         self._ep_start = s.frames_done
+        self.fx.reset_episode()  # path projection state: re-acquired at every episode start
         obs, finfo = self.fx.compute(s.tracker)
         self.reward.begin(s.tracker, self._arc(finfo))
         info = self._info(finfo, [])
@@ -273,7 +458,9 @@ class BallanceEnv(gym.Env):
                                            and self._ep_frames >= self.cfg.max_episode_frames)):
             truncated = True
         obs, finfo = self.fx.compute(s.tracker)
-        r, terms = self.reward.step(s.tracker, self._arc(finfo), died, finished, terminated)
+        p = finfo.get("path")
+        r, terms = self.reward.step(s.tracker, self._arc(finfo), died, finished, terminated,
+                                    rebase=bool(p and p.get("jump")), supported=finfo.get("supported", False))
         info = self._info(finfo, new, terms)
         info.update(extra)
         if error:
@@ -348,13 +535,17 @@ class BallanceEnv(gym.Env):
                 "valid": t.control_valid(), "surface": finfo.get("surface"), "gap": finfo.get("gap"),
                 "paused": t.flags.paused, "followers": t.followers(),
                 "edge_fan_min": float(np.min(finfo["edge_fan"])) if "edge_fan" in finfo else None,
+                "supported": finfo.get("supported"), "progress_held": self.reward.held,
                 "life": len(self.recorder.lives) - 1 if self.recorder else None,
-                "run_id": self.recorder.meta.run_id if self.recorder else None}
+                "run_id": self.recorder.meta.run_id if self.recorder else None, "start": self._start}
         if terms:
             info["reward_terms"] = terms
         return info
 
     def close(self):
-        if self.session is not None:
-            self._finish_process("closed")
+        try:
+            if self.session is not None:
+                self._finish_process("closed")
+        finally:
+            self._drop_warm()
         super().close()

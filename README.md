@@ -14,6 +14,8 @@
 | `scripts/m0_gates.py` | M0 保真门禁 G0–G5（启动游戏） |
 | `scripts/make_copies.py` | 创建 / 校验训练拷贝 `runtime/train-01..07`，同步新编译的 mod |
 | `scripts/build_tas_dataset.py` | 用 agent 模式回放全部 TAS，保存逐帧原始状态（启动游戏） |
+| `scripts/build_refpaths.py` | 从 TAS 数据集生成各关的 TAS 参考线 `benchmarks/refpaths/L<nn>.npz`（离线） |
+| `scripts/m2_start_states.py` | TAS 起点的开销、吞吐、导出验收（启动游戏，结果在 `runtime/m2-results/`） |
 | `docs/` | `benchmarks.md` 基准，`state-spec.md` 游戏状态清单，`agent-protocol.md` IPC 契约，`observations.md` 观测 / 奖励 / 录制 |
 | `tests/` | `uv run pytest`；不启动游戏（`BALLRAIN_LIVE=1` 时才跑 `test_live.py`） |
 | `reference/TASSupport/` | 参考 TASSupport 源码 |
@@ -29,9 +31,10 @@
 | `instances.py` | 游戏拷贝管理与启动（只在 `runtime/<copy>/Bin` 下启动，只停止自己启动并核对过路径的进程），创建训练拷贝 |
 | `synth.py` | 合成测试输入 |
 | `protocol.py`、`transport.py`、`client.py` | agent 模式：线格式、共享内存 + 事件、单进程会话 |
-| `state.py`、`geometry.py`、`path.py`、`features.py` | 状态累积、几何、参考路径、特征 |
+| `state.py`、`geometry.py`、`path.py`、`features.py` | 状态累积、几何、参考路径（TAS 参考线 / 检查点折线）、特征 |
 | `rewards.py`、`recording.py` | 奖励；每个进程的 .tas + 元数据（SR 按 BML+ 0.3.12 规则） |
-| `env.py`、`vecenv.py` | gymnasium 环境（每条命一个回合）、N 个拷贝的向量环境 |
+| `env.py`、`vecenv.py` | gymnasium 环境（每条命一个回合，可从 TAS 第 k 帧起步，可预启动下一个进程）、N 个拷贝的向量环境 |
+| `curriculum.py` | TAS 起点与反向课程 |
 | `dataset.py` | TAS 数据集构建 |
 | `fakegame.py` | 模拟 mod（同一套传输和线格式），用于测试和离线开发 |
 
@@ -62,7 +65,14 @@ obs, info = env.reset()
 obs, reward, terminated, truncated, info = env.step(1)               # 1 = 上
 
 venv = make_vec_env(EnvConfig(level=1, mode="hs"), n=8)              # train-00..07，每个拷贝一个子进程
+
+# 从 TAS 轨迹的第 k 帧起步，k 由反向课程抽取（从关卡末尾往前）
+cfg = EnvConfig(level=1, mode="sr", action_repeat=4, start_record="SR01_1_14_457_264", curriculum={},
+                max_episode_frames=6000)
+venv = make_vec_env(cfg, n=8)                                        # warm_pool=True 时每个 env 用两个拷贝
 ```
+
+课程的更新接口见 `docs/observations.md` §5.1（`ReverseCurriculum.update` + `venv.call("set_start_state", ...)`）。
 
 - 每条命一个 RL 回合；BallOff 结束回合，进程继续到 GameOver / LevelFinish / 上限。每个进程结束时在 `runtime/episodes/<copy>/<run_id>/`
   写出 `<run_id>.tas`（legacy）和 `<run_id>.json`（每条命的边界、SR、HS、帧日志核对）。
