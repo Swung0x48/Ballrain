@@ -22,6 +22,9 @@ add_library(BallrainIO SHARED
         src/BallrainIO.cpp
         src/Hook.h
         src/TASHook.h
+        src/Agent.cpp
+        src/Ivp2002.h
+        src/Wire.h
 )
 
 target_link_libraries(BallrainIO PRIVATE BML minhook bcrypt)

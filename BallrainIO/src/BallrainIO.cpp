@@ -21,7 +21,8 @@
 // Reference = reference/TASSupport/TASSupport.cpp (patched 0.3.12, LegacyMode 1). Line numbers cite that file.
 //
 // Contract (environment, read once at OnLoad):
-//   BALLRAIN_MODE=replay       anything else: the mod stays inert
+//   BALLRAIN_MODE=replay       BALLRAIN_MODE=agent: agent mode, see docs/agent-protocol.md and Agent.cpp
+//                              (same injection path; frames come from Python). Anything else: inert
 //   BALLRAIN_FRAMES=<path>     headerless 8-byte frames (the uncompressed payload of a legacy .tas)
 //   BALLRAIN_LEVEL=<1..13>     auto-load this level after the start menu
 //   BALLRAIN_TRACE=<path>      per-frame ball trace, the reference's BMMO_TAS_TRACE line format (no core section)
@@ -114,10 +115,18 @@ static bool Sha256File(const wchar_t *path, std::string &hex) {
 // ---------------------------------------------------------------- loading
 
 bool BallrainIO::ReadEnvironment() {
-    if (GetEnv("BALLRAIN_MODE") != "replay") {
-        GetLogger()->Info("BALLRAIN_MODE is not 'replay': inactive");
+    if (GetEnv("BALLRAIN_MODE") == "agent") {
+        m_Mode = Mode::Agent;
+        if (AgentReadEnvironment())
+            return true;
+        m_Mode = Mode::Inactive;
         return false;
     }
+    if (GetEnv("BALLRAIN_MODE") != "replay") {
+        GetLogger()->Info("BALLRAIN_MODE is not 'replay' or 'agent': inactive");
+        return false;
+    }
+    m_Mode = Mode::Replay;
     m_FramesPath = GetEnv("BALLRAIN_FRAMES");
     m_TracePath = GetEnv("BALLRAIN_TRACE");
     m_FrameLogPath = GetEnv("BALLRAIN_FRAMELOG");
@@ -189,6 +198,12 @@ void BallrainIO::OnLoad() {
         GetLogger()->Error("managers or PreProcess hooks unavailable: inactive");
         m_Active = false;
     }
+    if (m_Mode == Mode::Agent) {
+        if (!m_Active)
+            AgentFail(3, "agent: managers or PreProcess hooks unavailable");
+        else if (m_PhysicsOk > 0)
+            AgentHello();
+    }
     const std::string dbg = GetEnv("BALLRAIN_DEBUG");
     if (m_Active && !dbg.empty()) {
         m_Dbg = std::fopen(dbg.c_str(), "w");
@@ -205,6 +220,19 @@ void BallrainIO::OnUnload() {
     CKTimeManagerHook::Disable();
     CKInputManagerHook::Disable();
     MH_Uninitialize();
+    if (m_LevelInc)
+        std::fclose(m_LevelInc);
+    m_LevelInc = nullptr;
+    for (void *h : {m_EvObs, m_EvAct, m_ParentProc})
+        if (h)
+            ::CloseHandle(h);
+    m_EvObs = m_EvAct = m_ParentProc = nullptr;
+    if (m_Shm)
+        ::UnmapViewOfFile(m_Shm);
+    if (m_ShmMap)
+        ::CloseHandle(m_ShmMap);
+    m_Shm = nullptr;
+    m_ShmMap = nullptr;
 }
 
 bool BallrainIO::VerifyPhysicsDll(bool mustBeLoaded) {
@@ -219,15 +247,20 @@ bool BallrainIO::VerifyPhysicsDll(bool mustBeLoaded) {
     if (!module || !::GetModuleFileNameW(module, path, MAX_PATH) || !Sha256File(path, hex)) {
         GetLogger()->Error("physics_RT.dll is not loaded or cannot be hashed: refusing to run");
         m_Active = false;
+        if (m_Mode == Mode::Agent)
+            AgentFail(3, "agent: physics_RT.dll is not loaded or cannot be hashed");
         return false;
     }
     if (hex != kPhysicsSha256) {
         GetLogger()->Error("physics_RT.dll sha256 %s is not the 2002 DLL %s: refusing to run", hex.c_str(),
                            kPhysicsSha256);
         m_Active = false;
+        if (m_Mode == Mode::Agent)
+            AgentFail(3, "agent: physics_RT.dll is not the 2002 DLL");
         return false;
     }
     GetLogger()->Info("physics_RT.dll is the 2002 DLL (sha256 %.8s...)", hex.c_str());
+    m_PhysicsHex = hex;
     m_PhysicsOk = 1;
     return true;
 }
@@ -274,13 +307,16 @@ void BallrainIO::OnLoadScript(const char *filename, CKBehavior *script) {
 // ---------------------------------------------------------------- auto-load
 
 void BallrainIO::OnPreStartMenu() { Dbg("PreStartMenu cw=%04x", FpuCw()); }
-void BallrainIO::OnPostLoadLevel() { Dbg("PostLoadLevel idx=%u cw=%04x", (unsigned) m_FrameIndex, FpuCw()); }
 void BallrainIO::OnPostExitLevel() { Dbg("PostExitLevel cw=%04x", FpuCw()); }
 
 void BallrainIO::OnPostStartMenu() {
     Dbg("PostStartMenu cw=%04x", FpuCw());
     if (!m_Active || !VerifyPhysicsDll())
         return;
+    if (m_Mode == Mode::Agent && m_Phase == Phase::Idle) {
+        AgentHello();
+        AgentSetState(2);   // menu
+    }
     if (m_AutoLoadArmed && m_LoadIndex < m_Loads && m_Level >= 1) {
         m_AutoLoadArmed = false;
         if (m_LoadIndex == 0)
@@ -630,6 +666,8 @@ void BallrainIO::Start() {
     m_Playing = true;
     Event("PreLoadLevel");
     GetLogger()->Info("run %d/%d started", m_LoadIndex, m_Loads);
+    if (m_Mode == Mode::Agent)
+        AgentStart();
 }
 
 void BallrainIO::Stop(StopReason reason) {
@@ -645,9 +683,13 @@ void BallrainIO::Stop(StopReason reason) {
 
     const auto wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - m_StartTime).count();
-    CloseOutputs(wallMs);
+    CloseOutputs(wallMs, m_Mode == Mode::Agent);
     GetLogger()->Info("run %d/%d ended at frame %u", m_LoadIndex, m_Loads, (unsigned) m_FrameIndex);
 
+    if (m_Mode == Mode::Agent) {   // SR tail / final observation / exit: Agent.cpp
+        AgentAfterStop(reason);
+        return;
+    }
     if (m_LoadIndex < m_Loads) {
         // Back to the start menu through the game's own pause-menu message ("Exit Level" to Level and
         // All_Balls), then the next PostStartMenu runs the same auto-load. Not done when the level is
@@ -662,11 +704,32 @@ void BallrainIO::Stop(StopReason reason) {
         m_BML->ExitGame();   // reference :458-461 (ExitOnFinish)
 }
 
-void BallrainIO::OnPreResetLevel() { Stop(StopReason::ResetLevel); }   // reference :335
-void BallrainIO::OnPreExitLevel() { Stop(StopReason::ExitLevel); }     // reference :337
+// Agent mode: every hook is also an observation event (protocol 2.3) with its events-file line;
+// replay mode writes the same lines as before through Event() and ignores the agent-only hooks.
+#define BALLRAIN_EVENT(code, name)               \
+    do {                                         \
+        if (m_Mode == Mode::Agent)               \
+            AgentEvent((code), 0, (name));       \
+        else                                     \
+            Event(name);                         \
+    } while (0)
+#define BALLRAIN_AGENT_EVENT(code, name)         \
+    do {                                         \
+        if (m_Mode == Mode::Agent)               \
+            AgentEvent((code), 0, (name));       \
+    } while (0)
+
+void BallrainIO::OnPreResetLevel() {   // reference :335
+    BALLRAIN_AGENT_EVENT(28, "PreResetLevel");
+    Stop(StopReason::ResetLevel);
+}
+void BallrainIO::OnPreExitLevel() {   // reference :337
+    BALLRAIN_AGENT_EVENT(29, "PreExitLevel");
+    Stop(StopReason::ExitLevel);
+}
 
 void BallrainIO::OnLevelFinish() {   // reference :339-347
-    Event("LevelFinish");
+    BALLRAIN_EVENT(21, "LevelFinish");
     Stop(StopReason::LevelFinish);
 }
 
@@ -675,7 +738,7 @@ void BallrainIO::OnGameOver() {
     // Time callback, the point where the reference stops when its record runs out: this frame's trace
     // line is still written, so the frame log replayed as a legacy record by the real TASSupport gives
     // the identical trace, terminal frame included.
-    Event("GameOver");
+    BALLRAIN_EVENT(22, "GameOver");
     if (m_Playing)
         m_GameOverPending = true;
 }
@@ -686,27 +749,44 @@ void BallrainIO::OnStartLevel() {
     if (m_Dbg)
         DumpState(m_BML->GetCKContext(), m_IpionManager,
                   GetEnv("BALLRAIN_DEBUG") + ".dumpS" + std::to_string(m_LoadIndex));
-    Event("StartLevel");
+    BALLRAIN_EVENT(3, "StartLevel");
 }
-void BallrainIO::OnCamNavActive() { Event("CamNavActive"); }
-void BallrainIO::OnBallNavActive() { Event("BallNavActive"); }
-void BallrainIO::OnBallNavInactive() { Event("BallNavInactive"); }
-void BallrainIO::OnBallOff() { Event("BallOff"); }
-void BallrainIO::OnPreCheckpointReached() { Event("PreCheckpoint"); }
-void BallrainIO::OnPostCheckpointReached() { Event("PostCheckpoint"); }
-void BallrainIO::OnPreLifeUp() { Event("PreLifeUp"); }
+void BallrainIO::OnCamNavActive() { BALLRAIN_EVENT(4, "CamNavActive"); }
+void BallrainIO::OnBallNavActive() { BALLRAIN_EVENT(6, "BallNavActive"); }
+void BallrainIO::OnBallNavInactive() { BALLRAIN_EVENT(7, "BallNavInactive"); }
+void BallrainIO::OnBallOff() { BALLRAIN_EVENT(12, "BallOff"); }
+void BallrainIO::OnPreCheckpointReached() { BALLRAIN_EVENT(16, "PreCheckpoint"); }
+void BallrainIO::OnPostCheckpointReached() { BALLRAIN_EVENT(17, "PostCheckpoint"); }
+void BallrainIO::OnPreLifeUp() { BALLRAIN_EVENT(19, "PreLifeUp"); }
+
+void BallrainIO::OnPostLoadLevel() {
+    Dbg("PostLoadLevel idx=%u cw=%04x", (unsigned) m_FrameIndex, FpuCw());
+    BALLRAIN_AGENT_EVENT(2, "PostLoadLevel");
+}
+void BallrainIO::OnCamNavInactive() { BALLRAIN_AGENT_EVENT(5, "CamNavInactive"); }
+void BallrainIO::OnCounterActive() { BALLRAIN_AGENT_EVENT(8, "CounterActive"); }
+void BallrainIO::OnCounterInactive() { BALLRAIN_AGENT_EVENT(9, "CounterInactive"); }
+void BallrainIO::OnPauseLevel() { BALLRAIN_AGENT_EVENT(10, "PauseLevel"); }
+void BallrainIO::OnUnpauseLevel() { BALLRAIN_AGENT_EVENT(11, "UnpauseLevel"); }
+void BallrainIO::OnDead() { BALLRAIN_AGENT_EVENT(13, "Dead"); }
+void BallrainIO::OnPreSubLife() { BALLRAIN_AGENT_EVENT(14, "PreSubLife"); }
+void BallrainIO::OnPostSubLife() { BALLRAIN_AGENT_EVENT(15, "PostSubLife"); }
+void BallrainIO::OnExtraPoint() { BALLRAIN_AGENT_EVENT(18, "ExtraPoint"); }
+void BallrainIO::OnPostLifeUp() { BALLRAIN_AGENT_EVENT(20, "PostLifeUp"); }
+void BallrainIO::OnPreEndLevel() { BALLRAIN_AGENT_EVENT(23, "PreEndLevel"); }
+void BallrainIO::OnPostEndLevel() { BALLRAIN_AGENT_EVENT(24, "PostEndLevel"); }
+void BallrainIO::OnPostResetLevel() {}
 
 // ---------------------------------------------------------------- per frame
-
-const Frame *BallrainIO::GetFrame(size_t index) const {
-    return index < m_Frames.size() ? &m_Frames[index] : nullptr;
-}
+// GetFrame: Agent.cpp (replay: the BALLRAIN_FRAMES frames).
 
 void BallrainIO::OnPreProcessTime() {
     // Reference :506-513. The index is not advanced here.
     if (m_Dbg && (!m_Playing || m_FrameIndex < 140))
         Dbg("T idx=%u play=%d cw=%04x d=%.9g abs=%.9g", (unsigned) m_FrameIndex, (int) m_Playing, FpuCw(),
             m_TimeManager->GetLastDeltaTime(), m_TimeManager->GetAbsoluteTime());
+    if (m_Mode == Mode::Agent && AgentPreTime())
+        return;   // SR tail frame, or a stop deferred to this callback
     if (!m_Playing)
         return;
     if (m_GameOverPending) {
@@ -714,6 +794,13 @@ void BallrainIO::OnPreProcessTime() {
         return;
     }
     const Frame *frame = GetFrame(m_FrameIndex);
+    if (!frame && m_Mode == Mode::Agent) {
+        // Agent mode: the frame is Python's to choose. Blocks until the action arrives (the delta must
+        // be known here, before the game uses it); false when the run ended while waiting.
+        if (!AgentWaitAction())
+            return;
+        frame = GetFrame(m_FrameIndex);
+    }
     if (!frame) {
         Stop(StopReason::RecordEnd);
         return;
@@ -727,6 +814,8 @@ void BallrainIO::OnPreProcessInput() {
     // Reference :481-490: write the keys, then advance the frame.
     if (m_Dbg && (!m_Playing || m_FrameIndex < 140))
         Dbg("I idx=%u play=%d", (unsigned) m_FrameIndex, (int) m_Playing);
+    if (m_Mode == Mode::Agent && AgentPreInput())
+        return;   // SR tail frame (not exported)
     if (!m_Playing)
         return;
     if (m_GameOverPending) {
@@ -746,6 +835,10 @@ void BallrainIO::OnPreProcessInput() {
     }
     m_FrameLog.push_back(Frame{delta, frame->keys});
     ++m_FrameIndex;
+    if (m_Mode == Mode::Agent) {
+        ++m_Covered;
+        m_LastDelta = delta;
+    }
 }
 
 void BallrainIO::OnProcess() {
@@ -842,8 +935,11 @@ void BallrainIO::OnProcess() {
             std::fflush(m_Act);
         }
     }
-    if (!m_Playing)
+    if (!m_Playing) {
+        if (m_Mode == Mode::Agent)
+            AgentProcess();   // SR tail, final observation after a mid-frame stop
         return;
+    }
 
     // Reference :208-252: the trace line, frame index after the Input callback advanced it, flushed
     // after every line as the reference does.
@@ -861,6 +957,8 @@ void BallrainIO::OnProcess() {
             ++m_TraceLines;
         }
     }
+    if (m_Mode == Mode::Agent)
+        AgentProcess();   // events / SR / physicalize export / observation (after the trace line)
     // Reference :254-255 with SkipRenderUntil beyond the record.
     if (m_SkipRender)
         m_BML->SkipRenderForNextTick();
@@ -951,12 +1049,16 @@ void BallrainIO::OpenOutputs() {
         GetLogger()->Error("cannot open events %s", OutputPath(m_EventsPath).c_str());
 }
 
-void BallrainIO::CloseOutputs(long long wallMs) {
+void BallrainIO::CloseOutputs(long long wallMs, bool keepEvents) {
     if (m_Events) {
         std::fprintf(m_Events, "%u Summary frames=%u wall_ms=%lld\n", (unsigned) m_FrameIndex, (unsigned) m_FrameIndex,
                      wallMs);
-        std::fclose(m_Events);
-        m_Events = nullptr;
+        if (keepEvents) {   // agent mode: SR tail / final lines follow (Agent.cpp closes the file)
+            std::fflush(m_Events);
+        } else {
+            std::fclose(m_Events);
+            m_Events = nullptr;
+        }
     }
     if (m_Trace) {
         std::fclose(m_Trace);

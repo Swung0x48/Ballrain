@@ -259,6 +259,47 @@ def remove_installed(src, dst) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------------------- M1
+
+def majority_verdict(ref_shas, agent_sha) -> tuple[bool, str]:
+    """M1-B export gate: an exported agent-mode run passes if at least 2 of the reference replays have
+    identical traces (the majority) and the agent-mode trace is byte-identical to that majority.
+    A missing trace (None) never counts. Three distinct reference traces is a fail."""
+    shas = [s for s in ref_shas if s]
+    if len(ref_shas) < 3:
+        return False, f"FAIL: {len(ref_shas)} reference replays, 3 required"
+    counts: dict = {}
+    for s in shas:
+        counts[s] = counts.get(s, 0) + 1
+    major = max(counts.items(), key=lambda kv: kv[1]) if counts else (None, 0)
+    if major[1] * 2 <= len(ref_shas):
+        return False, f"FAIL: no reference majority ({len(counts)} distinct of {len(ref_shas)})"
+    if not agent_sha:
+        return False, "FAIL: no agent-mode trace"
+    if agent_sha != major[0]:
+        return False, f"FAIL: agent trace differs from the reference majority ({major[1]}/{len(ref_shas)})"
+    if major[1] == len(ref_shas):
+        return True, "PASS"
+    return True, f"PASS (reference majority {major[1]}/{len(ref_shas)})"
+
+
+def identical_files(a, b) -> bool:
+    """Byte equality of two files (False if either is missing)."""
+    a, b = Path(a), Path(b)
+    if not a.is_file() or not b.is_file():
+        return False
+    return a.stat().st_size == b.stat().st_size and a.read_bytes() == b.read_bytes()
+
+
+def events_without_summary(path) -> list[str]:
+    """Replay-mode events file lines without the Summary line (it carries wall-clock time)."""
+    p = Path(path)
+    if not p.is_file():
+        return []
+    return [ln for ln in p.read_text(encoding="latin-1").splitlines()
+            if not ln.partition(" ")[2].startswith("Summary")]
+
+
 # ------------------------------------------------------------------------------------- summary
 
 def summarize(cases: dict) -> dict:

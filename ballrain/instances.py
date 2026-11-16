@@ -48,6 +48,18 @@ BALLRAIN_VARS = (
     "BALLRAIN_EXIT",
     "BALLRAIN_LOADS",
     "BALLRAIN_DEBUG",  # diagnostic logging in the mod; always cleared unless a launch sets it
+    # agent mode (docs/agent-protocol.md section 6)
+    "BALLRAIN_SHM",
+    "BALLRAIN_PARENT_PID",
+    "BALLRAIN_TIMEOUT_MS",
+    "BALLRAIN_LEVELMSG",
+    "BALLRAIN_PREFIX",
+    "BALLRAIN_PREFIX_EVENTS",
+    "BALLRAIN_MAX_FRAMES",
+    "BALLRAIN_BODY_RADIUS",
+    "BALLRAIN_SR_TAIL",
+    "BALLRAIN_POST_FINISH",  # diagnostic: idle frames after the SR tail (BallrainIO >= 0.3.1)
+    "BALLRAIN_POST_LOG",  # diagnostic: per-frame text log from LevelFinish to the end of the run
 )
 BMMO_VARS = ("BMMO_TAS_TRACE", "BMMO_TAS_OFFSETS", "BMMO_TAS_CORE", "BMMO_TAS_PC")
 MANAGED_VARS = BALLRAIN_VARS + BMMO_VARS
@@ -494,6 +506,129 @@ def run_copy(copy: GameCopy, env: dict, outputs: dict, timeout: float, recipe=No
         if not p.exists() or p.stat().st_mtime < t_wall - 2:
             missing.append(k)
     return RunResult(copy.name, pid, code, timed_out, killed, wall, dict(outputs), missing, t_wall)
+
+
+def start_copy(copy: GameCopy, env: dict, recipe=None) -> "ProcessHandle":
+    """Launch without waiting (agent mode): preflight, start, return a verified handle to our own PID."""
+    recipe = recipe or LAUNCH_RECIPE
+    preflight(copy)
+    pid = recipe(copy, env)
+    return ProcessHandle(pid, copy.exe)
+
+
+def stop_handle(h: "ProcessHandle", wait_s: float = 10.0) -> int | None:
+    """Wait for our own process to exit; terminate it (after re-verifying its image) if it does not."""
+    try:
+        if not h.wait(wait_s):
+            h.terminate()
+            h.wait(10)
+        return h.exit_code()
+    finally:
+        _LAUNCHED.pop(h.pid, None)
+        h.close()
+
+
+# ------------------------------------------------------------------------------- training copies
+
+TRAINING_COPY_FMT = "train-{:02d}"
+COPY_SKIP_NAMES = {"ModLoader.log", "CommandBar.history", "ImGui.ini", LAUNCH_SCRIPT_NAME}
+COPY_SKIP_SUFFIXES = (".prev", ".cmd", ".bat", ".ps1", ".log")
+_HASH_SUFFIXES = (".dll", ".exe", ".bmodp", ".nmo", ".cmo")
+
+
+def training_copy_names(n: int) -> list[str]:
+    return [TRAINING_COPY_FMT.format(i) for i in range(n)]
+
+
+def _copy_ignore(_dir, names):
+    return [n for n in names if n in COPY_SKIP_NAMES or n.lower().endswith(COPY_SKIP_SUFFIXES)]
+
+
+MOD_REL = "ModLoader/Mods/BallrainIO.bmodp"  # rebuilt often: synced by sync_mod, not compared
+
+
+def _tree_files(root: Path) -> dict:
+    out = {}
+    for p in root.rglob("*"):
+        if p.is_file():
+            rel = p.relative_to(root)
+            if any(part in COPY_SKIP_NAMES for part in rel.parts) or p.name.lower().endswith(COPY_SKIP_SUFFIXES):
+                continue
+            if rel.as_posix() == MOD_REL:
+                continue
+            out[rel.as_posix()] = p
+    return out
+
+
+def mod_hashes(names, runtime=None) -> dict:
+    """sha256 of the installed BallrainIO.bmodp per copy (None when missing)."""
+    out = {}
+    for n in names:
+        p = get_copy(n, runtime).root / MOD_REL
+        out[n] = sha256_file(p) if p.is_file() else None
+    return out
+
+
+def verify_copy_matches(src: GameCopy, dst: GameCopy, hash_all: bool = False) -> list[str]:
+    """Differences between two copies: missing/extra files, sizes, sha256 of binaries (all with hash_all).
+    The BallrainIO mod itself is not compared (see sync_mod / mod_hashes)."""
+    a, b = _tree_files(src.root), _tree_files(dst.root)
+    probs = [f"missing {k}" for k in sorted(a.keys() - b.keys())]
+    probs += [f"extra {k}" for k in sorted(b.keys() - a.keys())]
+    for k in sorted(a.keys() & b.keys()):
+        if a[k].stat().st_size != b[k].stat().st_size:
+            probs.append(f"size {k}")
+        elif (hash_all or k.lower().endswith(_HASH_SUFFIXES)) and sha256_file(a[k]) != sha256_file(b[k]):
+            probs.append(f"sha256 {k}")
+    return probs
+
+
+def create_training_copies(n: int = 8, source: str = TRAINING_COPY, runtime=None, hash_all: bool = False) -> dict:
+    """Create train-01..train-(n-1) as copies of `source` (logs and launch scripts excluded), then
+    verify physics_RT.dll against the 2002 hash and every binary against the source. Existing copies
+    are only verified, never overwritten. Returns {name: "created" | "exists"} or raises."""
+    base = Path(runtime) if runtime is not None else runtime_dir()
+    src = get_copy(source, base)
+    verify_physics(src)
+    out = {}
+    for name in training_copy_names(n):
+        if name == source:
+            continue
+        root = base / name
+        if not root.exists():
+            shutil.copytree(src.root, root, ignore=_copy_ignore)
+            out[name] = "created"
+        else:
+            out[name] = "exists"
+        dst = get_copy(name, base)
+        verify_physics(dst)
+        verify_no_foreign_scripts(dst)
+        if dst.has_tassupport():
+            raise InstanceError(f"{dst.root} contains TASSupport.bmodp; training copies must not")
+        probs = verify_copy_matches(src, dst, hash_all)
+        if probs:
+            raise InstanceError(f"{dst.root} differs from {src.root}: {probs[:10]}")
+    return out
+
+
+def sync_mod(build_path, names, runtime=None) -> dict:
+    """Install a built BallrainIO.bmodp into each named copy; returns {name: sha256}. Copies that run
+    a game process are refused (the mod file is locked and the change would not take effect)."""
+    build_path = Path(build_path)
+    want = sha256_file(build_path)
+    out = {}
+    for name in names:
+        gc = get_copy(name, runtime)
+        if running_in_copy(gc):
+            raise InstanceError(f"{gc.root} has a running Player.exe; not replacing its mod")
+        dst = gc.mods_dir / "BallrainIO.bmodp"
+        if not dst.exists() or sha256_file(dst) != want:
+            shutil.copyfile(build_path, dst)
+        got = sha256_file(dst)
+        if got != want:
+            raise InstanceError(f"{dst}: sha256 {got} != {want}")
+        out[name] = got
+    return out
 
 
 def install_record(copy: GameCopy, tas_path) -> str:

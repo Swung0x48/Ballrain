@@ -324,3 +324,49 @@ def test_run_ballrain_end_to_end(fake, tmp_path, monkeypatch):
     res = r["result"]
     assert not res.ok and not res.timed_out
     assert sorted(res.missing_outputs) == ["events.2", "framelog.2", "trace.2"]
+
+
+def test_create_training_copies_and_sync_mod(tmp_path, monkeypatch):
+    rt = tmp_path / "rt"
+    src = make_copy(rt / "train-00", cls=ins.GameCopy, mods=("BallrainIO.bmodp",))
+    (src.modloader_dir / "ModLoader.log").write_text("log")
+    (src.root / ins.LAUNCH_SCRIPT_NAME).write_text("@echo off\r\n")
+    (src.root / "BuildingBlocks" / "extra.dll").write_bytes(b"abc")
+    monkeypatch.setattr(ins, "PHYSICS_RT_SHA256", hashlib.sha256(b"fake physics").hexdigest())
+    res = ins.create_training_copies(3, runtime=rt)
+    assert res == {"train-01": "created", "train-02": "created"}
+    c2 = ins.get_copy("train-02", rt)
+    assert not (c2.modloader_dir / "ModLoader.log").exists() and not (c2.root / ins.LAUNCH_SCRIPT_NAME).exists()
+    assert ins.verify_copy_matches(src, c2, hash_all=True) == []
+    assert ins.create_training_copies(3, runtime=rt) == {"train-01": "exists", "train-02": "exists"}
+    (c2.physics_dll).write_bytes(b"other physics")
+    with pytest.raises(ins.InstanceError):
+        ins.create_training_copies(3, runtime=rt)
+    (c2.physics_dll).write_bytes(b"fake physics")
+    (c2.root / "BuildingBlocks" / "extra.dll").write_bytes(b"abd")
+    with pytest.raises(ins.InstanceError):  # binaries are hash-checked against the source
+        ins.create_training_copies(3, runtime=rt)
+    (c2.root / "BuildingBlocks" / "extra.dll").write_bytes(b"abc")
+    (c2.mods_dir / "BallrainIO.bmodp").write_bytes(b"old")  # the mod is not compared: it is synced
+    assert ins.create_training_copies(3, runtime=rt)["train-02"] == "exists"
+    assert len(set(ins.mod_hashes(["train-00", "train-02"], rt).values())) == 2
+    build = tmp_path / "BallrainIO.bmodp"
+    build.write_bytes(b"new build")
+    out = ins.sync_mod(build, ["train-00", "train-01", "train-02"], runtime=rt)
+    assert set(out.values()) == {hashlib.sha256(b"new build").hexdigest()}
+    assert ins.create_training_copies(3, runtime=rt)["train-02"] == "exists"
+
+
+def test_training_copies_on_disk():
+    names = [n for n in ins.training_copy_names(8) if (ins.runtime_dir() / n / "BuildingBlocks" / "physics_RT.dll").exists()]
+    if not names:
+        pytest.skip("no training copies")
+    for n in names:
+        gc = ins.get_copy(n)
+        assert ins.verify_physics(gc) == ins.PHYSICS_RT_SHA256
+        assert not gc.has_tassupport() and gc.has_ballrainio()
+
+
+def test_agent_vars_are_managed():
+    for k in ("BALLRAIN_SHM", "BALLRAIN_PARENT_PID", "BALLRAIN_LEVELMSG", "BALLRAIN_PREFIX", "BALLRAIN_SR_TAIL"):
+        assert k in ins.MANAGED_VARS

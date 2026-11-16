@@ -1175,7 +1175,7 @@
   "date": null,
   "source": "HS01_4736_1_32_258.tas",
   "verified": true,
-  "notes": "local TAS file, not the current wiki record; replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 92179.023 ms -> does NOT match file name (-78.977 ms); score decomposition: level bonus 100 + time points (1000 - 184) + 11 x 220 extra points + 7 lives x 200",
+  "notes": "local TAS file, not the current wiki record; replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 92179.023 ms -> does NOT match file name (-78.977 ms); score decomposition: level bonus 100 + time points (1000 - 184) + 11 x 220 extra points + 7 lives x 200; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 4736 = file name score (12 small balls still following at LevelFinish)",
   "tas_time_ms": 92258
  },
  {
@@ -1188,7 +1188,7 @@
   "date": null,
   "source": "HS01_4738_1_31_317.tas",
   "verified": true,
-  "notes": "local TAS file, not the current wiki record; replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 91317.062 ms -> matches file name; score decomposition: level bonus 100 + time points (1000 - 182) + 11 x 220 extra points + 7 lives x 200",
+  "notes": "local TAS file, not the current wiki record; replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 91317.062 ms -> matches file name; score decomposition: level bonus 100 + time points (1000 - 182) + 11 x 220 extra points + 7 lives x 200; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 4738 = file name score (12 small balls still following at LevelFinish)",
   "tas_time_ms": 91317
  },
  {
@@ -1201,7 +1201,7 @@
   "date": "2025-10-06",
   "source": "HS01_4740_1_30_344.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 90344.844 ms -> matches file name; score decomposition: level bonus 100 + time points (1000 - 180) + 11 x 220 extra points + 7 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1BaxEzeE8j",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 90344.844 ms -> matches file name; score decomposition: level bonus 100 + time points (1000 - 180) + 11 x 220 extra points + 7 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1BaxEzeE8j; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 4740 = file name score (12 small balls still following at LevelFinish)",
   "tas_time_ms": 90344
  },
  {
@@ -1214,7 +1214,7 @@
   "date": null,
   "source": "HS02_5874_2_02_751.tas",
   "verified": true,
-  "notes": "local TAS file, not the current wiki record; replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 122751.570 ms -> matches file name; score decomposition: level bonus 200 + time points (999 - 245) + 16 x 220 extra points + 7 lives x 200",
+  "notes": "local TAS file, not the current wiki record; replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 122751.570 ms -> matches file name; score decomposition: level bonus 200 + time points (999 - 245) + 16 x 220 extra points + 7 lives x 200; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 5874 = file name score (24 small balls still following at LevelFinish)",
   "tas_time_ms": 122751
  },
  {
@@ -1227,7 +1227,7 @@
   "date": "2025-12-14",
   "source": "HS02_5885_1_57_481.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 117485.898 ms -> does NOT match file name (+4.898 ms); score decomposition: level bonus 200 + time points (999 - 234) + 16 x 220 extra points + 7 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1gDmoBaEPg",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 117485.898 ms -> does NOT match file name (+4.898 ms); score decomposition: level bonus 200 + time points (999 - 234) + 16 x 220 extra points + 7 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1gDmoBaEPg; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 5885 = file name score (24 small balls still following at LevelFinish)",
   "tas_time_ms": 117481
  },
  {
@@ -1240,7 +1240,7 @@
   "date": "2021-06-12",
   "source": "HS03_4906_1_56_934.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 116934.375 ms -> matches file name; score decomposition: level bonus 300 + time points (999 - 233) + 12 x 220 extra points + 6 lives x 200; wiki fps 240; video: https://www.bilibili.com/video/BV1dU4y1V71f",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 116934.375 ms -> matches file name; score decomposition: level bonus 300 + time points (999 - 233) + 12 x 220 extra points + 6 lives x 200; wiki fps 240; video: https://www.bilibili.com/video/BV1dU4y1V71f; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 4906 = file name score (0 small balls still following at LevelFinish)",
   "tas_time_ms": 116934
  },
  {
@@ -1253,7 +1253,7 @@
   "date": "2024-07-13",
   "source": "HS04_6925_2_27_295.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 147295.031 ms -> matches file name; score decomposition: level bonus 400 + time points (999 - 294) + 21 x 220 extra points + 6 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV11Z421K74e",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 147295.031 ms -> matches file name; score decomposition: level bonus 400 + time points (999 - 294) + 21 x 220 extra points + 6 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV11Z421K74e; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 5765 != 6925: the .tas never presses Esc and loses small balls at checkpoints (8 still following at LevelFinish); the name score is not reachable without Esc pauses; runtime/tas-patched/HS04_6925_2_27_295_esc.tas (Esc pauses inserted before every checkpoint and the airship, trace without the paused frames identical) reads 6925",
   "tas_time_ms": 147295
  },
  {
@@ -1266,7 +1266,7 @@
   "date": "2022-05-01",
   "source": "HS05_5046_2_26_749.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 146749.266 ms -> matches file name; score decomposition: level bonus 500 + time points (999 - 293) + 12 x 220 extra points + 6 lives x 200; wiki fps 240; video: https://www.bilibili.com/video/BV1QT4y1z7Ce",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 146749.266 ms -> matches file name; score decomposition: level bonus 500 + time points (999 - 293) + 12 x 220 extra points + 6 lives x 200; wiki fps 240; video: https://www.bilibili.com/video/BV1QT4y1z7Ce; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 5046 = file name score (0 small balls still following at LevelFinish)",
   "tas_time_ms": 146749
  },
  {
@@ -1279,7 +1279,7 @@
   "date": "2024-05-01",
   "source": "HS06_5156_2_31_949.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 151949.750 ms -> matches file name; score decomposition: level bonus 600 + time points (999 - 303) + 13 x 220 extra points + 5 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1Gt421c7ob",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 151949.750 ms -> matches file name; score decomposition: level bonus 600 + time points (999 - 303) + 13 x 220 extra points + 5 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1Gt421c7ob; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 5156 = file name score (18 small balls still following at LevelFinish)",
   "tas_time_ms": 151949
  },
  {
@@ -1292,7 +1292,7 @@
   "date": "2025-02-09",
   "source": "HS07_5008_2_35_802.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 155802.844 ms -> matches file name; score decomposition: level bonus 700 + time points (999 - 311) + 11 x 220 extra points + 6 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1RnN1e9ED9",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 155802.844 ms -> matches file name; score decomposition: level bonus 700 + time points (999 - 311) + 11 x 220 extra points + 6 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1RnN1e9ED9; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 5008 = file name score (0 small balls still following at LevelFinish)",
   "tas_time_ms": 155802
  },
  {
@@ -1305,7 +1305,7 @@
   "date": "2023-02-26",
   "source": "HS08_5721_3_09_448.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 189448.406 ms -> matches file name; score decomposition: level bonus 800 + time points (999 - 378) + 15 x 220 extra points + 5 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1xs4y1Z7RK",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 189448.406 ms -> matches file name; score decomposition: level bonus 800 + time points (999 - 378) + 15 x 220 extra points + 5 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1xs4y1Z7RK; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 5721 = file name score (12 small balls still following at LevelFinish)",
   "tas_time_ms": 189448
  },
  {
@@ -1331,7 +1331,7 @@
   "date": "2025-09-20",
   "source": "HS10_5523_2_48_443.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 168443.562 ms -> matches file name; score decomposition: level bonus 1000 + time points (999 - 336) + 13 x 220 extra points + 5 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1o9pQz2EWx",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 168443.562 ms -> matches file name; score decomposition: level bonus 1000 + time points (999 - 336) + 13 x 220 extra points + 5 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1o9pQz2EWx; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 5523 = file name score (6 small balls still following at LevelFinish)",
   "tas_time_ms": 168443
  },
  {
@@ -1344,7 +1344,7 @@
   "date": "2025-07-17",
   "source": "HS11_6040_2_59_745.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 179745.719 ms -> matches file name; score decomposition: level bonus 1100 + time points (999 - 359) + 15 x 220 extra points + 5 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1dUgNznEe7",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 264 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 179745.719 ms -> matches file name; score decomposition: level bonus 1100 + time points (999 - 359) + 15 x 220 extra points + 5 lives x 200; wiki fps 264; video: https://www.bilibili.com/video/BV1dUgNznEe7; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 6040 = file name score (6 small balls still following at LevelFinish)",
   "tas_time_ms": 179745
  },
  {
@@ -1357,7 +1357,7 @@
   "date": "2021-12-04",
   "source": "HS12_9670_4_24_849.tas",
   "verified": true,
-  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 264849.062 ms -> matches file name; score decomposition: level bonus 1200 + time points (999 - 529) + 30 x 220 extra points + 7 lives x 200; wiki fps 240; video: https://www.bilibili.com/video/BV1QP4y1V7uh",
+  "notes": "current wiki TAS record (hero board); replays to LevelFinish in our reference environment; 240 fps; IGT rule (float32 sum over LevelFinish-BallNavActive+3 frames minus ESC-paused frames) gives 264849.062 ms -> matches file name; score decomposition: level bonus 1200 + time points (999 - 529) + 30 x 220 extra points + 7 lives x 200; wiki fps 240; video: https://www.bilibili.com/video/BV1QP4y1V7uh; M1 HS readout (2026-11-16, official = end-screen score = Points + 20 x small balls still following + Lifes x 200 + LevelBonus at the end of the SR tail, docs/benchmarks.md): 9670 = file name score (27 small balls still following at LevelFinish)",
   "tas_time_ms": 264849
  },
  {

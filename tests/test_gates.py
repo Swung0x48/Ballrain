@@ -264,3 +264,31 @@ def test_remove_installed_never_deletes_the_same_file_under_another_spelling(tmp
         buf = ctypes.create_unicode_buffer(32768)
         if ctypes.windll.kernel32.GetShortPathNameW(str(rec), buf, len(buf)) and buf.value != str(rec):
             assert not gates.remove_installed(Path(buf.value), rec) and rec.exists()
+
+
+@pytest.mark.parametrize("refs,agent,ok", [
+    (["a", "a", "a"], "a", True),
+    (["a", "a", "b"], "a", True),       # one reference deviation: the majority decides
+    (["a", "b", "a"], "a", True),
+    (["a", "a", "b"], "b", False),      # agent equals the deviating replay only
+    (["a", "b", "c"], "a", False),      # no majority
+    (["a", None, None], "a", False),    # missing traces never count
+    (["a", "a", None], "a", True),
+    (["a", "a"], "a", False),           # 3 replays required
+    (["a", "a", "a"], None, False),
+])
+def test_m1_majority_verdict(refs, agent, ok):
+    got, why = gates.majority_verdict(refs, agent)
+    assert got is ok and why.startswith("PASS" if ok else "FAIL")
+
+
+def test_m1_identical_files_and_events(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.write_bytes(b"x\n")
+    b.write_bytes(b"x\n")
+    assert gates.identical_files(a, b) and not gates.identical_files(a, tmp_path / "missing")
+    b.write_bytes(b"y\n")
+    assert not gates.identical_files(a, b)
+    e = tmp_path / "events.txt"
+    e.write_text("3 StartLevel\n13205 LevelFinish\n13205 Summary frames=13205 wall_ms=1908\n")
+    assert gates.events_without_summary(e) == ["3 StartLevel", "13205 LevelFinish"]

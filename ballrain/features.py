@@ -1,0 +1,411 @@
+"""Observation features, computed entirely in Python from the raw state (docs/observations.md).
+
+FeatureExtractor(config).compute(tracker) -> (vector float32, info dict). The layout (name, size)
+of the vector is fixed by the config and returned by layout(); every block is documented in
+docs/observations.md. FEATURE_VERSION changes whenever the meaning of an existing entry changes.
+"""
+from __future__ import annotations
+
+import math
+from collections import OrderedDict
+from dataclasses import asdict, dataclass, field
+
+import numpy as np
+
+from . import geometry as G
+from .path import ReferencePath
+from .state import G_RAILS, G_STOPPER, GameTracker
+
+FEATURE_VERSION = "f3"  # f3: transforming from the ball (un)physicalize events; HS block (followers, pause)
+
+GEOM_EPS = 0.05  # state-spec.md 3.5: geometric contact threshold on the gap
+NO_CONTACT_GAP = 2.0  # value used for "no mindist"
+SURFACE_SLOTS = ("none", "stone", "wood", "metal", "other")
+
+
+@dataclass
+class FeatureConfig:
+    version: str = FEATURE_VERSION
+    camera: str = "orient_ref"  # frame for directional features: "orient_ref" | "orient" | "world"
+    pos_scale: float = 50.0  # positions are divided by this
+    vel_scale: float = 20.0
+    angvel_scale: float = 20.0
+    absolute_position: bool = False  # include the ball's world position (level-specific policies)
+    height_grid: int = 7  # G x G vertical rays around the ball (0 = off)
+    height_spacing: float = 1.0
+    height_clip: float = 5.0
+    height_up: float = 3.0  # rays start this far above the ball centre
+    fan_dirs: int = 8  # edge distance per direction (ray fan, 0 = off)
+    fan_step: float = 0.25
+    fan_max: float = 8.0
+    fan_drop: float = 1.0  # a sample lower than the contact height by this is "off the road"
+    mesh_edge: bool = True  # distance from the contact point to the walkable boundary (mesh method)
+    rail_radius: float = 6.0
+    waypoints: int = 3
+    bodies: int = 4
+    body_radius: float = 60.0
+    dynamic_geometry: bool = True  # include moving bodies in the height grid / fan
+    counters: bool = True
+    hs_block: bool = True  # small score balls following, pause, frames since the last checkpoint
+    follower_sources: int = 4  # per-instance follower counts (largest first)
+    checkpoint_frames_scale: float = 10000.0
+    clip: float = 10.0  # final clip of every entry
+
+    def to_dict(self):
+        return asdict(self)
+
+
+# ------------------------------------------------------------------------------- geometry cache
+
+class LevelGeometry:
+    """Static collision triangles (stoppers excluded), walkable boundary edges, rail triangles."""
+
+    def __init__(self, tracker: GameTracker):
+        lvl = tracker.level
+        items, rail_items = [], []
+        for ck in lvl.static_entities():
+            for m in lvl.meshes_of(ck):
+                V = G.ck_to_world(m.vertices, m.matrix)
+                items.append((ck, V, m.faces))
+                if lvl.in_group(ck, G_RAILS):
+                    rail_items.append((ck, V, m.faces))
+        self.tris = G.TriangleSet.from_meshes(items)
+        rails = {ck for ck, _, _ in rail_items}
+        self.edges = G.BoundaryEdges(self.tris, owner_filter=lambda o: ~np.isin(o, list(rails)))
+        self.rails = G.TriangleSet.from_meshes(rail_items)
+        self.key = lvl.static_key()
+
+
+_GEOM_CACHE: "OrderedDict[str, LevelGeometry]" = OrderedDict()
+_KEY_OF: dict = {}  # (id(LevelData), version) -> content key
+
+
+def level_geometry(tracker: GameTracker, cache_size: int = 4) -> LevelGeometry:
+    lvl = tracker.level
+    vk = (id(lvl), lvl.version)
+    key = _KEY_OF.get(vk)
+    if key is None:
+        key = lvl.static_key()
+        if len(_KEY_OF) > 64:
+            _KEY_OF.clear()
+        _KEY_OF[vk] = key
+    g = _GEOM_CACHE.get(key)
+    if g is None:
+        g = LevelGeometry(tracker)
+        _GEOM_CACHE[key] = g
+        while len(_GEOM_CACHE) > cache_size:
+            _GEOM_CACHE.popitem(last=False)
+    else:
+        _GEOM_CACHE.move_to_end(key)
+    return g
+
+
+def dynamic_triangles(tracker: GameTracker, center, radius: float) -> G.TriangleSet:
+    """Moving bodies of the BODY section near center, posed at the last PSI."""
+    obs = tracker.obs
+    items = []
+    if obs is not None:
+        lvl = tracker.level
+        for b in obs.body:
+            ck = int(b["ckid"])
+            if lvl.in_group(ck, G_STOPPER) or not lvl.is_physicalized(ck):
+                continue
+            if np.linalg.norm(b["pos"] - center) > radius:
+                continue
+            for m in lvl.meshes_of(ck):
+                V = G.body_to_world(m.vertices, b["pos"], b["q"], b["q_cfo"], b["shift"])
+                items.append((ck, V, m.faces))
+    return G.TriangleSet.from_meshes(items, grid_cell=None)
+
+
+# ------------------------------------------------------------------------------------- frames
+
+def yaw_basis(matrix43) -> tuple[np.ndarray, np.ndarray]:
+    """(right, forward) horizontal unit vectors of a CK matrix (rows: x axis, y axis, z axis, pos)."""
+    m = np.asarray(matrix43, np.float64)
+    f = m[2].copy()
+    f[1] = 0
+    n = np.linalg.norm(f)
+    f = f / n if n > 1e-9 else np.array([0.0, 0.0, 1.0])
+    r = np.array([f[2], 0.0, -f[0]])
+    return r, f
+
+
+def to_frame(v, right, fwd) -> np.ndarray:
+    v = np.asarray(v, np.float64)
+    return np.stack([v[..., 0] * right[0] + v[..., 2] * right[2], v[..., 1],
+                     v[..., 0] * fwd[0] + v[..., 2] * fwd[2]], -1)
+
+
+def yaw_of(matrix43) -> float:
+    m = np.asarray(matrix43, np.float64)
+    return math.atan2(m[2, 0], m[2, 2])
+
+
+# --------------------------------------------------------------------------------- extractor
+
+class FeatureExtractor:
+    def __init__(self, config: FeatureConfig | None = None):
+        self.cfg = config or FeatureConfig()
+        self._layout = self._make_layout()
+        self.size = sum(n for _, n in self._layout)
+        self.path: ReferencePath | None = None
+        self._path_key = None
+
+    # layout -------------------------------------------------------------------------------
+    def _make_layout(self):
+        c = self.cfg
+        L = [("valid", 1), ("ball_type", 3), ("vel_cam", 3), ("vel_path", 3), ("speed", 1), ("angvel", 3),
+             ("cam_yaw_ref", 2), ("cam_yaw", 2), ("cam_rotating", 1)]
+        if c.absolute_position:
+            L.append(("pos_world", 3))
+        L += [("geom_contact", 1), ("fric_contact", 1), ("n_fric", 1), ("n_mind", 1), ("min_gap", 1),
+              ("normal_cam", 3), ("surface", len(SURFACE_SLOTS)), ("partner_moving", 1), ("partner_rail", 1),
+              ("rel_vel_partner", 3)]
+        if c.mesh_edge:
+            L.append(("edge_mesh", 1))
+        if c.fan_dirs:
+            L.append(("edge_fan", c.fan_dirs))
+        L += [("rail_dist", 1), ("rail_dir", 2)]
+        if c.height_grid:
+            L += [("heights", c.height_grid ** 2), ("height_hit", c.height_grid ** 2)]
+        L += [("path_progress", 1), ("path_remaining", 1), ("path_lateral", 1), ("path_tangent_cam", 2),
+              ("waypoints", 3 * c.waypoints)]
+        if c.bodies:
+            L += [("bodies", 7 * c.bodies)]
+        if c.counters:
+            L += [("lives", 1), ("points", 1), ("sr_s", 1), ("sector", 1), ("transforming", 1), ("ball_nav", 1),
+                  ("depth_margin", 1)]
+        if c.hs_block:
+            L += [("followers", 1), ("follower_sources", c.follower_sources), ("follower_near", 1), ("paused", 1),
+                  ("since_checkpoint", 1)]
+        return L
+
+    def layout(self) -> list:
+        return list(self._layout)
+
+    def slices(self) -> dict:
+        out, o = {}, 0
+        for n, k in self._layout:
+            out[n] = slice(o, o + k)
+            o += k
+        return out
+
+    # helpers ------------------------------------------------------------------------------
+    def reference_path(self, tracker: GameTracker) -> ReferencePath | None:
+        key = (id(tracker), tracker.level.version, tracker.arrays.rows("Checkpoints"))
+        if key != self._path_key:
+            self.path = ReferencePath.from_tracker(tracker)
+            self._path_key = key
+        return self.path
+
+    def frame(self, tracker: GameTracker):
+        obs = tracker.obs
+        cams = obs.cams if obs is not None else None
+        if self.cfg.camera == "world" or cams is None:
+            return np.array([1.0, 0, 0]), np.array([0, 0, 1.0])
+        k = 0 if self.cfg.camera == "orient_ref" else 1
+        return yaw_basis(cams["cams"][k]["matrix"])
+
+    # main ---------------------------------------------------------------------------------
+    def compute(self, tracker: GameTracker):
+        c = self.cfg
+        obs = tracker.obs
+        F = OrderedDict((n, np.zeros(k)) for n, k in self._layout)
+        info = {}
+        right, fwd = self.frame(tracker)
+        ball = obs.ball if obs is not None else None
+        have_ball = ball is not None and bool(ball["found"]) and int(ball["type"]) in (0, 1, 2)
+        valid = have_ball and not tracker.transforming
+        F["valid"][0] = float(valid)
+        bt = tracker.ball_type()
+        if bt in (0, 1, 2):
+            F["ball_type"][bt] = 1
+        cams = obs.cams if obs is not None else None
+        if cams is not None:
+            y0, y1 = yaw_of(cams["cams"][0]["matrix"]), yaw_of(cams["cams"][1]["matrix"])
+            F["cam_yaw_ref"][:] = (math.cos(y0), math.sin(y0))
+            F["cam_yaw"][:] = (math.cos(y1), math.sin(y1))
+            F["cam_rotating"][0] = float(abs(math.remainder(y0 - y1, 2 * math.pi)) > 1e-3)
+        path = self.reference_path(tracker)
+        if have_ball:
+            pos = np.asarray(ball["pos"], np.float64)
+            vel = np.asarray(ball["speed"], np.float64) + np.asarray(ball["speed_change"], np.float64)
+            info["pos"], info["vel"] = pos, vel
+            F["vel_cam"][:] = to_frame(vel, right, fwd) / c.vel_scale
+            F["speed"][0] = np.linalg.norm(vel) / c.vel_scale
+            F["angvel"][:] = (np.asarray(ball["rot_speed"]) + np.asarray(ball["rot_speed_change"])) / c.angvel_scale
+            if c.absolute_position:
+                F["pos_world"][:] = pos / c.pos_scale
+            radius = float(ball["extra_radius"]) or 2.0
+            self._contacts(tracker, F, info, pos, vel, radius, right, fwd)
+            self._terrain(tracker, F, info, pos, radius, right, fwd)
+            if path is not None:
+                pr = path.project(pos, tracker.sector)
+                info["path"] = pr
+                F["path_progress"][0] = pr["s"] / max(path.length, 1e-9)
+                F["path_remaining"][0] = (path.length - pr["s"]) / (20 * c.pos_scale)
+                F["path_lateral"][0] = pr["dist"] / c.pos_scale
+                tc = to_frame(pr["tangent"], right, fwd)
+                F["path_tangent_cam"][:] = (tc[0], tc[2])
+                pr_r = np.array([pr["tangent"][2], 0, -pr["tangent"][0]])
+                F["vel_path"][:] = to_frame(vel, pr_r, pr["tangent"]) / c.vel_scale
+                if c.waypoints:
+                    wp = path.next_nodes(pr["seg"], c.waypoints) - pos
+                    F["waypoints"][:] = (to_frame(wp, right, fwd) / c.pos_scale).ravel()
+            if c.bodies:
+                self._bodies(tracker, F, pos, vel, right, fwd)
+        if c.counters:
+            F["lives"][0] = tracker.lives / 10
+            F["points"][0] = tracker.points / 1000
+            sr = tracker.sr_ms
+            F["sr_s"][0] = (sr or 0.0) / 100000.0
+            npath = (len(path.P) - 1) if path is not None else 1
+            F["sector"][0] = tracker.sector / max(npath, 1)
+            F["transforming"][0] = float(tracker.transforming)
+            F["ball_nav"][0] = float(tracker.flags.ball_nav)
+            if have_ball:
+                F["depth_margin"][0] = self._depth_margin(tracker, info["pos"]) / c.pos_scale
+        if c.hs_block:
+            n = tracker.followers()
+            info["followers"] = n
+            F["followers"][0] = n / 6
+            st = tracker.follower_state()
+            per = sorted(st["per_source"].values(), reverse=True)[:c.follower_sources]
+            F["follower_sources"][:len(per)] = np.asarray(per, np.float64) / 6
+            if have_ball and st["positions"]:
+                d = tracker.nearest_follower(info["pos"])
+                info["follower_near"] = d
+                F["follower_near"][0] = min(d, c.pos_scale) / c.pos_scale
+            F["paused"][0] = float(tracker.flags.paused)
+            F["since_checkpoint"][0] = tracker.frames_since_checkpoint() / c.checkpoint_frames_scale
+        vec = np.concatenate(list(F.values())).astype(np.float32)
+        np.clip(vec, -c.clip, c.clip, out=vec)
+        np.nan_to_num(vec, copy=False, nan=0.0, posinf=c.clip, neginf=-c.clip)
+        return vec, info
+
+    # blocks -------------------------------------------------------------------------------
+    def _contacts(self, tracker, F, info, pos, vel, radius, right, fwd):
+        obs, lvl = tracker.obs, tracker.level
+        mind, fric = obs.mind, obs.fric
+        F["n_mind"][0] = len(mind) / 10
+        F["n_fric"][0] = len(fric) / 4
+        F["fric_contact"][0] = float(len(fric) > 0)
+        partner = None
+        if len(mind):
+            k = int(np.argmin(mind["gap"]))
+            gap = float(mind["gap"][k])
+            normal = np.asarray(mind["plane"][k][:3], np.float64)
+            F["min_gap"][0] = min(gap, NO_CONTACT_GAP)
+            F["geom_contact"][0] = float(gap <= GEOM_EPS)
+            F["normal_cam"][:] = to_frame(normal, right, fwd)
+            partner = int(mind["partner"][k])
+            info.update(gap=gap, normal=normal, contact_point=pos - normal * (radius + gap))
+        else:
+            F["min_gap"][0] = NO_CONTACT_GAP
+        if len(fric):
+            partner = int(fric["partner"][int(np.argmin(fric["gap"]))])
+        info["partner"] = partner
+        slot = "none"
+        if partner is not None:
+            cid = lvl.contact_id(partner)
+            slot = {1: "stone", 2: "wood", 3: "metal"}.get(cid, "other")
+            moving = not lvl.is_fixed(partner)
+            F["partner_moving"][0] = float(moving)
+            F["partner_rail"][0] = float(lvl.in_group(partner, G_RAILS))
+            if moving:
+                for b in obs.body:
+                    if int(b["ckid"]) == partner:
+                        rel = vel - np.asarray(b["speed"], np.float64)
+                        F["rel_vel_partner"][:] = to_frame(rel, right, fwd) / self.cfg.vel_scale
+                        break
+        F["surface"][SURFACE_SLOTS.index(slot)] = 1
+        info["surface"] = slot
+
+    def _terrain(self, tracker, F, info, pos, radius, right, fwd):
+        c = self.cfg
+        geo = level_geometry(tracker)
+        dyn = dynamic_triangles(tracker, pos, c.body_radius) if c.dynamic_geometry else None
+        bottom = pos[1] - radius
+        contact = info.get("contact_point")
+        h_ref = contact[1] if contact is not None and info.get("gap", 9) <= 1.0 else bottom
+
+        def rays(P):
+            y, t = geo.tris.ray_down(P)
+            if dyn is not None and len(dyn):
+                y2, t2 = dyn.ray_down(P)
+                y, _, _ = G.merge_ray(y, t, y2, t2)
+            return y
+
+        if c.height_grid:
+            g = c.height_grid
+            o = (np.arange(g) - (g - 1) / 2) * c.height_spacing
+            gx, gz = np.meshgrid(o, o, indexing="ij")  # gx: right, gz: forward
+            off = gx[..., None] * right + gz[..., None] * fwd
+            P = (pos + off).reshape(-1, 3)
+            P[:, 1] = pos[1] + c.height_up
+            y = rays(P)
+            hit = ~np.isnan(y)
+            F["heights"][:] = np.where(hit, np.clip(y - bottom, -c.height_clip, c.height_clip), -c.height_clip) / c.height_clip
+            F["height_hit"][:] = hit
+        if c.fan_dirs:
+            ang = np.arange(c.fan_dirs) * (2 * math.pi / c.fan_dirs)
+            dirs = np.cos(ang)[:, None] * fwd + np.sin(ang)[:, None] * right  # 0 = forward, then clockwise
+            steps = np.arange(c.fan_step, c.fan_max + 1e-9, c.fan_step)
+            base = contact if contact is not None else pos
+            P = (base + steps[None, :, None] * dirs[:, None, :]).reshape(-1, 3)
+            P[:, 1] = pos[1] + 1.0
+            y = rays(P).reshape(c.fan_dirs, len(steps))
+            drop = np.isnan(y) | (y < h_ref - c.fan_drop)
+            first = np.where(drop.any(1), steps[np.argmax(drop, 1)], c.fan_max)
+            F["edge_fan"][:] = first / c.fan_max
+            info["edge_fan"] = first
+        if c.mesh_edge:
+            q = contact if contact is not None else pos - np.array([0, radius, 0])
+            d = geo.edges.distance(q, 12.0)
+            F["edge_mesh"][0] = min(d, 12.0) / 12.0
+            info["edge_mesh"] = d
+        rc = geo.rails.closest(pos, c.rail_radius) if len(geo.rails) else None
+        if rc is not None:
+            F["rail_dist"][0] = (rc["d"] - radius) / c.rail_radius
+            dv = to_frame(rc["q"] - pos, right, fwd)
+            h = math.hypot(dv[0], dv[2])
+            if h > 1e-9:
+                F["rail_dir"][:] = (dv[0] / h, dv[2] / h)
+        else:
+            F["rail_dist"][0] = 1.0
+
+    def _bodies(self, tracker, F, pos, vel, right, fwd):
+        c = self.cfg
+        lvl = tracker.level
+        rows = []
+        for b in tracker.obs.body:
+            ck = int(b["ckid"])
+            if lvl.in_group(ck, G_STOPPER):
+                continue
+            d = np.asarray(b["pos"], np.float64) - pos
+            dist = float(np.linalg.norm(d))
+            if dist <= c.body_radius:
+                rows.append((dist, d, np.asarray(b["speed"], np.float64) - vel))
+        rows.sort(key=lambda r: r[0])
+        out = F["bodies"].reshape(c.bodies, 7)
+        for i, (dist, d, rv) in enumerate(rows[:c.bodies]):
+            out[i, 0] = 1
+            out[i, 1:4] = to_frame(d, right, fwd) / c.pos_scale
+            out[i, 4:7] = to_frame(rv, right, fwd) / c.vel_scale
+
+    def _depth_margin(self, tracker, pos) -> float:
+        """Height of the ball centre above the highest death box under it (state-spec.md 2.7)."""
+        best = None
+        for _ck, lo, hi in tracker.level.depth:
+            if lo[0] <= pos[0] <= hi[0] and lo[2] <= pos[2] <= hi[2]:
+                m = pos[1] - float(hi[1])
+                best = m if best is None else min(best, m)
+        return best if best is not None else 20 * self.cfg.pos_scale
+
+
+def feature_names(extractor: FeatureExtractor) -> list:
+    names = []
+    for n, k in extractor.layout():
+        names += [n] if k == 1 else [f"{n}[{i}]" for i in range(k)]
+    return names

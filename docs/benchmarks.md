@@ -152,11 +152,44 @@ float32 和只作为辅助列保留，用来和在旧版 BML 上计时的纪录�
 - `AllLevel`：列 6 `LevelBonus`（关卡奖励）。
 - `CurrentLevel`：列 0 `Level ID`，列 1 `ActiveBall`，列 5 `Points`。
 
-**HS = Points + Lifes × LifeBonus + LevelBonus**。最早可以在 `LevelFinish` 时读取：结算过程会把 Points 和 Lifes 扣到 0，
-所以不能更晚。但 wiki（通关页）提到，通关时仍在追逐的分数小球可能在结算中途才吃到，这也是伪纪录的来源之一。
-因此 LevelFinish 时读到的值可能与结算画面的 Score 不同。准确的读取时机尚未核实，需要在一条 TAS-HS 回放上实测一次。
+**HS = Points + Lifes × LifeBonus + LevelBonus**，但要加上通关时仍在跟随的分数小球（见下）。
 BML+ 自带的 `GetHSScore()` 只算 Points + Lifes × 200，**不含关卡奖励**，不能直接当作 HS。
 事件钩子 `ExtraPoint` 和 `PreLifeUp`/`PostLifeUp` 可以用来记录吃到了什么。
+
+#### HS 读数（正式口径，M1 实测，2026-11-16，BallrainIO 0.3.1）
+
+规则（用户给定）：碰到分数球立即 +100，它的 6 个小球（各 20）随后跟着玩家球；按 Esc 暂停时小球飞到球上被收集，计时和扣分都停止；
+到下一个检查点时还在跟随的小球作废；**通关时还在跟随的小球计入最终分数**。
+
+测量：`tools/probe/post_finish.py` 在 agent 模式下回放记录，SR 尾帧之后继续空跑 4000–6000 帧（`BALLRAIN_POST_FINISH`），逐帧记录
+Energy、跟随中的小球、事件和全部数据数组的变化（`tools/analysis/post_finish_credit.py` 分析）：
+
+| 记录 | fps | LevelFinish 钩子：Points / 跟随数 | 小球到达（LevelFinish 后的帧数，+分） | 结算开始（LF 后帧数）时 Points / 命 | 重建的结算分 | 文件名 |
+|---|---|---|---|---|---|---|
+| HS01_4738_1_31_317 | 240 | 2998 / 12 | 83–297 帧，6 次 +40 | 2931：3238 / 7 | 3238 + 1400 + 100 = 4738 | 4738 |
+| HS03_4906_1_56_934 | 240 | 3406 / 0 | 无 | 2931：3406 / 6 | 4906 | 4906 |
+| SR05_2_10_850_264 | 264 | 1518 / 4 | 259–339 帧，4 次 +20 | 3224：1598 / 5 | 3098 | （SR 记录） |
+| HS12_9670_4_24_849 | 240 | 6530 / 27 | 55–306 帧，+80 +80 +80 +100 +100 +100 | 6000 帧窗口内未开始（L12 的 PreEndLevel 在 LF 后 5523 帧） | 未观测到结算；Points 在 306 帧后停在 7070：7070 + 1400 + 1200 = 9670 | 9670 |
+| HS04_6925_2_27_295_esc | 264 | 5325 / 0 | 无 | 3224：5325 / 6 | 6925 | 6925 |
+
+- LevelFinish 之后 3 帧 CounterInactive（时间分计数器停止）；之后 Points 只因小球到达而增加，每个 +20，全部在 LevelFinish 后约 350 帧内到齐。
+- LevelFinish 后约 2900–3200 帧（L12 更晚）开始结算：Points 逐帧扣到 0（先 1/帧，后 5、25/帧），然后每约 148 帧扣一条命（PreSubLife/PostSubLife）。
+  结算画面上的分数不在任何数据数组里（窗口内变化过的数组只有 Energy、CurrentLevel、IngameParameter、LifeBalls），所以按结算开始时的
+  Points + Lifes × LifeBonus + LevelBonus 重建；它与 wiki 计分规则和文件名分数都一致。
+- 30 条到达 LevelFinish 的记录在 3 个尾帧里 Points 都没有变化（`tools/analysis/hs_followers/taildrop.py`）。
+
+**定义**：正式 HS = 结算画面的分数 = **SR 尾帧结束时（CounterInactive 那一帧）的 Points + 20 × 仍在跟随的小球数 + Lifes × LifeBonus + LevelBonus**。
+mod 的最后一条观测就建在这一帧（`agent-protocol.md` §5），跟随数取 SCOR 的计数（0.3.1：主球不可见、小球仍可见，`state-spec.md` §2.9）。
+在这一帧读而不在 LevelFinish 钩子读，是因为计数器要到 CounterInactive 才停：如果一个 500 ms 边界落在尾帧里，Points 应该还会再扣 1、结算也会算进去
+（推断，没有观测到：30 条记录的尾帧里都没有扣分）；小球在尾帧里到达时，Points + 20 × 跟随数不变。两种读法在全部记录上相同。不采用"拉长尾帧、等小球到齐再读"：每次通关要多跑约 350 帧（L12 还要更多才能确认），
+而上面的读数已经与探针重建的结算分逐分相同；SR 尾帧（3 帧，不导出）也因此不变。
+`ballrain.state.GameTracker` 的 `hs_at_finish`、运行元数据的 `hs`、数据集的 `hs`、HS 奖励的通关项都用这个读数；
+LevelFinish 钩子的快照（不含小球）另记为 `hs_mod` / `hs_parts.levelfinish_hook`。
+
+**M1-C 结果**（`scripts/m1_gates.py --gates D,C`，`runtime/m1-results/results.json` 的 `C/readout`）：见下表"HS 读数"列和第 7 节。
+HS04_6925_2_27_295 的原始 .tas 从不按 Esc，在 4 个检查点一共丢掉 58 个小球，通关时还有 8 个在跟随，所以它的正式读数是 5765，
+文件名的 6925 用这条 .tas 得不到；`runtime/tas-patched/HS04_6925_2_27_295_esc.tas`
+在每个检查点前和飞艇前插入 Esc 暂停（暂停帧去掉后 trace 与原记录逐字节相同，SR 不变），读数正好是 6925。
 
 ## 3. 单关基准
 
@@ -206,6 +239,8 @@ TAS-人类差距：SR 用"人类 − TAS"表示（秒，括号内为占人类纪
 | 13 | 8484 (240)† | 8315 | 8050 | 8180 | +169 | 同上 / HS13_8484_4_17_833 |
 
 ‡ 需要修改过的环境才能回放，M0 没有回放结果。† 不可重复（见第 7 节）。
+HS 读数（第 2 节的正式口径）：到达 LevelFinish 的 HS-TAS 中，01–03、05–08、10–12 读出的分数都等于文件名分数；
+HS04 的原始 .tas 读出 5765，插入 Esc 暂停的版本 `HS04_6925_2_27_295_esc` 读出 6925。
 
 ## 4. 连打（全流程，人类）
 
@@ -258,7 +293,9 @@ SR 和 HS 各走一条阶梯，逐关推进：
   比较时要记下 fps。TAS 纪录的成绩以"TAS 播放标准环境 B"为准（暂定规则）；我们的参考环境是本地 patched TASSupport 0.3.12。
 - **在我们参考环境中不能复现的纪录**：
   - SR08_1_59_626_264、SR09_1_29_321_264：参考环境回放会 GameOver，没有 LevelFinish。
-  - HS13_8484_4_17_833：真实 TASSupport 从约第 42749 帧起，每次运行得到的轨迹都不同，不可重复。
+  - HS13_8484_4_17_833：真实 TASSupport 从第 42749 帧起，每次运行得到的轨迹都不同，不可重复。
+  - HS04_6925_2_27_295：可以回放到 LevelFinish，但不按 Esc，在检查点丢掉小球，正式 HS 读数 5765 ≠ 6925；
+    插入 Esc 暂停的 `runtime/tas-patched/HS04_6925_2_27_295_esc.tas` 读数为 6925（第 2 节）。
   - HS09_6170_2_04_662：需要修改过的环境，M0 没有回放结果。
   - 这 4 条在 records.json 中 `verified=false`。非纪录文件 SR03_1_46_066_240 没有在 M0 中运行，也记为 false。它们作为成绩基准仍然有效（wiki 认可），只是不能作为回放门槛或示范数据。
 - **IGT 口径**：正式口径是 BML+ 0.3.12 的规则（float32 delta 的 double 和，截断到毫秒），见第 2 节。
@@ -289,11 +326,14 @@ SR 和 HS 各走一条阶梯，逐关推进：
   - TAS 行：该文件在我们的参考环境里回放到 LevelFinish 为 true。
   - 人类行、连打行、阈值行：数值经脚本核对，在英雄榜和排行榜两个 wiki 页面之间一致（阈值只出现在排行榜），为 true。
   - 疯狂行：只有英雄榜一个来源，一律为 false。
-- `notes`：视频链接、fps、IGT 复现结果、分数分解等。
+- `notes`：视频链接、fps、IGT 复现结果、分数分解等。HS-TAS 行另记 M1 的正式 HS 读数（"M1 HS readout"，第 2 节）；`score` 始终是文件名 / wiki 的分数。
 - 额外字段（仅 TAS 行）：`is_current_record`、`tas_time_ms`（HS-TAS 文件名中的时间）、`fps`（SR-TAS 文件名中的 fps）。
 - 额外字段（仅 SR-TAS 行）：
   - `sr_ms_bmlp0312`：正式口径（BML+ 0.3.12 规则），即在 M0 G1 回放事件的计时区间上，float32 delta 的 double 和截断到毫秒。
-    这是计算值，不是在 0.3.12 上实测的（计时区间是代理，见第 2 节）。
+    最初是计算值（计时区间是代理，见第 2 节）。**M1（2026-11-16）已实测**：BallrainIO agent 模式按 0.3.12 规则、由真实的
+    CounterActive / CounterInactive / Pause / Unpause 钩子驱动计时（含 LevelFinish 之后到 CounterInactive 的 3 个尾帧），
+    16 条到达 LevelFinish 的 SR-TAS 实测值与原计算值逐毫秒相同，`sr_ms_float32` 也相同，所以两列数值未变
+    （`scripts/m1_gates.py --gates D,C`，结果在 `runtime/m1-results/results.json` 的 `C/readout`）。
   - `sr_ms_float32`：同一区间上的 float32 和截断到毫秒，用来和旧版 BML 计时的成绩比较。
   - 回放没有到达 LevelFinish 或没有在 M0 回放的行（SR03_1_46_066_240、SR08、SR09），两个字段都是 `null`。
 
