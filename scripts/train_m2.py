@@ -57,6 +57,23 @@ RUN_COLS = ["update", "t", "copy", "run_id", "end_reason", "sr_ms", "start_frame
             "framelog_match", "handover_mismatches", "invalid", "ball_order", "dir"]
 
 
+def parse_rest_starts(spec: str):
+    """--rest-starts: "lo-hi" or "lo-hi@x:z:jitter" entries -> [[lo, hi]] / [[lo, hi, x, z, jitter]] (None when empty)."""
+    out = []
+    for r in spec.split(","):
+        r = r.strip()
+        if not r:
+            continue
+        rng, _, tgt = r.partition("@")
+        e = [int(v) for v in rng.split("-")]
+        if tgt:
+            e += [float(v) for v in tgt.split(":")]
+            if len(e) != 5:
+                raise SystemExit(f"--rest-starts entry {r!r}: lo-hi@x:z:jitter")
+        out.append(e)
+    return out or None
+
+
 def gated_curriculum(starts, cfg, finish_gate: float):
     """ReverseCurriculum whose frontier also needs the LevelFinish rate of the band episodes to reach finish_gate:
     with --success cp a frontier in an early sector only has to reach the next checkpoint, and the gate keeps it from
@@ -182,7 +199,10 @@ def parse(argv=None):
     p.add_argument("--stall-speed", type=float, default=None,
                    help="the stall clock pauses while the ball is faster than this (units/s): run-ups are not cut")
     p.add_argument("--stall-max-s", type=float, default=15.0, help="with --stall-speed: max time without new arc progress")
-    p.add_argument("--rest-starts", default="", help="at-rest starts: lo-hi record frame ranges, e.g. 11760-11900,13450-13650")
+    p.add_argument("--rest-starts", default="", help="at-rest starts: lo-hi record frame ranges, e.g. 11760-11900,13450-13650; "
+                   "lo-hi@x:z:jitter drives the ball to a target in [x +- jitter] x [z +- jitter] before braking")
+    p.add_argument("--respawn-level-starts", action="store_true",
+                   help="play every respawn of a process started from level load (WorkerSpec.respawn_level_starts)")
     p.add_argument("--p-rest", type=float, default=0.0, help="probability of an at-rest start for a new process")
     p.add_argument("--rehearse-starts", default="", help="rehearsal start ranges lo-hi (record frames), e.g. 4900-5075")
     p.add_argument("--p-rehearse", type=float, default=0.0, help="probability of a rehearsal start for a new process")
@@ -302,7 +322,7 @@ def make_env_config(a, out_root: Path):
                      backend=a.backend, headless=hl,
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
                      per_life=not a.no_respawn,
-                     rest_starts=[[int(v) for v in r.split("-")] for r in a.rest_starts.split(",") if r.strip()] or None,
+                     rest_starts=parse_rest_starts(a.rest_starts),
                      p_rest=a.p_rest,
                      rehearse_starts=[[int(v) for v in r.split("-")] for r in a.rehearse_starts.split(",") if r.strip()] or None,
                      p_rehearse=a.p_rehearse,
@@ -486,6 +506,7 @@ def main(argv=None) -> int:
                           wall_push_rate=a.wall_push_rate, wall_min_rise=a.wall_min_rise,
                           wall_max_progress=a.wall_max_progress, wall_push_everywhere=a.wall_push_everywhere,
                           zone_stall_exempt=a.zone_stall_exempt, rail_gate=json.loads(a.rail_gate) if a.rail_gate else {},
+                          respawn_level_starts=a.respawn_level_starts,
                           launcher_factory=FakeLauncher if a.fake else None)
 
     hub = None
@@ -533,7 +554,8 @@ def main(argv=None) -> int:
                                "zones": json.loads(a.zones) if a.zones else {}, "wall_push_rate": a.wall_push_rate,
                                "wall_min_rise": a.wall_min_rise, "wall_max_progress": a.wall_max_progress,
                                "wall_push_everywhere": a.wall_push_everywhere, "zone_stall_exempt": a.zone_stall_exempt,
-                               "rail_gate": json.loads(a.rail_gate) if a.rail_gate else {}}}
+                               "rail_gate": json.loads(a.rail_gate) if a.rail_gate else {},
+                               "respawn_level_starts": a.respawn_level_starts}}
         hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):

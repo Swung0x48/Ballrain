@@ -99,7 +99,9 @@ class EnvConfig:
     # at-rest starts: with probability p_rest a new process starts at a valid frame drawn from one of rest_starts
     # ([lo, hi] record frames), and after the hand-over the env brakes the ball (world arrows against its horizontal
     # velocity) until it is slower than rest_speed or rest_max_frames passed; the episode's start kind is "tas_rest"
-    # (not a curriculum outcome). For skills a respawn at a checkpoint (ball at rest) needs, e.g. a run-up
+    # (not a curriculum outcome). For skills a respawn at a checkpoint (ball at rest) needs, e.g. a run-up.
+    # An entry [lo, hi, x, z, jitter] first drives the ball (world arrows) to a target drawn uniformly in
+    # [x +- jitter] x [z +- jitter] and then brakes it there (e.g. a ball at rest in a guard-rail pocket beside the line)
     rest_starts: list | None = None
     p_rest: float = 0.0
     # rehearsal starts: with probability p_rehearse a new process starts at a valid frame drawn uniformly from one of
@@ -261,8 +263,13 @@ class BallanceEnv(gym.Env):
             lo, hi = c.rehearse_starts[int(self._start_rng.integers(len(c.rehearse_starts)))]
             return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
         if c.rest_starts and c.p_rest and self._start_rng.random() < c.p_rest:
-            lo, hi = c.rest_starts[int(self._start_rng.integers(len(c.rest_starts)))]
+            e = c.rest_starts[int(self._start_rng.integers(len(c.rest_starts)))]
+            lo, hi = e[0], e[1]
             self._rest_next = True
+            if len(e) >= 5:  # drive to a target first: (x, z) drawn in the jitter box
+                j = float(e[4])
+                self._rest_next = (float(e[2]) + float(self._start_rng.uniform(-j, j)),
+                                   float(e[3]) + float(self._start_rng.uniform(-j, j)))
             return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
         if self.curriculum is not None:
             return self.curriculum.sample(self._start_rng)
@@ -346,8 +353,43 @@ class BallanceEnv(gym.Env):
         p["recorder"].meta.start_state = dict(p["recorder"].meta.start_state or {},
                                               handover_mismatches=len(mismatches))
         if rest and k:
+            if isinstance(rest, tuple):
+                self._drive(p, rest)
             self._brake(p)
         return p
+
+    def _drive(self, p: dict, target) -> None:
+        """At-rest start with a target (rest_starts entry [lo, hi, x, z, jitter]): push the ball with world arrows towards
+        (x, z), aiming at a velocity proportional to the remaining distance (capped), until it is within 1 unit and
+        slower than rest_speed or rest_max_frames passed; _brake then stops it there."""
+        s, c = p["session"], self.cfg
+        n0 = s.frames_done
+        tgt = np.array([target[0], target[1]], np.float64)
+        dirs = [(a, np.array([bool(a & tas.KEY_RIGHT) - bool(a & tas.KEY_LEFT), bool(a & tas.KEY_UP) - bool(a & tas.KEY_DOWN)],
+                             np.float64)) for a in ARROWS9[1:]]
+        while s.frames_done - n0 < c.rest_max_frames and not s.ended:
+            o = s.tracker.obs
+            if o is None or o.ball is None:
+                break
+            pos = np.asarray(o.ball["pos"], np.float64)[[0, 2]]
+            v = (np.asarray(o.ball["speed"], np.float64) + np.asarray(o.ball["speed_change"], np.float64))[[0, 2]]
+            d = tgt - pos
+            if np.linalg.norm(d) < 1.0 and np.linalg.norm(v) < c.rest_speed:
+                break
+            want = d * 0.8
+            if np.linalg.norm(want) > 6.0:
+                want *= 6.0 / np.linalg.norm(want)
+            w = want - v
+            keys = 0
+            if np.linalg.norm(w) > 0.3:
+                best = max(dirs, key=lambda kd: float(np.dot(w, kd[1])) / np.linalg.norm(kd[1]))[0]
+                keys = world_to_camera_keys(best, o.cams["cams"][0]["matrix"]) if o.cams is not None else best
+            ev0 = len(s.tracker.events)
+            s.act(tas.make_frames([self.delta], [keys]), repeat=2, stop=EPISODE_STOP)
+            if any(c_ in (Ev.BallOff, Ev.LevelFinish, Ev.GameOver) for _, c_, _ in s.tracker.events[ev0:]):
+                break
+        p["start"]["rest_target"] = [float(tgt[0]), float(tgt[1])]
+        p["start"]["drive_frames"] = int(s.frames_done - n0)
 
     def _launch(self, copy: str, k: int | None) -> dict:
         """Launch one game process on `copy` and bring it to the player's control: the TAS prefix (k > 0) is

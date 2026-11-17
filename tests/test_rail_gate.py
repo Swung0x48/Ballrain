@@ -159,3 +159,19 @@ def _clear_geometry_cache():
     from ballrain import features
     features._GEOM_CACHE.clear()
     features._KEY_OF.clear()
+
+
+def test_box_gate_pays_once_above_the_top():
+    ep = object.__new__(_Episode)
+    ep.gates_hit = set()
+    g = {"walltop": {"boxes": [[-168.0, -163.0, -165.0, -138.0, 21.5], [-158.6, -153.6, -141.0, -136.0, 23.5]], "bonus": 2.0}}
+    v = np.zeros(3)
+    assert ep.gate(np.array([-160.0, 19.4, -150.0]), v, g) == 0.0  # middle depression: no
+    assert ep.gate(np.array([-165.5, 19.4, -150.0]), v, g) == 0.0  # below the strip top: no
+    assert ep.gate(np.array([-156.0, 22.9, -139.0]), v, g) == 0.0  # beside / below the single box top: no
+    assert ep.gate(np.array([-165.5, 22.9, -150.0]), v, g) == 2.0  # on the west strip
+    assert ep.gate(np.array([-165.5, 22.9, -151.0]), v, g) == 0.0  # once per episode
+    ep.gates_hit = set()
+    assert ep.gate(np.array([-156.0, 24.6, -139.0]), v, g) == 2.0  # on the single box
+    ep.gates_hit = set()  # the centre / radius form still works
+    assert ep.gate(np.array([0.0, 0.0, 0.0]), v, {"c": {"center": [0, 0, 1], "radius": 2.0, "bonus": 0.5}}) == 0.5

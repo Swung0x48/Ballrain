@@ -75,7 +75,8 @@ class WorkerSpec:
     # sub-goal gates (training-side shaping, off by default): {name: {"center": [x, y, z], "radius": r, "bonus": b,
     # "min_speed": v (horizontal, ball speed units), "heading": deg (atan2(vz, vx)), "heading_tol": deg}}; the first time in
     # an episode the ball is within radius of center and meets the speed / heading conditions, the step's reward gets
-    # +bonus (term "gate_bonus"); each gate pays at most once per episode
+    # +bonus (term "gate_bonus"); each gate pays at most once per episode. Box form instead of center / radius:
+    # {"boxes": [[xmin, xmax, zmin, zmax, y_above], ...], "bonus": b}: the ball centre inside any box above its y_above
     gates: dict = field(default_factory=dict)
     # split bonus (off when split_k = 0): at every checkpoint / LevelFinish reached in a life, k * (t_ref - t_agent) /
     # max(t_ref, split_min_ref_s) clipped to [-k, k]; t_agent = IGT of the life since its start or the previous checkpoint,
@@ -120,6 +121,9 @@ class WorkerSpec:
     # missed landings (middle-floor falls) cannot bleed into the 4100+ starts' landing; the value there comes from the
     # starts at / after `below`. Read with getattr: a bridge's older pickled WorkerSpec has no such field
     rail_gate: dict = field(default_factory=dict)
+    # respawn_level_starts: in a process started from level load (k = 0) every respawn life is played, whatever
+    # p_early_respawn says (from-spawn training: the agent's own approach, deaths and respawns included); getattr-read
+    respawn_level_starts: bool = False
     wall_gap: float = 0.1
     wall_max_ny: float = 0.5
     wall_min_rise: float = 2.0
@@ -229,7 +233,10 @@ class _Episode:
         for name, g in gates.items():
             if name in self.gates_hit:
                 continue
-            if np.linalg.norm(pos - np.asarray(g["center"], np.float64)) > g.get("radius", 2.0):
+            if "boxes" in g:  # box form: [[xmin, xmax, zmin, zmax, y_above], ...]: ball centre in any box, above its y
+                if not any(b[0] <= pos[0] <= b[1] and b[2] <= pos[2] <= b[3] and pos[1] > b[4] for b in g["boxes"]):
+                    continue
+            elif np.linalg.norm(pos - np.asarray(g["center"], np.float64)) > g.get("radius", 2.0):
                 continue
             vh = float(np.hypot(vel[0], vel[2]))
             if vh < g.get("min_speed", 0.0):
@@ -396,6 +403,9 @@ class Worker:
         if (p >= 1.0 or end != "BallOff" or not getattr(env, "_after_death", False) or env.curriculum is None
                 or env.starts is None):
             return False
+        if getattr(self.spec, "respawn_level_starts", False) and \
+                int((getattr(env, "_start", None) or {}).get("process_start_frame") or 0) == 0:
+            return False  # a process started from level load plays all its respawns (from-spawn training)
         cross = self._tas_cross_frame(int(info.get("sector") or 0))
         if cross is None or cross >= int(env.curriculum.frontier):
             return False
