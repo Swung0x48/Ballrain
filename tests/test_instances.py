@@ -265,6 +265,57 @@ def test_direct_recipe_starts_in_bin(fake, monkeypatch):
         assert h.wait(10)
 
 
+def test_windows_visible_switch(monkeypatch):
+    monkeypatch.delenv(ins.VISIBLE_VAR, raising=False)
+    assert ins.windows_visible() is False
+    for v, want in (("1", True), ("yes", True), ("0", False), ("", False), (" ", False)):
+        monkeypatch.setenv(ins.VISIBLE_VAR, v)
+        assert ins.windows_visible() is want
+    monkeypatch.setenv(ins.VISIBLE_VAR, "1")
+    assert ins.windows_visible(False) is False and ins.windows_visible(True) is True
+    assert ins.VISIBLE_VAR not in ins.full_env({})  # launcher-only: never passed to the game
+
+
+@win
+def test_direct_recipe_hides_windows_by_default(fake, monkeypatch):
+    seen = []
+
+    class FakePopen:
+        def __init__(self, args, **kw):
+            seen.append(kw)
+            self.pid = 4242
+
+    monkeypatch.setattr(ins.subprocess, "Popen", FakePopen)
+    monkeypatch.delenv(ins.VISIBLE_VAR, raising=False)
+    try:
+        ins.launch_direct(fake, {})
+        si = seen[-1]["startupinfo"]
+        assert si.dwFlags & ins.subprocess.STARTF_USESHOWWINDOW and si.wShowWindow == ins.SW_HIDE
+        assert seen[-1]["cwd"] == str(fake.bin_dir)
+        ins.launch_direct(fake, {}, visible=True)
+        assert seen[-1]["startupinfo"] is None
+        monkeypatch.setenv(ins.VISIBLE_VAR, "1")
+        ins.launch_direct(fake, {})
+        assert seen[-1]["startupinfo"] is None
+    finally:
+        ins._LAUNCHED.pop(4242, None)
+
+
+def test_set_splash(fake, monkeypatch):
+    assert ins.splash_state(fake) == "missing"
+    with pytest.raises(ins.InstanceError, match="missing"):
+        ins.set_splash(fake, False)
+    (fake.bin_dir / "splash.bmp").write_bytes(b"BM")
+    assert ins.set_splash(fake, False) == "off"
+    assert not (fake.bin_dir / "splash.bmp").exists() and (fake.bin_dir / "splash.bmp.off").read_bytes() == b"BM"
+    assert ins.set_splash(fake, False) == "off"
+    assert ins.set_splash(fake, True) == "on"
+    monkeypatch.setattr(ins, "running_in_copy", lambda c: [4242])
+    with pytest.raises(ins.InstanceError, match="running"):
+        ins.set_splash(fake, False)
+    assert ins.splash_state(fake) == "on"
+
+
 def _cmd_recipe(command_for, keep):
     """Stub recipe: run the fake exe (a cmd.exe copy) with a /c command built from env, cwd = Bin."""
     def recipe(copy, env):

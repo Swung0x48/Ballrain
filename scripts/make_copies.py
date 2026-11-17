@@ -3,6 +3,10 @@ optionally install a freshly built BallrainIO.bmodp into all of them.
 
   uv run python scripts/make_copies.py                 # create missing copies, verify all
   uv run python scripts/make_copies.py --sync-mod      # also install BallrainIO/build/BallrainIO.bmodp
+  uv run python scripts/make_copies.py -n 16 --splash off --also ref   # no start-up splash in every train-NN and ref
+
+--splash on|off renames Bin/splash.bmp <-> Bin/splash.bmp.off in every runtime/train-NN and the --also copies (README,
+"游戏窗口"); nothing is changed unless no Player.exe runs in any of them.
 """
 from __future__ import annotations
 
@@ -22,7 +26,18 @@ def main(argv=None) -> int:
     p.add_argument("--source", default=instances.TRAINING_COPY)
     p.add_argument("--hash-all", action="store_true", help="sha256 every file, not only binaries")
     p.add_argument("--sync-mod", nargs="?", const=str(instances.REPO_ROOT / "BallrainIO" / "build" / "BallrainIO.bmodp"))
+    p.add_argument("--splash", choices=("on", "off"), help="enable / disable Player.exe's start-up splash")
+    p.add_argument("--also", default="", help="comma-separated extra copies for --splash (e.g. ref)")
     a = p.parse_args(argv)
+    if a.splash:
+        # every train-NN present (not only the -n range), so no copy is left with the other splash state
+        names = sorted(p.name for p in instances.runtime_dir().glob("train-[0-9][0-9]") if p.is_dir())
+        targets = [instances.get_copy(n) for n in names + [x for x in a.also.split(",") if x]]
+        busy = [c.name for c in targets if instances.running_in_copy(c)]
+        if busy:
+            print(f"Player.exe running in {busy}; splash not changed", file=sys.stderr)
+            return 1
+        print(json.dumps({c.name: instances.set_splash(c, a.splash == "on") for c in targets}))
     res = instances.create_training_copies(a.n, a.source, hash_all=a.hash_all)
     print(json.dumps(res))
     names = instances.training_copy_names(a.n)
@@ -30,7 +45,7 @@ def main(argv=None) -> int:
         instances.sync_mod(a.sync_mod, names)
     mods = instances.mod_hashes(names)
     print(json.dumps(mods))
-    if len(set(mods.values())) != 1:
+    if len(set(mods.values())) > 1:
         print("warning: the copies hold different BallrainIO.bmodp builds; run with --sync-mod", file=sys.stderr)
         return 1
     return 0

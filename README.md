@@ -59,6 +59,32 @@ uv run python scripts/make_copies.py            # 创建并校验 train-01..07�
 uv run python scripts/make_copies.py --sync-mod # 把新编译的 mod 装进全部拷贝
 ```
 
+## 游戏窗口（默认隐藏）
+
+`instances.launch_direct`（所有脚本、`client.py` / `env.py` 的 `launch="direct"`、`run_ballrain`、`run_reference` 都走它）用
+`STARTUPINFO(dwFlags=STARTF_USESHOWWINDOW, wShowWindow=SW_HIDE)` 启动 Player.exe：Player.exe 用 `ShowWindow(SW_SHOW)` 显示主窗口时，
+Windows 把这第一次调用换成 SW_HIDE，之后窗口模式下它不会再显示主窗口。没有窗口，也没有任务栏按钮。只靠启动器，不改 mod，
+所以 `ref`（只装真 TASSupport）同样适用；`runtime/ref-run.ps1` 用 `Start-Process -WindowStyle Hidden`，效果相同。
+
+- 调试时显示窗口：`BALLRAIN_VISIBLE=1`（环境变量，spawn 出来的 worker 进程会继承；不传给游戏），或 `launch_direct(..., visible=True)`，
+  或 `ref-run.ps1 -Visible`。`explorer_cmd` 配方的窗口总是可见。
+- 启动画面（splash）：Player.exe 在主窗口之前弹出 `Bin/splash.bmp`（约 0.4 s，会抢前台），启动器管不到它。
+  `uv run python scripts/make_copies.py -n 16 --splash off --also ref` 把所有 `train-NN` 和 `--also` 列出的拷贝的 `Bin/splash.bmp` 改名为 `splash.bmp.off`
+  （Player.exe 读不到图片就跳过 splash 并继续，返回值不检查），`--splash on` 改回。拷贝里有 Player.exe 在跑时不改任何拷贝。
+  新拷贝从 `train-00` 复制，状态跟着走；`verify_copy_matches` 会报出不一致的拷贝。
+- 保真（2026-11-16，`runtime/test-nowin` / `test-nowin-ref`，有无 splash 都测了）：BallrainIO 回放 SR06_1_36_163_132、SR01_1_14_457_264、
+  HS03_4906_1_56_934 的 trace 和 framelog 与 `runtime/m0-results-r2/G1/<record>/bio/` 逐字节相同（SR06 在不跳过渲染时也相同）；agent 模式（BallanceEnv，SR01 第 3000 帧
+  TAS 前缀交接，400 步固定随机动作）可见 / 隐藏 12 次运行的 framelog、trace、.tas、观测完全相同（events.txt 只差 Summary 的 wall_ms）；
+  真 TASSupport 回放 SR06、SR01、HS03 与 `ref_trace.txt` 相同；`Bin/Player.ini` 不被改写。启动时间和 steps/s 与可见窗口相同（在噪声内）；
+  去掉 splash 启动约快 0.5–0.8 s。
+- 限制（抢焦点没有解决）：Player.exe 显示主窗口后立刻 `SetFocus`（在 mod 的 OnLoad 之前约 0.2 s），所以 Windows 允许新进程拿前台时
+  （例如前台本来就是另一个 Player，或此刻没有前台窗口），隐藏的主窗口在启动后约 1–2 s 照样成为前台窗口，键盘输入进了一个看不见的窗口，
+  直到用户点别的窗口或下一个 Player 启动再抢走。隐藏后只少了两件事：运行期间不会被再次激活（可见窗口会被反复激活），
+  以及（关掉 splash 时）每次启动的抢前台从两三次变成一两次。只能在 mod 里补救（OnLoad 时把前台交还），而且管不到 `ref`。
+  错误对话框（MessageBox）同样看不见，进程会挂到超时，这时用 `BALLRAIN_VISIBLE=1` 重跑看。
+  另一个桌面（`CreateDesktop` + `lpDesktop`）能把一切藏起来，但不可用：不在输入桌面上时 D3D 报告 HAL 设备不可用（`D3DERR_NOTAVAILABLE`），
+  Player.exe 以 "No render driver found" 退出。
+
 ## 使用
 
 ```python

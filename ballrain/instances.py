@@ -10,6 +10,10 @@ Safety model:
 
 Machine paths are never hard-coded: the runtime directory is <repo>/runtime, overridable by
 the BALLRAIN_RUNTIME environment variable.
+
+Game windows: the direct recipe starts Player.exe with STARTUPINFO wShowWindow = SW_HIDE, so its main
+window is never shown (no window, no taskbar button). Set BALLRAIN_VISIBLE=1 (inherited by worker
+processes) or pass visible=True to see them again. Traces are unchanged by this (README, "游戏窗口").
 """
 from __future__ import annotations
 
@@ -63,6 +67,9 @@ BALLRAIN_VARS = (
 )
 BMMO_VARS = ("BMMO_TAS_TRACE", "BMMO_TAS_OFFSETS", "BMMO_TAS_CORE", "BMMO_TAS_PC")
 MANAGED_VARS = BALLRAIN_VARS + BMMO_VARS
+# Read by this module only (never passed to the game).
+VISIBLE_VAR = "BALLRAIN_VISIBLE"  # "1": show the game windows (debugging); unset / "0": hidden (default)
+LAUNCHER_VARS = (VISIBLE_VAR,)
 
 # TASSupport.cfg keys this module may edit, with their cfg type letter.
 TAS_CFG_KEYS = {
@@ -366,8 +373,8 @@ class ProcessHandle:
 # ---------------------------------------------------------------------------------- launch recipes
 
 def full_env(env: dict) -> dict:
-    """Complete environment for direct process creation: parent env minus managed vars, plus env."""
-    out = {k: v for k, v in os.environ.items() if k.upper() not in MANAGED_VARS}
+    """Complete environment for direct process creation: parent env minus managed / launcher vars, plus env."""
+    out = {k: v for k, v in os.environ.items() if k.upper() not in MANAGED_VARS + LAUNCHER_VARS}
     for k, v in env.items():
         if v is not None:
             out[k] = str(v)
@@ -409,7 +416,8 @@ def launch_explorer_cmd(copy: GameCopy, env: dict, start_timeout: float = 30.0) 
 
     explorer hands the script to the shell, so the game inherits the shell's environment, not
     ours: every variable is therefore written into the script. The script is removed once the
-    new Player.exe is found (or the start times out).
+    new Player.exe is found (or the start times out). The game window is always visible with
+    this recipe (BALLRAIN_VISIBLE applies to the direct recipe only).
     """
     script = copy.root / LAUNCH_SCRIPT_NAME
     script.write_bytes(launch_script_text(copy, env).encode("mbcs"))
@@ -424,8 +432,32 @@ def launch_explorer_cmd(copy: GameCopy, env: dict, start_timeout: float = 30.0) 
 _LAUNCHED: dict = {}
 
 
-def launch_direct(copy: GameCopy, env: dict) -> int:
-    """Direct process creation (like Start-Process -WorkingDirectory <copy>/Bin)."""
+SW_HIDE = 0
+
+
+def windows_visible(visible: bool | None = None) -> bool:
+    """Whether launched game windows are shown: `visible` if given, else BALLRAIN_VISIBLE (unset / "0" = hidden)."""
+    if visible is not None:
+        return bool(visible)
+    return os.environ.get(VISIBLE_VAR, "").strip() not in ("", "0")
+
+
+def hidden_startupinfo():
+    """STARTUPINFO that makes the game's first ShowWindow of its main window SW_HIDE.
+
+    Player.exe shows its main window with ShowWindow(SW_SHOW) (Windows substitutes wShowWindow for the first
+    such call of an overlapped window) and never shows it again in windowed mode; the main loop does not depend
+    on visibility or focus. Not covered: the start-up splash (a popup shown before the main window, from
+    Bin/splash.bmp; see set_splash), and the SetFocus right after ShowWindow can still make the hidden window
+    the foreground window when Windows lets a new process take the foreground. A separate desktop
+    (CreateDesktop + lpDesktop) would hide everything but is not usable: off the input desktop D3D reports the
+    HAL device as not available (D3DERR_NOTAVAILABLE) and Player.exe exits with "No render driver found"."""
+    return subprocess.STARTUPINFO(dwFlags=subprocess.STARTF_USESHOWWINDOW, wShowWindow=SW_HIDE)
+
+
+def launch_direct(copy: GameCopy, env: dict, visible: bool | None = None) -> int:
+    """Direct process creation (like Start-Process -WorkingDirectory <copy>/Bin [-WindowStyle Hidden]).
+    Windows are hidden unless windows_visible(visible)."""
     p = subprocess.Popen(
         [str(copy.exe)],
         cwd=str(copy.bin_dir),
@@ -435,6 +467,7 @@ def launch_direct(copy: GameCopy, env: dict) -> int:
         stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         close_fds=True,
+        startupinfo=None if windows_visible(visible) or sys.platform != "win32" else hidden_startupinfo(),
     )
     _LAUNCHED[p.pid] = p  # keep the process handle open so the PID cannot be reused while we track it
     return p.pid
@@ -629,6 +662,37 @@ def sync_mod(build_path, names, runtime=None) -> dict:
             raise InstanceError(f"{dst}: sha256 {got} != {want}")
         out[name] = got
     return out
+
+
+SPLASH_REL = "Bin/splash.bmp"
+SPLASH_OFF_SUFFIX = ".off"
+
+
+def splash_state(copy: GameCopy) -> str:
+    """'on' (Bin/splash.bmp present), 'off' (renamed to splash.bmp.off), 'missing' or 'both' (inconsistent)."""
+    on = (copy.root / SPLASH_REL).is_file()
+    off = (copy.root / (SPLASH_REL + SPLASH_OFF_SUFFIX)).is_file()
+    return {(True, False): "on", (False, True): "off", (False, False): "missing", (True, True): "both"}[(on, off)]
+
+
+def set_splash(copy: GameCopy, enabled: bool) -> str:
+    """Enable / disable Player.exe's start-up splash by renaming Bin/splash.bmp <-> Bin/splash.bmp.off.
+
+    Player.exe loads <exe dir>/splash.bmp before anything else; when that fails it skips the splash
+    window and carries on (the return value is ignored), so the only effect is no ~0.4 s popup (which
+    takes the foreground) and a launch about 0.8 s shorter. Traces are unchanged (README, "游戏窗口").
+    Refuses a copy with a running Player.exe. Returns the new state."""
+    if running_in_copy(copy):
+        raise InstanceError(f"{copy.root} has a running Player.exe; not changing its splash")
+    on, off = copy.root / SPLASH_REL, copy.root / (SPLASH_REL + SPLASH_OFF_SUFFIX)
+    state = splash_state(copy)
+    if state in ("missing", "both"):
+        raise InstanceError(f"{copy.root}: splash is {state} ({on}, {off})")
+    if enabled and state == "off":
+        os.replace(off, on)
+    elif not enabled and state == "on":
+        os.replace(on, off)
+    return splash_state(copy)
 
 
 def install_record(copy: GameCopy, tas_path) -> str:
