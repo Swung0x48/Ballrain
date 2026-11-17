@@ -245,8 +245,16 @@ def make_env_config(a, out_root: Path):
     from ballrain.rewards import RewardConfig
     rc = RewardConfig(mode="sr", **json.loads(a.reward))
     fl = lambda x: tuple(float(v) for v in x.split(",") if v.strip()) if x else ()  # noqa: E731
+    from ballrain.path import asset_path, file_sha256, portable_path_dir, resolve_path_dir
+    # repo-relative, so remote workers on another machine resolve it in their own checkout, plus the asset's sha256
+    # (a worker whose copy of the line differs refuses to run: ballrain.path.RouteError)
+    path_dir = portable_path_dir(a.path_dir)
+    asset = asset_path(1, resolve_path_dir(path_dir))
+    if path_dir is not None and not asset.is_file():
+        raise SystemExit(f"--path-dir {a.path_dir}: no reference line {asset}")
     fc = FeatureConfig(hs_block=a.hs_block, camera="world" if a.world_actions else "orient_ref",
-                       far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=a.path_dir)
+                       far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=path_dir,
+                       path_sha256=file_sha256(asset) if asset.is_file() else None)
     cu = {"start_back": a.start_back, "step": a.cu_step, "band": a.cu_band, "recent": a.cu_recent,
           "advance_at": a.advance_at, "min_episodes": a.min_episodes, "p_level_start": a.p_level_start}
     hl = None

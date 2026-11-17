@@ -9,9 +9,14 @@ Two sources, one class (ReferencePath: points P[i] with a sector label per point
               checkpoint Checkpoints[k] matrix position, k = 0..n-1 (sector k+1 ends there)
               end        the airship platform (LevelData.physical_position("PE_Balloon_Platform"): world bbox
                          centre of its collision meshes; the ENTS matrix has it parked at the origin)
-A TAS asset is used only when its stored start and checkpoint positions match the running level (so the
-toy level of ballrain.fakegame, or a changed level, falls back to the polyline); levels without a
-completing TAS record (9, 13 in tas-v1) have no asset and also use the polyline.
+A TAS asset must match the running level (stored start and checkpoint positions): a level that has an asset
+(or an explicit FeatureConfig.path_dir) but whose asset is missing, of another sha256 than
+FeatureConfig.path_sha256 or not matching the level raises RouteError instead of quietly using another line
+(r6: an absolute path_dir of the learner machine did not exist on the retail machine, and the retail workers
+ran on the checkpoint polyline). Levels without a completing TAS record (9, 13 in tas-v1) have no asset and use
+the polyline; so does path_source="checkpoints" (e.g. the toy level of ballrain.fakegame).
+path_dir is stored repo-relative (resolve_path_dir resolves it against the repo root of this checkout); an
+absolute path_dir that does not exist here is refused.
 
 Projection (PathFollower) keeps continuity: it searches a window [s_prev - back, s_prev + ahead] of arc
 length around the previous projection, restricted to the arc range of the current sector (plus a margin).
@@ -31,9 +36,69 @@ import numpy as np
 
 START_NAMES = ("PS_FourFlames_MF",)
 AIRSHIP_NAMES = ("PE_Balloon_Platform", "PE_Balloon_MF")
-REFPATH_DIR = Path(__file__).resolve().parents[1] / "benchmarks" / "refpaths"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REFPATH_DIR = REPO_ROOT / "benchmarks" / "refpaths"
 REFPATH_VERSION = 1
 MATCH_TOL = 1.0  # stored start / checkpoint positions must match the level within this (units)
+
+
+# entity name a synthetic level (ballrain.fakegame's toy road) carries: such a level has no reference asset even
+# when its level number has one, and uses the checkpoint polyline (real levels never carry it)
+SYNTHETIC_LEVEL_MARKER = "Ballrain_SyntheticLevel"
+
+
+def is_synthetic_level(tracker) -> bool:
+    return SYNTHETIC_LEVEL_MARKER in getattr(tracker.level, "by_name", {})
+
+
+class RouteError(RuntimeError):
+    """The reference line a configuration asks for cannot be used (it is never replaced by another line)."""
+
+
+def _is_abs(path_dir) -> bool:
+    """Absolute on any platform (a Mac path is absolute on Windows too: it must never be joined to the repo root)."""
+    from pathlib import PurePosixPath, PureWindowsPath
+    t = str(path_dir)
+    return PurePosixPath(t).is_absolute() or PureWindowsPath(t).is_absolute() or t.startswith(("/", "\\"))
+
+
+def resolve_path_dir(path_dir) -> Path:
+    """FeatureConfig.path_dir -> directory: None = benchmarks/refpaths, relative = against the repo root of this
+    checkout, absolute = as is (must exist: another machine's absolute path is refused)."""
+    if path_dir is None or str(path_dir) == "":
+        return REFPATH_DIR
+    p = Path(str(path_dir))
+    if not _is_abs(path_dir):
+        return REPO_ROOT / p
+    if not p.is_dir():
+        raise RouteError(f"path_dir {str(path_dir)!r} does not exist on this machine (absolute paths do not travel "
+                         f"between machines: store it repo-relative, e.g. runtime/refpaths-alt)")
+    return p
+
+
+def portable_path_dir(path_dir) -> str | None:
+    """path_dir as a configuration should store it: repo-relative with forward slashes (an absolute directory
+    inside this checkout is converted; one outside it is refused)."""
+    if path_dir is None or str(path_dir) == "":
+        return None
+    p = Path(str(path_dir))
+    if not _is_abs(path_dir):
+        return p.as_posix()
+    try:
+        return p.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+    except ValueError:
+        raise RouteError(f"path_dir {str(path_dir)!r} is outside the repo; other machines could not resolve it") from None
+
+
+def migrate_path_dir(path_dir):
+    """Configurations from before the fix (r5, r6) stored the learner machine's absolute path_dir: a path that does
+    not exist here and whose tail is runtime/... or benchmarks/... maps to that repo-relative place (the asset's
+    sha256 is checked when the configuration has one). Anything else is returned unchanged."""
+    import re
+    if path_dir is None or not _is_abs(path_dir) or Path(str(path_dir)).is_dir():
+        return path_dir
+    m = re.search(r"[\\/]((?:runtime|benchmarks)[\\/].+)$", str(path_dir))
+    return m.group(1).replace("\\", "/") if m else path_dir
 
 
 def _matrix_pos(v):
@@ -260,19 +325,40 @@ def anchors_match(meta: dict, anchors: dict, tol: float = MATCH_TOL) -> bool:
 _ASSET_CACHE: dict = {}
 
 
-def load_tas_path(level: int, tracker=None, root=None) -> ReferencePath | None:
-    """The committed TAS reference line of a level, or None (no asset, or the tracker's level does not match
-    the stored start / checkpoints)."""
-    p = asset_path(level, root)
+def file_sha256(p) -> str:
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+
+def anchors_ready(meta: dict, anchors: dict) -> bool:
+    """The level data has a start and at least as many checkpoints as the asset (before that, nothing to compare)."""
+    return anchors["start"] is not None and len(anchors["checkpoints"]) >= len(meta.get("checkpoints", []))
+
+
+def load_tas_path(level: int, tracker=None, root=None, strict: bool = False, sha256: str | None = None):
+    """The TAS reference line of a level from <root>/L<nn>.npz (root: FeatureConfig.path_dir, see
+    resolve_path_dir), or None (no asset, or the tracker's level does not match the stored start / checkpoints).
+    strict: a missing asset raises RouteError when root was given explicitly, a level whose data is complete but
+    does not match the asset raises (None only while the level data is incomplete). A sha256 other than `sha256`
+    always raises."""
+    p = asset_path(level, resolve_path_dir(root))
     if not p.is_file():
+        if strict and root not in (None, ""):
+            raise RouteError(f"reference line {p} missing (path_dir {root!r})")
         return None
     key = (str(p), p.stat().st_mtime_ns)
-    path = _ASSET_CACHE.get(key)
-    if path is None:
-        path = ReferencePath.load(p)
-        _ASSET_CACHE[key] = path
-    if tracker is not None and not anchors_match(path.meta, level_anchors(tracker)):
-        return None
+    hit = _ASSET_CACHE.get(key)
+    if hit is None:
+        hit = (ReferencePath.load(p), file_sha256(p))
+        _ASSET_CACHE[key] = hit
+    path, sha = hit
+    if sha256 and sha != sha256:
+        raise RouteError(f"reference line {p} has sha256 {sha[:12]}..., the configuration expects {sha256[:12]}...")
+    if tracker is not None:
+        anchors = level_anchors(tracker)
+        if not anchors_match(path.meta, anchors):
+            if strict and anchors_ready(path.meta, anchors):
+                raise RouteError(f"reference line {p} does not match the running level {level} (start / checkpoints)")
+            return None
     return path
 
 

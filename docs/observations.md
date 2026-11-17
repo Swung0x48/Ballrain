@@ -539,6 +539,13 @@ random = 随机粘滞动作（2–39 步换一次），curr = 从课程抽的 TA
   16 次人类成功通过投影到新线上：没有 re-acquire，弧长不回退，横向距离中位数 0.4–1.9。这段的参考时间（f6 `ref_speed`）用人类通过时间的中位数 7.61 s
   按弧长均匀分布（TAS 走 shortcut 2 用 4.75 s），之后的 TAS 时间整体后移。TAS 在 A 段里的状态（第 4764–6018 帧）走的是 shortcut 2，
   不再作为起点（`--exclude-starts 4764-6018`，课程、演练、静止起点都跳过），前沿从 A 段之前（4700）继续往前。
+- **参考线必须真的加载**（r6 事故）：r5/r6 的 `path_dir` 存的是学习机上的绝对路径，PC 上不存在，`load_tas_path` 返回 None，特征静默退回到盘点折线；
+  PC retail worker 整个 r6 都在没有路线的观测上跑（retail cp 0.02 / 通关 0.01，同起点 headless 0.46），约占 r6 步数的 20%，配对评估的 retail 结果也无效。
+  修正：`path_dir` 按仓库相对路径保存（`ballrain.path.portable_path_dir`，各机器用 `resolve_path_dir` 在自己的仓库里解析；别的机器的绝对路径直接拒绝），
+  学习端把资产的 sha256 写进 `FeatureConfig.path_sha256`（worker 上的资产不一致就拒绝）；有资产的关卡（或显式给了 `path_dir`）加载失败、
+  或关卡数据完整但起点/盘点对不上时抛 `RouteError`，球在场上时没有 TAS 线也抛，不再退回折线。只有没有资产的关卡、`path_source="checkpoints"`
+  和带 `Ballrain_SyntheticLevel` 标记的合成关卡（fakegame）用折线。旧检查点（r5、r6）评估时由 `migrate_path_dir` 把 `.../runtime/...` 映射回仓库相对路径。
+  验证：同一检查点、同一起点（9600），retail 与 headless 的观测 40 步逐维完全相同（修正前 step 0 就在 path_* / waypoints / ref_speed 上不同）。
 - **重生回合**：`--no-respawn`（`EnvConfig.per_life=False`）时 BallOff 结束进程，下一条命是新的课程起点。r2 前期用它（策略接近均匀时重生回合几乎都停在盘点不动，
   占了 2/3 的步数），策略熵降到 1.4 以下后恢复重生回合：验收是从关卡加载开始的整关，死亡后要从盘点静止起步，重生回合正好是这些状态。
   日志 `rsp_cp_sec1..4` = 从各小节盘点静止起步、到达下一个盘点（或 LevelFinish）的比例。

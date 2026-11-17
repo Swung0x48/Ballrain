@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from . import protocol as P, tas
+from .path import SYNTHETIC_LEVEL_MARKER
 from .protocol import Ev
 from .transport import ModChannel, SocketChannel, SocketModChannel
 
@@ -45,6 +46,7 @@ ACCEL = 25.0
 GRAVITY = 30.0
 
 ENT_FLOOR, ENT_BOX, ENT_BALL, ENT_END, ENT_DEPTH, ENT_START = 1001, 1100, 2001, 3001, 4001, 5001
+ENT_SYNTHETIC = 6901  # carries ballrain.path.SYNTHETIC_LEVEL_MARKER
 ENT_SCORE = (2100, 2200)  # + k: P_Extra_Point_Ball<k> (template) / P_Extra_Point_Ball<k>001
 ARR_ENERGY, ARR_CUR, ARR_INGAME, ARR_CP, ARR_RESET, ARR_ALL = 7001, 7002, 7003, 7004, 7005, 7006
 CAM_IDS = (6001, 6002, 6003, 6004, 6005)
@@ -199,6 +201,8 @@ class FakeGame:
             P.Entity(ENT_END, "PE_Balloon_Platform", 41, 0, True, mat43([0, 2, -L]), 0, -1, b""),
             P.Entity(ENT_START, "PS_FourFlames_MF", 33, 0, True, mat43(START), -1, -1, b""),
             P.Entity(ENT_DEPTH, "Quader01", 41, 0, False, mat43([0, -25, -100]), -1, -1, b""),
+            # not a real level: no reference asset applies, whatever the level number (ballrain.path)
+            P.Entity(ENT_SYNTHETIC, SYNTHETIC_LEVEL_MARKER, 41, 0, False, IDENT43.copy(), -1, -1, b""),
         ]
         score_ids = []
         for src in self.sources:

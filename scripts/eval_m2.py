@@ -38,8 +38,10 @@ def build_env_config(ck: dict, out_root: str, start_frame: int, max_frames: int,
     from ballrain.env import EnvConfig
     from ballrain.features import FeatureConfig
     from ballrain.rewards import RewardConfig
+    from ballrain.path import migrate_path_dir
     e = ck["env_config"]
-    fc = FeatureConfig(**e["features"])
+    # checkpoints from before the fix (r5, r6) carry the learner machine's absolute path_dir: map it to this checkout
+    fc = FeatureConfig(**dict(e["features"], path_dir=migrate_path_dir(e["features"].get("path_dir"))))
     rc = RewardConfig(**e["reward"])
     return EnvConfig(level=1, mode="sr", action_repeat=e["action_repeat"], out_root=out_root, features=fc, reward=rc,
                      start_record=RECORD if start_frame else None, start_frame=start_frame or None,

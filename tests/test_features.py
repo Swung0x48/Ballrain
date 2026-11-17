@@ -6,6 +6,7 @@ import pytest
 
 from ballrain import features as FX, geometry as G, protocol as P
 from ballrain.fakegame import box_mesh
+from ballrain.path import SYNTHETIC_LEVEL_MARKER
 from ballrain.state import GameTracker
 
 FLOOR, RAIL, STOPPER, BOX, STONE = 10, 11, 12, 13, 14
@@ -51,6 +52,7 @@ def make_tracker(cam_forward=(0, 0, 1)):
                  P.ArrayDef(502, "Energy", [P.ArrayColumn(n, 1, None) for n in ("Points", "Lifes", "S", "L", "T", "LifeBonus")],
                             [[np.int32(v).tobytes() for v in (950, 3, 1000, 3, 500, 200)]])]
     lm.entities.append(P.Entity(20, "PE_Balloon_Platform", 41, 0, True, np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 2, 40]], np.float32), 0, 0, b""))
+    lm.entities.append(P.Entity(21, SYNTHETIC_LEVEL_MARKER, 41, 0, False, I43, -1, -1, b""))  # hand-built level
     t = GameTracker(1)
     t.merge_level(lm)
     t.flags.ball_nav = True

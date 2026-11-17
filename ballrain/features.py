@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 
 from . import geometry as G
-from .path import PathFollower, ReferencePath, load_tas_path
+from .path import PathFollower, ReferencePath, RouteError, is_synthetic_level, load_tas_path
 from .state import G_RAILS, G_STOPPER, GameTracker
 
 FEATURE_VERSION = "f6"  # f6: optional look-ahead block (far_waypoints, ref_speed_at; off by default = the f5 layout)
@@ -49,8 +49,9 @@ class FeatureConfig:
     fan_up: float = 1.0  # fan rays start this far above the ball centre
     mesh_edge: bool = True  # distance from the contact point to the walkable boundary (mesh method)
     rail_radius: float = 6.0
-    path_source: str = "tas"  # "tas" (committed TAS line, polyline fallback) | "checkpoints" (polyline)
-    path_dir: str | None = None  # directory of the L<nn>.npz assets (default benchmarks/refpaths)
+    path_source: str = "tas"  # "tas" (TAS line; the polyline only for levels without an asset) | "checkpoints"
+    path_dir: str | None = None  # directory of the L<nn>.npz assets, repo-relative (default benchmarks/refpaths)
+    path_sha256: str | None = None  # sha256 the level's asset must have (set by the learner; None = unchecked)
     path_lateral_scale: float = 10.0  # path_lateral = distance to the line / this
     path_back: float = 10.0  # projection window behind the previous arc length
     path_ahead: float = 30.0  # ... and ahead of it
@@ -310,9 +311,13 @@ class FeatureExtractor:
         key = (id(tracker), tracker.level.version, tracker.arrays.rows("Checkpoints"))
         if key != self._path_key:
             path = None
-            if self.cfg.path_source == "tas":
-                path = load_tas_path(tracker.level_no, tracker, self.cfg.path_dir)
-            if path is None:
+            tas_pending = False
+            if self.cfg.path_source == "tas" and not is_synthetic_level(tracker):
+                path = load_tas_path(tracker.level_no, tracker, self.cfg.path_dir, strict=True,
+                                     sha256=self.cfg.path_sha256)
+                # the level has an asset but its data is still incomplete: no line yet (never the polyline)
+                tas_pending = path is None and self._needs_asset(tracker)
+            if path is None and not tas_pending:
                 path = ReferencePath.from_tracker(tracker)
             new_tracker = self._path_key is None or key[0] != self._path_key[0]
             same_line = (path is not None and self.path is not None and path.source == self.path.source
@@ -324,6 +329,19 @@ class FeatureExtractor:
             self.path = path
             self._path_key = key
         return self.path
+
+    def _has_asset(self, level) -> bool:
+        from .path import asset_path, resolve_path_dir
+        return asset_path(level, resolve_path_dir(self.cfg.path_dir)).is_file()
+
+    def _needs_asset(self, tracker: GameTracker) -> bool:
+        return self.cfg.path_source == "tas" and not is_synthetic_level(tracker) and self._has_asset(tracker.level_no)
+
+    def check_route(self, tracker: GameTracker) -> None:
+        """RouteError when the ball is in play while the line a "tas" configuration needs is not loaded."""
+        if (self.path is None or self.path.source != "tas") and self._needs_asset(tracker):
+            raise RouteError(f"level {tracker.level_no}: ball in play without its reference line "
+                             f"(path_dir {self.cfg.path_dir!r}); refusing to run without the route")
 
     def reset_episode(self) -> None:
         """Forget the projection state (call at every episode start: new process, respawn, TAS hand-over)."""
@@ -359,6 +377,8 @@ class FeatureExtractor:
             F["cam_yaw"][:] = (math.cos(y1), math.sin(y1))
             F["cam_rotating"][0] = float(abs(math.remainder(y0 - y1, 2 * math.pi)) > 1e-3)
         path = self.reference_path(tracker)
+        if valid:
+            self.check_route(tracker)
         if have_ball:
             pos = np.asarray(ball["pos"], np.float64)
             vel = np.asarray(ball["speed"], np.float64) + np.asarray(ball["speed_change"], np.float64)
