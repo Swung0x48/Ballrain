@@ -510,8 +510,10 @@ def sr_estimate(runs, sel: str) -> dict:
 def k0_evals() -> list[dict]:
     """Evaluations from the very start of the level (k = 0) on the original game."""
     rows = []
-    for f in sorted(glob.glob(str(PC_DIR / "*-sim2real" / "*.jsonl"))):
-        run = Path(f).parent.name.split("-")[0]
+    # results sit in <run>-sim2real/ (r3) or <run>-sim2real/pairs/ (r4 on); one-off check folders are not evaluations
+    files = glob.glob(str(PC_DIR / "*-sim2real" / "*.jsonl")) + glob.glob(str(PC_DIR / "*-sim2real" / "pairs" / "*.jsonl"))
+    for f in sorted(set(files)):
+        run = next(part for part in Path(f).parts if part.endswith("-sim2real")).split("-")[0]
         try:
             lines = Path(f).read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -523,6 +525,8 @@ def k0_evals() -> list[dict]:
                 continue
             p = (j.get("per_start") or {}).get("0")
             if not p or j.get("invalid"):  # invalid: e.g. r5/r6 retail evals without the reference line
+                continue
+            if str(j.get("backend")) != "retail":  # this table is the original game only
                 continue
             rows.append({"run": run, "update": j.get("update"),
                          "backend": BACKEND_LABEL.get(str(j.get("backend")), "其他"),
