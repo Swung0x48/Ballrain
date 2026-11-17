@@ -210,6 +210,9 @@ def parse(argv=None):
                    help="JSON ballrain.train.guard.ReachGuard fields, e.g. {\"lo\": 4100, \"hi\": 4299, \"bin\": 100, "
                         "\"min_n\": 20, \"low\": 0.5, \"good\": 0.7}: reload the newest good bin's checkpoint when the "
                         "TAS starts in [lo, hi] reach the next checkpoint at < low in consecutive bins of policy versions")
+    p.add_argument("--rail-gate", default="",
+                   help='JSON {"s": route arc length, "below": TAS frame}: truncate (bootstrapped, end gate_truncate) a 小节-1 '
+                        'life not started at or after "below" once it reaches route s (WorkerSpec.rail_gate)')
     p.add_argument("--watch-s", default="",
                    help="LO,HI: also log the behaviour policy's entropy on batch states whose route position (feature "
                         "path_progress x line length) is in [LO, HI] (u_watch_entropy, u_watch_n; L1 r6: 300,400, the exit)")
@@ -473,7 +476,8 @@ def main(argv=None) -> int:
                           p_early_respawn=a.p_early_respawn, zones=json.loads(a.zones) if a.zones else {},
                           wall_push_rate=a.wall_push_rate, wall_min_rise=a.wall_min_rise,
                           wall_max_progress=a.wall_max_progress, wall_push_everywhere=a.wall_push_everywhere,
-                          zone_stall_exempt=a.zone_stall_exempt, launcher_factory=FakeLauncher if a.fake else None)
+                          zone_stall_exempt=a.zone_stall_exempt, rail_gate=json.loads(a.rail_gate) if a.rail_gate else {},
+                          launcher_factory=FakeLauncher if a.fake else None)
 
     hub = None
     cu_bins = defaultdict(lambda: deque(maxlen=100))
@@ -519,7 +523,8 @@ def main(argv=None) -> int:
                                "p_early_respawn": a.p_early_respawn,
                                "zones": json.loads(a.zones) if a.zones else {}, "wall_push_rate": a.wall_push_rate,
                                "wall_min_rise": a.wall_min_rise, "wall_max_progress": a.wall_max_progress,
-                               "wall_push_everywhere": a.wall_push_everywhere, "zone_stall_exempt": a.zone_stall_exempt}}
+                               "wall_push_everywhere": a.wall_push_everywhere, "zone_stall_exempt": a.zone_stall_exempt,
+                               "rail_gate": json.loads(a.rail_gate) if a.rail_gate else {}}}
         hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):

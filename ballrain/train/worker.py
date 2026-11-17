@@ -111,6 +111,13 @@ class WorkerSpec:
     # zone_stall_exempt: a life that has entered a penalty zone pays no stall penalty when it ends by stall (it still
     # ends there, terminal with --stall-terminal, and keeps the one-off zone penalty): a pit life costs less than a death
     zone_stall_exempt: bool = False
+    # rail-end gate (off when empty): {"s": route arc length, "below": TAS frame (default 4000)}: a 小节-1 life that did not
+    # start at or after TAS frame `below` (a TAS / at-rest start below it, a level start, or a 小节-1 respawn) is truncated
+    # (bootstrapped, end "gate_truncate", not a failure) once its route arc length reaches s while still in 小节 1. L1 r6:
+    # lives started on the early 小节 1 stretch stop at the entry rail end, before the flight onto platform A, so their
+    # missed landings (middle-floor falls) cannot bleed into the 4100+ starts' landing; the value there comes from the
+    # starts at / after `below`. Read with getattr: a bridge's older pickled WorkerSpec has no such field
+    rail_gate: dict = field(default_factory=dict)
     wall_gap: float = 0.1
     wall_max_ny: float = 0.5
     wall_min_rise: float = 2.0
@@ -392,6 +399,17 @@ class Worker:
             return False
         return bool(self._respawn_rng.random() >= p)
 
+    def _gate_hit(self, ep, s, info) -> bool:
+        """WorkerSpec.rail_gate: this 小节-1 life (not started at or after TAS frame gate["below"]) has reached the gate's
+        route arc length."""
+        g = getattr(self.spec, "rail_gate", None) or {}
+        if not g or s is None or int(ep.d.get("start_sector") or 0) != 1 or int(info.get("sector") or 1) > 1:
+            return False
+        k = ep.d.get("start_frame")
+        if ep.d.get("kind") != "respawn" and k is not None and int(k) >= int(g.get("below", 4000)):
+            return False
+        return float(s) >= float(g["s"])
+
     def _split_start(self, ep, info):
         """Segment start of a new life for the split bonus."""
         if not self.spec.split_k or self.env.starts is None:
@@ -637,7 +655,9 @@ class Worker:
                         since = min(since, ef - ep.move_frame)
                         if ef - ep.mark_frame >= stall_max:
                             since = win
-                    if ep.d["cap_frames"] is not None and ef >= ep.d["cap_frames"]:
+                    if self._gate_hit(ep, s, info2):
+                        trunc, end = True, "gate_truncate"
+                    elif ep.d["cap_frames"] is not None and ef >= ep.d["cap_frames"]:
                         trunc, end = True, "cap"
                     elif s is not None and since >= win:
                         trunc, end = True, "stall"
