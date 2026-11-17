@@ -476,6 +476,62 @@ def hidden_startupinfo():
     return subprocess.STARTUPINFO(dwFlags=subprocess.STARTF_USESHOWWINDOW, wShowWindow=SW_HIDE)
 
 
+NOFOCUS_DIR = Path(__file__).resolve().parents[1] / "runtime" / "nofocus"  # built by tools/nofocus/build.bat
+NOFOCUS_VAR = "BALLRAIN_NOFOCUS"  # "0" = hidden launches go straight to Player.exe (no activation hook)
+_nofocus_warned = False
+
+
+def nofocus_available() -> bool:
+    return sys.platform == "win32" and (NOFOCUS_DIR / "nofocus.dll").is_file() and (NOFOCUS_DIR / "nofocus_launch.exe").is_file()
+
+
+class _LaunchedProc:
+    """Popen-like stand-in for a process started by nofocus_launch.exe (holds a handle so the PID is not reused)."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self._h = _k32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+
+    def poll(self):
+        code = wintypes.DWORD()
+        if not self._h or not _k32.GetExitCodeProcess(self._h, ctypes.byref(code)):
+            return -1
+        return None if code.value == 259 else code.value  # 259 = STILL_ACTIVE
+
+    def __del__(self):
+        if getattr(self, "_h", None):
+            _k32.CloseHandle(self._h)
+            self._h = None
+
+
+def launch_nofocus(copy: GameCopy, env: dict, visible: bool | None = None, audio_on: bool | None = None,
+                   keep_focus: bool | None = None) -> int:
+    """launch_direct, but Player.exe is created suspended by runtime/nofocus/nofocus_launch.exe, which loads
+    nofocus.dll on its main thread before the game's own code runs. The DLL installs a thread WH_CBT hook that
+    refuses every window activation, so no game window (splash, main window) ever becomes the active or
+    foreground window. Same working directory (<copy>/Bin), environment and show flags as launch_direct;
+    traces were checked byte-identical to direct launches (BallrainIO and TASSupport paths)."""
+    if not nofocus_available():
+        raise InstanceError(f"no-focus launcher not built ({NOFOCUS_DIR}); run tools/nofocus/build.bat")
+    show = windows_visible(visible)
+    if game_keeps_focus(keep_focus, show):
+        env = {**env, "BALLRAIN_KEEP_FOCUS": "1"}
+    full = full_env(env)
+    if os.environ.get("NOFOCUS_LOG"):
+        full["NOFOCUS_LOG"] = os.environ["NOFOCUS_LOG"]
+    out = subprocess.run([str(NOFOCUS_DIR / "nofocus_launch.exe"), str(NOFOCUS_DIR / "nofocus.dll"), str(copy.exe)],
+                         cwd=str(copy.bin_dir), env=full, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                         timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                         startupinfo=None if show else hidden_startupinfo())
+    line = out.stdout.strip()
+    if out.returncode != 0 or not line.startswith("pid "):
+        raise InstanceError(f"nofocus_launch failed (exit {out.returncode}): {line!r}")
+    p = _LaunchedProc(int(line.split()[1]))
+    _LAUNCHED[p.pid] = p
+    audio.watch(p, copy.exe, muted=not audio.audio_enabled(audio_on))
+    return p.pid
+
+
 def launch_direct(copy: GameCopy, env: dict, visible: bool | None = None, audio_on: bool | None = None,
                   keep_focus: bool | None = None) -> int:
     """Direct process creation (like Start-Process -WorkingDirectory <copy>/Bin [-WindowStyle Hidden]).
@@ -483,6 +539,14 @@ def launch_direct(copy: GameCopy, env: dict, visible: bool | None = None, audio_
     audio.audio_enabled(audio_on) (BALLRAIN_AUDIO=1), in which case they are kept unmuted (Windows remembers
     the mute per executable path); BALLRAIN_KEEP_FOCUS=1 is passed when game_keeps_focus(keep_focus, visible)."""
     show = windows_visible(visible)
+    if not show and os.environ.get(NOFOCUS_VAR, "").strip() != "0":
+        if nofocus_available():  # hidden game: start it through the no-focus launcher
+            return launch_nofocus(copy, env, visible=False, audio_on=audio_on, keep_focus=keep_focus)
+        global _nofocus_warned
+        if not _nofocus_warned:
+            print(f"warning: {NOFOCUS_DIR} not built (tools/nofocus/build.bat); hidden games may take the foreground",
+                  file=sys.stderr, flush=True)
+            _nofocus_warned = True
     if game_keeps_focus(keep_focus, show):
         env = {**env, "BALLRAIN_KEEP_FOCUS": "1"}
     p = subprocess.Popen(
@@ -501,7 +565,7 @@ def launch_direct(copy: GameCopy, env: dict, visible: bool | None = None, audio_
     return p.pid
 
 
-LAUNCH_RECIPES = {"explorer_cmd": launch_explorer_cmd, "direct": launch_direct}
+LAUNCH_RECIPES = {"explorer_cmd": launch_explorer_cmd, "direct": launch_direct, "nofocus": launch_nofocus}
 LAUNCH_RECIPE = launch_explorer_cmd
 
 

@@ -202,7 +202,7 @@ def test_refuses_when_already_running(fake, monkeypatch):
 
 def test_recipes_registry():
     assert ins.LAUNCH_RECIPE is ins.launch_explorer_cmd
-    assert set(ins.LAUNCH_RECIPES) == {"explorer_cmd", "direct"}
+    assert set(ins.LAUNCH_RECIPES) == {"explorer_cmd", "direct", "nofocus"}
 
 
 @win
@@ -259,6 +259,7 @@ def test_run_copy_timeout_kills_only_own_pid(fake):
 
 @win
 def test_direct_recipe_starts_in_bin(fake, monkeypatch):
+    monkeypatch.setenv(ins.NOFOCUS_VAR, "0")  # plain Popen path (the no-focus path is tested below)
     # launch_direct itself, on the fake exe (cmd.exe copy exits at once on empty stdin); the audio watcher runs
     # for real (the fake exe opens no audio session, so nothing is changed)
     pid = ins.launch_direct(fake, {"BALLRAIN_MODE": "replay"})
@@ -279,6 +280,7 @@ def test_windows_visible_switch(monkeypatch):
 
 @win
 def test_direct_recipe_hides_windows_by_default(fake, monkeypatch):
+    monkeypatch.setenv(ins.NOFOCUS_VAR, "0")  # plain Popen path (the no-focus path is tested below)
     seen = []
 
     class FakePopen:
@@ -310,6 +312,7 @@ def test_direct_recipe_hides_windows_by_default(fake, monkeypatch):
 
 @win
 def test_direct_recipe_audio_and_focus_switches(fake, monkeypatch):
+    monkeypatch.setenv(ins.NOFOCUS_VAR, "0")  # plain Popen path (the no-focus path is tested below)
     seen, watched = [], []
 
     class FakePopen:
@@ -528,3 +531,25 @@ def test_training_copies_on_disk():
 def test_agent_vars_are_managed():
     for k in ("BALLRAIN_SHM", "BALLRAIN_PARENT_PID", "BALLRAIN_LEVELMSG", "BALLRAIN_PREFIX", "BALLRAIN_SR_TAIL"):
         assert k in ins.MANAGED_VARS
+
+
+def test_hidden_direct_launch_goes_through_nofocus(fake, monkeypatch):
+    calls = []
+    monkeypatch.delenv(ins.NOFOCUS_VAR, raising=False)
+    monkeypatch.delenv(ins.VISIBLE_VAR, raising=False)
+    monkeypatch.setattr(ins, "nofocus_available", lambda: True)
+    monkeypatch.setattr(ins, "launch_nofocus", lambda c, e, **k: calls.append(k) or 4242)
+    assert ins.launch_direct(fake, {}) == 4242
+    assert calls == [{"visible": False, "audio_on": None, "keep_focus": None}]
+    calls.clear()
+    monkeypatch.setenv(ins.NOFOCUS_VAR, "0")
+    monkeypatch.setattr(ins.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("popen")))
+    with pytest.raises(RuntimeError, match="popen"):
+        ins.launch_direct(fake, {})
+    assert calls == []
+
+
+def test_launch_nofocus_requires_build(fake, monkeypatch):
+    monkeypatch.setattr(ins, "nofocus_available", lambda: False)
+    with pytest.raises(ins.InstanceError, match="build.bat"):
+        ins.launch_nofocus(fake, {})
