@@ -301,6 +301,7 @@ class Dashboard:
             def frontier():
                 cur_st = D.run_status(next(r for r in mac if r.name == sel), off, L.n, {**self.machines, "sources": self.sources}) if sel else {}
                 cur = int(cur_st.get("frontier") or 19086)
+                self.map_frontier = (sel, cur)  # what the charts were built for (status() compares)
                 sig = (tuple(D._sig(r.path / "train.log") for r in runs), cur, sel, self.show_alt)
                 put("frontier", sig, lambda: D.frontier_payload(L, runs, off, sel, cur, self.show_alt))
             self._section("frontier", errors, frontier)
@@ -380,6 +381,16 @@ class Dashboard:
         with self.lock:
             gen = {k: v for k, v in self.gen.items() if k != "last_start"}
             summ = self.summary
+        # the charts are rebuilt every --interval; when the live frontier moved since the last build, rebuild now so
+        # the tiles and the maps never disagree for long (no user rate limit: at most once per frontier change)
+        sel_run = D.default_run(runs)
+        live = (st.get(sel_run) or {}).get("frontier")
+        built = getattr(self, "map_frontier", None)
+        if live is not None and built is not None and built[0] == sel_run and int(live) != built[1]:
+            with self.lock:
+                if not self.gen["running"] and getattr(self, "_woken_for", None) != int(live):
+                    self._woken_for = int(live)
+                    self.wake.set()
         res = {"now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "tz": D.tz_label(), "milestone": "M2",
                "runs": [r.name for r in mac], "default_run": D.default_run(runs), "status": st, "gen": gen,
                "interval_s": self.interval, "min_refresh_s": self.min_refresh, "machines": self.machines,
