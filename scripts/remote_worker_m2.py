@@ -32,11 +32,16 @@ def main(argv=None) -> int:
     p.add_argument("--tag", default="pc")
     p.add_argument("--backend", default="retail")
     p.add_argument("--fake", action="store_true", help="FakeLauncher (tests)")
+    p.add_argument("--launch", default=None,
+                   help="launch recipe for this machine's copies (a key of ballrain.instances.LAUNCH_RECIPES); default: "
+                        "the learner template's env.launch. Lets the bridge switch launchers without a learner restart")
     a = p.parse_args(argv)
     from ballrain import instances
     from ballrain.train.remote import RemoteBridge, parse_addr
     from train_m2 import stop_copies
-    instances.LAUNCH_RECIPE = instances.launch_direct
+    if a.launch is not None and a.launch not in instances.LAUNCH_RECIPES:
+        raise SystemExit(f"--launch {a.launch!r}: not one of {sorted(instances.LAUNCH_RECIPES)}")
+    instances.LAUNCH_RECIPE = instances.LAUNCH_RECIPES[a.launch] if a.launch else instances.launch_direct
     key = (a.key or os.environ.get("BALLRAIN_REMOTE_KEY") or "").encode()
     if not key:
         raise SystemExit("needs --key or $BALLRAIN_REMOTE_KEY")
@@ -62,6 +67,15 @@ def main(argv=None) -> int:
         overrides["launcher_factory"] = FakeLauncher
     br = RemoteBridge(parse_addr(a.learner), key, copies, a.backend, lambda c: out / "episodes" / c, log=log,
                       worker_overrides=overrides)
+    if a.launch:
+        _spec_l = br._spec
+
+        def spec_launch(i, name, restart):
+            s = _spec_l(i, name, restart)
+            s.env.launch = a.launch
+            return s
+        br._spec = spec_launch
+        log(f"launch recipe: {a.launch}")
     if a.fake:
         _spec = br._spec
 
