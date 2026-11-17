@@ -171,7 +171,8 @@ function tile(k, v, s, gt) {
 function renderStatus() {
   const s = S.status[sel] || {};
   $("state").textContent = s.state || "";
-  const share = s.backend_share ? Object.entries(s.backend_share).map(([k, v]) => `${k} ${v}%`).join(" · ") : "—";
+  const SHORT = { "无头 x87-soft": "x87-soft", "原版 2002": "2002" };
+  const share = s.backend_share ? Object.entries(s.backend_share).map(([k, v]) => `<div class="row"><span>${esc(SHORT[k] || k)}</span><span>${v}%</span></div>`).join("") : "—";
   $("tiles").innerHTML = [
     tile("run", sel, s.machine ? `训练机：${s.machine}` : "", true),
     tile(`最后记录（${S.tz}）`, s.last_log || "—", s.last_log_age_min != null ? `${num(s.last_log_age_min, 0)} 分钟前；开始于 ${s.started || "—"}` : "", false),
@@ -182,7 +183,7 @@ function renderStatus() {
     tile("开局区间成功率", pct(s.band_success), `推进阈值 60%；最近 20 次平均 ${pct(s.band_success_avg20)}`, true),
     tile("回合通关率", pct(s.finish_tas), `最近 20 次平均 ${pct(s.finish_tas_avg20)}`, true),
     tile("策略熵 / KL", `${num(s.u_entropy, 3)} / ${num(s.u_approx_kl, 4)}`, "随机策略的熵为 2.20", true),
-    tile("训练数据来源（最近 100 次更新）", share, "", false),
+    `<div class="tile"><div class="k">数据来源（近 100 次）</div><div class="v split">${share}</div></div>`,
     tile("最佳 SR（含 TAS 前缀）", sec(s.best_sr_any), s.best_sr_k0 != null ? `从头开始最佳 ${sec(s.best_sr_k0)}` : "从 TAS 中途接手时的整关计时", true),
     tile("记录了轨迹的回合", num((S.traced_counts || {})[sel]), "抽样记录，供轨迹地图使用", true),
   ].join("");
