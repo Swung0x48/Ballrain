@@ -70,6 +70,7 @@ def main(argv=None) -> int:
             s.env.copy = instances.TRAINING_COPY
             return s
         br._spec = spec_fake
+    br.heartbeat = out / "heartbeat.json"
     ctx = mp.get_context("spawn")
     data_q = ctx.Queue()
     try:

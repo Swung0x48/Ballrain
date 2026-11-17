@@ -20,6 +20,8 @@ weights. Transport: multiprocessing.connection (pickle + HMAC authkey; LAN use o
 from __future__ import annotations
 
 import copy as _copy
+from pathlib import Path
+import os
 import queue
 import socket
 import threading
@@ -174,7 +176,8 @@ class RemoteBridge:
         self.wid_base = None
         self.procs, self.ctrl_qs, self.specs = [], [], []
         self.stop = False
-        self.counts = {"forwarded": 0, "dropped": 0, "params": 0, "reconnects": 0}
+        self.counts = {"forwarded": 0, "dropped": 0, "params": 0, "reconnects": 0, "fatal": 0}
+        self.heartbeat = None  # path: a JSON health record written every 30 s (scripts/remote_supervisor_m2.py)
         self.max_queue = max_queue
 
     # --------------------------------------------------------------------------------- connection
@@ -246,6 +249,13 @@ class RemoteBridge:
             cfg.curriculum = dict(cfg.curriculum, seed=seed)
         kw = dict(t["worker"])
         kw.update(self.overrides)
+        import dataclasses
+        known = {f.name for f in dataclasses.fields(WorkerSpec)}
+        unknown = sorted(set(kw) - known)
+        if unknown:  # the learner runs newer worker code than this bridge: restart the bridge to pick it up
+            self.log(f"bridge: WARNING the learner's worker template has fields this bridge does not know: {unknown}; "
+                     f"they are ignored until the bridge is restarted with the current code")
+            kw = {k: v for k, v in kw.items() if k in known}
         return WorkerSpec(wid=i, copy=name, env=cfg, seed=seed, **kw)
 
     def _start_worker(self, i, name, restart):
@@ -296,7 +306,18 @@ class RemoteBridge:
         self.start_workers(ctx, data_q)
         threading.Thread(target=self._recv_loop, daemon=True, name="bridge-recv").start()
         restarts = [0] * len(self.copies)
+        t_beat = 0.0
         while not self.stop and not should_stop():
+            if self.heartbeat is not None and time.time() - t_beat > 30:
+                t_beat = time.time()
+                try:
+                    import json as _json
+                    tmp = Path(str(self.heartbeat) + ".tmp")
+                    tmp.write_text(_json.dumps(dict(self.counts, t=t_beat, connected=self.conn is not None,
+                                                    pid=os.getpid())), encoding="utf-8")
+                    os.replace(tmp, self.heartbeat)
+                except OSError:
+                    pass
             if getattr(self, "_restart_all", False):
                 self._restart_all = False
                 for i, p in enumerate(self.procs):
@@ -321,6 +342,7 @@ class RemoteBridge:
             if "fatal" in m:
                 i = m["wid"]
                 restarts[i] += 1
+                self.counts["fatal"] += 1
                 self.log(f"bridge: worker {i} fatal (restart {restarts[i]}): {m['fatal'][-800:]}")
                 self.procs[i].join(timeout=30)
                 if on_fatal:

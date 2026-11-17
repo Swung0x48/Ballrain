@@ -37,9 +37,9 @@ sys.path.insert(0, str(REPO))
 import numpy as np  # noqa: E402
 
 RECORD = "SR01_1_14_457_264"
-TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "checkpoint", "stall_penalty",
+TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "checkpoint", "stall_penalty", "gate_bonus",
          "camera_off_quarter")
-EP_COLS = ["update", "t", "wid", "backend", "host", "copy", "kind", "start_frame", "start_sector", "end", "end_sector", "max_sector",
+EP_COLS = ["update", "t", "wid", "backend", "host", "copy", "kind", "probes", "death_probe", "start_frame", "start_sector", "end", "end_sector", "max_sector",
            "success_cp", "finish", "ret", "steps", "frames", "sr_ms_end", "start_sr_ms", "agent_s", "s_start", "s_end",
            "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id"] + [f"r_{k}" for k in TERMS] + ["actions"]
 UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_per_s", "frontier", "frontier_sector",
@@ -50,6 +50,7 @@ UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_pe
                + [f"{p}_bin{b}" for b in range(12) for p in ("cp", "fin")]
                + [f"{p}_sec{s}" for s in range(1, 5) for p in ("cp", "fin")]
                + [f"{p}_sec{s}" for s in range(1, 5) for p in ("rsp_cp", "rsp_n")]
+               + [f"{p}_sec{s}" for s in range(1, 5) for p in ("rest_cp", "rest_n")]
                + [f"u_{k}" for k in ("pg_loss", "v_loss", "entropy", "approx_kl", "clip_frac", "early_stop",
                                      "explained_var", "adv_std", "ret_mean")])
 RUN_COLS = ["update", "t", "copy", "run_id", "end_reason", "sr_ms", "start_frame", "frames", "lives", "deaths",
@@ -110,6 +111,10 @@ def parse(argv=None):
     p.add_argument("--hl-bin", default=None, help="headless: SimTool binary (default $BALLRAIN_HL_BIN)")
     p.add_argument("--hl-root", default=None, help="headless: Ballance game folder (default $BALLRAIN_HL_ROOT)")
     p.add_argument("--hl-socket", default=None, help="headless: unix | tcp (default $BALLRAIN_HL_SOCKET)")
+    p.add_argument("--hl-ball-order", default=None,
+                   help="headless: ball-ball contact order (ckid | reverse | perm:<seed> | table:... | retail[:<seed>])")
+    p.add_argument("--gates", default="", help="JSON sub-goal gates (ballrain.train.worker.WorkerSpec.gates)")
+    p.add_argument("--route-probes", default="", help='JSON {name: [xmin, xmax, zmin, zmax]}: per-route visit / death stats')
     p.add_argument("--remote-listen", default=None,
                    help="HOST:PORT: accept remote rollout workers (scripts/remote_worker_m2.py, ballrain.train.remote)")
     p.add_argument("--remote-key", default=None, help="shared secret (default $BALLRAIN_REMOTE_KEY)")
@@ -150,6 +155,13 @@ def parse(argv=None):
     p.add_argument("--stall-s", type=float, default=10.0)
     p.add_argument("--stall-terminal", action="store_true",
                    help="a stall is a terminal failure (death penalty + sector refund) instead of a bootstrapped truncation")
+    p.add_argument("--stall-speed", type=float, default=None,
+                   help="the stall clock pauses while the ball is faster than this (units/s): run-ups are not cut")
+    p.add_argument("--stall-max-s", type=float, default=15.0, help="with --stall-speed: max time without new arc progress")
+    p.add_argument("--rest-starts", default="", help="at-rest starts: lo-hi record frame ranges, e.g. 11760-11900,13450-13650")
+    p.add_argument("--p-rest", type=float, default=0.0, help="probability of an at-rest start for a new process")
+    p.add_argument("--rehearse-starts", default="", help="rehearsal start ranges lo-hi (record frames), e.g. 4900-5075")
+    p.add_argument("--p-rehearse", type=float, default=0.0, help="probability of a rehearsal start for a new process")
     p.add_argument("--stall-extra", type=float, default=0.0, help="with --stall-terminal: extra penalty on top of a death's")
     p.add_argument("--stall-compensate", action="store_true",
                    help="with --stall-terminal: divide the stall penalty by gamma ** window steps (never cheaper than dying now)")
@@ -234,11 +246,16 @@ def make_env_config(a, out_root: Path):
           "advance_at": a.advance_at, "min_episodes": a.min_episodes, "p_level_start": a.p_level_start}
     hl = None
     if a.backend == "headless":
-        hl = {k: v for k, v in (("binary", a.hl_bin), ("root", a.hl_root), ("socket", a.hl_socket)) if v}
+        hl = {k: v for k, v in (("binary", a.hl_bin), ("root", a.hl_root), ("socket", a.hl_socket),
+                                ("ball_order", a.hl_ball_order)) if v}
     return EnvConfig(level=1, mode="sr", action_repeat=a.action_repeat, out_root=str(out_root), start_record=RECORD,
                      backend=a.backend, headless=hl,
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
-                     per_life=not a.no_respawn)
+                     per_life=not a.no_respawn,
+                     rest_starts=[[int(v) for v in r.split("-")] for r in a.rest_starts.split(",") if r.strip()] or None,
+                     p_rest=a.p_rest,
+                     rehearse_starts=[[int(v) for v in r.split("-")] for r in a.rehearse_starts.split(",") if r.strip()] or None,
+                     p_rehearse=a.p_rehearse)
 
 
 def stop_copies(names, log=None):
@@ -401,11 +418,14 @@ def main(argv=None) -> int:
                           activation=a.activation, cap_mult=a.cap_mult, stall_s=a.stall_s,
                           respawn_stall_s=a.respawn_stall_s, stall_terminal=a.stall_terminal, prune=a.prune,
                           stall_extra=a.stall_extra, stall_compensate=a.stall_compensate, gamma=a.gamma,
-                          trace_sample=a.trace_sample,
+                          stall_speed=a.stall_speed, stall_max_s=a.stall_max_s,
+                          trace_sample=a.trace_sample, route_probes=json.loads(a.route_probes) if a.route_probes else {},
+                          gates=json.loads(a.gates) if a.gates else {},
                           launcher_factory=FakeLauncher if a.fake else None)
 
     hub = None
-    cu_bins = defaultdict(lambda: deque(maxlen=100))  # curriculum bin -> recent LevelFinish outcomes (failure-weighted starts)
+    cu_bins = defaultdict(lambda: deque(maxlen=100))
+    by_rest = defaultdict(lambda: deque(maxlen=200))  # at-rest starts by start sector  # curriculum bin -> recent LevelFinish outcomes (failure-weighted starts)
 
     def broadcast(qs=None, with_model=True):
         if cu.cfg.weighted:
@@ -438,7 +458,10 @@ def main(argv=None) -> int:
                                "stall_s": a.stall_s, "respawn_stall_s": a.respawn_stall_s,
                                "stall_terminal": a.stall_terminal, "stall_extra": a.stall_extra,
                                "stall_compensate": a.stall_compensate, "gamma": a.gamma, "prune": a.prune,
-                               "trace_sample": a.trace_sample}}
+                               "stall_speed": a.stall_speed, "stall_max_s": a.stall_max_s,
+                               "trace_sample": a.trace_sample,
+                               "route_probes": json.loads(a.route_probes) if a.route_probes else {},
+                               "gates": json.loads(a.gates) if a.gates else {}}}
         hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):
@@ -463,6 +486,9 @@ def main(argv=None) -> int:
     frames_last_log = counters["frames"]
     stop = False
     update_times = deque(maxlen=50)
+    remote_last = [time.time()]  # last remote chunk (watchdog)
+    remote_chunks = [0]
+    remote_warned = [False]
     last_be_steps: dict = {}
     collect_times = deque(maxlen=50)
     reset_frac = deque(maxlen=200)
@@ -479,6 +505,8 @@ def main(argv=None) -> int:
         log.row("episodes", e)
         if e["kind"] == "respawn":
             by_rsp_sector[e["start_sector"]].append((e["success_cp"], e["finish"]))
+        if e["kind"] == "tas_rest":
+            by_rest[e["start_sector"]].append((e["success_cp"], e["finish"]))
         if e["kind"] == "tas":
             k = e["start_frame"]
             succ = e["finish"] if a.success == "finish" else e["success_cp"]
@@ -578,6 +606,9 @@ def main(argv=None) -> int:
                     e["backend"] = be
                     handle_episode(e)
                 counters[f"steps_{be}"] = counters.get(f"steps_{be}", 0) + len(m["rewards"])
+                if m.get("remote"):
+                    remote_last[0] = time.time()
+                    remote_chunks[0] += 1
                 counters["frames"] += m["frames"]
                 reset_frac.append(m["t_reset"] / max(m["t_chunk"], 1e-9))
                 if m["raw"].shape[1] != n_obs:  # a worker still on an older observation layout (remote, before its restart)
@@ -666,6 +697,9 @@ def main(argv=None) -> int:
                         row[f"cp_sec{s}"] = round(float(np.mean([x[0] for x in by_sector[s]])), 3)
                         row[f"fin_sec{s}"] = round(float(np.mean([x[1] for x in by_sector[s]])), 3)
                 for s in range(1, 5):
+                    if by_rest.get(s):
+                        row[f"rest_cp_sec{s}"] = round(float(np.mean([x[0] for x in by_rest[s]])), 3)
+                        row[f"rest_n_sec{s}"] = len(by_rest[s])
                     if by_rsp_sector.get(s):
                         row[f"rsp_cp_sec{s}"] = round(float(np.mean([x[0] for x in by_rsp_sector[s]])), 3)
                         row[f"rsp_n_sec{s}"] = len(by_rsp_sector[s])
@@ -692,7 +726,30 @@ def main(argv=None) -> int:
                     log.tb.add_scalar(f"train_{be}/dropped_chunks", counters.get(f"dropped_{be}", 0), counters["steps"])
                     log.tb.add_scalar(f"train_{be}/dropped_step_frac",
                                       counters.get(f"dropped_steps_{be}", 0) / max(counters.get(sk, 0), 1), counters["steps"])
+                if a.gates:
+                    for name in json.loads(a.gates):
+                        hits = sum(f"gate:{name}" in (e.get("probes") or []) for e in eps)
+                        log.tb.add_scalar(f"gate/{name}_hits", hits, counters["steps"])
+                        log.tb.add_scalar(f"gate/{name}_hit_rate", hits / max(len(eps), 1), counters["steps"])
+                if a.route_probes:
+                    for name in json.loads(a.route_probes):
+                        vis = [e for e in eps if name in (e.get("probes") or [])]
+                        log.tb.add_scalar(f"route/{name}_visits", len(vis), counters["steps"])
+                        log.tb.add_scalar(f"route/{name}_deaths", sum(e.get("death_probe") == name for e in eps),
+                                          counters["steps"])
+                        row[f"route_{name}_visits"] = len(vis)
+                        row[f"route_{name}_deaths"] = sum(e.get("death_probe") == name for e in eps)
                 if hub is not None:
+                    idle = time.time() - remote_last[0]
+                    log.tb.add_scalar("remote/alive", float(idle < 600), counters["steps"])
+                    log.tb.add_scalar("remote/chunks_per_min", remote_chunks[0] * 60.0 / max(dt, 1e-9), counters["steps"])
+                    remote_chunks[0] = 0
+                    if idle >= 600 and not remote_warned[0]:
+                        log.msg(f"WARNING remote: no remote chunks for {idle / 60:.0f} min (bridge down?)")
+                        remote_warned[0] = True
+                    elif idle < 600 and remote_warned[0]:
+                        log.msg("remote: chunks arriving again")
+                        remote_warned[0] = False
                     log.tb.add_scalar("remote/connections", len([c for c in hub.conns.values()]), counters["steps"])
                     log.tb.add_scalar("remote/chunks", hub.stats["chunks"], counters["steps"])
                     log.tb.add_scalar("remote/disconnects", hub.stats["disconnects"], counters["steps"])

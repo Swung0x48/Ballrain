@@ -51,6 +51,11 @@ class WorkerSpec:
     # stall_compensate: divide the stall penalty by gamma ** (stall window in steps): the penalty arrives a stall window
     # after the decision to stop, so undiscounted it is cheaper than dying now (the "stall because of death_refund" hole)
     stall_compensate: bool = False
+    # stall_speed: while the ball moves faster than this (units / s) the stall clock does not run, so a deliberate run-up
+    # (back first, then forward: no new arc progress for a while) is not cut; stall_max_s bounds the time without new
+    # progress regardless of speed (no endless oscillation). None = the stall clock only looks at arc progress
+    stall_speed: float | None = None
+    stall_max_s: float = 15.0
     gamma: float = 0.997
     respawn_stall_s: float | None = None  # stall limit of respawn lives (ball at rest at the checkpoint); None = stall_s
     stall_progress: float = 5.0
@@ -60,6 +65,14 @@ class WorkerSpec:
     launcher_factory: object = None  # tests (ballrain.fakegame.FakeLauncher)
     max_reset_failures: int = 6
     extra: dict = field(default_factory=dict)
+    # route probes: {name: [xmin, xmax, zmin, zmax]} world boxes; every episode records which boxes the ball entered and in
+    # which box (if any) it was last seen before a BallOff (e.g. a TAS shortcut vs the detour around it)
+    route_probes: dict = field(default_factory=dict)
+    # sub-goal gates (training-side shaping, off by default): {name: {"center": [x, y, z], "radius": r, "bonus": b,
+    # "min_speed": v (horizontal, ball speed units), "heading": deg (atan2(vz, vx)), "heading_tol": deg}}; the first time in
+    # an episode the ball is within radius of center and meets the speed / heading conditions, the step's reward gets
+    # +bonus (term "gate_bonus"); each gate pays at most once per episode
+    gates: dict = field(default_factory=dict)
 
 
 class _Episode:
@@ -77,7 +90,11 @@ class _Episode:
         self.s0 = env.reward.s
         self.best_s = env.reward.s if env.reward.s is not None else -np.inf
         self.mark_s, self.mark_frame = self.best_s, 0
+        self.move_frame = 0
         self.actions = np.zeros(env.action_space.n, np.int64)
+        self.probes_seen: set = set()
+        self.last_probe = None
+        self.gates_hit: set = set()
 
     def step(self, a, r, info, finfo):
         self.ret += r
@@ -90,6 +107,31 @@ class _Episode:
         if p and p.get("jump"):
             self.jumps += 1
 
+    def gate(self, pos, vel, gates: dict) -> float:
+        bonus = 0.0
+        for name, g in gates.items():
+            if name in self.gates_hit:
+                continue
+            if np.linalg.norm(pos - np.asarray(g["center"], np.float64)) > g.get("radius", 2.0):
+                continue
+            vh = float(np.hypot(vel[0], vel[2]))
+            if vh < g.get("min_speed", 0.0):
+                continue
+            if "heading" in g:
+                hd = np.degrees(np.arctan2(vel[2], vel[0]))
+                if abs((hd - g["heading"] + 180) % 360 - 180) > g.get("heading_tol", 180):
+                    continue
+            self.gates_hit.add(name)
+            bonus += float(g.get("bonus", 0.0))
+        return bonus
+
+    def probe(self, pos, probes: dict):
+        self.last_probe = None
+        for name, (x0, x1, z0, z1) in probes.items():
+            if x0 <= pos[0] <= x1 and z0 <= pos[2] <= z1:
+                self.probes_seen.add(name)
+                self.last_probe = name
+
     def finish(self, info: dict, end: str, env, frames: int) -> dict:
         d = self.d
         d.update(end=end, ret=self.ret, steps=self.steps, frames=frames, max_sector=self.max_sector,
@@ -98,6 +140,8 @@ class _Episode:
                  s_start=self.s0, s_end=env.reward.s, t_wall=time.time() - d.pop("t_wall_start"),
                  actions=self.actions.tolist())
         d["success_cp"] = bool(d["finish"] or self.max_sector > d["start_sector"])
+        d["probes"] = sorted(self.probes_seen | {f"gate:{g}" for g in self.gates_hit})
+        d["death_probe"] = self.last_probe if end == "BallOff" else None
         return d
 
 
@@ -267,6 +311,7 @@ class Worker:
         ep = _Episode(info, self.env, self.version, self._cap_frames(info))
         stall_all = int(1000 * sp.stall_s / sp.env.delta_ms)
         stall_rsp = int(1000 * (sp.respawn_stall_s or sp.stall_s) / sp.env.delta_ms)
+        stall_max = int(1000 * sp.stall_max_s / sp.env.delta_ms)
         while not self.stop:
             T = sp.chunk
             buf = {"obs": np.zeros((T, n_obs), np.float32), "raw": np.zeros((T, n_obs), np.float32),
@@ -305,15 +350,37 @@ class Worker:
                     continue
                 frames += int(info2.get("frames_done", f0)) - f0
                 ep.step(a, r, info2, self.fx_info)
+                if (sp.route_probes or sp.gates) and self.env.session is not None:
+                    o = self.env.session.tracker.obs
+                    if o is not None and o.ball is not None and bool(o.ball["found"]):
+                        bpos = np.asarray(o.ball["pos"], np.float64)
+                        if sp.route_probes:
+                            ep.probe(bpos, sp.route_probes)
+                        if sp.gates and not term:
+                            gb = ep.gate(bpos, np.asarray(o.ball["speed"], np.float64)
+                                         + np.asarray(o.ball["speed_change"], np.float64), sp.gates)
+                            if gb:
+                                r += gb
+                                ep.ret += gb
+                                ep.terms["gate_bonus"] = ep.terms.get("gate_bonus", 0.0) + gb
                 end = info2.get("episode_end") if (term or trunc) else None
                 if not (term or trunc):
                     ef = self.env._ep_frames
                     s = self.env.reward.s
                     if s is not None and s > ep.mark_s + sp.stall_progress:
                         ep.mark_s, ep.mark_frame = s, ef
+                    win = stall_rsp if ep.d["kind"] == "respawn" else stall_all
+                    since = ef - ep.mark_frame
+                    if sp.stall_speed is not None:
+                        o = self.env.session.tracker.obs if self.env.session is not None else None
+                        if o is not None and o.ball is not None and float(np.linalg.norm(o.ball["speed"])) > sp.stall_speed:
+                            ep.move_frame = ef
+                        since = min(since, ef - ep.move_frame)
+                        if ef - ep.mark_frame >= stall_max:
+                            since = win
                     if ep.d["cap_frames"] is not None and ef >= ep.d["cap_frames"]:
                         trunc, end = True, "cap"
-                    elif s is not None and ef - ep.mark_frame >= (stall_rsp if ep.d["kind"] == "respawn" else stall_all):
+                    elif s is not None and since >= win:
                         trunc, end = True, "stall"
                         if sp.stall_terminal:  # stuck = a failure like a death: penalty + the sector's progress back
                             rc = self.env.reward.cfg

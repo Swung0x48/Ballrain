@@ -123,6 +123,10 @@ def export_check(meta_path: Path, out: Path, bio_copy: str, n_ref: int = 5) -> d
     # inputs (spot-checks: ~8% of long runs), so the verdict is the majority, and k / n_ref identical is reported
     refs = [m0.run_ref(rec, 1, out / "ref" / f"{rec.stem}_ref{j + 1}.txt") for j in range(n_ref)]
     shas = [r["sha256"] for r in refs]
+    from collections import Counter
+    if Counter(shas).most_common(1)[0][1] * 5 <= 3 * len(shas):  # split 3:2 or closer: two more replays (user rule)
+        refs += [m0.run_ref(rec, 1, out / "ref" / f"{rec.stem}_ref{j + 1}.txt") for j in range(n_ref, n_ref + 2)]
+        shas = [r["sha256"] for r in refs]
     r = instances.run_ballrain(rec, 1, out / "bio" / rec.stem, loads=1, timeout=m0.TIMEOUT + 60, copy=bio_copy)
     replay_sha = instances.sha256_file(r["loads"][0]["trace"]) if r["loads"] and Path(r["loads"][0]["trace"]).is_file() else None
     ok, why, kind = gates.export_diagnosis(shas[:3], agent_sha, replay_sha)
@@ -130,7 +134,7 @@ def export_check(meta_path: Path, out: Path, bio_copy: str, n_ref: int = 5) -> d
     return {"run": str(run_dir), "tas": str(rec), "sr_ms": m.get("sr_ms"), "frames": m.get("frames"),
             "framelog_match": m.get("framelog_match"), "agent_trace_sha256": agent_sha, "ref_sha256": shas,
             "all_three_equal": len(set(shas[:3])) == 1, "replay_sha256": replay_sha, "verdict": why, "kind": kind,
-            "ref_identical_to_agent": f"{k_equal}/{len(shas)}",
+            "ref_identical_to_agent": f"{k_equal}/{len(shas)}", "ref_distinct_traces": len(set(shas)),
             "pass_3of3": bool(ok and len(set(shas[:3])) == 1 and shas[0] == agent_sha and m.get("framelog_match")),
             "pass": bool(2 * k_equal > len(shas) and m.get("framelog_match"))}
 

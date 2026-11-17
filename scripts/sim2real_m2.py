@@ -194,6 +194,101 @@ def cmd_pair(a) -> int:
         time.sleep(60 * a.watch)
 
 
+def replay_order(tas_path: Path, order: str, out: Path, hl: dict, copy: str = "hl-90") -> dict:
+    """Replay a .tas on the headless backend with the ball-ball contact order mode `order` (BALLRAIN_HL_BALL_ORDER:
+    ckid | reverse | perm:<seed> | table:<name=rank,...>): the whole .tas is the prefix, the session ends with it.
+    Returns the trace sha256 (lines without line ends), end reason, LevelFinish frame, sectors reached, SR."""
+    import hashlib
+    from ballrain import tas, trace
+    from ballrain.client import AgentSession, SessionConfig
+    from ballrain.headless import HeadlessConfig, HeadlessLauncher
+    out.mkdir(parents=True, exist_ok=True)
+    frames = tas.load_any(tas_path)
+    fb = out / "frames.bin"
+    tas.save_raw(fb, frames)
+    cfg = dict(hl or {})
+    cfg["extra_env"] = dict(cfg.get("extra_env") or {}, BALLRAIN_HL_BALL_ORDER=order)
+    sess = AgentSession(SessionConfig(level=1, out_dir=out, copy=copy, prefix=fb, trace=True),
+                        HeadlessLauncher(HeadlessConfig(**cfg)))
+    sectors = set()
+    try:
+        sess.start()
+        sectors.add(int(sess.tracker.sector))
+        if not sess.ended:
+            sess.stop()
+    finally:
+        sess.close()
+    t = sess.tracker
+    names = {c for _, c, _ in t.events}
+    from ballrain.protocol import Ev
+    end = ("LevelFinish" if Ev.LevelFinish in names else "GameOver" if Ev.GameOver in names else
+           "BallOff" if Ev.BallOff in names else "stop")
+    lines = [trace._strip_eol(x) for x in trace.read_lines(out / "trace.txt")] if (out / "trace.txt").is_file() else []
+    sr = t.sr_ms
+    return {"order": order, "trace_sha": hashlib.sha256(b"\n".join(lines)).hexdigest(), "lines": lines, "end": end,
+            "deaths": sum(1 for _, c, _ in t.events if c == Ev.BallOff), "levelfinish_frame": t.levelfinish_frame,
+            "checkpoints": int(t.checkpoints), "sr_ms": None if sr is None else int(float(sr))}
+
+
+def order_check(tas_path: Path, out: Path, hl: dict, orders: list[str]) -> dict:
+    """The same .tas under several contact orders: order-sensitive = the traces differ; outcome-sensitive = the end
+    reason, the checkpoints reached, the LevelFinish frame or the SR differ."""
+    rows = [replay_order(tas_path, o, out / o.replace(":", "_"), hl) for o in orders]
+    base = rows[0]["lines"]
+    for r in rows:
+        i = next((j for j in range(min(len(base), len(r["lines"]))) if base[j] != r["lines"][j]), None)
+        if i is None and len(base) != len(r["lines"]):
+            i = min(len(base), len(r["lines"]))
+        r["first_diff_line"] = i
+        r["first_diff_frame"] = None if i is None or i >= len(r["lines"]) else _frame(r["lines"][i])
+        del r["lines"]
+    outc = {(r["end"], r["checkpoints"], r["levelfinish_frame"], r["sr_ms"]) for r in rows}
+    srs = [r["sr_ms"] for r in rows if r["end"] == "LevelFinish" and r["sr_ms"] is not None]
+    return {"tas": str(tas_path), "orders": rows, "distinct_traces": len({r["trace_sha"] for r in rows}),
+            "order_sensitive": len({r["trace_sha"] for r in rows}) > 1, "outcome_sensitive": len(outc) > 1,
+            "finishes": f"{sum(r['end'] == 'LevelFinish' for r in rows)}/{len(rows)}",
+            "sr_spread_ms": (max(srs) - min(srs)) if srs else None}
+
+
+def _frame(line: bytes):
+    from ballrain import trace
+    return trace.frame_of(line)
+
+
+def cmd_orders(a) -> int:
+    """Order / outcome sensitivity of .tas files (run where the headless engine is: the Mac)."""
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    hl = json.loads(a.headless) if a.headless else {}
+    orders = a.orders.split(",")
+    files = [Path(x) for x in a.tas] + (sorted(Path(a.runs_dir).glob("*/*/*.tas"), key=lambda q: q.stat().st_mtime)[-a.max:]
+                                        if a.runs_dir else [])
+    log_p = out / "orders.jsonl"
+    done = set()
+    if log_p.is_file():
+        done = {json.loads(x)["tas"] for x in log_p.read_text(encoding="utf-8").splitlines() if x.strip()}
+    for f in files:
+        if str(f) in done:
+            continue
+        try:
+            res = order_check(f, out / f.stem, hl, orders)
+        except Exception as e:  # noqa: BLE001
+            res = {"tas": str(f), "error": f"{type(e).__name__}: {e}"}
+        with open(log_p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(res) + "\n")
+        print(json.dumps({k: v for k, v in res.items() if k != "orders"}), flush=True)
+    if a.tb:
+        from torch.utils.tensorboard import SummaryWriter
+        allr = [json.loads(x) for x in log_p.read_text(encoding="utf-8").splitlines() if x.strip()]
+        ok = [r for r in allr if "order_sensitive" in r]
+        if ok:
+            w = SummaryWriter(a.tb)
+            w.add_scalar("eval/order_sensitive_rate", float(np.mean([r["order_sensitive"] for r in ok])), len(ok))
+            w.add_scalar("eval/outcome_sensitive_rate", float(np.mean([r["outcome_sensitive"] for r in ok])), len(ok))
+            w.close()
+    return 0
+
+
 def spot_one(run_dir: Path, copy: str, div_root: Path, label: str = "", after: float = 0.0) -> dict | None:
     from ballrain import instances, trace
     meta_p = next(run_dir.glob("L*.json"))
@@ -317,6 +412,14 @@ def main(argv=None) -> int:
         q.add_argument(n, **kw)
     q.add_argument("--greedy", action="store_true")
     q.add_argument("--headless", default=None)
+    o = sub.add_parser("orders", help="ball-contact order / outcome sensitivity of .tas files (headless)")
+    o.add_argument("--tas", nargs="*", default=[])
+    o.add_argument("--runs-dir", default=None, help="also the newest --max kept runs under this directory")
+    o.add_argument("--max", type=int, default=10)
+    o.add_argument("--orders", default="ckid,reverse,perm:1,perm:2,perm:3")
+    o.add_argument("--headless", default=None, help="HeadlessConfig fields as JSON")
+    o.add_argument("--out", required=True)
+    o.add_argument("--tb", default=None)
     s = sub.add_parser("spotcheck")
     s.add_argument("--runs-dir", required=True)
     s.add_argument("--copy", default="train-11")
@@ -326,7 +429,7 @@ def main(argv=None) -> int:
     s.add_argument("--label", default="", help="engine build label written to each record (rates are per label)")
     s.add_argument("--after", type=float, default=0.0, help="only runs started after this unix time (a build switch)")
     a = p.parse_args(argv)
-    return {"eval": cmd_eval, "pair": cmd_pair, "spotcheck": cmd_spotcheck}[a.cmd](a)
+    return {"eval": cmd_eval, "pair": cmd_pair, "spotcheck": cmd_spotcheck, "orders": cmd_orders}[a.cmd](a)
 
 
 if __name__ == "__main__":
