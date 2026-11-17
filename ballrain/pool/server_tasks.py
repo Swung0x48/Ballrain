@@ -1,0 +1,154 @@
+"""The gateway's task source: the exported policy version tasks name, and how a task's start is picked
+(docs/pool-prototype.md 5).
+
+PolicySource.refresh() takes the newest readable learner checkpoint of the run (read-only, a local copy such as
+runtime/m2-train-mac/r6/ckpt_*.pt; the newest file may be mid-copy, so it falls back to older ones), exports its weights
+(weights.export_state -> <pool>/weights/<sha>.{npz,json}) and the task assets (the start record's starts pack, the
+reference line the policy was trained on -> <pool>/assets/<sha>.npz), and keeps the curriculum state OF THE SAME
+checkpoint. A task's start frame is drawn like the trainer draws it: ballrain.curriculum.ReverseCurriculum.sample
+over the record's valid start frames after the run's exclude_starts, with that state (frontier band, failure-weighted
+bins, k = 0 at the start of the level), from an unpredictable server-side generator; the ball-order seed is a fresh 32-bit
+draw. The at-rest and rehearsal draws of the trainer are not used (the client runs no random start draws).
+"""
+from __future__ import annotations
+
+import json
+import secrets
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+from . import task as T, weights as W
+
+
+@dataclass
+class Published:
+    manifest: dict
+    policy_sha: str
+    run: str
+    record: str
+    record_sha256: str
+    starts_sha: str
+    path_sha: str
+    level: int
+    valid: np.ndarray  # valid start frames after exclude_starts (with 0)
+    curriculum: object  # ReverseCurriculum or None
+    source: str  # checkpoint file name (or "state")
+    published_at: int
+
+    @property
+    def n_obs(self) -> int:
+        return int(self.manifest["arch"]["n_obs"])
+
+    @property
+    def n_act(self) -> int:
+        return int(self.manifest["arch"]["n_act"])
+
+
+class PolicySource:
+    def __init__(self, pool_dir, run: str, datasets_dir, path_dirs, ckpt_dir=None, ckpt_glob: str = "ckpt_*.pt",
+                 clock=time.time):
+        self.pool_dir = Path(pool_dir)
+        self.run = run
+        self.datasets_dir = Path(datasets_dir)
+        self.path_dirs = [Path(p) for p in path_dirs]
+        self.ckpt_dir = Path(ckpt_dir) if ckpt_dir else None
+        self.ckpt_glob = ckpt_glob
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.current: Published | None = None
+        self.history: dict = {}  # policy_sha -> Published
+        self.rng = np.random.Generator(np.random.PCG64(secrets.randbits(128)))
+        self.last_error: str | None = None
+
+    @property
+    def weights_dir(self) -> Path:
+        return self.pool_dir / "weights"
+
+    @property
+    def assets_dir(self) -> Path:
+        return self.pool_dir / "assets"
+
+    # ------------------------------------------------------------------------------------------ publishing
+    def publish_state(self, state: dict, source: str = "state") -> Published:
+        """Export a checkpoint dict and its assets; make it the version new tasks name."""
+        from ballrain.curriculum import CurriculumConfig, ReverseCurriculum, TasStarts
+        m = W.export_state(state, self.weights_dir, self.run)
+        record = m["env"]["start_record"]
+        if not record or "/" in record or "\\" in record:
+            raise ValueError(f"the policy's start record {record!r} is not a dataset record name")
+        rd = self.datasets_dir / record
+        meta = json.loads((rd / "meta.json").read_text(encoding="utf-8"))
+        ssha, _ = T.export_starts_pack(rd, self.assets_dir)
+        psha_want = m["features"].get("path_sha256")
+        if not psha_want:
+            raise ValueError("the policy does not pin its reference line (features.path_sha256)")
+        line = T.find_path_asset(int(m["env"]["level"]), psha_want, self.path_dirs)
+        psha, _ = T.export_path_asset(line, self.assets_dir)
+        excl = m["env"].get("exclude_starts")
+        st = TasStarts(str(rd))
+        if excl:
+            v = st.valid
+            keep = np.ones(len(v), bool)
+            for lo, hi in excl:
+                keep &= ~((v >= int(lo)) & (v < int(hi)))
+            st.restrict(keep)
+        cu = None
+        cs = state.get("curriculum")
+        if cs:
+            cfg = dict(cs.get("config") or {})
+            cfg["seed"] = None
+            cu = ReverseCurriculum(st, CurriculumConfig(**{k: v for k, v in cfg.items()
+                                                           if k in CurriculumConfig.__dataclass_fields__}))
+            cu.load_state_dict({k: v for k, v in cs.items() if k in ("frontier", "history", "bin_fail")})
+        pub = Published(manifest=m, policy_sha=m["policy_sha"], run=self.run, record=record,
+                        record_sha256=meta["record_sha256"], starts_sha=ssha, path_sha=psha,
+                        level=int(m["env"]["level"]), valid=T.valid_start_frames(rd, excl), curriculum=cu,
+                        source=source, published_at=int(self.clock()))
+        with self.lock:
+            self.current = pub
+            self.history[pub.policy_sha] = pub
+        return pub
+
+    def refresh(self, max_tries: int = 3) -> Published | None:
+        """Publish the newest readable checkpoint of ckpt_dir if it is not the current one. Returns the current."""
+        if self.ckpt_dir is None:
+            return self.current
+        files = sorted(self.ckpt_dir.glob(self.ckpt_glob))
+        for p in reversed(files[-max_tries:]):
+            if self.current is not None and self.current.source == p.name:
+                return self.current
+            try:
+                state = W.load_trusted_checkpoint(p)
+                return self.publish_state(state, p.name)
+            except Exception as e:  # noqa: BLE001  (mid-copy file, missing asset, ...): try the previous one
+                self.last_error = f"{p.name}: {type(e).__name__}: {str(e)[:200]}"
+        return self.current
+
+    # ------------------------------------------------------------------------------------------ tasks
+    def pick_start(self, pub: Published) -> int:
+        with self.lock:
+            if pub.curriculum is not None:
+                k = int(pub.curriculum.sample(self.rng))
+            else:
+                k = int(pub.valid[int(self.rng.integers(len(pub.valid)))])
+        i = int(np.searchsorted(pub.valid, k))
+        if not (i < len(pub.valid) and int(pub.valid[i]) == k):  # never hand out a start the env would snap
+            raise ValueError(f"start frame {k} is not valid")
+        return k
+
+    def new_task(self, engine: str, now: int, max_steps: int, max_frames: int, deadline_s: int,
+                 kind: str = "sample") -> T.Task:
+        pub = self.current
+        if pub is None:
+            raise LookupError("no policy published")
+        chunk = int(pub.manifest["rollout"].get("chunk") or 256)
+        return T.Task(task_id=T.new_task_id(), run=pub.run, policy_sha=pub.policy_sha, level=pub.level,
+                      record=pub.record, record_sha256=pub.record_sha256, start_frame=self.pick_start(pub),
+                      ball_order_seed=T.new_ball_order_seed(), engine=engine,
+                      assets={"starts": pub.starts_sha, "path": pub.path_sha}, chunk_steps=min(chunk, 4096),
+                      max_steps=int(max_steps), max_frames=int(max_frames), deadline_s=int(deadline_s),
+                      issued_at=int(now), kind=kind, greedy=kind == "eval", sample_seed=T.new_sample_seed())

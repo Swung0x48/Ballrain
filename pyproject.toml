@@ -15,6 +15,11 @@ dependencies = [
     "pillow>=12.3.0",
 ]
 
+[project.optional-dependencies]
+pool = [
+    "textual>=8.2.8",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.2.0",
