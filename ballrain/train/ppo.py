@@ -113,7 +113,11 @@ def gae(chunk: dict, gamma: float, lam: float, reward_scale: float = 1.0):
 
 
 def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int, clip: float, vf_coef: float,
-               ent_coef: float, max_grad_norm: float, device="cpu", gen=None, target_kl: float | None = None) -> dict:
+               ent_coef: float, max_grad_norm: float, device="cpu", gen=None, target_kl: float | None = None,
+               teacher_logp=None, teacher_mask=None, teacher_coef: float = 0.0) -> dict:
+    """teacher_logp (n, n_act) log-probabilities of a frozen teacher policy on the batch states, teacher_mask (n,) bool:
+    the loss gets + teacher_coef * KL(teacher || policy) averaged over the masked states of each minibatch (e.g. keep the
+    back half of a level near a faster earlier policy while the front changes); stats teacher_kl / teacher_n."""
     obs = torch.as_tensor(batch["obs"], device=device)
     act = torch.as_tensor(batch["actions"], dtype=torch.long, device=device)
     old_logp = torch.as_tensor(batch["logp"], device=device)
@@ -121,6 +125,11 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
     ret = torch.as_tensor(batch["ret"], device=device)
     n = obs.shape[0]
     stats = {"pg_loss": [], "v_loss": [], "entropy": [], "approx_kl": [], "clip_frac": [], "grad_norm": []}
+    use_teacher = teacher_logp is not None and teacher_mask is not None and teacher_coef > 0
+    if use_teacher:
+        t_logp = torch.as_tensor(teacher_logp, dtype=torch.float32, device=device)
+        t_mask = torch.as_tensor(teacher_mask, dtype=torch.bool, device=device)
+        stats["teacher_kl"] = []
     stop = False
     for _ in range(epochs):
         perm = torch.randperm(n, generator=gen).to(device)
@@ -136,6 +145,13 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
             pg = -torch.min(ratio * a, ratio.clamp(1 - clip, 1 + clip) * a).mean()
             vl = 0.5 * ((v - ret[idx]) ** 2).mean()
             loss = pg + vf_coef * vl - ent_coef * ent
+            if use_teacher:
+                m = t_mask[idx]
+                if bool(m.any()):
+                    lt = t_logp[idx][m]
+                    kl_t = (lt.exp() * (lt - logp_all[m])).sum(-1).mean()
+                    loss = loss + teacher_coef * kl_t
+                    stats["teacher_kl"].append(kl_t.item())
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # total norm before clipping
@@ -156,6 +172,9 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
             break
     out = {k: float(np.mean(v)) if v else float("nan") for k, v in stats.items()}
     out["early_stop"] = float(stop)
+    if use_teacher:
+        out["teacher_n"] = float(t_mask.sum().item())
+        out["teacher_coef"] = float(teacher_coef)
     return out
 
 

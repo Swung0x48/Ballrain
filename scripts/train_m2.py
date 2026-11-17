@@ -52,7 +52,8 @@ UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_pe
                + [f"{p}_sec{s}" for s in range(1, 5) for p in ("rsp_cp", "rsp_n")]
                + [f"{p}_sec{s}" for s in range(1, 5) for p in ("rest_cp", "rest_n")]
                + [f"u_{k}" for k in ("pg_loss", "v_loss", "entropy", "approx_kl", "clip_frac", "early_stop",
-                                     "explained_var", "adv_std", "ret_mean", "grad_norm", "watch_entropy", "watch_n")])
+                                     "explained_var", "adv_std", "ret_mean", "grad_norm", "watch_entropy", "watch_n",
+                                     "teacher_kl", "teacher_n", "teacher_coef")])
 RUN_COLS = ["update", "t", "copy", "run_id", "end_reason", "sr_ms", "start_frame", "frames", "lives", "deaths",
             "framelog_match", "handover_mismatches", "invalid", "ball_order", "dir"]
 
@@ -241,6 +242,14 @@ def parse(argv=None):
     p.add_argument("--rail-gate", default="",
                    help='JSON {"s": route arc length, "below": TAS frame}: truncate (bootstrapped, end gate_truncate) a 小节-1 '
                         'life not started at or after "below" once it reaches route s (WorkerSpec.rail_gate)')
+    p.add_argument("--teacher", default="", help="checkpoint of a frozen teacher policy: the PPO loss gets + coef x "
+                   "KL(teacher || policy) on batch states whose route s (path_progress x line length) is >= --teacher-s-min")
+    p.add_argument("--teacher-coef", type=float, default=0.1)
+    p.add_argument("--teacher-coef-floor", type=float, default=None,
+                   help="decay the coefficient linearly to this floor over --teacher-decay-updates (default: constant)")
+    p.add_argument("--teacher-decay-updates", type=int, default=0)
+    p.add_argument("--teacher-s-min", type=float, default=331.4,
+                   help="route arc length from which the teacher term applies (L1 refpaths-alt: 331.4 = TAS frame 4460)")
     p.add_argument("--watch-s", default="",
                    help="LO,HI: also log the behaviour policy's entropy on batch states whose route position (feature "
                         "path_progress x line length) is in [LO, HI] (u_watch_entropy, u_watch_n; L1 r6: 300,400, the exit)")
@@ -679,6 +688,41 @@ def main(argv=None) -> int:
         watch = (sl.start, lo_s / length, hi_s / length)
         log.msg(f"watch entropy on route s {lo_s:g}-{hi_s:g} (line length {length:.1f})")
 
+    teacher = None
+    if a.teacher:
+        from ballrain.features import FeatureExtractor
+        from ballrain.path import ReferencePath, asset_path, resolve_path_dir
+        tck = torch.load(a.teacher, weights_only=False)
+        mine, theirs = asdict(env_cfg)["features"], tck["env_config"]["features"]
+        diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k))
+        if int(tck["n_obs"]) != n_obs or int(tck["n_act"]) != n_act or diff:
+            raise SystemExit(f"--teacher {a.teacher}: observations differ (n_obs {tck['n_obs']} vs {n_obs}, features {diff})")
+        ta = tck["args"]
+        tmodel = ActorCritic(n_obs, n_act, tuple(int(x) for x in ta["hidden"].split(",")), ta["activation"]).to(a.device)
+        tmodel.load_state_dict(tck["model"])
+        tmodel.eval()
+        sl = FeatureExtractor(env_cfg.features).slices()["path_progress"]
+        length = ReferencePath.load(asset_path(1, resolve_path_dir(env_cfg.features.path_dir))).length
+        teacher = {"model": tmodel, "rms": tck["rms"], "col": sl.start, "lo": a.teacher_s_min / length,
+                   "u0": counters["update"]}
+        log.msg(f"teacher {a.teacher} (update {tck['counters']['update']}): KL coef {a.teacher_coef}"
+                + (f" -> {a.teacher_coef_floor} over {a.teacher_decay_updates} updates" if a.teacher_decay_updates else "")
+                + f" on route s >= {a.teacher_s_min:g} (line length {length:.1f})")
+
+    def teacher_terms(raw):
+        """Teacher log-probabilities on the batch (the teacher's own observation statistics), the route mask, the
+        coefficient of this update."""
+        with torch.no_grad():
+            x = torch.as_tensor(normalize(raw, teacher["rms"]), device=a.device)
+            logits, _ = teacher["model"](x)
+            lt = torch.log_softmax(logits, -1).cpu().numpy()
+        mask = raw[:, teacher["col"]] >= teacher["lo"]
+        coef = a.teacher_coef
+        if a.teacher_decay_updates and a.teacher_coef_floor is not None:
+            f = min(1.0, (counters["update"] - teacher["u0"]) / a.teacher_decay_updates)
+            coef = a.teacher_coef + (a.teacher_coef_floor - a.teacher_coef) * f
+        return lt, mask, coef
+
     def watch_entropy(obs_n, raw):
         """Entropy of the current (behaviour) policy on the batch states inside the watched route window."""
         m = (raw[:, watch[0]] >= watch[1]) & (raw[:, watch[0]] <= watch[2])
@@ -796,8 +840,9 @@ def main(argv=None) -> int:
                          "ret": np.concatenate(rets)}
                 wstats = watch_entropy(batch["obs"], raw) if watch is not None else {}
                 model.train()
+                tl, tm, tc = teacher_terms(raw) if teacher is not None else (None, None, 0.0)
                 ustats = ppo_update(model, opt, batch, a.epochs, a.minibatch, a.clip, a.vf_coef, a.ent_coef,
-                                    a.max_grad_norm, a.device, gen, a.target_kl)
+                                    a.max_grad_norm, a.device, gen, a.target_kl, tl, tm, tc)
                 model.eval()
                 ustats["explained_var"] = explained_variance(np.concatenate([c["values"] for c in chunks]), batch["ret"])
                 ustats["adv_std"] = float(batch["adv"].std())
