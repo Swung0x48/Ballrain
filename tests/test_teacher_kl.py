@@ -66,4 +66,4 @@ def test_options():
     a = train_m2.parse(["--run", "x", "--teacher", "t.pt", "--teacher-coef", "0.1", "--teacher-coef-floor", "0.05",
                         "--teacher-decay-updates", "5000"])
     assert a.teacher == "t.pt" and a.teacher_coef_floor == 0.05 and a.teacher_decay_updates == 5000
-    assert "teacher_kl" in train_m2.UPDATE_COLS
+    assert "u_teacher_kl" in train_m2.UPDATE_COLS and "u_teacher_coef" in train_m2.UPDATE_COLS
