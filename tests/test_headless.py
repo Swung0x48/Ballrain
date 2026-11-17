@@ -265,6 +265,16 @@ def test_ball_order_resolution_and_draws():
     assert headless.retail_draw_l1(0) == ["Ball_Wood", "P_Ball_Stone_MF", "P_Ball_Wood_MF", "P_Ball_Stone_MF003",
                                           "P_Ball_Stone_MF004", "P_Ball_Stone_MF002", "P_Ball_Stone_MF001"]
     assert sorted(headless.perm_draw(9, list("abcd"))) == list("abcd")
+    # table / retail: the ranked balls swap among their own CK-id places; Ball_Stone / Ball_Paper / the paper pool
+    # keep theirs (the L1 order under ckid, as the engine logs it)
+    ckid = ["Ball_Wood", "Ball_Stone", "Ball_Paper", "P_Ball_Paper_MF", "P_Ball_Stone_MF", "P_Ball_Wood_MF",
+            "P_Ball_Paper_MF001", "P_Ball_Stone_MF001", "P_Ball_Stone_MF002", "P_Ball_Stone_MF003", "P_Ball_Stone_MF004"]
+    got = headless.ranked_order(ckid, headless.retail_draw_l1(0))
+    assert got == ["Ball_Wood", "Ball_Stone", "Ball_Paper", "P_Ball_Paper_MF", "P_Ball_Stone_MF", "P_Ball_Wood_MF",
+                   "P_Ball_Paper_MF001", "P_Ball_Stone_MF003", "P_Ball_Stone_MF004", "P_Ball_Stone_MF002",
+                   "P_Ball_Stone_MF001"]
+    assert headless.ranked_order(ckid, headless.retail_draw_l1(12)) == ckid  # the draw equal to ckid changes nothing
+    assert headless.ranked_order(ckid, ["P_Ball_Stone_MF004", "Missing", "Ball_Wood"]) ==         ["P_Ball_Stone_MF004"] + ckid[1:-1] + ["Ball_Wood"]
     assert headless.effective_ball_order("retail:5", "1") == "retail:5"
     assert headless.effective_ball_order("retail:5", 2) == "ckid" and headless.effective_ball_order("perm:5", 2) == "perm:5"
 

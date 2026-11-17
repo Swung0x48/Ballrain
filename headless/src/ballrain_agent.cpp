@@ -408,10 +408,11 @@ private:
 //   reverse                the CK ids reversed
 //   perm:<seed>            the pooled balls (P_Ball_*_MF*) swap their CK-id places by a seeded permutation; every other
 //                          ball (the player ball included) keeps its place
-//   table:<name=rank,...>  the named entities by rank (distinct ranks), then every other ball by CK id
-//   retail:<seed>          a draw of retail's measured per-process order (L1: Ball_Wood, then P_Ball_Stone_MF /
-//                          P_Ball_Wood_MF with P(Stone_MF first) = 0.66, then a uniform permutation of
-//                          P_Ball_Stone_MF001-004, then every other ball by CK id); other levels: ckid (not measured)
+//   table:<name=rank,...>  the named entities, ordered by rank (distinct ranks), among the CK-id places they occupy
+//                          under ckid; every other ball keeps its CK-id place
+//   retail:<seed>          a draw of retail's measured per-process order, among the named balls' CK-id places (L1:
+//                          Ball_Wood, then P_Ball_Stone_MF / P_Ball_Wood_MF with P(Stone_MF first) = 0.66, then a
+//                          uniform permutation of P_Ball_Stone_MF001-004); other levels: ckid (not measured)
 // The draws are splitmix64 (ballrain/headless.py makes the same ones).
 struct BallOrder {
     enum Mode { CKID, REVERSE, PERM, TABLE, RETAIL } mode = CKID;
@@ -424,7 +425,7 @@ struct BallOrder {
     std::unordered_map<CK_ID, uint32_t> keys;   // PERM / TABLE / RETAIL
 };
 BallOrder g_BallOrder;
-constexpr uint32_t kUnranked = 1u << 20;   // TABLE / RETAIL: an unnamed ball's key is kUnranked + its CK id
+constexpr uint32_t kRankLimit = 1u << 20;   // TABLE: ranks 0 .. 2^20-1
 
 uint64_t SplitMix64(uint64_t &state) {
     uint64_t z = (state += 0x9E3779B97F4A7C15ull);
@@ -519,7 +520,7 @@ bool ParseBallOrder(const std::string &spec, int level, BallOrder &out, std::str
             const std::string item = arg.substr(at, end - at);
             const size_t eq = item.rfind('=');
             uint64_t rank = 0;
-            if (eq == std::string::npos || eq == 0 || !ParseU64(item.substr(eq + 1), rank) || rank >= kUnranked) {
+            if (eq == std::string::npos || eq == 0 || !ParseU64(item.substr(eq + 1), rank) || rank >= kRankLimit) {
                 err = "table entry '" + item + "' is not <name>=<rank> (rank 0 .. 2^20-1)";
                 return false;
             }
@@ -570,16 +571,24 @@ void BuildBallOrder() {
         for (size_t i = 0; i < slots.size(); ++i)
             o.keys[perm[i]] = (uint32_t) slots[i];   // perm[i] takes the i-th place
     } else if (o.mode == BallOrder::TABLE || o.mode == BallOrder::RETAIL) {
+        // the named entities take the CK-id places they occupy under ckid, in rank order (ties: by CK id); every
+        // other ball keeps its own CK id as its key
         std::unordered_map<std::string, uint32_t> rank(o.ranks.begin(), o.ranks.end());
         std::unordered_set<std::string> seen;
+        std::vector<std::pair<uint32_t, CK_ID>> named;   // (rank, CK id)
+        std::vector<CK_ID> slots;                        // their CK ids, ascending (all is by CK id)
         for (CK3dEntity *e : all) {
             auto it = e->GetName() ? rank.find(e->GetName()) : rank.end();
             if (it == rank.end())
                 continue;
             if (!seen.insert(it->first).second)
                 Log("warning: ball order %s: more than one entity named %s", o.spec.c_str(), it->first.c_str());
-            o.keys[e->GetID()] = it->second;
+            named.emplace_back(it->second, e->GetID());
+            slots.push_back(e->GetID());
         }
+        std::sort(named.begin(), named.end());
+        for (size_t i = 0; i < named.size(); ++i)
+            o.keys[named[i].second] = (uint32_t) slots[i];   // the i-th ranked takes the i-th place
     }
 }
 
@@ -614,7 +623,7 @@ unsigned int BallOrderKey(void *client_data) {
     }
     if (it != o.keys.end())
         return it->second;
-    return o.mode == BallOrder::PERM ? (uint32_t) id : kUnranked + (uint32_t) id;
+    return (uint32_t) id;   // an unnamed / unpooled ball keeps its CK-id place
 }
 
 // The balls that can take part (pooled, named, player balls) in the order a key gives them, for the log.

@@ -75,8 +75,8 @@ socket EOF：游戏已结束时是"结束"（`wait_obs` 返回 None），否则�
 | `ckid`（默认） | 产品的 CK id 键，不动它（门禁用的就是它） |
 | `reverse` | CK id 反过来（玩家球也跟着反，零售从不这样） |
 | `perm:<seed>` | 池里的球（名字 `P_Ball_*_MF*`）在它们自己的 CK id 位置之间按种子置换；其余的球（含玩家球）位置不变 |
-| `table:<名字=名次,...>` | 列出的实体按名次（不能重复）排在前面，其余的球按 CK id 排在后面 |
-| `retail:<seed>` | 按零售实测分布抽一个进程的顺序。第 1 关：Ball_Wood 最低；然后 P_Ball_Stone_MF / P_Ball_Wood_MF，Stone_MF 在前的概率 0.66；然后 MF001–004 的均匀随机排列；其余的球按 CK id。其它关没测过：用 `ckid`，headless.log 里警告一行 |
+| `table:<名字=名次,...>` | 列出的实体在它们 `ckid` 下占的那些位置之间按名次（不能重复）重排；其余的球（Ball_Stone、Ball_Paper、纸球池等）位置不变 |
+| `retail:<seed>` | 按零售实测分布抽一个进程的顺序。第 1 关：Ball_Wood 最低；然后 P_Ball_Stone_MF / P_Ball_Wood_MF，Stone_MF 在前的概率 0.66；然后 MF001–004 的均匀随机排列；像 `table` 一样只在这 7 个球自己的 `ckid` 位置之间重排，其余的球位置不变。其它关没测过：用 `ckid`，headless.log 里警告一行 |
 
 `perm` / `retail` 不带种子时由 `HeadlessLauncher` 给每个进程抽一个新种子（32 位）。实际跑的值记进元数据 `RunMeta.ball_order`（`extra_env` 里的
 `BALLRAIN_HL_BALL_ORDER` 优先于 `ball_order`；第 1 关以外的 `retail:<seed>` 记成 `ckid`）；引擎在 headless.log 里写一行 `ball order <值>: <球按键排的顺序>`。抽法是 splitmix64 + Fisher–Yates，
@@ -180,7 +180,7 @@ hx1c 构建（`hx1c-96c0cc01-ce6afc34`）上用 agent 模式回放，与零售�
   每关 3 个（random：死亡到 GameOver；hs_esc_random：Esc 暂停 / 解除 + 死亡；jitter：8000 帧上限），共 18 个，合计 61 次死亡、599 次暂停、12 次 GameOver。
   每个都是参考 TASSupport 3 次回放逐字节相同且等于 BallrainIO agent 轨迹；hx1c 无头 agent 模式回放 **18/18 全部帧相同**。
 
-### 7.3 产品提交构建（2026-11-16，M6 arm64，`x87s-ba5ba279-f7d25565-e9e7ac69`）
+### 7.3 产品提交构建（2026-11-16，M6 arm64，`x87s-ba5ba279-f7d25565-e98aa446`；之前的 `-e9e7ac69` 只差 table / retail 的排位规则，门禁结果相同）
 
 BallanceMMO x87-soft 产品提交 `ba5ba279`（Ballanced `b70ab01` 等，`headless/README.md`）+ 新的 0002 + agent（帧方案用 SimTool 的 `--tas` 参数，默认 `ckid` 球序），
 与 hx1c 构建（`hx1c-96c0cc01-ce6afc34`）同样的输入逐个比较（`replay_stub`，K = 1，全部段）：

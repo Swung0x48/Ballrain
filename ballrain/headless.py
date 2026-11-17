@@ -45,8 +45,9 @@ def _env_path(name: str, default: str = "") -> str:
 #   ckid                   the product's CK-id key (default; the gate's recipe)
 #   reverse                the CK ids reversed
 #   perm:<seed>            a seeded permutation of the pooled balls (P_Ball_*_MF*) over their own CK-id places
-#   table:<name=rank,...>  the named entities by rank (distinct), every other ball after them by CK id
-#   retail:<seed>          a draw of retail's measured order (L1 only, retail_draw_l1; other levels: ckid)
+#   table:<name=rank,...>  the named entities by rank (distinct) among the CK-id places they hold; others keep theirs
+#   retail:<seed>          a draw of retail's measured order (L1 only, retail_draw_l1; other levels: ckid), placed
+#                          like a table: among the drawn balls' CK-id places
 # "perm" / "retail" without a seed: the launcher draws a fresh seed for every process (recorded in the run metadata).
 BALL_ORDER_ENV = "BALLRAIN_HL_BALL_ORDER"
 BALL_ORDER_MODES = ("ckid", "reverse", "perm", "table", "retail")
@@ -129,11 +130,20 @@ def _shuffle(items: list, state: int):
 def retail_draw_l1(seed: int) -> list[str]:
     """retail:<seed> on L1, lowest address first (the engine's RetailDrawL1): Ball_Wood; P_Ball_Stone_MF before
     P_Ball_Wood_MF with probability 0.66; a uniform permutation of P_Ball_Stone_MF001-004 (50 fresh Player.exe
-    processes, runtime/analysis/ball_order/summary.json). Every other ball comes after these, by CK id."""
+    processes, runtime/analysis/ball_order/summary.json). The engine puts them in this order among the CK-id places
+    they hold; every other ball keeps its place (ranked_order)."""
     state, coin = _below(int(seed) & _M64, 100)
     order = ["Ball_Wood"] + (["P_Ball_Stone_MF", "P_Ball_Wood_MF"] if coin < 66 else ["P_Ball_Wood_MF", "P_Ball_Stone_MF"])
     mf, _ = _shuffle([f"P_Ball_Stone_MF00{i}" for i in range(1, 5)], state)
     return order + mf
+
+
+def ranked_order(by_ckid: list, ranked: list) -> list:
+    """table / retail: the order of all balls (given by CK id) once the ranked ones (lowest rank first) take the
+    places they hold, in rank order; every other ball keeps its place (the engine's BuildBallOrder)."""
+    named = set(ranked)
+    queue = iter([n for n in ranked if n in by_ckid])
+    return [next(queue) if n in named else n for n in by_ckid]
 
 
 def perm_draw(seed: int, pooled_by_ckid: list) -> list:
