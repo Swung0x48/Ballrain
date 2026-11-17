@@ -82,6 +82,17 @@ body {
 .tile .v.split { font-size: 17px; line-height: 1.35; }
 .tile .v.split .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .tile .s { font-size: 12px; color: var(--parch-muted); overflow-wrap: anywhere; }
+.rat { font: 700 13px/1 "Microsoft YaHei", sans-serif; letter-spacing: 0; text-shadow: none; color: #fff1c4; margin-left: 10px; }
+.rtitle { font: 700 16px/1.45 "Noto Serif SC", serif; color: var(--amber); }
+.ritems { margin: 6px 0 0; padding-left: 20px; }
+.ritems li { margin: 3px 0; overflow-wrap: anywhere; }
+.rnext { margin-top: 8px; color: var(--ink); overflow-wrap: anywhere; }
+.rnext b { color: var(--brass-hi); margin-right: 8px; }
+.rold { margin-top: 12px; border-top: 1px solid rgba(184, 137, 58, .3); padding-top: 6px; font-size: 13.5px; }
+.rold summary { cursor: pointer; color: var(--brass-hi); }
+.rprev { margin-top: 10px; }
+.rprev time { color: var(--muted); font-size: 12px; }
+.rprev .rtitle { font-size: 14px; }
 .log { margin: 0; padding: 0 0 0 18px; font-size: 13px; color: var(--ink); }
 .log li { margin: 2px 0; overflow-wrap: anywhere; }
 .log time { color: var(--brass-hi); margin-right: 8px; font-variant-numeric: tabular-nums; }

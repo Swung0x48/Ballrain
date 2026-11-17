@@ -192,6 +192,20 @@ function renderStatus() {
   $("curr").innerHTML = c.length ? c.map((l) => `<li><time>${esc(l.slice(0, 11))}</time>${esc(l.slice(13).replace("curriculum: ", ""))}</li>`).join("") : "<li>（无）</li>";
 }
 
+/* ---------------------------------------------------------------------------- progress report */
+function renderReport() {
+  const R = S.reports || [];
+  $("s-report").hidden = !R.length;
+  if (!R.length) return;
+  const one = (r) => `<div class="rtitle">${esc(r.title)}</div><ul class="ritems">${r.items.map((i) => `<li>${esc(i)}</li>`).join("")}</ul>` +
+    (r.next ? `<div class="rnext"><b>下一步</b>${esc(r.next)}</div>` : "");
+  const [cur, ...old] = R;
+  $("r-at").textContent = `${cur.at.slice(5)}（${cur.tz}）`;
+  const open = $("report").querySelector("details")?.open;
+  $("report").innerHTML = one(cur) + (old.length ? `<details class="rold"${open ? " open" : ""}><summary>更早的报告（${old.length}）</summary>` +
+    old.map((r) => `<div class="rprev"><time>${esc(r.at.slice(5))}（${esc(r.tz)}）</time>${one(r)}</div>`).join("") + `</details>` : "");
+}
+
 /* ---------------------------------------------------------------------------------- SR chart */
 function renderSR() {
   const r = (S.sr || {})[sel];
@@ -579,7 +593,7 @@ function zoomCurves(mode) {
 /* ------------------------------------------------------------------------------------ render */
 const hasCharts = typeof window.echarts !== "undefined";
 async function render() {
-  for (const f of [renderHeader, renderStatus]) { try { f(); } catch (e) { console.error(e); } }
+  for (const f of [renderHeader, renderReport, renderStatus]) { try { f(); } catch (e) { console.error(e); } }
   if (!hasCharts) {
     document.querySelectorAll(".map, .chart").forEach((el) => { el.style.height = "auto"; el.innerHTML = '<p class="note" style="padding:12px">图表库没能加载（需要能访问 cdn.jsdelivr.net），只显示文字与表格。</p>'; });
   }

@@ -24,6 +24,18 @@ uv run python tools/dashboard/server.py --host 127.0.0.1 --tensorboard-url /tens
 复制几张贴图（天空、木板、地砖、菜单按钮、菜单字体）到 `runtime/dashboard/assets/`，游戏素材不进 git；找不到时页面退回纯色。
 进程自动降低 CPU 优先级，只读训练输出，不启动游戏，不碰训练进程。
 
+## 最新进展报告
+
+页面最上方的“最新进展”来自 `runtime/dashboard/reports.json`（不提交），用下面的命令追加一条（每 3 小时写一次）：
+
+```bash
+uv run python tools/dashboard/report.py add --title "标题" --item "要点 1" --item "要点 2" --next "下一步"
+uv run python tools/dashboard/report.py list
+```
+
+写入前会检查有没有不能公开的内容（路径、主机、IP、用户名、进程号、实例名、本机运维琐事、人类录像数据），有就拒绝写入；
+服务端输出前会再查一遍。页面显示最新一条，更早的折叠在下面。
+
 ## 公开内容与隐私
 
 页面可能放到公网上，所以服务端只输出训练本身：

@@ -33,6 +33,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import assets as A  # noqa: E402
 import data as D  # noqa: E402
+import report as R  # noqa: E402
 
 ROOT = D.ROOT
 OUT = ROOT / "runtime" / "dashboard"
@@ -239,7 +240,8 @@ class Dashboard:
                "interval_s": self.interval, "min_refresh_s": self.min_refresh, "machines": self.machines,
                "tensorboard_url": self.tensorboard_url, "data": summ.get("data") or {},
                "sr": summ.get("sr") or {}, "k0": summ.get("k0") or [],
-               "traced_counts": summ.get("traced_counts") or {}, "assets": self.assets}
+               "traced_counts": summ.get("traced_counts") or {}, "assets": self.assets,
+               "reports": R.public(R.load())}
         self._status = (time.time(), res)
         return res
 
