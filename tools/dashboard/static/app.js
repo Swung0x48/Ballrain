@@ -431,7 +431,7 @@ async function renderFrontier(force, full) {
     { type: "lines", name: "已覆盖段", coordinateSystem: "geo", polyline: true, silent: true, z: 3, data: [{ coords: F.covered }], lineStyle: { color: "#7ed69a", width: 3.2, opacity: 0.9 } },
     { type: "scatter", name: "TAS 帧", coordinateSystem: "geo", z: 4, symbolSize: 5, itemStyle: { color: "rgba(233,237,247,.55)" },
       data: F.tas_pts.map((p) => ({ value: [p[0], p[1]], frame: p[2] })), tooltip: { formatter: (p) => `TAS 第 ${p.data.frame} 帧` } },
-    { type: "scatter", name: "盘点", coordinateSystem: "geo", z: 6, symbol: "rect", symbolSize: 11, itemStyle: { color: "#1b1206", borderColor: AMBER, borderWidth: 1.5 },
+    { type: "scatter", name: "盘点", coordinateSystem: "geo", z: 6, symbol: "rect", symbolSize: 11, itemStyle: { color: AMBER, borderColor: "#1b1206", borderWidth: 1.5 },
       data: [...pt(F.checkpoints), ...pt([F.start], { symbol: "triangle" }), ...pt([F.end], { symbol: "diamond", symbolSize: 16, itemStyle: { color: "#ff9f1c" } })],
       label: { show: true, formatter: (p) => p.data.label, color: INK, fontSize: 11, position: "right", textBorderColor: "#000", textBorderWidth: 2 },
       tooltip: { formatter: (p) => `${p.data.label}<br>TAS 第 ${p.data.frame} 帧` } },
