@@ -455,8 +455,9 @@ def run_once(force: bool = False, max_candidates: int = MAX_CANDIDATES, keep_wor
     run = next((r for r in runs if r.name == name), None)
     if run is None:
         return {"status": "no run"}
-    lp = run.path / "runs.csv"
-    if not lp.is_file() or time.time() - lp.stat().st_mtime > 2 * 3600:
+    # a resumed learner writes runs.1.csv, runs.2.csv, ...: freshness comes from the newest of them
+    logs = [p for p in run.path.glob("runs*.csv") if p.is_file()]
+    if not logs or time.time() - max(p.stat().st_mtime for p in logs) > 2 * 3600:
         return {"status": "no recent training data"}
     rows, summ = candidates(run)
     log(f"{run.name}: {summ}")
