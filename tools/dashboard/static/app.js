@@ -44,7 +44,10 @@ function gameText(el, text, h, tone) {
   if (!FONT.img) { el.textContent = text; return; }
   const g = FONT.meta.glyphs, cell = FONT.meta.cell, top = 2, bot = 30;
   const scale = h / (bot - top), dpr = window.devicePixelRatio || 1;
-  const chars = [...String(text).replace(/[—–]/g, "-")].map((ch) => g[ch.charCodeAt(0)] || g[63]);
+  const norm = String(text).replace(/[—–]/g, "-");
+  // the game's menu font has Latin glyphs only: anything it cannot draw stays in the page font, never "?"
+  if ([...norm].some((ch) => !g[ch.charCodeAt(0)])) { el.textContent = norm; el.classList.add("gt-plain"); return; }
+  const chars = [...norm].map((ch) => g[ch.charCodeAt(0)]);
   const gap = 2;
   const w = chars.reduce((a, c) => a + (c ? c[2] + gap : 8), 0);
   const cv = document.createElement("canvas");
@@ -173,8 +176,10 @@ function tile(k, v, s, gt) {
 function renderStatus() {
   const s = S.status[sel] || {};
   $("state").textContent = s.state || "";
-  const SHORT = { "原版 2002": "原版", "无头 x87-soft": "x87-soft", "无头 2002": "2002 无头" };
-  const share = s.backend_share ? Object.entries(s.backend_share).map(([k, v]) => `<div class="row"><span class="gt">${esc(SHORT[k] || k)}</span><span class="gt">${esc(v + "%")}</span></div>`).join("") : "—";
+  const src = s.source_share || s.backend_share;
+  const det = (s.source_share && s.source_detail) || {};
+  const share = src ? Object.entries(src).map(([k, v]) => `<div class="row"><span class="gt">${esc(k)}</span><span class="gt">${esc(v + "%")}</span></div>` +
+    (det[k] ? `<div class="sub">${esc(det[k].join(" + "))}</div>` : "")).join("") : "—";
   $("tiles").innerHTML = [
     tile("run", sel, s.machine ? `训练机：${s.machine}` : "", true),
     tile(`最后记录（${S.tz}）`, s.last_log || "—", s.last_log_age_min != null ? `${num(s.last_log_age_min, 0)} 分钟前；开始于 ${s.started || "—"}` : "", true),
@@ -185,7 +190,7 @@ function renderStatus() {
     tile("开局区间成功率", pct(s.band_success), `推进阈值 60%；最近 20 次平均 ${pct(s.band_success_avg20)}`, true),
     tile("回合通关率", pct(s.finish_tas), `最近 20 次平均 ${pct(s.finish_tas_avg20)}`, true),
     tile("策略熵 / KL", `${num(s.u_entropy, 3)} / ${num(s.u_approx_kl, 4)}`, "随机策略的熵为 2.20", true),
-    `<div class="tile"><div class="k">数据来源（按步数，近 100 次）</div><div class="v split">${share}</div></div>`,
+    `<div class="tile"><div class="k">训练数据来自哪台机器（按步数，近 100 次）</div><div class="v split">${share}</div></div>`,
     tile("最佳 SR（含 TAS 前缀）", sec(s.best_sr_any), s.best_sr_k0 != null ? `从头开始最佳 ${sec(s.best_sr_k0)}` : "从 TAS 中途接手时的整关计时", true),
     tile("记录了轨迹的回合", num((S.traced_counts || {})[sel]), "抽样记录，供轨迹地图使用", true),
   ].join("");

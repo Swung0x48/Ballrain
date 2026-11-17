@@ -81,6 +81,7 @@ body {
 .tile .v { font-size: 20px; font-weight: 800; min-height: 26px; overflow-wrap: anywhere; color: var(--parch-ink); }
 .tile .v.split { font-size: 17px; line-height: 1.35; }
 .tile .v.split .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.tile .v.split .sub { font-size: 11.5px; font-weight: 600; color: var(--parch-muted); margin: -2px 0 3px; }
 .tile .s { font-size: 12px; color: var(--parch-muted); overflow-wrap: anywhere; }
 .rat { font: 700 13px/1 "Microsoft YaHei", sans-serif; letter-spacing: 0; text-shadow: none; color: #fff1c4; margin-left: 10px; }
 .rtitle { font: 700 16px/1.45 "Noto Serif SC", serif; color: var(--amber); }

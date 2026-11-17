@@ -317,5 +317,5 @@ def test_public_meta_is_public_safe():
     pub = H.public_meta(run, row, {"started_at": 1794890000.0}, {"sr_ms": 104886}, {"matched": True}, 112.0,
                         {"highlight.mp4": 123})
     assert not report.check(json.dumps(pub, ensure_ascii=False))
-    assert pub["backend"] == "无头 x87-soft" and pub["k"] == 4703
+    assert pub["backend"] == "x87-soft headless" and pub["k"] == 4703
     assert np.isfinite(pub["duration_s"])

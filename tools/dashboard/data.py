@@ -43,7 +43,21 @@ DEFAULT_MAC_OFFSET_H = 12.0  # Mac log clock minus PC clock, used when it cannot
 MAX_TRAJ_POINTS = 2000
 MIN_STEP = 1.0  # world units between kept trajectory points
 
-BACKEND_LABEL = {"headless": "无头 x87-soft", "retail": "原版 2002", "headless2002": "无头 2002"}
+BACKEND_LABEL = {"headless": "x87-soft headless", "retail": "2002 retail", "headless2002": "2002 headless"}
+
+
+def machine_of(backend, host, sources: dict) -> str:
+    """Generic machine name of an episode for the data-source tile. `sources` maps the generic host labels the
+    workers send (--host-label) to machine names, plus "learner" (episodes from the learner's own workers, which
+    carry no host) and "retail" (retail episodes whose host is the machine's own name, never shown)."""
+    h = "" if host is None or (isinstance(host, float) and host != host) else str(host)
+    if not h:
+        return sources.get("learner", "其他")
+    if h in sources:
+        return sources[h]
+    if str(backend) == "retail" and "retail" in sources:
+        return sources["retail"]
+    return "其他"
 
 LOG_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)$")
 UPD_RE = re.compile(r"u(\d+) steps (\d+) sps (\d+) frontier (\d+) band ([\d.]+)/(\d+).*? ent ([\d.]+) kl ([\d.]+)")
@@ -279,15 +293,24 @@ def run_status(run: Run, off_h: float, level_n: int, machines: dict) -> dict:
             st["band_success_avg20"] = _num(tail["band_success"].mean())
         if st.get("frontier") is not None:
             st["covered_pct"] = round(100 * (level_n - st["frontier"]) / (level_n - 936), 1)
-    e = read_many(run.files("episodes*.csv"), usecols=["update", "backend", "steps"], dedup=None)
+    e = read_many(run.files("episodes*.csv"), usecols=["update", "backend", "steps", "host"], dedup=None)
     if e is not None and len(e) and "backend" in e:
         e = e[e["update"] >= e["update"].max() - 100]
         # share of training steps (what the learner consumes), not of episodes: retail episodes are much shorter
-        vc = e.groupby("backend")["steps"].sum() if "steps" in e else e["backend"].value_counts()
-        vc = vc.sort_values(ascending=False)
+        w = e["steps"] if "steps" in e else pd.Series(1, index=e.index)
+        vc = w.groupby(e["backend"]).sum().sort_values(ascending=False)
         tot = float(vc.sum())
         if tot > 0:
             st["backend_share"] = {BACKEND_LABEL.get(str(k), "其他"): round(100 * float(v) / tot, 1) for k, v in vc.items()}
+            src = (machines or {}).get("sources") or {}
+            hosts = e["host"] if "host" in e else pd.Series(None, index=e.index, dtype=object)
+            labels = [machine_of(b, h, src) for b, h in zip(e["backend"], hosts)]
+            mv = w.groupby(pd.Series(labels, index=e.index)).sum().sort_values(ascending=False)
+            st["source_share"] = {str(k): round(100 * float(v) / tot, 1) for k, v in mv.items()}
+            lab = pd.Series(labels, index=e.index)
+            st["source_detail"] = {str(m): [BACKEND_LABEL.get(str(b), "其他") for b in
+                                            w[lab == m].groupby(e["backend"][lab == m]).sum().sort_values(ascending=False).index]
+                                   for m in mv.index}
     age = st.get("last_log_age_min")
     if (run.path / "STOP").exists() or (age is not None and age > 120):
         st["state"] = "已结束"

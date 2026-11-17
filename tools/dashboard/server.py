@@ -221,6 +221,8 @@ class Dashboard:
     def __init__(self, a):
         self.interval, self.min_refresh = a.interval, a.min_refresh
         self.machines = {"train": a.train_machine, "eval": a.eval_machine}
+        # host label -> generic machine name for the data-source tile (never sent to the page as a mapping)
+        self.sources = dict(kv.split("=", 1) for kv in (a.source_labels or "").split(",") if "=" in kv)
         self.tensorboard_url = a.tensorboard_url or ""
         self.show_alt = a.show_shortcut_line
         self.game_assets = not a.no_game_assets
@@ -297,7 +299,7 @@ class Dashboard:
             put("geometry", 1, lambda: L.outlines)
 
             def frontier():
-                cur_st = D.run_status(next(r for r in mac if r.name == sel), off, L.n, self.machines) if sel else {}
+                cur_st = D.run_status(next(r for r in mac if r.name == sel), off, L.n, {**self.machines, "sources": self.sources}) if sel else {}
                 cur = int(cur_st.get("frontier") or 19086)
                 sig = (tuple(D._sig(r.path / "train.log") for r in runs), cur, sel, self.show_alt)
                 put("frontier", sig, lambda: D.frontier_payload(L, runs, off, sel, cur, self.show_alt))
@@ -371,7 +373,7 @@ class Dashboard:
         st = {}
         for r in mac:
             try:
-                st[r.name] = D.run_status(r, off, n, self.machines)
+                st[r.name] = D.run_status(r, off, n, {**self.machines, "sources": self.sources})
             except Exception as e:
                 st[r.name] = {"run": r.name, "error": type(e).__name__}
                 log(f"status {r.name} failed:\n" + traceback.format_exc())
@@ -513,6 +515,9 @@ def main(argv=None):
                     help="generic description of the training machine shown on the page")
     ap.add_argument("--eval-machine", default=os.environ.get("BALLRAIN_DASH_EVAL_MACHINE", "Windows PC"),
                     help="generic description of the evaluation machine shown on the page")
+    ap.add_argument("--source-labels", default=os.environ.get("BALLRAIN_DASH_SOURCE_LABELS", "learner=Mac mini,retail=Windows PC"),
+                    help="data-source tile: comma list HOSTLABEL=machine, plus learner= (the learner's own workers) and "
+                         "retail= (retail episodes); use generic machine names only")
     ap.add_argument("--no-game-assets", action="store_true",
                     help="do not serve the game textures / menu font (the page falls back to plain colours)")
     ap.add_argument("--show-shortcut-line", action="store_true",
