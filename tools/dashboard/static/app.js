@@ -148,7 +148,6 @@ function renderHeader() {
   const errs = Object.entries(g.errors || {});
   $("errs").textContent = errs.length ? "部分内容计算出错：" + errs.map(([k, v]) => `${k}: ${v}`).join("；") : "";
   updateMeta();
-  $("foot").textContent = `时间 ${S.tz} · 训练机 ${S.machines.train} · 评估机 ${S.machines.eval}`;
 }
 
 function updateMeta() {
@@ -250,12 +249,11 @@ function renderHighlight() {
     b.onclick = () => { hlOverlay = b.dataset.ov === "1"; try { localStorage.setItem("dash-hl-ov", hlOverlay ? "1" : "0"); } catch (e) { /* */ } renderHighlight(); };
   });
   $("hl-at").textContent = (h.recorded_at ? `录制于 ${h.recorded_at.slice(5)}（${h.tz}）` : "") + (pending ? " · 有新的回放，暂停后切换" : "");
-  const parts = [`<b>${esc(h.run)}</b>`, `第 ${num(h.update)} 次更新`, h.k > 0 ? `从 TAS 第 ${num(h.k)} 帧接手` : "从头开始",
-    `整关 <b>${(h.sr_ms / 1000).toFixed(3)} 秒</b>${h.tas_ms ? `（TAS ${(h.tas_ms / 1000).toFixed(3)} 秒）` : ""}`,
-    `原始尝试：${esc(h.backend || "—")}${h.episode_at ? `，${esc(h.episode_at.slice(5))}` : ""}`,
-    h.matched ? "原版游戏复现一致" : "原版游戏复现不一致"];
+  const parts = [`<b>${esc(h.run)}</b>`, h.k > 0 ? `TAS 第 ${num(h.k)} 帧接手` : "从头开始",
+    `<b>${(h.sr_ms / 1000).toFixed(3)} 秒</b>${h.tas_ms ? `（TAS ${(h.tas_ms / 1000).toFixed(3)}）` : ""}`];
   $("hl-cap").innerHTML = parts.join(" · ");
-  $("hl-cap").title = `上一小时最好的一局，在原版游戏里按原输入重放录制，从出生到上${TERMS.airship}，不剪辑`;
+  $("hl-cap").title = `第 ${num(h.update)} 次更新 · 原始尝试 ${h.backend || "—"}${h.episode_at ? " " + h.episode_at.slice(5) : ""} · ${h.matched ? "原版游戏复现一致" : "原版游戏复现不一致"}
+上一小时最好的一局，在原版游戏里按原输入重放录制，从出生到上${TERMS.airship}，不剪辑`;
 }
 
 /* ---------------------------------------------------------------------------------- SR chart */
@@ -505,7 +503,9 @@ function wirePick(ch, id, pickBox) {
     const st = mapState[id];
     st.picked = d && (!st.picked || st.picked.id !== d.id) ? d : null;
     ch.setOption({ series: [pickedSeries(st)] });
-    $(pickBox).innerHTML = st.picked ? "选中：" + trajTooltip(st.picked).replace(/<br>/g, " · ") : "";
+    const box = $(pickBox);
+    if (box.dataset.hint == null) box.dataset.hint = box.textContent;  // the page's own hint, shown when nothing is picked
+    box.innerHTML = st.picked ? "选中：" + trajTooltip(st.picked).replace(/<br>/g, " · ") : esc(box.dataset.hint);
   });
 }
 
@@ -523,7 +523,7 @@ async function renderAttempts(force, full) {
   const trs = A.traj.filter((d) => st.outcomes[d.end]);
   const groups = Object.entries(OUT).filter(([k]) => st.outcomes[k]).map(([k, o]) => [o.n, o.c]);
   const series = [tasSeries(F), ...trajSeries(trs, (d) => (OUT[d.end] || OUT.stopped).c, (d) => (OUT[d.end] || OUT.stopped).n, groups), pickedSeries(st)];
-  if (ch._run !== sel) { st.picked = null; $("p-attempts").textContent = ""; series[series.length - 1] = pickedSeries(st); }
+  if (ch._run !== sel) { st.picked = null; $("p-attempts").textContent = "点击轨迹查看详情"; series[series.length - 1] = pickedSeries(st); }
   apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: series.filter((s) => s.name !== "选中").map((s) => s.name) }, geo: { ...geoBase(roamOn[id]), top: 40 }, series }, full || ch._run !== sel);
   ch._run = sel;
   wirePick(ch, id, "p-attempts");
