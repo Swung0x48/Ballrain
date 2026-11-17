@@ -350,7 +350,12 @@ def run_status(run: Run, off_h: float, level_n: int, machines: dict) -> dict:
                                             w[lab == m].groupby(e["backend"][lab == m]).sum().sort_values(ascending=False).index]
                                    for m in mv.index}
     age = st.get("last_log_age_min")
-    if (run.path / "STOP").exists() or (age is not None and age > 120):
+    # a STOP file only means "ended" if nothing was logged after it: the Mac -> PC pull copies files but never
+    # deletes them, so a STOP from an earlier stop / resume stays in the mirrored run directory
+    stop = run.path / "STOP"
+    stopped = stop.exists() and (age is None or dt.datetime.fromtimestamp(stop.stat().st_mtime)
+                                 >= now - dt.timedelta(minutes=age))
+    if stopped or (age is not None and age > 120):
         st["state"] = "已结束"
     elif age is not None and age < 20:
         st["state"] = "训练中"
