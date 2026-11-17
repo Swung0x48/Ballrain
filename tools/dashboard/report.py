@@ -63,6 +63,19 @@ def tz_label() -> str:
     return f"UTC{h:+d}" + (f":{m:02d}" if m else "")
 
 
+def _ts(at: str, tz: str) -> int | None:
+    """Unix seconds of the report time, so the page can show it in the viewer's time zone."""
+    m = re.fullmatch(r"UTC([+-])(\d{1,2})(?::(\d{2}))?", tz)
+    try:
+        t = dt.datetime.strptime(at, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    if not m:
+        return None
+    off = dt.timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0)) * (1 if m.group(1) == "+" else -1)
+    return int(t.replace(tzinfo=dt.timezone(off)).timestamp())
+
+
 def load() -> list[dict]:
     try:
         data = json.loads(FILE.read_text(encoding="utf-8"))
@@ -80,8 +93,8 @@ def public(reports: list[dict], n: int = 12) -> list[dict]:
         nxt = str(r.get("next", ""))[:MAX_LEN]
         if check(" ".join([title, nxt, *items])):
             continue
-        out.append({"at": str(r.get("at", ""))[:16], "tz": str(r.get("tz", ""))[:10], "title": title,
-                    "items": items, "next": nxt})
+        at, tz = str(r.get("at", ""))[:16], str(r.get("tz", ""))[:10]
+        out.append({"at": at, "tz": tz, "ts": _ts(at, tz), "title": title, "items": items, "next": nxt})
     return out
 
 

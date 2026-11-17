@@ -274,6 +274,24 @@ def fmt(t: dt.datetime) -> str:
     return t.strftime("%m-%d %H:%M")
 
 
+def epoch(t: dt.datetime) -> int:
+    """Unix seconds of a naive PC-local time: the page formats every time in the viewer's own time zone."""
+    return int(t.timestamp())
+
+
+def ts_from_label(at, tz) -> int | None:
+    """Unix seconds of "YYYY-MM-DD HH:MM" written in time zone "UTC+h[:mm]" (reports, highlight json)."""
+    try:
+        t = dt.datetime.strptime(str(at)[:16], "%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return None
+    m = re.fullmatch(r"UTC([+-])(\d{1,2})(?::(\d{2}))?", str(tz or ""))
+    if not m:
+        return None
+    off = dt.timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0)) * (1 if m.group(1) == "+" else -1)
+    return int(t.replace(tzinfo=dt.timezone(off)).timestamp())
+
+
 # ---------------------------------------------------------------------------------- status
 
 def run_status(run: Run, off_h: float, level_n: int, machines: dict) -> dict:
@@ -299,10 +317,13 @@ def run_status(run: Run, off_h: float, level_n: int, machines: dict) -> dict:
     if last_ts:
         t = to_pc(last_ts, run, off_h)
         st["last_log"] = fmt(t)
+        st["last_log_ts"] = epoch(t)
         st["last_log_age_min"] = round((now - t).total_seconds() / 60, 1)
     if first_ts:
         st["started"] = fmt(to_pc(first_ts, run, off_h))
-    st["curriculum"] = [f"{fmt(to_pc(ts, run, off_h))}  {curriculum_text(msg)}" for ts, msg in curr[-6:]]
+        st["started_ts"] = epoch(to_pc(first_ts, run, off_h))
+    st["curriculum"] = [f"{fmt(to_pc(t, run, off_h))}  {curriculum_text(msg)}" for t, msg in curr[-6:]]
+    st["curriculum_items"] = [{"ts": epoch(to_pc(t, run, off_h)), "text": curriculum_text(msg)} for t, msg in curr[-6:]]
 
     u = read_many(run.files("updates*.csv"))
     if u is not None and len(u):
@@ -447,7 +468,8 @@ def frontier_history(runs, off_h) -> list[dict]:
                 continue
             mf = FRONTIER_RE.search(m.group(2))
             if mf:
-                out.append({"run": r.name, "t": fmt(to_pc(m.group(1), r, off_h)), "frame": int(mf.group(1))})
+                t = to_pc(m.group(1), r, off_h)
+                out.append({"run": r.name, "t": fmt(t), "ts": epoch(t), "frame": int(mf.group(1))})
     return out
 
 
@@ -631,7 +653,8 @@ def k0_evals() -> list[dict]:
                          "runs": p.get("runs"), "success": p.get("success"),
                          "finished_no_death": p.get("finished_no_death"), "deaths_per_run": p.get("deaths_per_run"),
                          "sr_ms_median": p.get("sr_ms_median"), "sr_ms_min": p.get("sr_ms_min"),
-                         "t": dt.datetime.fromtimestamp(j["t"]).strftime("%m-%d %H:%M") if j.get("t") else None})
+                         "t": dt.datetime.fromtimestamp(j["t"]).strftime("%m-%d %H:%M") if j.get("t") else None,
+                         "ts": int(j["t"]) if isinstance(j.get("t"), (int, float)) else None})
     return rows
 
 

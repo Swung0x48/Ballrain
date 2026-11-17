@@ -179,6 +179,8 @@ def highlight_public() -> dict | None:
            "matched": j.get("matched") is True,
            "duration_s": j.get("duration_s") if isinstance(j.get("duration_s"), (int, float)) else None,
            "v": i("v"),
+           "recorded_ts": D.ts_from_label(j.get("recorded_at"), j.get("tz")),
+           "episode_ts": D.ts_from_label(j.get("episode_at"), j.get("tz")),
            # file names of this recording's set, as its json lists them (never a leftover file)
            "video": video, "overlay": overlay}
     if out["run"] is None or not re.fullmatch(r"r\d+", out["run"]) or out["sr_ms"] is None or out["k"] is None:
@@ -352,10 +354,12 @@ class Dashboard:
         finally:
             secs = round(time.time() - t0, 1)
             summary["generated_at"] = dt.datetime.now().strftime("%m-%d %H:%M:%S")
+            summary["generated_ts"] = int(time.time())
             summary["gen_seconds"] = secs
             with self.lock:
                 self.summary = summary
-                self.gen.update(running=False, generated_at=summary["generated_at"], seconds=secs, errors=errors)
+                self.gen.update(running=False, generated_at=summary["generated_at"], generated_ts=summary["generated_ts"],
+                                seconds=secs, errors=errors)
                 self._status = (0.0, None)
             log(f"generated in {secs}s" + (f", errors: {list(errors)}" if errors else ""))
 
@@ -395,7 +399,7 @@ class Dashboard:
             compute = D.discarded_steps(runs, D.default_run(runs))
         except Exception:
             compute = None
-        res = {"now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "tz": D.tz_label(), "milestone": "M2",
+        res = {"now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "now_ts": int(time.time()), "tz": D.tz_label(), "milestone": "M2",
                "runs": [r.name for r in mac], "default_run": D.default_run(runs), "status": st, "gen": gen,
                "interval_s": self.interval, "min_refresh_s": self.min_refresh, "machines": self.machines,
                "tensorboard_url": self.tensorboard_url, "data": summ.get("data") or {},

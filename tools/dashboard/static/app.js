@@ -15,6 +15,17 @@ const $ = (id) => document.getElementById(id);
 const esc = (t) => String(t == null ? "" : t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const num = (v, d = 0) => (v == null || isNaN(v) ? "—" : Number(v).toLocaleString("zh-CN", { maximumFractionDigits: d, minimumFractionDigits: d }));
 const pct = (v) => (v == null || isNaN(v) ? "—" : (100 * v).toFixed(0) + "%");
+const pad2 = (n) => String(n).padStart(2, "0");
+// every time on the page is shown in the viewer's own time zone (the server sends Unix seconds)
+const lt = (ts, fallback = "—") => {
+  if (ts == null) return fallback;
+  const d = new Date(ts * 1000);
+  return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+};
+const TZ = (() => {
+  const m = -new Date().getTimezoneOffset(), h = Math.trunc(Math.abs(m) / 60), mm = Math.abs(m) % 60;
+  return `UTC${m >= 0 ? "+" : "-"}${h}${mm ? ":" + pad2(mm) : ""}`;
+})();
 const sec = (ms) => (ms == null ? "—" : (ms / 1000).toFixed(3) + " s");
 const runColor = (r) => RUN_COLORS[r] || "#ddd";
 
@@ -154,7 +165,7 @@ function updateMeta() {
   if (!S) return;
   const g = S.gen || {};
   const left = Math.max(0, Math.round((nextAt - Date.now()) / 1000));
-  $("meta").textContent = `${S.now.slice(5, 16)}（${S.tz}）· 图表更新于 ${g.generated_at ? g.generated_at.slice(6, 11) : "—"}` +
+  $("meta").textContent = `${lt(S.now_ts, S.now.slice(5, 16))}（${TZ}）· 图表更新于 ${g.generated_ts ? lt(g.generated_ts).slice(6) : "—"}` +
     (g.running ? " · 正在重算…" : "") + ` · ${left} 秒后刷新`;
 }
 setInterval(updateMeta, 1000);
@@ -181,7 +192,7 @@ function renderStatus() {
     (det[k] ? `<div class="sub">${esc(det[k].join(" + "))}</div>` : "")).join("") : "—";
   $("tiles").innerHTML = [
     tile("run", sel, s.machine ? `训练机：${s.machine}` : "", true),
-    tile(`最后记录（${S.tz}）`, s.last_log || "—", s.last_log_age_min != null ? `${num(s.last_log_age_min, 0)} 分钟前；开始于 ${s.started || "—"}` : "", true),
+    tile(`最后记录（${TZ}）`, lt(s.last_log_ts, s.last_log || "—"), s.last_log_age_min != null ? `${num(s.last_log_age_min, 0)} 分钟前；开始于 ${lt(s.started_ts, s.started || "—")}` : "", true),
     tile("更新次数", num(s.update), "", true),
     tile("训练步数", s.steps != null ? (s.steps / 1e6).toFixed(2) + " M" : "—", "", true),
     tile("每秒步数", num(s.steps_per_s), `近 20 次 ${num(s.steps_per_s_avg20)}`, true),
@@ -196,8 +207,8 @@ function renderStatus() {
     tile("记录了轨迹的回合", num((S.traced_counts || {})[sel]), "", true),
   ].join("");
   $("tiles").querySelectorAll(".gt").forEach((el) => gameText(el, el.textContent, el.closest(".split") ? 18 : 20, "dark"));
-  const c = s.curriculum || [];
-  $("curr").innerHTML = c.length ? c.map((l) => `<li><time>${esc(l.slice(0, 11))}</time>${esc(l.slice(13).replace("curriculum: ", ""))}</li>`).join("") : "<li>（无）</li>";
+  const c = s.curriculum_items || (s.curriculum || []).map((l) => ({ t: l.slice(0, 11), text: l.slice(13) }));
+  $("curr").innerHTML = c.length ? c.map((x) => `<li><time>${esc(x.ts != null ? lt(x.ts) : x.t)}</time>${esc(String(x.text).replace("curriculum: ", ""))}</li>`).join("") : "<li>（无）</li>";
 }
 
 /* ---------------------------------------------------------------------------- progress report */
@@ -208,10 +219,11 @@ function renderReport() {
   const one = (r) => `<div class="rtitle">${esc(r.title)}</div><ul class="ritems">${r.items.map((i) => `<li>${esc(i)}</li>`).join("")}</ul>` +
     (r.next ? `<div class="rnext"><b>下一步</b>${esc(r.next)}</div>` : "");
   const [cur, ...old] = R;
-  $("r-at").textContent = `${cur.at.slice(5)}（${cur.tz}）`;
+  const rat = (r) => (r.ts != null ? `${lt(r.ts)}（${TZ}）` : `${r.at.slice(5)}（${r.tz}）`);
+  $("r-at").textContent = rat(cur);
   const open = $("report").querySelector("details")?.open;
   $("report").innerHTML = one(cur) + (old.length ? `<details class="rold"${open ? " open" : ""}><summary>更早的报告（${old.length}）</summary>` +
-    old.map((r) => `<div class="rprev"><time>${esc(r.at.slice(5))}（${esc(r.tz)}）</time>${one(r)}</div>`).join("") + `</details>` : "");
+    old.map((r) => `<div class="rprev"><time>${esc(rat(r))}</time>${one(r)}</div>`).join("") + `</details>` : "");
 }
 
 /* --------------------------------------------------------------------------- highlight replay */
@@ -250,11 +262,11 @@ function renderHighlight() {
     b.classList.toggle("on", (b.dataset.ov === "1") === !!ov);
     b.onclick = () => { hlOverlay = b.dataset.ov === "1"; try { localStorage.setItem("dash-hl-ov", hlOverlay ? "1" : "0"); } catch (e) { /* */ } renderHighlight(); };
   });
-  $("hl-at").textContent = (h.recorded_at ? `录制于 ${h.recorded_at.slice(5)}（${h.tz}）` : "") + (pending ? " · 有新的回放，暂停后切换" : "");
+  $("hl-at").textContent = (h.recorded_ts != null ? `录制于 ${lt(h.recorded_ts)}（${TZ}）` : h.recorded_at ? `录制于 ${h.recorded_at.slice(5)}（${h.tz}）` : "") + (pending ? " · 有新的回放，暂停后切换" : "");
   const parts = [`<b>${esc(h.run)}</b>`, h.k > 0 ? `TAS 第 ${num(h.k)} 帧接手` : "从头开始",
     `<b>${(h.sr_ms / 1000).toFixed(3)} 秒</b>${h.tas_ms ? `（TAS ${(h.tas_ms / 1000).toFixed(3)}）` : ""}`];
   $("hl-cap").innerHTML = parts.join(" · ");
-  $("hl-cap").title = `第 ${num(h.update)} 次更新 · 原始尝试 ${h.backend || "—"}${h.episode_at ? " " + h.episode_at.slice(5) : ""} · ${h.matched ? "原版游戏复现一致" : "原版游戏复现不一致"}
+  $("hl-cap").title = `第 ${num(h.update)} 次更新 · 原始尝试 ${h.backend || "—"}${h.episode_ts != null ? " " + lt(h.episode_ts) : h.episode_at ? " " + h.episode_at.slice(5) : ""} · ${h.matched ? "原版游戏复现一致" : "原版游戏复现不一致"}
 上一小时最好的一局，在原版游戏里按原输入重放录制，从出生到上${TERMS.airship}，不剪辑`;
 }
 
@@ -335,7 +347,7 @@ function renderSR() {
   if (!k0.length) $("k0").innerHTML = `<p class="note" style="margin:0">这个 run 还没有从头开始的原版评估。</p>`;
   else {
     let k = `<table><thead><tr><th>run</th><th>时间</th><th>更新</th><th>游戏</th><th>采样</th><th>局数</th><th>通关率</th><th>无死亡通关</th><th>每局死亡</th><th>SR 中位</th><th>SR 最佳</th></tr></thead><tbody>`;
-    for (const x of k0) k += `<tr><td>${esc(x.run)}</td><td>${esc(x.t || "")}</td><td>${num(x.update)}</td><td>${esc(x.backend)}</td><td>${x.greedy ? "贪心" : "温度 " + esc(x.temperature)}</td><td>${num(x.runs)}</td><td>${pct(x.success)}</td><td>${num(x.finished_no_death)}</td><td>${num(x.deaths_per_run, 1)}</td><td>${sec(x.sr_ms_median)}</td><td>${sec(x.sr_ms_min)}</td></tr>`;
+    for (const x of k0) k += `<tr><td>${esc(x.run)}</td><td>${esc(x.ts != null ? lt(x.ts) : x.t || "")}</td><td>${num(x.update)}</td><td>${esc(x.backend)}</td><td>${x.greedy ? "贪心" : "温度 " + esc(x.temperature)}</td><td>${num(x.runs)}</td><td>${pct(x.success)}</td><td>${num(x.finished_no_death)}</td><td>${num(x.deaths_per_run, 1)}</td><td>${sec(x.sr_ms_median)}</td><td>${sec(x.sr_ms_min)}</td></tr>`;
     $("k0").innerHTML = k + "</tbody></table>";
   }
   $("sr-note").innerHTML = `<details><summary>怎么算的</summary>比率 = 智能体从接手帧 k 跑到终点的用时 ÷ TAS 同一段的用时（TAS 在第 k 帧的计时 = (k − c0) × 1000 / 264，c0 = 20483 − 74446 × 0.264）。` +
@@ -441,7 +453,7 @@ async function renderFrontier(force, full) {
       type: "scatter", name: `${r} 开局点`, coordinateSystem: "geo", z: 7, symbolSize: 8,
       itemStyle: { color: runColor(r), borderColor: "#000", borderWidth: 0.6 },
       data: F.history.filter((h) => h.run === r).map((h) => ({ value: [h.x, h.z], ...h })),
-      tooltip: { formatter: (p) => `<b>${p.data.run}</b> 课程开局点<br>第 ${p.data.frame} 帧<br>${p.data.t}（${S.tz}）` },
+      tooltip: { formatter: (p) => `<b>${p.data.run}</b> 课程开局点<br>第 ${p.data.frame} 帧<br>${p.data.ts != null ? lt(p.data.ts) : p.data.t}（${TZ}）` },
     })),
     { type: "scatter", name: "当前开局点", coordinateSystem: "geo", z: 9, symbolSize: 18, itemStyle: { color: "#ff6b2d", borderColor: "#fff1c4", borderWidth: 2 },
       data: [{ value: [F.current.x, F.current.z], ...F.current }],
@@ -454,7 +466,7 @@ async function renderFrontier(force, full) {
 
 function trajTooltip(d) {
   const o = OUT[d.end] || OUT.stopped;
-  return `<b>${d.run}</b> · <span style="color:${o.c}">${o.n}</span><br>开始 ${d.t}（${S.tz}）<br>接手帧 ${d.k}，结束帧 ${d.end_frame}` +
+  return `<b>${d.run}</b> · <span style="color:${o.c}">${o.n}</span><br>开始 ${d.ts != null ? lt(d.ts) : d.t}（${TZ}）<br>接手帧 ${d.k}，结束帧 ${d.end_frame}` +
     (d.sr ? `<br>SR ${(d.sr / 1000).toFixed(3)} s` : "") + `<br>死亡 ${d.deaths.length} 次 · ${d.backend}`;
 }
 
