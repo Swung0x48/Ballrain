@@ -69,6 +69,7 @@ def gated_curriculum(starts, cfg, finish_gate: float):
             self.finishes = deque(maxlen=max(cfg.min_episodes, 1))
             self.finish_gate = finish_gate
             self.gate_blocked = 0
+            self.floor = 0  # --frontier-floor: the frontier never moves below this frame (0 = no floor)
 
         def update_gated(self, k: int, success: bool, finish: bool) -> bool:
             if not self.in_band(k):
@@ -81,7 +82,12 @@ def gated_curriculum(starts, cfg, finish_gate: float):
                     if frate < self.finish_gate:
                         self.gate_blocked += 1
                         return False
-                    self.frontier = self._snap(self.frontier - self.cfg.step)
+                    new = self._snap(max(self.frontier - self.cfg.step, self.floor))
+                    if new >= self.frontier:  # at the floor: no move
+                        self.outcomes.clear()
+                        self.finishes.clear()
+                        return False
+                    self.frontier = new
                     self.history.append((self.frontier, rate))
                     self.outcomes.clear()
                     self.finishes.clear()
@@ -210,6 +216,8 @@ def parse(argv=None):
                    help="JSON ballrain.train.guard.ReachGuard fields, e.g. {\"lo\": 4100, \"hi\": 4299, \"bin\": 100, "
                         "\"min_n\": 20, \"low\": 0.5, \"good\": 0.7}: reload the newest good bin's checkpoint when the "
                         "TAS starts in [lo, hi] reach the next checkpoint at < low in consecutive bins of policy versions")
+    p.add_argument("--frontier-floor", type=int, default=0,
+                   help="the curriculum frontier never moves below this TAS frame (0 = no floor)")
     p.add_argument("--rail-gate", default="",
                    help='JSON {"s": route arc length, "below": TAS frame}: truncate (bootstrapped, end gate_truncate) a 小节-1 '
                         'life not started at or after "below" once it reaches route s (WorkerSpec.rail_gate)')
@@ -368,6 +376,7 @@ def main(argv=None) -> int:
             keep &= ~((starts.valid >= lo) & (starts.valid < hi))
         starts.restrict(keep)
     cu = gated_curriculum(starts, CurriculumConfig(**(env_cfg.curriculum or cu_cfg), seed=a.seed), a.finish_gate)
+    cu.floor = int(a.frontier_floor or 0)
     hidden = tuple(int(x) for x in a.hidden.split(","))
     from ballrain.env import BallanceEnv
     from ballrain.fakegame import FakeLauncher
