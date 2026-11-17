@@ -781,11 +781,12 @@ def main(argv=None) -> int:
                         log.tb.add_scalar(f"gate/{name}_hits", hits, counters["steps"])
                         log.tb.add_scalar(f"gate/{name}_hit_rate", hits / max(len(eps), 1), counters["steps"])
                 if a.zones or a.wall_push_rate:
-                    row["zone_entries"] = sum(int(e.get("zone_entries") or 0) for e in eps)
-                    row["wall_push"] = float(sum((e.get("terms") or {}).get("wall_push", 0.0) for e in eps))
-                    log.tb.add_scalar("zone/entries", row["zone_entries"], counters["steps"])
-                    log.tb.add_scalar("zone/entries_per_episode", row["zone_entries"] / max(len(eps), 1), counters["steps"])
-                    log.tb.add_scalar("zone/wall_push", row["wall_push"], counters["steps"])
+                    # TensorBoard only (a new updates.csv column would start updates.<i>.csv); per episode in episodes*.csv
+                    n_zone = sum(int(e.get("zone_entries") or 0) for e in eps)
+                    log.tb.add_scalar("zone/entries", n_zone, counters["steps"])
+                    log.tb.add_scalar("zone/entries_per_episode", n_zone / max(len(eps), 1), counters["steps"])
+                    log.tb.add_scalar("zone/wall_push", float(sum((e.get("terms") or {}).get("wall_push", 0.0) for e in eps)),
+                                      counters["steps"])
                 if a.route_probes:
                     for name in json.loads(a.route_probes):
                         vis = [e for e in eps if name in (e.get("probes") or [])]
