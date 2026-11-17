@@ -482,7 +482,7 @@ def make_handler(dash: Dashboard, media: MediaCache | None = None):
                 allowed = (m.group(2) in dash.assets) if m.group(1) == "assets" else True
                 p = base / m.group(2)
                 if allowed and p.is_file():
-                    cache = "no-cache" if m.group(1) == "static" else "public, max-age=86400"
+                    cache = "no-cache"  # assets are regenerated when their version changes: always revalidate
                     return self._send(200, p.read_bytes(), CTYPES[p.suffix], cache)
             self._send(404, "未找到".encode("utf-8"), "text/plain; charset=utf-8")
 
