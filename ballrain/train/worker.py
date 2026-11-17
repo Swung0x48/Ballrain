@@ -111,7 +111,9 @@ class WorkerSpec:
     # zone_stall_exempt: a life that has entered a penalty zone pays no stall penalty when it ends by stall (it still
     # ends there, terminal with --stall-terminal, and keeps the one-off zone penalty): a pit life costs less than a death
     zone_stall_exempt: bool = False
-    # rail-end gate (off when empty): {"s": route arc length, "below": TAS frame (default 4000)}: a 小节-1 life that did not
+    # rail-end gate (off when empty): {"s": route arc length, "below": TAS frame (default 4000), "follow_frontier": bool}:
+    # with follow_frontier the effective "below" is min(below, curriculum frontier), so band / curriculum starts at or
+    # after the frontier always play through once the frontier moves below "below". A 小节-1 life that did not
     # start at or after TAS frame `below` (a TAS / at-rest start below it, a level start, or a 小节-1 respawn) is truncated
     # (bootstrapped, end "gate_truncate", not a failure) once its route arc length reaches s while still in 小节 1. L1 r6:
     # lives started on the early 小节 1 stretch stop at the entry rail end, before the flight onto platform A, so their
@@ -405,8 +407,13 @@ class Worker:
         g = getattr(self.spec, "rail_gate", None) or {}
         if not g or s is None or int(ep.d.get("start_sector") or 0) != 1 or int(info.get("sector") or 1) > 1:
             return False
+        below = int(g.get("below", 4000))
+        if g.get("follow_frontier"):  # starts in the curriculum's range [frontier, end] always play through
+            cu = getattr(getattr(self, "env", None), "curriculum", None)
+            if cu is not None:
+                below = min(below, int(cu.frontier))
         k = ep.d.get("start_frame")
-        if ep.d.get("kind") != "respawn" and k is not None and int(k) >= int(g.get("below", 4000)):
+        if ep.d.get("kind") != "respawn" and k is not None and int(k) >= below:
             return False
         return float(s) >= float(g["s"])
 

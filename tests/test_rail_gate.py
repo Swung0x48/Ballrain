@@ -15,9 +15,10 @@ from ballrain.train.worker import Worker, WorkerSpec, _Episode
 D = np.float32(1000 / 132)
 
 
-def _w(gate):
+def _w(gate, frontier=None):
     w = object.__new__(Worker)
     w.spec = SimpleNamespace(rail_gate=gate) if gate is not None else SimpleNamespace()
+    w.env = SimpleNamespace(curriculum=SimpleNamespace(frontier=frontier) if frontier is not None else None)
     return w
 
 
@@ -44,6 +45,21 @@ def test_gate_rule():
     assert not _w(None)._gate_hit(_ep("tas", 2100), 300.0, {"sector": 1})  # an older pickled WorkerSpec
     assert _w({"s": 10.0})._gate_hit(_ep("tas", 3999), 10.0, {"sector": 1})  # below defaults to 4000
     assert WorkerSpec(wid=0, copy="x", env=None, seed=0).rail_gate == {}
+
+
+def test_gate_follows_the_frontier():
+    g = {"s": 277.0, "below": 4000, "follow_frontier": True}
+    w = _w(g, frontier=3900)  # unpinned: the band starts at 3900
+    assert not w._gate_hit(_ep("tas", 3900), 300.0, {"sector": 1})  # band start plays through the platform
+    assert not w._gate_hit(_ep("tas", 3950), 300.0, {"sector": 1})
+    assert w._gate_hit(_ep("tas", 2000), 300.0, {"sector": 1})  # 小节-1 rehearsal start still gated
+    assert w._gate_hit(_ep("tas", 3899), 277.0, {"sector": 1})
+    w = _w(g, frontier=4100)  # pinned at 4100: below stays 4000, the 4000-4099 rehearsal plays through
+    assert not w._gate_hit(_ep("tas", 4000), 300.0, {"sector": 1})
+    assert w._gate_hit(_ep("tas", 3700), 300.0, {"sector": 1})
+    assert w._gate_hit(_ep("tas", 3900), 300.0, {"sector": 1})
+    assert _w({"s": 277.0, "below": 4000}, frontier=3900)._gate_hit(_ep("tas", 3900), 300.0, {"sector": 1})  # no follow
+    assert _w(g)._gate_hit(_ep("tas", 3900), 300.0, {"sector": 1})  # no curriculum: the fixed below
 
 
 def test_train_m2_option_reaches_spec_and_remote_template():
@@ -101,6 +117,40 @@ def test_worker_truncates_at_the_gate_and_bootstraps(tmp_path, fake_record):
     tv = np.concatenate([c["trunc_values"] for c in chunks])
     assert tr.sum() >= len(gated) and not (tr & te).any()
     assert np.allclose(tv[tr], 0.75)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="named shared memory / events need Windows")
+def test_worker_band_starts_play_through_rehearsal_starts_gated(tmp_path, fake_record):
+    """Frontier 300 (start_back 300), gate below 4000 following the frontier: curriculum starts (>= 300) are never gated,
+    rehearsal starts at 40-100 (below the frontier) are."""
+    cfg = EnvConfig(level=1, copy="train-00", out_root=str(tmp_path / "ep2"), action_repeat=4,
+                    start_record=str(fake_record), curriculum={"start_back": 300, "seed": 1},
+                    rehearse_starts=[[40, 100]], p_rehearse=0.5)
+    spec = WorkerSpec(wid=0, copy="train-00", env=cfg, seed=5, chunk=64, launcher_factory=fakegame.FakeLauncher,
+                      prune="none", rail_gate={"s": 6.0, "below": 4000, "follow_frontier": True})
+    ctrl_q, data_q = queue.Queue(), queue.Queue()
+    w = Worker(spec, ctrl_q, data_q)
+    w.model.act = lambda x, gen=None: (1, np.float32(-2.2), np.float32(0.0))
+    w.model.value = lambda x: np.float32(0.5)
+    n = w.env.observation_space.shape[0]
+    ctrl_q.put({"version": 0, "model": {k: v.detach().numpy() for k, v in w.model.state_dict().items()},
+                "rms": {"mean": np.zeros(n), "var": np.ones(n), "count": 1.0},
+                "curriculum": w.env.get_start_state()})
+    th = threading.Thread(target=w.run, daemon=True)
+    th.start()
+    eps = []
+    for _ in range(8):
+        m = data_q.get(timeout=120)
+        assert "fatal" not in m and not m["errors"], m.get("errors")
+        eps += m["episodes"]
+    ctrl_q.put({"cmd": "stop"})
+    th.join(timeout=120)
+    assert int(w.env.curriculum.frontier) == 300
+    low = [e for e in eps if e["kind"] == "tas" and 0 < e["start_frame"] < 300]
+    band = [e for e in eps if e["kind"] == "tas" and e["start_frame"] >= 300]
+    assert low and band
+    assert any(e["end"] == "gate_truncate" for e in low)
+    assert not any(e["end"] == "gate_truncate" for e in band)
 
 
 @pytest.fixture(autouse=True)
