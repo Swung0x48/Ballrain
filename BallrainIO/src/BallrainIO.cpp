@@ -284,6 +284,8 @@ void BallrainIO::OnLoad() {
         else if (m_PhysicsOk > 0)
             AgentHello();
     }
+    if (m_Active)
+        CaptureInit();   // BALLRAIN_CAPTURE (Capture.cpp); inert without it
     const std::string dbg = GetEnv("BALLRAIN_DEBUG");
     if (m_Active && !dbg.empty()) {
         m_Dbg = std::fopen(dbg.c_str(), "w");
@@ -296,6 +298,10 @@ void BallrainIO::OnLoad() {
 void BallrainIO::OnUnload() {
     if (m_Playing)
         CloseOutputs(0);
+    if (m_CaptureRc)
+        m_CaptureRc->RemovePostSpriteRenderCallBack(&BallrainIO::CaptureRenderCallback, this);
+    m_CaptureRc = nullptr;
+    CaptureClose();
     FreeColdState();
     CKTimeManagerHook::Disable();
     CKInputManagerHook::Disable();
@@ -865,6 +871,8 @@ void BallrainIO::OnPreProcessTime() {
     if (m_Dbg && (!m_Playing || m_FrameIndex < 140))
         Dbg("T idx=%u play=%d cw=%04x d=%.9g abs=%.9g", (unsigned) m_FrameIndex, (int) m_Playing, FpuCw(),
             m_TimeManager->GetLastDeltaTime(), m_TimeManager->GetAbsoluteTime());
+    if (CaptureTailTime())
+        return;   // capture tail (Capture.cpp): after the run ended, nothing of the run is affected
     if (m_Mode == Mode::Agent && AgentPreTime())
         return;   // SR tail frame, or a stop deferred to this callback
     if (!m_Playing)
@@ -894,6 +902,8 @@ void BallrainIO::OnPreProcessInput() {
     // Reference :481-490: write the keys, then advance the frame.
     if (m_Dbg && (!m_Playing || m_FrameIndex < 140))
         Dbg("I idx=%u play=%d", (unsigned) m_FrameIndex, (int) m_Playing);
+    if (CaptureTailInput())
+        return;   // capture tail frame (not exported, not traced)
     if (m_Mode == Mode::Agent && AgentPreInput())
         return;   // SR tail frame (not exported)
     if (!m_Playing)
@@ -929,6 +939,7 @@ void BallrainIO::OnProcess() {
     }
     if (!m_Active)
         return;
+    CaptureProcess();   // BALLRAIN_CAPTURE only: which frames are rendered and written (Capture.cpp)
 
     if (m_SendExitLevel) {
         m_SendExitLevel = false;

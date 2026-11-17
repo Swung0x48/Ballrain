@@ -8,6 +8,8 @@ const RUN_COLORS = { r1: "#9aa0a6", r2: "#6fbf73", r3: "#5aa9e6", r4: "#b58cf0",
 const OUT = { finish: { c: "#7ed69a", n: "通关" }, gameover: { c: "#ff6b5e", n: "命用完" }, stopped: { c: "#8f9bff", n: "提前结束（卡住 / 超时）" } };
 const INK = "#ebe3cf", MUTED = "#a9a089", BRASS = "#b8893a", AMBER = "#ffcf5a";
 const coarse = matchMedia("(pointer: coarse)").matches;
+// Ballance terms in the Chinese community's wording (one place, so they are easy to rename)
+const TERMS = { checkpoint: "盘点", sector: "小节", fan: "风扇", airship: "飞船" };
 
 const $ = (id) => document.getElementById(id);
 const esc = (t) => String(t == null ? "" : t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -171,7 +173,7 @@ function tile(k, v, s, gt) {
 function renderStatus() {
   const s = S.status[sel] || {};
   $("state").textContent = s.state || "";
-  const SHORT = { "无头 x87-soft": "x87-soft", "原版 2002": "2002" };
+  const SHORT = { "原版 2002": "原版", "无头 x87-soft": "x87-soft", "无头 2002": "2002 无头" };
   const share = s.backend_share ? Object.entries(s.backend_share).map(([k, v]) => `<div class="row"><span class="gt">${esc(SHORT[k] || k)}</span><span class="gt">${esc(v + "%")}</span></div>`).join("") : "—";
   $("tiles").innerHTML = [
     tile("run", sel, s.machine ? `训练机：${s.machine}` : "", true),
@@ -179,11 +181,11 @@ function renderStatus() {
     tile("更新次数", num(s.update), "", true),
     tile("训练步数", s.steps != null ? (s.steps / 1e6).toFixed(2) + " M" : "—", "", true),
     tile("每秒步数", num(s.steps_per_s), `最近 20 次平均 ${num(s.steps_per_s_avg20)}`, true),
-    tile("课程开局点（TAS 帧）", num(s.frontier), [s.frontier_sector != null ? `第 ${num(s.frontier_sector)} 段` : "", s.covered_pct != null ? `已覆盖控制段 ${s.covered_pct}%` : ""].filter(Boolean).join("，"), true),
+    tile("课程开局点（TAS 帧）", num(s.frontier), [s.frontier_sector != null ? `第 ${num(s.frontier_sector)} 小节` : "", s.covered_pct != null ? `智能体已能接手全程的 ${s.covered_pct}%` : ""].filter(Boolean).join("，"), true),
     tile("开局区间成功率", pct(s.band_success), `推进阈值 60%；最近 20 次平均 ${pct(s.band_success_avg20)}`, true),
     tile("回合通关率", pct(s.finish_tas), `最近 20 次平均 ${pct(s.finish_tas_avg20)}`, true),
     tile("策略熵 / KL", `${num(s.u_entropy, 3)} / ${num(s.u_approx_kl, 4)}`, "随机策略的熵为 2.20", true),
-    `<div class="tile"><div class="k">数据来源（近 100 次）</div><div class="v split">${share}</div></div>`,
+    `<div class="tile"><div class="k">数据来源（按步数，近 100 次）</div><div class="v split">${share}</div></div>`,
     tile("最佳 SR（含 TAS 前缀）", sec(s.best_sr_any), s.best_sr_k0 != null ? `从头开始最佳 ${sec(s.best_sr_k0)}` : "从 TAS 中途接手时的整关计时", true),
     tile("记录了轨迹的回合", num((S.traced_counts || {})[sel]), "抽样记录，供轨迹地图使用", true),
   ].join("");
@@ -206,6 +208,50 @@ function renderReport() {
     old.map((r) => `<div class="rprev"><time>${esc(r.at.slice(5))}（${esc(r.tz)}）</time>${one(r)}</div>`).join("") + `</details>` : "");
 }
 
+/* --------------------------------------------------------------------------- highlight replay */
+let hlOverlay = true;
+try { hlOverlay = localStorage.getItem("dash-hl-ov") !== "0"; } catch (e) { /* private mode */ }
+let hlShown = null;  // the recording on screen
+function renderHighlight() {
+  let h = S.highlight;
+  $("s-hl").hidden = !h;
+  if (!h) return;
+  const vid = $("hl-video");
+  // a new hourly recording never replaces the one someone is watching: it waits until playback is paused (the
+  // server keeps the previous set for exactly this); caption and video stay those of the recording on screen
+  const pending = hlShown && String(hlShown.v) !== String(h.v) && !vid.paused && !vid.ended;
+  if (pending) {
+    h = hlShown;
+    if (!vid.dataset.waitPause) { vid.dataset.waitPause = "1"; vid.addEventListener("pause", () => { delete vid.dataset.waitPause; renderHighlight(); }, { once: true }); }
+  }
+  hlShown = h;
+  // file names of this recording's set from the server (a server of the first version sends a flag, fixed names)
+  const files = { video: typeof h.video === "string" ? h.video : "highlight.mp4",
+    overlay: typeof h.overlay === "string" ? h.overlay : (h.overlay ? "highlight-overlay.mp4" : null) };
+  const ov = hlOverlay && !!files.overlay;
+  const src = `/media/${encodeURIComponent(ov ? files.overlay : files.video)}?v=${h.v}`;
+  document.querySelector(".hlbox").style.setProperty("--hl-ar", ov ? "1366 / 768" : "1024 / 768");
+  if (vid.dataset.src !== src) {
+    const same = vid.dataset.v === String(h.v);  // same recording, other version: keep the position
+    const t = same ? vid.currentTime : 0, playing = same && !vid.paused;
+    vid.dataset.src = src; vid.dataset.v = String(h.v);
+    vid.src = src;
+    if (t > 0) vid.addEventListener("loadedmetadata", () => { vid.currentTime = Math.min(t, vid.duration || t); if (playing) vid.play().catch(() => {}); }, { once: true });
+  }
+  const tools = $("hl-tools");
+  tools.style.display = files.overlay ? "" : "none";  // .maptools sets display: flex, which beats [hidden]
+  tools.querySelectorAll("button").forEach((b) => {
+    b.classList.toggle("on", (b.dataset.ov === "1") === !!ov);
+    b.onclick = () => { hlOverlay = b.dataset.ov === "1"; try { localStorage.setItem("dash-hl-ov", hlOverlay ? "1" : "0"); } catch (e) { /* */ } renderHighlight(); };
+  });
+  $("hl-at").textContent = (h.recorded_at ? `录制于 ${h.recorded_at.slice(5)}（${h.tz}）` : "") + (pending ? " · 有新的回放，暂停后切换" : "");
+  const parts = [`<b>${esc(h.run)}</b>`, `第 ${num(h.update)} 次更新`, h.k > 0 ? `从 TAS 第 ${num(h.k)} 帧接手` : "从头开始",
+    `整关 <b>${(h.sr_ms / 1000).toFixed(3)} 秒</b>${h.tas_ms ? `（TAS ${(h.tas_ms / 1000).toFixed(3)} 秒）` : ""}`,
+    `原始尝试：${esc(h.backend || "—")}${h.episode_at ? `，${esc(h.episode_at.slice(5))}` : ""}`,
+    h.matched ? "原版游戏复现一致" : "原版游戏复现不一致"];
+  $("hl-cap").innerHTML = parts.join(" · ") + `<br><span class="note">上一小时内成绩最好的一次尝试（无死亡通关，优先选接手最早的），在原版游戏（2002 物理）里按原输入重放、用游戏自己的画面录制：从出生到上${esc(TERMS.airship)}，TAS 部分加智能体部分，不剪辑。</span>`;
+}
+
 /* ---------------------------------------------------------------------------------- SR chart */
 function renderSR() {
   const r = (S.sr || {})[sel];
@@ -216,12 +262,12 @@ function renderSR() {
   let h = "";
   if (r.estimate_s) {
     h += `<div class="big"><span class="gt" data-h="30">${r.estimate_s[0].toFixed(1)} - ${r.estimate_s[1].toFixed(1)} s</span>
-      <span class="note" style="margin:0">中位比率 ${r.ratio_range[0].toFixed(3)} – ${r.ratio_range[1].toFixed(3)}${r.alt ? `，已含捷径 1 段约 ${r.shortcut_extra_s} s × 比率` : ""}</span></div>`;
+      <span class="note" style="margin:0">中位比率 ${r.ratio_range[0].toFixed(3)} – ${r.ratio_range[1].toFixed(3)}${r.alt ? `，已含鬼躲石变约 ${r.shortcut_extra_s} s × 比率` : ""}</span></div>`;
   } else {
     h += `<p class="note">样本不足，暂无整关估计。</p>`;
   }
-  h += `<div class="bench"><span>TAS <b>${sec(b.tas)}</b></span><span>人类纪录 <b>${sec(b.human_wr)}</b></span><span>加精线 <b>${sec(b.featured)}</b></span><span>上榜线 <b>${sec(b.threshold)}</b></span></div>`;
-  h += `<div class="note" style="margin:0">样本：${esc((r.runs_used || []).join(" + "))} 最近 ${r.window} 次更新（${r.update_range ? r.update_range.join(" – ") : "—"}）中，从 TAS 中途接手（k &gt; 0）且没有掉落的通关局，共 ${num(r.n)} 局${r.n_retail ? `（其中原版 2002 ${num(r.n_retail)} 局）` : ""}。</div>`;
+  h += `<div class="bench"><span>TAS <b>${sec(b.tas)}</b></span><span>人类纪录 <b>${sec(b.human_wr)}</b></span><span>精品线 <b>${sec(b.featured)}</b></span><span>上榜线 <b>${sec(b.threshold)}</b></span></div>`;
+  h += `<div class="note" style="margin:0">样本：${esc((r.runs_used || []).join(" + "))} 最近 ${r.window} 次更新（${r.update_range ? r.update_range.join(" – ") : "—"}）中，从 TAS 中途接手（k &gt; 0）且没有死亡的通关局，共 ${num(r.n)} 局${r.n_retail ? `（其中原版 2002 ${num(r.n_retail)} 局）` : ""}。</div>`;
   $("sr-head").innerHTML = h;
   $("sr-head").querySelectorAll(".gt").forEach((el) => gameText(el, el.textContent, 30));
 
@@ -252,7 +298,7 @@ function renderSR() {
       {
         type: "bar", name: "中位比率估计", barMaxWidth: 34,
         data: bins.map((x, i) => ({ value: ys[i], itemStyle: { color: x.in_range ? "#d79b32" : "rgba(184,137,58,.35)", borderColor: "#2b1a0a" } })),
-        markLine: { symbol: "none", silent: true, data: [benchLine(b.tas, "TAS", "#7ed69a", "insideStartBottom"), benchLine(b.human_wr, "人类纪录", "#5aa9e6", "insideEndTop"), benchLine(b.featured, "加精线", "#b58cf0", "insideEndTop"), benchLine(b.threshold, "上榜线", "#ff7a66", "insideEndTop")] },
+        markLine: { symbol: "none", silent: true, data: [benchLine(b.tas, "TAS", "#7ed69a", "insideStartBottom"), benchLine(b.human_wr, "人类纪录", "#5aa9e6", "insideEndTop"), benchLine(b.featured, "精品线", "#b58cf0", "insideEndTop"), benchLine(b.threshold, "上榜线", "#ff7a66", "insideEndTop")] },
         markArea: r.estimate_s ? { silent: true, itemStyle: { color: "rgba(255,207,90,.10)" }, data: [[{ yAxis: r.estimate_s[0] }, { yAxis: r.estimate_s[1] }]] } : undefined,
       },
       {
@@ -282,13 +328,13 @@ function renderSR() {
   const k0 = (S.k0 || []).filter((x) => x.run === sel || (r.runs_used || []).includes(x.run));
   if (!k0.length) $("k0").innerHTML = `<p class="note" style="margin:0">这个 run 还没有从头开始的原版评估。</p>`;
   else {
-    let k = `<table><thead><tr><th>run</th><th>时间</th><th>更新</th><th>游戏</th><th>采样</th><th>局数</th><th>通关率</th><th>无掉落通关</th><th>每局掉落</th><th>SR 中位</th><th>SR 最佳</th></tr></thead><tbody>`;
+    let k = `<table><thead><tr><th>run</th><th>时间</th><th>更新</th><th>游戏</th><th>采样</th><th>局数</th><th>通关率</th><th>无死亡通关</th><th>每局死亡</th><th>SR 中位</th><th>SR 最佳</th></tr></thead><tbody>`;
     for (const x of k0) k += `<tr><td>${esc(x.run)}</td><td>${esc(x.t || "")}</td><td>${num(x.update)}</td><td>${esc(x.backend)}</td><td>${x.greedy ? "贪心" : "温度 " + esc(x.temperature)}</td><td>${num(x.runs)}</td><td>${pct(x.success)}</td><td>${num(x.finished_no_death)}</td><td>${num(x.deaths_per_run, 1)}</td><td>${sec(x.sr_ms_median)}</td><td>${sec(x.sr_ms_min)}</td></tr>`;
     $("k0").innerHTML = k + "</tbody></table>";
   }
   $("sr-note").textContent = `怎么算的：比率 = 智能体从接手帧 k 跑到终点的用时 ÷ TAS 同一段的用时（TAS 在第 k 帧的计时 = (k − c0) × 1000 / 264，c0 = 20483 − 74446 × 0.264）。` +
-    `整关估计 = ${(b.tas / 1000).toFixed(3)} s × 比率${r.alt ? ` + 捷径 1 段约 ${r.shortcut_extra_s} s × 比率` : ""}；范围取局数 ≥ ${r.min_n} 且 TAS 剩余段 ≥ ${r.min_seg_s} s 的分箱的中位比率最小值到最大值（柱状图中亮色的柱子，竖线为 p10–p90）。` +
-    `这是外推：只统计无掉落的通关局，前段还没练到的部分按后段的比率估计，近终点分箱的段很短、噪声大，无头后端与原版游戏也略有差别；最终以从头开始的原版评估为准。`;
+    `整关估计 = ${(b.tas / 1000).toFixed(3)} s × 比率${r.alt ? ` + 鬼躲石变约 ${r.shortcut_extra_s} s × 比率` : ""}；范围取局数 ≥ ${r.min_n} 且 TAS 剩余段 ≥ ${r.min_seg_s} s 的分箱的中位比率最小值到最大值（柱状图中亮色的柱子，竖线为 p10–p90）。` +
+    `这是外推：只统计无死亡的通关局，前段还没练到的部分按后段的比率估计，近终点分箱的段很短、噪声大，无头后端与原版游戏也略有差别；最终以从头开始的原版评估为准。`;
 }
 
 /* --------------------------------------------------------------------------------- the maps */
@@ -381,7 +427,7 @@ async function renderFrontier(force, full) {
     { type: "lines", name: "已覆盖段", coordinateSystem: "geo", polyline: true, silent: true, z: 3, data: [{ coords: F.covered }], lineStyle: { color: "#7ed69a", width: 3.2, opacity: 0.9 } },
     { type: "scatter", name: "TAS 帧", coordinateSystem: "geo", z: 4, symbolSize: 5, itemStyle: { color: "rgba(233,237,247,.55)" },
       data: F.tas_pts.map((p) => ({ value: [p[0], p[1]], frame: p[2] })), tooltip: { formatter: (p) => `TAS 第 ${p.data.frame} 帧` } },
-    { type: "scatter", name: "检查点", coordinateSystem: "geo", z: 6, symbol: "rect", symbolSize: 11, itemStyle: { color: "#1b1206", borderColor: AMBER, borderWidth: 1.5 },
+    { type: "scatter", name: "盘点", coordinateSystem: "geo", z: 6, symbol: "rect", symbolSize: 11, itemStyle: { color: "#1b1206", borderColor: AMBER, borderWidth: 1.5 },
       data: [...pt(F.checkpoints), ...pt([F.start], { symbol: "triangle" }), ...pt([F.end], { symbol: "diamond", symbolSize: 16, itemStyle: { color: "#ff9f1c" } })],
       label: { show: true, formatter: (p) => p.data.label, color: INK, fontSize: 11, position: "right", textBorderColor: "#000", textBorderWidth: 2 },
       tooltip: { formatter: (p) => `${p.data.label}<br>TAS 第 ${p.data.frame} 帧` } },
@@ -394,16 +440,16 @@ async function renderFrontier(force, full) {
     { type: "scatter", name: "当前开局点", coordinateSystem: "geo", z: 9, symbolSize: 18, itemStyle: { color: "#ff6b2d", borderColor: "#fff1c4", borderWidth: 2 },
       data: [{ value: [F.current.x, F.current.z], ...F.current }],
       label: { show: true, formatter: (p) => `当前 ${p.data.frame}`, color: AMBER, fontWeight: "bold", fontSize: 13, position: "right", textBorderColor: "#000", textBorderWidth: 3 },
-      tooltip: { formatter: (p) => `<b>当前（${p.data.run}）</b><br>第 ${p.data.frame} 帧<br>已覆盖控制段 ${p.data.covered_pct}%` } },
+      tooltip: { formatter: (p) => `<b>当前（${p.data.run}）</b><br>第 ${p.data.frame} 帧<br>智能体已能接手全程的 ${p.data.covered_pct}%` } },
   ];
-  if (F.alt) series.splice(2, 0, { type: "lines", name: "捷径 1 参考线", coordinateSystem: "geo", polyline: true, silent: true, z: 3, data: [{ coords: F.alt }], lineStyle: { color: "#7ed69a", width: 3, type: "dotted" } });
+  if (F.alt) series.splice(2, 0, { type: "lines", name: "鬼躲石变参考线", coordinateSystem: "geo", polyline: true, silent: true, z: 3, data: [{ coords: F.alt }], lineStyle: { color: "#7ed69a", width: 3, type: "dotted" } });
   apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: series.map((s) => s.name) }, geo: { ...geoBase(roamOn[id]), top: 40 }, series }, full);
 }
 
 function trajTooltip(d) {
   const o = OUT[d.end] || OUT.stopped;
   return `<b>${d.run}</b> · <span style="color:${o.c}">${o.n}</span><br>开始 ${d.t}（${S.tz}）<br>接手帧 ${d.k}，结束帧 ${d.end_frame}` +
-    (d.sr ? `<br>SR ${(d.sr / 1000).toFixed(3)} s` : "") + `<br>掉落 ${d.deaths.length} 次 · ${d.backend}`;
+    (d.sr ? `<br>SR ${(d.sr / 1000).toFixed(3)} s` : "") + `<br>死亡 ${d.deaths.length} 次 · ${d.backend}`;
 }
 
 function plasma(t) {
@@ -429,8 +475,8 @@ function trajSeries(trs, colorOf, groupOf, groups) {
   }
   series.push({ type: "scatter", name: "接手点", coordinateSystem: "geo", z: 6, symbolSize: 6, itemStyle: { color: "#fff1c4", borderColor: "#000", borderWidth: 0.6 },
     data: trs.map((d) => ({ value: d.start, d })), tooltip: { formatter: (p) => `接手点：第 ${p.data.d.k} 帧<br>` + trajTooltip(p.data.d) } });
-  series.push({ type: "scatter", name: "掉落", coordinateSystem: "geo", z: 7, symbol: "path://M0,0L10,10M10,0L0,10", symbolSize: 8, itemStyle: { color: "#ff6b5e", borderColor: "#ff6b5e", borderWidth: 2 },
-    data: trs.flatMap((d) => d.deaths.map((x) => ({ value: [x[0], x[1]], frame: x[2], d }))), tooltip: { formatter: (p) => `掉落：第 ${p.data.frame} 帧<br>` + trajTooltip(p.data.d) } });
+  series.push({ type: "scatter", name: "死亡", coordinateSystem: "geo", z: 7, symbol: "path://M0,0L10,10M10,0L0,10", symbolSize: 8, itemStyle: { color: "#ff6b5e", borderColor: "#ff6b5e", borderWidth: 2 },
+    data: trs.flatMap((d) => d.deaths.map((x) => ({ value: [x[0], x[1]], frame: x[2], d }))), tooltip: { formatter: (p) => `死亡：第 ${p.data.frame} 帧<br>` + trajTooltip(p.data.d) } });
   return series;
 }
 
@@ -547,7 +593,7 @@ async function renderCurves(force, full) {
       const pts = d.steps.map((s, j) => [s, d[k][j], d.update[j]]).filter((p) => p[1] != null && p[0] > 0);
       series.push({ type: "line", name: r, xAxisIndex: i, yAxisIndex: i, data: pts, showSymbol: false, sampling: "lttb", step: k === "frontier" ? "end" : undefined, lineStyle: { width: 1.6 }, color: runColor(r), emphasis: { disabled: true },
         markLine: i === 0 && r === runs[0] && F ? { symbol: "none", silent: true, lineStyle: { color: "rgba(255,255,255,.35)", type: "dashed" }, label: { color: MUTED, fontSize: 10, position: "insideStartTop" },
-          data: [...F.checkpoints.map((c) => ({ yAxis: c[2], name: c[3], label: { formatter: c[3] } })), { yAxis: F.start[2], label: { formatter: "起点" } }] } :
+          data: [...F.checkpoints.map((c) => ({ yAxis: c[2], name: c[3], label: { formatter: c[3] } })), { yAxis: F.start[2], label: { formatter: "出生点" } }] } :
           i === 1 && r === runs[0] ? { symbol: "none", silent: true, lineStyle: { color: "#ff7a66", type: "dotted" }, label: { formatter: "推进阈值 0.6", color: "#ff7a66", fontSize: 10, position: "insideStartTop" }, data: [{ yAxis: 0.6 }] } : undefined });
       if (k === "finish" && d.band_finish) {
         const pb = d.steps.map((s, j) => [s, d.band_finish[j], d.update[j]]).filter((p) => p[1] != null && p[0] > 0);
@@ -593,7 +639,7 @@ function zoomCurves(mode) {
 /* ------------------------------------------------------------------------------------ render */
 const hasCharts = typeof window.echarts !== "undefined";
 async function render() {
-  for (const f of [renderHeader, renderReport, renderStatus]) { try { f(); } catch (e) { console.error(e); } }
+  for (const f of [renderHeader, renderReport, renderHighlight, renderStatus]) { try { f(); } catch (e) { console.error(e); } }
   if (!hasCharts) {
     document.querySelectorAll(".map, .chart").forEach((el) => { el.style.height = "auto"; el.innerHTML = '<p class="note" style="padding:12px">图表库没能加载（需要能访问 cdn.jsdelivr.net），只显示文字与表格。</p>'; });
   }

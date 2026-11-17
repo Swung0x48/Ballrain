@@ -16,7 +16,7 @@
   <header class="top">
     <div class="brand">
       <span class="gt title" data-text="BALLRAIN" data-h="38">BALLRAIN</span>
-      <div class="sub">第 1 关 · 速通（SR）训练进度 · 里程碑 <span id="milestone">M2</span></div>
+      <div class="sub">第 1 关 · SR 竞速训练进度 · 里程碑 <span id="milestone">M2</span></div>
     </div>
     <nav class="menu" id="runs" aria-label="选择 run"></nav>
     <div class="menu tools">
@@ -30,6 +30,17 @@
   <section class="sec" id="s-report" hidden>
     <h2 class="plank">最新进展<span class="rat" id="r-at"></span></h2>
     <div class="panel" id="report"></div>
+  </section>
+
+  <section class="sec" id="s-hl" hidden>
+    <h2 class="plank">精彩回放<span class="rat" id="hl-at"></span></h2>
+    <div class="panel">
+      <div class="hlbox">
+        <div class="maptools" id="hl-tools" hidden>叠加信息：<button type="button" class="tbtn" data-ov="1">开</button><button type="button" class="tbtn" data-ov="0">关</button></div>
+        <video id="hl-video" controls muted playsinline loop preload="metadata"></video>
+        <p class="hlcap" id="hl-cap"></p>
+      </div>
+    </div>
   </section>
 
   <section class="sec" id="s-status">
@@ -58,7 +69,7 @@
     <div class="panel">
       <div class="maptools" id="t-frontier"></div>
       <div class="map" id="m-frontier"></div>
-      <p class="note">课程从关卡末尾往前推：智能体从 TAS 轨迹的“开局点”帧接手。点越靠近起点，智能体自己跑完的部分越长。悬停查看帧号与时间，点击图例开关图层，滚轮 / 双指缩放、拖动平移。</p>
+      <p class="note">课程从关卡末尾往前推：智能体从 TAS 轨迹的“开局点”帧接手。点越靠近出生点，智能体自己跑完的部分越长。悬停查看帧号与时间，点击图例开关图层，滚轮 / 双指缩放、拖动平移。</p>
     </div>
   </section>
 

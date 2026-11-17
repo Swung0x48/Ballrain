@@ -20,6 +20,7 @@ import argparse  # noqa: E402
 import datetime as dt  # noqa: E402
 import gzip  # noqa: E402
 import json  # noqa: E402
+import math  # noqa: E402
 import re  # noqa: E402
 import sys  # noqa: E402
 import threading  # noqa: E402
@@ -45,14 +46,156 @@ ATTEMPTS_N = 80
 HISTORY_N = 150
 CTYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
           ".css": "text/css; charset=utf-8", ".json": "application/json; charset=utf-8",
-          ".png": "image/png", ".jpg": "image/jpeg"}
+          ".png": "image/png", ".jpg": "image/jpeg", ".mp4": "video/mp4"}
+MEDIA = OUT / "media"  # written by tools/dashboard/highlight.py
+# the only names /media/ serves: one set per recording, versioned (highlight[-overlay]-<v>.mp4, named in highlight.json)
+# or the fixed names of the first version
+MEDIA_NAME_RE = re.compile(r"^highlight(?:-overlay)?(?:-\d{9,12})?\.mp4$")
+LEGACY_NAMES = ("highlight.mp4", "highlight-overlay.mp4")
+MEDIA_MAX = 64 << 20
+MEDIA_CACHE_N = 4  # two sets: the current one and the one before (viewers still playing it)
+
+
+def _media_json() -> dict:
+    try:
+        j = json.loads((MEDIA / "highlight.json").read_text(encoding="utf-8"))
+        return j if isinstance(j, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def media_allowed(name: str) -> bool:
+    """A versioned name, or a fixed name of the first version only while highlight.json is still a first-version json
+    (no "video" key): once the job has published a versioned set, the old fixed names are never served again."""
+    if not MEDIA_NAME_RE.match(name):
+        return False
+    if name in LEGACY_NAMES:
+        return "video" not in _media_json()
+    return True
+
+
+class MediaCache:
+    """The highlight videos, held in memory per (size, mtime): requests never keep the file open (on Windows an
+    open file blocks the job's os.replace), and Range requests are cut from the cached bytes. Holds at most
+    MEDIA_CACHE_N files; an entry whose file is gone or changed is dropped."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.files: dict = {}  # name -> (sig, bytes), oldest first
+
+    def _prune(self):
+        for n in list(self.files):
+            try:
+                st = (MEDIA / n).stat()
+                ok = (st.st_size, st.st_mtime_ns) == self.files[n][0]
+            except OSError:
+                ok = False
+            if not ok:
+                del self.files[n]
+        while len(self.files) > MEDIA_CACHE_N:
+            del self.files[next(iter(self.files))]
+
+    def get(self, name: str) -> bytes | None:
+        if not media_allowed(name):
+            return None
+        p = MEDIA / name
+        try:
+            st = p.stat()
+        except OSError:
+            with self.lock:
+                self.files.pop(name, None)
+            return None
+        sig = (st.st_size, st.st_mtime_ns)
+        with self.lock:
+            hit = self.files.get(name)
+            if hit and hit[0] == sig:
+                self.files[name] = self.files.pop(name)  # most recently used last
+                return hit[1]
+        if st.st_size > MEDIA_MAX:
+            return None
+        try:
+            body = p.read_bytes()
+        except OSError:
+            return None
+        with self.lock:
+            self.files.pop(name, None)
+            self.files[name] = (sig, body)
+            self._prune()
+        return body
+
+
+RANGE_RE = re.compile(r"^bytes=(\d{0,15})-(\d{0,15})$")  # 15 digits: far beyond any file, far below int() limits
+
+
+def parse_range(header: str | None, size: int):
+    """RFC 9110 14.2 for one byte range: None = serve the whole file (no Range, an unknown unit, a multi-range or an
+    invalid range spec are ignored); (a, b) inclusive; "bad" = 416, only for a valid but unsatisfiable range."""
+    if not header:
+        return None
+    m = RANGE_RE.match(header.strip())
+    if not m or (not m.group(1) and not m.group(2)):
+        return None
+    a, b = m.group(1), m.group(2)
+    if a == "":  # suffix: the last n bytes
+        n = int(b)
+        if n == 0 or size == 0:
+            return "bad"
+        return (max(0, size - n), size - 1)
+    a = int(a)
+    if b and int(b) < a:
+        return None  # invalid spec: ignored
+    if a >= size:
+        return "bad"
+    b = int(b) if b else size - 1
+    return (a, min(b, size - 1))
+
+
+def highlight_public() -> dict | None:
+    """highlight.json re-checked field by field (only these fields, plain values, no local details)."""
+    j = _media_json()
+    if not j:
+        return None
+
+    def media(k, legacy):
+        v = j.get(k)
+        if v is None and "video" not in j and isinstance(j.get("files"), dict) and legacy in j["files"]:
+            v = legacy  # a json of the first version: fixed names, listed in "files"
+        return v if isinstance(v, str) and media_allowed(v) and (MEDIA / v).is_file() else None
+
+    video, overlay = media("video", "highlight.mp4"), media("overlay", "highlight-overlay.mp4")
+    if video is None:
+        return None
+
+    def s(k, n=40):
+        v = j.get(k)
+        return str(v)[:n] if isinstance(v, str) else None
+
+    def i(k):
+        v = j.get(k)
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+    out = {"run": s("run", 8), "update": i("update"), "episode_at": s("episode_at", 16), "recorded_at": s("recorded_at", 16),
+           "tz": s("tz", 10), "sr_ms": i("sr_ms"), "k": i("k"), "tas_ms": i("tas_ms"), "backend": s("backend", 16),
+           "matched": j.get("matched") is True,
+           "duration_s": j.get("duration_s") if isinstance(j.get("duration_s"), (int, float)) else None,
+           "v": i("v"),
+           # file names of this recording's set, as its json lists them (never a leftover file)
+           "video": video, "overlay": overlay}
+    if out["run"] is None or not re.fullmatch(r"r\d+", out["run"]) or out["sr_ms"] is None or out["k"] is None:
+        return None
+    if R.check(json.dumps(out, ensure_ascii=False)):
+        return None
+    return out
 
 
 def lower_priority():
     try:
         if sys.platform == "win32":
             import ctypes
-            k32 = ctypes.windll.kernel32
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32")
+            k32.GetCurrentProcess.restype = wintypes.HANDLE  # the default int truncates the pseudo-handle (call failed)
+            k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
             k32.SetPriorityClass(k32.GetCurrentProcess(), 0x4000)  # BELOW_NORMAL_PRIORITY_CLASS
         else:
             os.nice(10)
@@ -241,16 +384,19 @@ class Dashboard:
                "tensorboard_url": self.tensorboard_url, "data": summ.get("data") or {},
                "sr": summ.get("sr") or {}, "k0": summ.get("k0") or [],
                "traced_counts": summ.get("traced_counts") or {}, "assets": self.assets,
-               "reports": R.public(R.load())}
+               "reports": R.public(R.load()), "highlight": highlight_public()}
         self._status = (time.time(), res)
         return res
 
 
 DATA_RE = re.compile(r"^/api/data/([a-z0-9_]+)\.json$")
 FILE_RE = re.compile(r"^/(static|assets)/([a-z0-9_]+\.(?:js|css|png|jpg|json))$")
+MEDIA_RE = re.compile(r"^/media/(highlight(?:-overlay)?(?:-\d{9,12})?\.mp4)$")
 
 
-def make_handler(dash: Dashboard):
+def make_handler(dash: Dashboard, media: MediaCache | None = None):
+    media = media or MediaCache()
+
     class H(BaseHTTPRequestHandler):
         server_version = "Dashboard"
         sys_version = ""
@@ -272,8 +418,42 @@ def make_handler(dash: Dashboard):
         def _json(self, obj, code=200):
             self._send(code, json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8"), CTYPES[".json"])
 
+        def _media(self, name: str, head: bool = False):
+            body = media.get(name)
+            if body is None:
+                return self._send(404, "未找到".encode("utf-8"), "text/plain; charset=utf-8")
+            size = len(body)
+            rng = parse_range(self.headers.get("Range"), size)
+            cache = "public, max-age=86400" if "v=" in (urlparse(self.path).query or "") else "no-cache"
+            if rng == "bad":
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            a, b = rng if rng else (0, size - 1)
+            self.send_response(206 if rng else 200)
+            self.send_header("Content-Type", CTYPES[".mp4"])
+            self.send_header("Accept-Ranges", "bytes")
+            if rng:
+                self.send_header("Content-Range", f"bytes {a}-{b}/{size}")
+            self.send_header("Content-Length", str(b - a + 1))
+            self.send_header("Cache-Control", cache)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            if not head:
+                try:
+                    mv = memoryview(body)
+                    for o in range(a, b + 1, 1 << 18):
+                        self.wfile.write(mv[o:min(b + 1, o + (1 << 18))])
+                except (ConnectionError, OSError):
+                    pass  # the browser dropped the request (seeking)
+
         def do_GET(self):
             u = urlparse(self.path)
+            m = MEDIA_RE.match(u.path)
+            if m:
+                return self._media(m.group(1))
             if u.path in ("/", "/index.html"):
                 html = (STATIC / "index.html").read_text(encoding="utf-8")
                 for f in ("app.js", "style.css"):  # cache-busting: bump on every change of the file
@@ -305,6 +485,9 @@ def make_handler(dash: Dashboard):
             self._send(404, "未找到".encode("utf-8"), "text/plain; charset=utf-8")
 
         def do_HEAD(self):
+            m = MEDIA_RE.match(urlparse(self.path).path)
+            if m:
+                return self._media(m.group(1), head=True)
             self._send(405, b"", "text/plain")
 
         def do_POST(self):

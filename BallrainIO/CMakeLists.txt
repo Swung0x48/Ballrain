@@ -23,6 +23,7 @@ add_library(BallrainIO SHARED
         src/Hook.h
         src/TASHook.h
         src/Agent.cpp
+        src/Capture.cpp
         src/Ivp2002.h
         src/Wire.h
 )

@@ -11,6 +11,8 @@ dependencies = [
     "numpy>=2.2.6",
     "torch>=2.14.1",
     "tensorboard>=2.21.0",
+    "imageio-ffmpeg>=0.8.1",
+    "pillow>=12.3.0",
 ]
 
 [dependency-groups]

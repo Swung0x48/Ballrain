@@ -30,7 +30,7 @@ public:
     explicit BallrainIO(IBML *bml) : IMod(bml) {}
 
     const char *GetID() override { return "BallrainIO"; }
-    const char *GetVersion() override { return "0.3.2"; }
+    const char *GetVersion() override { return "0.3.3"; }
     const char *GetName() override { return "BallrainIO"; }
     const char *GetAuthor() override { return "Swung0x48"; }
     const char *GetDescription() override { return "Ballrain episode I/O (legacy TAS replay, agent mode)."; }
@@ -164,6 +164,32 @@ private:
     CKKEYBOARD m_KeyRight = CKKEY_RIGHT;
     CKKEYBOARD m_KeyShift = CKKEY_LSHIFT;
     CKKEYBOARD m_KeySpace = CKKEY_SPACE;
+
+    // Video capture (Capture.cpp; BALLRAIN_CAPTURE, inert without it). Output only: reads the back buffer
+    // after the frame is drawn, never touches game objects, input or timing.
+    void CaptureInit();
+    bool CaptureRegister();
+    bool CaptureTailStart();
+    bool CaptureTailTime();
+    bool CaptureTailInput();
+    uint32_t m_CaptureTail = 0;              // BALLRAIN_CAPTURE_TAIL: idle frames after the run's final observation
+    uint32_t m_CaptureTailLeft = 0;
+    bool m_CaptureTailActive = false;
+    void CaptureProcess();
+    void CaptureClose();
+    static void CaptureRenderCallback(CKRenderContext *rc, void *self);
+    void CaptureFrame(CKRenderContext *rc);
+    std::string m_CapturePath;
+    void *m_CaptureFile = nullptr;           // HANDLE (file or named pipe)
+    CKRenderContext *m_CaptureRc = nullptr;  // where the render callback is registered
+    double m_CaptureFps = 60.0;
+    double m_CaptureTime = 0.0;              // game time (ms) since the run's first frame (sum of the frame deltas)
+    long long m_CaptureNext = 0;             // index of the next video frame (due at m_CaptureNext * 1000 / fps ms)
+    uint32_t m_CaptureRepeat = 0;            // video frames the frame being rendered now stands for (0 = skip it)
+    size_t m_CaptureLastIndex = 0;           // m_FrameIndex at the previous OnProcess
+    uint32_t m_CaptureFrames = 0, m_CaptureWritten = 0, m_CaptureFailed = 0;
+    bool m_CaptureStarted = false, m_CaptureDone = false;
+    std::vector<uint8_t> m_CaptureBuf;
 
     // Physics DLL identity: 0 = not checked yet, 1 = the 2002 physics_RT.dll, -1 = refused.
     int m_PhysicsOk = 0;

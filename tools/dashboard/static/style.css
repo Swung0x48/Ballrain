@@ -125,6 +125,12 @@ th:first-child, td:first-child { text-align: left; }
 th { color: var(--amber); font-weight: 700; background: rgba(106, 69, 33, .45); }
 tr.dim td { color: #8a8574; }
 .note { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
+.hlbox { width: 100%; max-width: min(1366px, calc((100vh - 120px) * 1366 / 768)); margin: 0 auto; }
+.hlbox video { display: block; width: 100%; aspect-ratio: var(--hl-ar, 1366 / 768); background: #000; border: 1px solid var(--brass-lo);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .55); }
+.hlbox .maptools { justify-content: flex-start; }
+.hlcap { color: var(--ink); font-size: 13.5px; margin: 8px 0 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.hlcap b { color: var(--amber); }
 .foot { color: var(--muted); font-size: 12px; margin-top: 26px; border-top: 1px solid rgba(184, 137, 58, .3); padding-top: 8px; }
 @media (max-width: 560px) {
   body { font-size: 14px; }

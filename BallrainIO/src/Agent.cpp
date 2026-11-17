@@ -822,6 +822,8 @@ void BallrainIO::AgentFinish(uint32_t endReason) {
     m_Phase = Phase::Ended;
     GetLogger()->Info("agent: run ended (reason %u) after %u exported frames, SR %.3f ms", endReason,
                       (unsigned) m_FrameLog.size(), m_Sr);
+    if (endReason == END_FINISH && CaptureTailStart())
+        return;   // capture only: idle frames for the video after the final observation, then the exit (Capture.cpp)
     if (m_ExitWhenDone || endReason == END_TIMEOUT || endReason == END_ERROR)
         m_BML->ExitGame();
 }

@@ -72,6 +72,9 @@ BALLRAIN_VARS = (
     "BALLRAIN_POST_FINISH",  # diagnostic: idle frames after the SR tail (BallrainIO >= 0.3.1)
     "BALLRAIN_POST_LOG",  # diagnostic: per-frame text log from LevelFinish to the end of the run
     "BALLRAIN_KEEP_FOCUS",  # "1": the mod does not hand the foreground back (BallrainIO >= 0.3.2; set by the launch)
+    "BALLRAIN_CAPTURE",  # video capture of the game's own picture to this pipe / file (BallrainIO >= 0.3.3)
+    "BALLRAIN_CAPTURE_FPS",
+    "BALLRAIN_CAPTURE_TAIL",  # idle frames after a finished run's final observation, captured (the video's ending)
 )
 BMMO_VARS = ("BMMO_TAS_TRACE", "BMMO_TAS_OFFSETS", "BMMO_TAS_CORE", "BMMO_TAS_PC")
 MANAGED_VARS = BALLRAIN_VARS + BMMO_VARS

@@ -43,7 +43,7 @@ DEFAULT_MAC_OFFSET_H = 12.0  # Mac log clock minus PC clock, used when it cannot
 MAX_TRAJ_POINTS = 2000
 MIN_STEP = 1.0  # world units between kept trajectory points
 
-BACKEND_LABEL = {"headless": "无头 x87-soft", "retail": "原版 2002"}
+BACKEND_LABEL = {"headless": "无头 x87-soft", "retail": "原版 2002", "headless2002": "无头 2002"}
 
 LOG_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)$")
 UPD_RE = re.compile(r"u(\d+) steps (\d+) sps (\d+) frontier (\d+) band ([\d.]+)/(\d+).*? ent ([\d.]+) kl ([\d.]+)")
@@ -279,12 +279,15 @@ def run_status(run: Run, off_h: float, level_n: int, machines: dict) -> dict:
             st["band_success_avg20"] = _num(tail["band_success"].mean())
         if st.get("frontier") is not None:
             st["covered_pct"] = round(100 * (level_n - st["frontier"]) / (level_n - 936), 1)
-    e = read_many(run.files("episodes*.csv"), usecols=["update", "backend"], dedup=None)
+    e = read_many(run.files("episodes*.csv"), usecols=["update", "backend", "steps"], dedup=None)
     if e is not None and len(e) and "backend" in e:
         e = e[e["update"] >= e["update"].max() - 100]
-        vc = e["backend"].value_counts()
-        tot = int(vc.sum())
-        st["backend_share"] = {BACKEND_LABEL.get(str(k), "其他"): round(100 * int(v) / tot, 1) for k, v in vc.items()}
+        # share of training steps (what the learner consumes), not of episodes: retail episodes are much shorter
+        vc = e.groupby("backend")["steps"].sum() if "steps" in e else e["backend"].value_counts()
+        vc = vc.sort_values(ascending=False)
+        tot = float(vc.sum())
+        if tot > 0:
+            st["backend_share"] = {BACKEND_LABEL.get(str(k), "其他"): round(100 * float(v) / tot, 1) for k, v in vc.items()}
     age = st.get("last_log_age_min")
     if (run.path / "STOP").exists() or (age is not None and age > 120):
         st["state"] = "已结束"
@@ -305,7 +308,7 @@ def curriculum_text(msg: str) -> str:
         return f"开局点 {old} → {new}（手动设定）"
     out = f"开局点推进到第 {new} 帧"
     if sector:
-        out += f"（第 {sector} 段）"
+        out += f"（第 {sector} 小节）"
     if rate:
         out += f"，此前区间成功率 {float(rate):.0%}"
     return out
@@ -336,9 +339,9 @@ def frontier_payload(L, runs, off_h, cur_run, cur, show_alt: bool) -> dict:
         "tas": [xz(i) for i in tas] + [xz(n - 1)],
         "tas_pts": [xz(i) + [int(i)] for i in ok[::150]],
         "covered": [xz(i) for i in tas if i >= cur] + [xz(n - 1)],
-        "checkpoints": [xz(i) + [int(i), f"检查点 {k + 1}"] for k, i in enumerate(L.checkpoints)],
-        "start": xz(ok[0]) + [int(ok[0]), "起点（拿到控制）"],
-        "end": xz(n - 1) + [int(n - 1), "飞艇（终点）"],
+        "checkpoints": [xz(i) + [int(i), f"盘点 {k + 1}"] for k, i in enumerate(L.checkpoints)],
+        "start": xz(ok[0]) + [int(ok[0]), "出生点"],
+        "end": xz(n - 1) + [int(n - 1), "飞船"],
         "history": [dict(h, x=xz(min(h["frame"], n - 1))[0], z=xz(min(h["frame"], n - 1))[1])
                     for h in frontier_history(runs, off_h)],
         "current": {"run": cur_run, "frame": int(cur), "x": xz(min(cur, n - 1))[0], "z": xz(min(cur, n - 1))[1],
@@ -496,7 +499,7 @@ def k0_evals() -> list[dict]:
             except Exception:
                 continue
             p = (j.get("per_start") or {}).get("0")
-            if not p:
+            if not p or j.get("invalid"):  # invalid: e.g. r5/r6 retail evals without the reference line
                 continue
             rows.append({"run": run, "update": j.get("update"),
                          "backend": BACKEND_LABEL.get(str(j.get("backend")), "其他"),
