@@ -106,12 +106,16 @@ _KEY_OF: dict = {}  # (id(LevelData), version) -> content key
 def level_geometry(tracker: GameTracker, cache_size: int = 4) -> LevelGeometry:
     lvl = tracker.level
     vk = (id(lvl), lvl.version)
-    key = _KEY_OF.get(vk)
-    if key is None:
+    hit = _KEY_OF.get(vk)
+    # the entry holds the object itself: a freed LevelData's id can be reused by a new one with the same version,
+    # and an id-only key would then hand back the old level's content key (and its geometry)
+    if hit is not None and hit[0] is lvl:
+        key = hit[1]
+    else:
         key = lvl.static_key()
-        if len(_KEY_OF) > 64:
+        if len(_KEY_OF) > 16:
             _KEY_OF.clear()
-        _KEY_OF[vk] = key
+        _KEY_OF[vk] = (lvl, key)
     g = _GEOM_CACHE.get(key)
     if g is None:
         g = LevelGeometry(tracker)
