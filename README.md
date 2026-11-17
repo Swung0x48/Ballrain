@@ -77,13 +77,43 @@ Windows 把这第一次调用换成 SW_HIDE，之后窗口模式下它不会再�
   TAS 前缀交接，400 步固定随机动作）可见 / 隐藏 12 次运行的 framelog、trace、.tas、观测完全相同（events.txt 只差 Summary 的 wall_ms）；
   真 TASSupport 回放 SR06、SR01、HS03 与 `ref_trace.txt` 相同；`Bin/Player.ini` 不被改写。启动时间和 steps/s 与可见窗口相同（在噪声内）；
   去掉 splash 启动约快 0.5–0.8 s。
-- 限制（抢焦点没有解决）：Player.exe 显示主窗口后立刻 `SetFocus`（在 mod 的 OnLoad 之前约 0.2 s），所以 Windows 允许新进程拿前台时
-  （例如前台本来就是另一个 Player，或此刻没有前台窗口），隐藏的主窗口在启动后约 1–2 s 照样成为前台窗口，键盘输入进了一个看不见的窗口，
-  直到用户点别的窗口或下一个 Player 启动再抢走。隐藏后只少了两件事：运行期间不会被再次激活（可见窗口会被反复激活），
-  以及（关掉 splash 时）每次启动的抢前台从两三次变成一两次。只能在 mod 里补救（OnLoad 时把前台交还），而且管不到 `ref`。
+- 抢焦点（BallrainIO 0.3.2 交还前台；2026-11-16 舰队仍是 0.3.1，等推送）：Player.exe 显示主窗口后立刻 `SetFocus`，这时 mod 还没加载
+  （约 0.2 s 后才 OnLoad），Windows 照样让新进程拿到前台（前台是用户窗口时也一样），隐藏窗口成了前台窗口，键盘输入进了看不见的窗口；
+  0.3.1 下要一直占到进程退出（每次启动约 4 s）。0.3.2 在 OnLoad 和之后每 0.1 s（OnProcess，任何模式）检查：前台窗口属于本进程**且不可见**时，
+  把前台交给 z 序最上面的、用户可能在用的窗口（可见、未最小化、未 cloak、不是 tool / no-activate / 穿透窗口、不是被拥有的窗口、别的进程），
+  记一行 `focus (OnLoad): foreground handed to pid ...` 到 ModLoader.log。只调窗口管理 API，不碰游戏对象、输入和时间。
+  占有前台的进程可以随时交出前台，所以交还总能成功；之后游戏自己的再次激活拿不到前台（只多一个不改变前台的 EVENT_SYSTEM_FOREGROUND 事件，
+  2 ms 轮询 `GetForegroundWindow` 看不到 Player）。可见的游戏窗口（手动启动、`BALLRAIN_VISIBLE=1`、`explorer_cmd`）从不交还。
+  - 实测（2026-11-16，3 个拷贝循环重启 SR06 回放 60 s，每 5 ms 轮询 `GetForegroundWindow`）：Player 占前台的时间从 71.3%（每次中位 4.08 s）
+    降到 7.4–9.2%（每次中位 0.19 s，最长 0.35 s），每拷贝 10–11 次运行（基线 11）；交还目标都是此前的前台窗口。
+    剩下的约 0.2 s/次是 SetFocus 到 mod 加载之间，mod 管不到：按舰队每 300 s 约 243 次启动算，仍约 15%，没有到 0。
+    按事件计时的 `fg_watch` 会把上面那个假事件算成 Player 占前台直到下一个事件，新 mod 下读数虚高（约 89%），要用轮询测。
+  - 不交还：`BALLRAIN_FOCUS=1`（启动器变量，不传给游戏）或 `launch_direct(..., keep_focus=True)`；启动器随即给游戏设 `BALLRAIN_KEEP_FOCUS=1`
+    （可见窗口也设）。
+  - 管不到：`ref`（没有 BallrainIO，每次回放仍占前台到退出）。启动器侧试过，不行：启动器 `SetForegroundWindow` 交还几乎总被拒
+    （210 次里 208 次失败，占比反而升到 80%），启动器在启动前调 `LockSetForegroundWindow(LSFW_LOCK)`（返回 1）后 Player 照样在 0.9 s 后拿到前台。
+    再往下压只能让代码在主窗口出现之前运行（例如额外的 BuildingBlocks 插件 DLL 装线程 CBT 钩子，挡住 HCBT_ACTIVATE），超出 mod 的范围，没做；
+    由游戏进程在交还前调 `LockSetForegroundWindow` 没测过，而且会锁住整个桌面的前台切换直到用户按 Alt 或点击，不推荐。
   错误对话框（MessageBox）同样看不见，进程会挂到超时，这时用 `BALLRAIN_VISIBLE=1` 重跑看。
   另一个桌面（`CreateDesktop` + `lpDesktop`）能把一切藏起来，但不可用：不在输入桌面上时 D3D 报告 HAL 设备不可用（`D3DERR_NOTAVAILABLE`），
   Player.exe 以 "No render driver found" 退出。
+
+## 游戏声音（默认静音）
+
+`instances.launch_direct` 启动后把这个 PID 的 Windows 音频会话静音（`ballrain/audio.py`，ctypes 直接调 Core Audio：枚举所有输出设备的
+`IAudioSessionManager2` 会话，按 `IAudioSessionControl2::GetProcessId` 匹配自己启动的 PID，`ISimpleAudioVolume::SetMute(TRUE)`）。
+会话要等游戏打开音频设备才出现（启动后约 0.8 s），所以后台线程每 0.1 s 查一次，直到找到会话，之后每 2 s 再查一次直到进程退出（会话重建也会被再静音）。
+只动自己启动、映像路径核对过是 `<copy>/Bin/Player.exe` 的进程；不改系统设置、设备音量或别的程序。游戏本身完全不变（只在音频引擎里静音），`ref` 也适用。
+
+- 打开声音：`BALLRAIN_AUDIO=1`（启动器变量，worker 继承，不传给游戏）或 `launch_direct(..., audio_on=True)`。
+- Windows 按可执行文件路径记住静音：某个拷贝的 Player.exe 被静音过一次，以后从同一路径启动的进程一开始就是静音的（不经过本模块也一样），
+  所以 `BALLRAIN_AUDIO=1` 会主动取消静音，而不是不管。要手动恢复：Windows 音量合成器里取消静音，或用 `BALLRAIN_AUDIO=1` 跑一次。
+- 验证（2026-11-16，`test-nowin` / `test-nowin-ref`）：静音在会话出现后 0.06–0.4 s 内生效（此前会话处于 inactive，峰值 0）。
+  会话自己的峰值表在静音之前测量，静音时照样跳动（约 1.5）；输出设备的峰值表（混音之后）在静音运行中始终为 0，不静音时为 1.0。
+  BallrainIO 回放 SR06 / SR01 / HS03 的 trace、framelog 与 `runtime/m0-results-r2/G1/<record>/bio/` 逐字节相同，真 TASSupport 回放 SR06 与 `ref_trace.txt` 相同。
+- 游戏自己的音量选项（`Database.tdb` 的 `DB_Options.Volume`，原值 1.0）不起作用：设成 0 后（只改这 4 个字节，trace 照样相同）
+  BallrainIO 和 TASSupport 回放的声音和原来一样响，所以拷贝里保持原值。工具留着：`instances.tdb_volume` / `set_tdb_volume`，
+  `scripts/make_copies.py --volume V [--also ref]`；`verify_copy_matches` 现在也比较 `.tdb` 的 sha256。
 
 ## 使用
 

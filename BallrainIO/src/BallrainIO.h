@@ -30,7 +30,7 @@ public:
     explicit BallrainIO(IBML *bml) : IMod(bml) {}
 
     const char *GetID() override { return "BallrainIO"; }
-    const char *GetVersion() override { return "0.3.1"; }
+    const char *GetVersion() override { return "0.3.2"; }
     const char *GetName() override { return "BallrainIO"; }
     const char *GetAuthor() override { return "Swung0x48"; }
     const char *GetDescription() override { return "Ballrain episode I/O (legacy TAS replay, agent mode)."; }
@@ -90,6 +90,7 @@ private:
 
     bool ReadEnvironment();
     bool VerifyPhysicsDll(bool mustBeLoaded = true);
+    void ReturnForeground(const char *where);   // hand the foreground back if this process holds it
     void ScheduleAutoLoad();
 
     void Start();
@@ -178,6 +179,8 @@ private:
     int m_LoadIndex = 0;              // number of level loads started (1-based index of the current run)
     bool m_AutoLoadArmed = true;      // the next PostStartMenu schedules the autoload
     bool m_SendExitLevel = false;     // OnProcess sends "Exit Level" (LOADS > 1)
+    bool m_KeepFocus = false;         // BALLRAIN_KEEP_FOCUS=1: never hand the foreground back
+    unsigned long long m_FocusCheckMs = 0;   // GetTickCount64 of the last foreground check in OnProcess
     bool m_ReloadWaiting = false;
     std::chrono::steady_clock::time_point m_ReloadDeadline;
     std::chrono::steady_clock::time_point m_StartTime;

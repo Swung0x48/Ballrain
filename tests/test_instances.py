@@ -259,7 +259,8 @@ def test_run_copy_timeout_kills_only_own_pid(fake):
 
 @win
 def test_direct_recipe_starts_in_bin(fake, monkeypatch):
-    # launch_direct itself, on the fake exe (cmd.exe copy exits at once on empty stdin)
+    # launch_direct itself, on the fake exe (cmd.exe copy exits at once on empty stdin); the audio watcher runs
+    # for real (the fake exe opens no audio session, so nothing is changed)
     pid = ins.launch_direct(fake, {"BALLRAIN_MODE": "replay"})
     with ins.ProcessHandle(pid, fake.exe) as h:
         assert h.wait(10)
@@ -285,20 +286,126 @@ def test_direct_recipe_hides_windows_by_default(fake, monkeypatch):
             seen.append(kw)
             self.pid = 4242
 
+    watched = []
     monkeypatch.setattr(ins.subprocess, "Popen", FakePopen)
-    monkeypatch.delenv(ins.VISIBLE_VAR, raising=False)
+    monkeypatch.setattr(ins.audio, "watch", lambda proc, exe, muted: watched.append((proc.pid, exe, muted)))
+    for v in (ins.VISIBLE_VAR, ins.AUDIO_VAR, ins.FOCUS_VAR):
+        monkeypatch.delenv(v, raising=False)
     try:
         ins.launch_direct(fake, {})
         si = seen[-1]["startupinfo"]
         assert si.dwFlags & ins.subprocess.STARTF_USESHOWWINDOW and si.wShowWindow == ins.SW_HIDE
         assert seen[-1]["cwd"] == str(fake.bin_dir)
+        assert "BALLRAIN_KEEP_FOCUS" not in seen[-1]["env"]  # hidden: the mod hands the foreground back
         ins.launch_direct(fake, {}, visible=True)
         assert seen[-1]["startupinfo"] is None
+        assert seen[-1]["env"]["BALLRAIN_KEEP_FOCUS"] == "1"  # visible: the user may click into it
         monkeypatch.setenv(ins.VISIBLE_VAR, "1")
         ins.launch_direct(fake, {})
         assert seen[-1]["startupinfo"] is None
     finally:
         ins._LAUNCHED.pop(4242, None)
+    assert watched == [(4242, fake.exe, True)] * 3  # muted by default
+
+
+@win
+def test_direct_recipe_audio_and_focus_switches(fake, monkeypatch):
+    seen, watched = [], []
+
+    class FakePopen:
+        def __init__(self, args, **kw):
+            seen.append(kw["env"])
+            self.pid = 4243
+
+    monkeypatch.setattr(ins.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(ins.audio, "watch", lambda proc, exe, muted: watched.append(muted))
+    for v in (ins.VISIBLE_VAR, ins.AUDIO_VAR, ins.FOCUS_VAR):
+        monkeypatch.delenv(v, raising=False)
+    try:
+        ins.launch_direct(fake, {}, audio_on=True)
+        monkeypatch.setenv(ins.AUDIO_VAR, "1")
+        ins.launch_direct(fake, {})
+        ins.launch_direct(fake, {}, audio_on=False)
+        assert watched == [False, False, True]  # opt-out actively unmutes (Windows keeps a mute per exe path)
+        ins.launch_direct(fake, {}, keep_focus=True)
+        assert seen[-1]["BALLRAIN_KEEP_FOCUS"] == "1"
+        monkeypatch.setenv(ins.FOCUS_VAR, "1")
+        ins.launch_direct(fake, {})
+        assert seen[-1]["BALLRAIN_KEEP_FOCUS"] == "1"
+        ins.launch_direct(fake, {}, keep_focus=False)
+        assert "BALLRAIN_KEEP_FOCUS" not in seen[-1]
+        for k in ins.LAUNCHER_VARS:  # launcher-only switches never reach the game
+            assert all(k not in e for e in seen)
+    finally:
+        ins._LAUNCHED.pop(4243, None)
+
+
+def test_game_keeps_focus(monkeypatch):
+    monkeypatch.delenv(ins.FOCUS_VAR, raising=False)
+    assert ins.game_keeps_focus() is False and ins.game_keeps_focus(visible=True) is True
+    assert ins.game_keeps_focus(False, visible=True) is False and ins.game_keeps_focus(True) is True
+    monkeypatch.setenv(ins.FOCUS_VAR, "1")
+    assert ins.game_keeps_focus() is True and ins.game_keeps_focus(False) is False
+    monkeypatch.setenv(ins.FOCUS_VAR, "0")
+    assert ins.game_keeps_focus() is False
+    assert "BALLRAIN_KEEP_FOCUS" in ins.MANAGED_VARS
+
+
+def _tdb_array(name: str, cols, rows) -> bytes:
+    """One decoded Database.tdb array (cells column by column)."""
+    import struct
+    kinds = {"int": 1, "float": 2, "string": 3}
+    pack = {"int": lambda x: struct.pack("<i", x), "float": lambda x: struct.pack("<f", x),
+            "string": lambda x: x.encode() + bytes(1)}
+    body = struct.pack("<IIi", len(cols), len(rows), -1)
+    for cname, kind in cols:
+        body += cname.encode() + bytes(1) + struct.pack("<I", kinds[kind])
+    for c, (_, kind) in enumerate(cols):
+        for r in rows:
+            body += pack[kind](r[c])
+    return name.encode() + bytes(1) + struct.pack("<I", len(body)) + body
+
+
+def _tdb_plain(volume=1.0) -> bytes:
+    hs = _tdb_array("DB_Highscore_Lv01", [("Playername", "string"), ("Points", "int")],
+                    [("Mr. Default", 4000), ("swung", 3900)])
+    opts = _tdb_array("DB_Options", [("Volume", "float"), ("Synch to Screen?", "int"), ("LastPlayer", "string"),
+                                     ("CloudLayer?", "int")], [(volume, 1, "Swung", 0)])
+    return hs + opts
+
+
+def test_tdb_codec_and_volume_edit(fake, monkeypatch):
+    plain = _tdb_plain()
+    data = ins.tdb_encode(plain)
+    assert ins.tdb_decode(data) == plain and data != plain
+    arrays = ins.tdb_arrays(plain)
+    assert list(arrays) == ["DB_Highscore_Lv01", "DB_Options"]
+    assert arrays["DB_Options"]["cols"][0] == ("Volume", "float")
+    new = ins.tdb_with_volume(data, 0.0)
+    assert ins.tdb_decode(new) == _tdb_plain(0.0)
+    assert len(new) == len(data) and sum(a != b for a, b in zip(new, data)) <= 4
+    assert ins.tdb_with_volume(new, 1.0) == data  # back to the exact original bytes
+    with pytest.raises(ValueError):
+        ins.tdb_with_volume(data, 1.5)
+    with pytest.raises(ins.InstanceError):
+        ins.tdb_arrays(plain[:-1])  # truncated: does not parse to the end
+    (fake.root / "Database.tdb").write_bytes(data)
+    assert ins.tdb_volume(fake) == 1.0
+    assert ins.set_tdb_volume(fake, 0.0) == 0.0 and ins.tdb_volume(fake) == 0.0
+    monkeypatch.setattr(ins, "running_in_copy", lambda c: [4242])
+    with pytest.raises(ins.InstanceError, match="running"):
+        ins.set_tdb_volume(fake, 1.0)
+
+
+def test_tdb_of_real_copies():
+    names = [n for n in (ins.REFERENCE_COPY, ins.TRAINING_COPY) if (ins.runtime_dir() / n / "Database.tdb").is_file()]
+    if not names:
+        pytest.skip("no game copies")
+    for n in names:
+        data = (ins.get_copy(n).root / "Database.tdb").read_bytes()
+        assert ins.tdb_encode(ins.tdb_decode(data)) == data
+        assert "DB_Options" in ins.tdb_arrays(ins.tdb_decode(data))
+        assert 0.0 <= ins.tdb_volume(ins.get_copy(n)) <= 1.0
 
 
 def test_set_splash(fake, monkeypatch):

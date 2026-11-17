@@ -14,6 +14,13 @@ the BALLRAIN_RUNTIME environment variable.
 Game windows: the direct recipe starts Player.exe with STARTUPINFO wShowWindow = SW_HIDE, so its main
 window is never shown (no window, no taskbar button). Set BALLRAIN_VISIBLE=1 (inherited by worker
 processes) or pass visible=True to see them again. Traces are unchanged by this (README, "游戏窗口").
+
+Foreground: Player.exe takes the foreground at start-up (before any mod loads); BallrainIO >= 0.3.2 hands it
+straight back unless the launch sets BALLRAIN_KEEP_FOCUS=1, which launch_direct does for visible windows,
+keep_focus=True or BALLRAIN_FOCUS=1 (README, "游戏窗口"). runtime/ref (no BallrainIO) keeps the foreground.
+
+Game sound: launch_direct mutes the Windows audio sessions of the process it started (ballrain.audio,
+per PID, Core Audio ISimpleAudioVolume::SetMute); BALLRAIN_AUDIO=1 or audio_on=True keeps the sound.
 """
 from __future__ import annotations
 
@@ -29,7 +36,7 @@ from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import tas
+from . import audio, tas
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,12 +71,15 @@ BALLRAIN_VARS = (
     "BALLRAIN_SR_TAIL",
     "BALLRAIN_POST_FINISH",  # diagnostic: idle frames after the SR tail (BallrainIO >= 0.3.1)
     "BALLRAIN_POST_LOG",  # diagnostic: per-frame text log from LevelFinish to the end of the run
+    "BALLRAIN_KEEP_FOCUS",  # "1": the mod does not hand the foreground back (BallrainIO >= 0.3.2; set by the launch)
 )
 BMMO_VARS = ("BMMO_TAS_TRACE", "BMMO_TAS_OFFSETS", "BMMO_TAS_CORE", "BMMO_TAS_PC")
 MANAGED_VARS = BALLRAIN_VARS + BMMO_VARS
 # Read by this module only (never passed to the game).
 VISIBLE_VAR = "BALLRAIN_VISIBLE"  # "1": show the game windows (debugging); unset / "0": hidden (default)
-LAUNCHER_VARS = (VISIBLE_VAR,)
+AUDIO_VAR = audio.AUDIO_VAR  # "BALLRAIN_AUDIO" = "1": keep game sound; unset / "0": muted (default)
+FOCUS_VAR = "BALLRAIN_FOCUS"  # "1": let the game keep the foreground; unset / "0": BallrainIO hands it back (default)
+LAUNCHER_VARS = (VISIBLE_VAR, AUDIO_VAR, FOCUS_VAR)
 
 # TASSupport.cfg keys this module may edit, with their cfg type letter.
 TAS_CFG_KEYS = {
@@ -420,6 +430,7 @@ def launch_explorer_cmd(copy: GameCopy, env: dict, start_timeout: float = 30.0) 
     this recipe (BALLRAIN_VISIBLE applies to the direct recipe only).
     """
     script = copy.root / LAUNCH_SCRIPT_NAME
+    env = {**env, "BALLRAIN_KEEP_FOCUS": "1"}  # visible window: the user may want to click into it
     script.write_bytes(launch_script_text(copy, env).encode("mbcs"))
     before = set(running_in_copy(copy))
     try:
@@ -442,6 +453,16 @@ def windows_visible(visible: bool | None = None) -> bool:
     return os.environ.get(VISIBLE_VAR, "").strip() not in ("", "0")
 
 
+def game_keeps_focus(keep_focus: bool | None = None, visible: bool = False) -> bool:
+    """Whether the launch tells BallrainIO to leave the foreground alone (BALLRAIN_KEEP_FOCUS=1): `keep_focus`
+    if given, else BALLRAIN_FOCUS=1, else only for a visible window (one the user may click into)."""
+    if keep_focus is not None:
+        return bool(keep_focus)
+    if os.environ.get(FOCUS_VAR, "").strip() not in ("", "0"):
+        return True
+    return bool(visible)
+
+
 def hidden_startupinfo():
     """STARTUPINFO that makes the game's first ShowWindow of its main window SW_HIDE.
 
@@ -455,9 +476,15 @@ def hidden_startupinfo():
     return subprocess.STARTUPINFO(dwFlags=subprocess.STARTF_USESHOWWINDOW, wShowWindow=SW_HIDE)
 
 
-def launch_direct(copy: GameCopy, env: dict, visible: bool | None = None) -> int:
+def launch_direct(copy: GameCopy, env: dict, visible: bool | None = None, audio_on: bool | None = None,
+                  keep_focus: bool | None = None) -> int:
     """Direct process creation (like Start-Process -WorkingDirectory <copy>/Bin [-WindowStyle Hidden]).
-    Windows are hidden unless windows_visible(visible)."""
+    Windows are hidden unless windows_visible(visible); the game's audio sessions are kept muted unless
+    audio.audio_enabled(audio_on) (BALLRAIN_AUDIO=1), in which case they are kept unmuted (Windows remembers
+    the mute per executable path); BALLRAIN_KEEP_FOCUS=1 is passed when game_keeps_focus(keep_focus, visible)."""
+    show = windows_visible(visible)
+    if game_keeps_focus(keep_focus, show):
+        env = {**env, "BALLRAIN_KEEP_FOCUS": "1"}
     p = subprocess.Popen(
         [str(copy.exe)],
         cwd=str(copy.bin_dir),
@@ -467,9 +494,10 @@ def launch_direct(copy: GameCopy, env: dict, visible: bool | None = None) -> int
         stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         close_fds=True,
-        startupinfo=None if windows_visible(visible) or sys.platform != "win32" else hidden_startupinfo(),
+        startupinfo=None if show or sys.platform != "win32" else hidden_startupinfo(),
     )
     _LAUNCHED[p.pid] = p  # keep the process handle open so the PID cannot be reused while we track it
+    audio.watch(p, copy.exe, muted=not audio.audio_enabled(audio_on))
     return p.pid
 
 
@@ -566,7 +594,7 @@ def stop_handle(h: "ProcessHandle", wait_s: float = 10.0) -> int | None:
 TRAINING_COPY_FMT = "train-{:02d}"
 COPY_SKIP_NAMES = {"ModLoader.log", "CommandBar.history", "ImGui.ini", LAUNCH_SCRIPT_NAME}
 COPY_SKIP_SUFFIXES = (".prev", ".cmd", ".bat", ".ps1", ".log")
-_HASH_SUFFIXES = (".dll", ".exe", ".bmodp", ".nmo", ".cmo")
+_HASH_SUFFIXES = (".dll", ".exe", ".bmodp", ".nmo", ".cmo", ".tdb")  # .tdb: same-size option edits
 
 
 def training_copy_names(n: int) -> list[str]:
@@ -693,6 +721,108 @@ def set_splash(copy: GameCopy, enabled: bool) -> str:
     elif not enabled and state == "on":
         os.replace(on, off)
     return splash_state(copy)
+
+
+# ------------------------------------------------------------------------------- Database.tdb volume
+
+TDB_REL = "Database.tdb"
+TDB_TYPES = {1: "int", 2: "float", 3: "string"}
+
+
+def tdb_decode(data: bytes) -> bytes:
+    """Database.tdb byte coding (Ballance): plain = -(rol3(b) ^ 0xAF) mod 256."""
+    return bytes((-((((b << 3) | (b >> 5)) & 0xFF) ^ 0xAF)) & 0xFF for b in data)
+
+
+def tdb_encode(plain: bytes) -> bytes:
+    out = bytearray()
+    for c in plain:
+        x = ((-c) & 0xFF) ^ 0xAF
+        out.append(((x >> 3) | (x << 5)) & 0xFF)
+    return bytes(out)
+
+
+def tdb_arrays(plain: bytes) -> dict:
+    """Parse decoded Database.tdb: {array name: {"cols": [(name, type)], "rows": n, "cells": {(col, row): (offset, size)}}}.
+
+    Layout per array: name NUL, u32 byte count of the rest, u32 columns, u32 rows, i32 key column, per column
+    (name NUL, u32 type: 1 int, 2 float, 3 string), then the cells column by column (4 bytes, or a NUL-terminated
+    string). Raises on anything that does not parse exactly to the end of the file."""
+    import struct
+    arrays, pos = {}, 0
+    while pos < len(plain):
+        end_name = plain.index(b"\0", pos)
+        name = plain[pos:end_name].decode("latin-1")
+        size, ncols, nrows, _key = struct.unpack_from("<IIIi", plain, end_name + 1)
+        stop = end_name + 5 + size
+        q = end_name + 17
+        cols = []
+        for _ in range(ncols):
+            e = plain.index(b"\0", q)
+            (t,) = struct.unpack_from("<I", plain, e + 1)
+            if t not in TDB_TYPES:
+                raise InstanceError(f"Database.tdb {name}: unknown column type {t}")
+            cols.append((plain[q:e].decode("latin-1"), TDB_TYPES[t]))
+            q = e + 5
+        cells = {}
+        for c, (_, t) in enumerate(cols):
+            for r in range(nrows):
+                n = plain.index(b"\0", q) + 1 - q if t == "string" else 4
+                cells[(c, r)] = (q, n)
+                q += n
+        if q != stop or stop > len(plain) or name in arrays:
+            raise InstanceError(f"Database.tdb {name}: parse ends at {q}, expected {stop}")
+        arrays[name] = {"cols": cols, "rows": nrows, "cells": cells}
+        pos = stop
+    return arrays
+
+
+def _tdb_volume_cell(plain: bytes) -> tuple[int, int]:
+    opts = tdb_arrays(plain).get("DB_Options")
+    if opts is None or opts["rows"] != 1:
+        raise InstanceError("Database.tdb: DB_Options with one row expected")
+    names = [n for n, _ in opts["cols"]]
+    if names.count("Volume") != 1 or opts["cols"][names.index("Volume")][1] != "float":
+        raise InstanceError("Database.tdb: one float column DB_Options.Volume expected")
+    return opts["cells"][(names.index("Volume"), 0)]
+
+
+def tdb_volume(copy: GameCopy) -> float:
+    """The game's own volume option (DB_Options.Volume, 0..1; 1.0 in the stock file)."""
+    import struct
+    plain = tdb_decode((copy.root / TDB_REL).read_bytes())
+    off, _ = _tdb_volume_cell(plain)
+    return struct.unpack_from("<f", plain, off)[0]
+
+
+def tdb_with_volume(data: bytes, volume: float) -> bytes:
+    """Encoded Database.tdb `data` with only the 4 bytes of DB_Options.Volume replaced."""
+    import struct
+    if not 0.0 <= float(volume) <= 1.0:
+        raise ValueError(f"volume must be in [0, 1], got {volume!r}")
+    plain = tdb_decode(data)
+    if tdb_encode(plain) != data:
+        raise InstanceError("Database.tdb does not round-trip through decode / encode")
+    off, n = _tdb_volume_cell(plain)
+    new = tdb_encode(plain[:off] + struct.pack("<f", float(volume)) + plain[off + n:])
+    if len(new) != len(data) or sum(a != b for a, b in zip(new, data)) > 4:
+        raise InstanceError("Database.tdb volume edit touched more than the Volume cell")
+    return new
+
+
+def set_tdb_volume(copy: GameCopy, volume: float) -> float:
+    """Set the game's own volume option in <copy>/Database.tdb (only those 4 bytes change). Refuses a copy
+    with a running Player.exe. Returns the new value read back."""
+    if running_in_copy(copy):
+        raise InstanceError(f"{copy.root} has a running Player.exe; not changing its Database.tdb")
+    path = copy.root / TDB_REL
+    data = path.read_bytes()
+    new = tdb_with_volume(data, volume)
+    if new != data:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(new)
+        os.replace(tmp, path)
+    return tdb_volume(copy)
 
 
 def install_record(copy: GameCopy, tas_path) -> str:

@@ -34,6 +34,7 @@
 //                              NOT trajectory-exact after a full level: use one process per episode for
 //                              exact runs (see "Same-process reload" below; LOADS=1 never runs that code)
 //   BALLRAIN_DEBUG=<path>      debug log (+ .dump/.dumpS/.act files); changes callback registration time
+//   BALLRAIN_KEEP_FOCUS=1      do not hand the foreground back (any mode, also inert; see ReturnForeground)
 //
 // Same-process reload (LOADS > 1). After "Exit Level" the warm process differs from a cold one in ways
 // that change the next load. Written back to the cold process's values, in this order:
@@ -112,6 +113,83 @@ static bool Sha256File(const wchar_t *path, std::string &hex) {
     return true;
 }
 
+// ---------------------------------------------------------------- foreground
+
+// Player.exe activates its (hidden) main window at start-up, before any mod is loaded, and Windows lets
+// the new process take the foreground, so the keyboard goes to an invisible window. The process holding
+// the foreground may always give it away: when this process owns the foreground window and that window
+// is hidden (instances.launch_direct starts Player.exe with SW_HIDE), hand it to the
+// first window in z-order (top first) that the user could have been using: visible, not minimised, not
+// cloaked, not a tool / no-activate / click-through window, a top-level window not owned by another, of
+// another process. Window management only: no game object, input or timing state is read or written.
+static bool IsCloaked(HWND hwnd) {
+    using DwmGetWindowAttributeFn = HRESULT(WINAPI *)(HWND, DWORD, PVOID, DWORD);
+    static DwmGetWindowAttributeFn fn = [] {
+        HMODULE dwm = ::LoadLibraryW(L"dwmapi.dll");
+        return dwm ? (DwmGetWindowAttributeFn) ::GetProcAddress(dwm, "DwmGetWindowAttribute") : nullptr;
+    }();
+    DWORD cloaked = 0;
+    return fn && fn(hwnd, 14 /* DWMWA_CLOAKED */, &cloaked, sizeof(cloaked)) == S_OK && cloaked != 0;
+}
+
+static HWND PickForegroundTarget() {
+    const DWORD self = ::GetCurrentProcessId();
+    int n = 0;
+    for (HWND h = ::GetTopWindow(nullptr); h && n < 4096; h = ::GetWindow(h, GW_HWNDNEXT), ++n) {
+        if (!::IsWindowVisible(h) || ::IsIconic(h))
+            continue;
+        DWORD pid = 0;
+        ::GetWindowThreadProcessId(h, &pid);
+        if (pid == self || pid == 0)
+            continue;
+        const LONG ex = ::GetWindowLongW(h, GWL_EXSTYLE);
+        if (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT))
+            continue;
+        if (::GetWindow(h, GW_OWNER) && !(ex & WS_EX_APPWINDOW))
+            continue;
+        RECT r = {};
+        if (!::GetWindowRect(h, &r) || r.right <= r.left || r.bottom <= r.top || IsCloaked(h))
+            continue;
+        return h;
+    }
+    return nullptr;
+}
+
+static std::string ProcessImage(DWORD pid) {
+    char buf[MAX_PATH] = {};
+    DWORD size = MAX_PATH;
+    HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h)
+        return "?";
+    const BOOL ok = ::QueryFullProcessImageNameA(h, 0, buf, &size);
+    ::CloseHandle(h);
+    return ok ? std::string(buf, size) : std::string("?");
+}
+
+void BallrainIO::ReturnForeground(const char *where) {
+    if (m_KeepFocus)
+        return;
+    HWND fg = ::GetForegroundWindow();
+    DWORD fgPid = 0;
+    if (!fg || !::GetWindowThreadProcessId(fg, &fgPid) || fgPid != ::GetCurrentProcessId())
+        return;
+    if (::IsWindowVisible(fg))
+        return;   // a visible game window (started by hand, BALLRAIN_VISIBLE=1): the user may have clicked into it
+    HWND target = PickForegroundTarget();
+    if (!target)
+        target = ::GetShellWindow();
+    DWORD targetPid = 0;
+    if (target)
+        ::GetWindowThreadProcessId(target, &targetPid);
+    const BOOL ok = target && ::SetForegroundWindow(target);
+    HWND now = ::GetForegroundWindow();
+    DWORD nowPid = 0;
+    if (now)
+        ::GetWindowThreadProcessId(now, &nowPid);
+    GetLogger()->Info("focus (%s): foreground handed to pid %u %s: %s, foreground now pid %u", where,
+                      (unsigned) targetPid, ProcessImage(targetPid).c_str(), ok ? "ok" : "failed", (unsigned) nowPid);
+}
+
 // ---------------------------------------------------------------- loading
 
 bool BallrainIO::ReadEnvironment() {
@@ -174,6 +252,8 @@ bool BallrainIO::ReadEnvironment() {
 }
 
 void BallrainIO::OnLoad() {
+    m_KeepFocus = GetEnv("BALLRAIN_KEEP_FOCUS") == "1";
+    ReturnForeground("OnLoad");
     m_Active = ReadEnvironment();
     if (!m_Active)
         return;
@@ -842,6 +922,11 @@ void BallrainIO::OnPreProcessInput() {
 }
 
 void BallrainIO::OnProcess() {
+    const unsigned long long nowMs = ::GetTickCount64();
+    if (nowMs - m_FocusCheckMs >= 100) {   // a later activation of this process is handed back within 0.1 s
+        m_FocusCheckMs = nowMs;
+        ReturnForeground("OnProcess");
+    }
     if (!m_Active)
         return;
 

@@ -210,6 +210,7 @@ frame × n_frames: f32 delta_ms, u32 keys        // 正好是 legacy .tas 的 8 
 | `BALLRAIN_SR_TAIL` | 默认 32 | LevelFinish 后等 CounterInactive 的最多帧数 |
 | `BALLRAIN_POST_FINISH` | 整数（可选，0.3.1，诊断） | SR 尾帧之后再跑的空闲帧数（§5） |
 | `BALLRAIN_POST_LOG` | 文件路径（可选，0.3.1，诊断） | post-finish 逐帧文本日志（§5） |
+| `BALLRAIN_KEEP_FOCUS` | `1`（可选，0.3.2，任何模式） | 不把前台交还（默认：隐藏的游戏窗口拿到前台时交给此前的窗口，README「游戏窗口」） |
 | `BALLRAIN_FRAMELOG` | 文件路径 | 可导出的帧日志（同回放） |
 | `BALLRAIN_TRACE` | 文件路径（可选） | 每帧球 trace，格式与回放相同，用于和参考对照 |
 | `BALLRAIN_EVENTS` | 文件路径（可选） | 文本事件日志（同回放） |
