@@ -120,7 +120,7 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
     adv = torch.as_tensor(batch["adv"], device=device)
     ret = torch.as_tensor(batch["ret"], device=device)
     n = obs.shape[0]
-    stats = {"pg_loss": [], "v_loss": [], "entropy": [], "approx_kl": [], "clip_frac": []}
+    stats = {"pg_loss": [], "v_loss": [], "entropy": [], "approx_kl": [], "clip_frac": [], "grad_norm": []}
     stop = False
     for _ in range(epochs):
         perm = torch.randperm(n, generator=gen).to(device)
@@ -138,7 +138,7 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
             loss = pg + vf_coef * vl - ent_coef * ent
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            gn = nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # total norm before clipping
             opt.step()
             with torch.no_grad():
                 lr = logp - old_logp[idx]
@@ -148,6 +148,7 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
                 stats["entropy"].append(ent.item())
                 stats["approx_kl"].append(kl)
                 stats["clip_frac"].append(((ratio - 1).abs() > clip).float().mean().item())
+                stats["grad_norm"].append(float(gn))
             if target_kl is not None and kl > 1.5 * target_kl:
                 stop = True
                 break

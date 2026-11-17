@@ -52,7 +52,7 @@ UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_pe
                + [f"{p}_sec{s}" for s in range(1, 5) for p in ("rsp_cp", "rsp_n")]
                + [f"{p}_sec{s}" for s in range(1, 5) for p in ("rest_cp", "rest_n")]
                + [f"u_{k}" for k in ("pg_loss", "v_loss", "entropy", "approx_kl", "clip_frac", "early_stop",
-                                     "explained_var", "adv_std", "ret_mean")])
+                                     "explained_var", "adv_std", "ret_mean", "grad_norm", "watch_entropy", "watch_n")])
 RUN_COLS = ["update", "t", "copy", "run_id", "end_reason", "sr_ms", "start_frame", "frames", "lives", "deaths",
             "framelog_match", "handover_mismatches", "invalid", "ball_order", "dir"]
 
@@ -204,6 +204,15 @@ def parse(argv=None):
     p.add_argument("--min-episodes", type=int, default=40)
     p.add_argument("--p-level-start", type=float, default=0.3, help="k = 0 probability once the frontier is at the start")
     p.add_argument("--ckpt-every", type=int, default=25)
+    p.add_argument("--ckpt-keep-every", type=int, default=250,
+                   help="besides the newest 5, keep the checkpoints of updates divisible by this (rollback targets)")
+    p.add_argument("--auto-rollback", default="",
+                   help="JSON ballrain.train.guard.ReachGuard fields, e.g. {\"lo\": 4100, \"hi\": 4299, \"bin\": 100, "
+                        "\"min_n\": 20, \"low\": 0.5, \"good\": 0.7}: reload the newest good bin's checkpoint when the "
+                        "TAS starts in [lo, hi] reach the next checkpoint at < low in consecutive bins of policy versions")
+    p.add_argument("--watch-s", default="",
+                   help="LO,HI: also log the behaviour policy's entropy on batch states whose route position (feature "
+                        "path_progress x line length) is in [LO, HI] (u_watch_entropy, u_watch_n; L1 r6: 300,400, the exit)")
     p.add_argument("--log-every", type=int, default=5)
     p.add_argument("--prune", default="finish")
     p.add_argument("--trace-sample", type=float, default=0.0,
@@ -556,6 +565,8 @@ def main(argv=None) -> int:
             by_rsp_sector[e["start_sector"]].append((e["success_cp"], e["finish"]))
         if e["kind"] == "tas_rest":
             by_rest[e["start_sector"]].append((e["success_cp"], e["finish"]))
+        if guard is not None:
+            guard.add(e["kind"], e["start_frame"], e.get("version_start"), e["success_cp"])
         if e["kind"] == "tas":
             k = e["start_frame"]
             succ = e["finish"] if a.success == "finish" else e["success_cp"]
@@ -606,8 +617,70 @@ def main(argv=None) -> int:
         old = sorted(run_dir.glob("ckpt_*.pt"))
         for o in old[:-5]:
             u = int(o.stem.split("_")[1])
-            if u % 250 != 0:
+            if u % a.ckpt_keep_every != 0:
                 o.unlink(missing_ok=True)
+
+    guard = None
+    if a.auto_rollback:
+        from ballrain.train.guard import ReachGuard
+        guard = ReachGuard.from_config(json.loads(a.auto_rollback))
+        if guard.bin % a.ckpt_every or a.ckpt_keep_every % a.ckpt_every or guard.bin % a.ckpt_keep_every:
+            raise SystemExit("--auto-rollback: bin must be a multiple of --ckpt-keep-every (and both of --ckpt-every)")
+        guard.rolled_back(counters["update"])  # bins of a previous process are not in this one's statistics
+        log.msg(f"auto-rollback guard: TAS starts {guard.lo}-{guard.hi}, bins of {guard.bin} versions (>= {guard.min_n} "
+                f"episodes), roll back after {guard.consecutive} bins < {guard.low} to the newest bin >= {guard.good}")
+
+    watch = None
+    if a.watch_s:
+        from ballrain.features import FeatureExtractor
+        from ballrain.path import ReferencePath, asset_path, resolve_path_dir
+        lo_s, hi_s = (float(v) for v in a.watch_s.split(","))
+        sl = FeatureExtractor(env_cfg.features).slices().get("path_progress")
+        asset = asset_path(1, resolve_path_dir(env_cfg.features.path_dir)) if env_cfg.features.path_dir else None
+        if sl is None or asset is None or not asset.is_file():
+            raise SystemExit("--watch-s needs the path_progress feature and a reference line asset (--path-dir)")
+        length = ReferencePath.load(asset).length
+        watch = (sl.start, lo_s / length, hi_s / length)
+        log.msg(f"watch entropy on route s {lo_s:g}-{hi_s:g} (line length {length:.1f})")
+
+    def watch_entropy(obs_n, raw):
+        """Entropy of the current (behaviour) policy on the batch states inside the watched route window."""
+        m = (raw[:, watch[0]] >= watch[1]) & (raw[:, watch[0]] <= watch[2])
+        n = int(m.sum())
+        if n == 0:
+            return {"watch_entropy": float("nan"), "watch_n": 0.0}
+        with torch.no_grad():
+            logits, _ = model(torch.as_tensor(obs_n[m], device=a.device))
+            lp = torch.log_softmax(logits, -1)
+            ent = float(-(lp.exp() * lp).sum(-1).mean())
+        return {"watch_entropy": ent, "watch_n": float(n)}
+
+    def auto_rollback():
+        """--auto-rollback: reload the newest good bin's checkpoint (policy, optimiser, observation statistics,
+        curriculum; counters / best continue) and write ALERT_auto_rollback.txt."""
+        u = counters["update"]
+        if not guard.triggered(u):
+            return
+        cands = guard.targets(u)
+        f = next((run_dir / f"ckpt_{v:06d}.pt" for v in cands if (run_dir / f"ckpt_{v:06d}.pt").is_file()), None)
+        msg = (f"AUTO-ROLLBACK at u{u}: TAS starts {guard.lo}-{guard.hi} reach < {guard.low} in {guard.consecutive} bins "
+               f"({guard.summary(u)})")
+        if f is None:
+            log.msg(msg + f"; no checkpoint of a bin with reach >= {guard.good} (candidates {cands[:5]}), not rolled back")
+            guard.rolled_back(u)
+        else:
+            src = torch.load(f, weights_only=False)
+            load_policy(src)
+            opt.load_state_dict(src["opt"])
+            for g in opt.param_groups:
+                g["lr"] = a.lr
+            cu.load_state_dict(src["curriculum"])
+            guard.rolled_back(u)
+            msg += f" -> reloaded {f.name} (policy, optimiser, rms, curriculum; frontier {cu.frontier})"
+            log.msg(msg)
+            broadcast()
+        with open(run_dir / "ALERT_auto_rollback.txt", "a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
 
     try:
         first = ck is None and a.init_from is None
@@ -685,6 +758,7 @@ def main(argv=None) -> int:
                 batch = {"obs": normalize(raw, rms.state_dict()), "actions": np.concatenate([c["actions"] for c in chunks]),
                          "logp": np.concatenate([c["logp"] for c in chunks]), "adv": np.concatenate(advs),
                          "ret": np.concatenate(rets)}
+                wstats = watch_entropy(batch["obs"], raw) if watch is not None else {}
                 model.train()
                 ustats = ppo_update(model, opt, batch, a.epochs, a.minibatch, a.clip, a.vf_coef, a.ent_coef,
                                     a.max_grad_norm, a.device, gen, a.target_kl)
@@ -692,6 +766,7 @@ def main(argv=None) -> int:
                 ustats["explained_var"] = explained_variance(np.concatenate([c["values"] for c in chunks]), batch["ret"])
                 ustats["adv_std"] = float(batch["adv"].std())
                 ustats["ret_mean"] = float(batch["ret"].mean())
+                ustats.update(wstats)
             update_times.append(time.perf_counter() - tu)
             counters["update"] += 1
             broadcast()
@@ -830,6 +905,8 @@ def main(argv=None) -> int:
                 win_eps, win_runs = [], []
             if u % a.ckpt_every == 0:
                 save_ckpt()
+            if guard is not None and u % 5 == 0:
+                auto_rollback()
     finally:
         log.msg("stopping workers")
         if hub is not None:
