@@ -41,7 +41,7 @@ TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "chec
          "camera_off_quarter")
 EP_COLS = ["update", "t", "wid", "backend", "host", "copy", "kind", "probes", "death_probe", "splits", "start_frame", "start_sector", "end", "end_sector", "max_sector",
            "success_cp", "finish", "ret", "steps", "frames", "sr_ms_end", "start_sr_ms", "agent_s", "s_start", "s_end",
-           "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id", "ball_order"] + [f"r_{k}" for k in TERMS] + ["actions"]
+           "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id", "ball_order", "respawn_skipped"] + [f"r_{k}" for k in TERMS] + ["actions"]
 UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_per_s", "frontier", "frontier_sector",
                 "band_success", "band_n", "band_finish", "gate_blocked", "episodes", "ret_mean", "ret_tas", "ret_respawn", "success_cp_tas", "finish_tas",
                 "deaths", "finishes", "stalls", "caps", "camera_off_quarter", "invalid_runs", "speed_mean", "runs", "finish_runs", "sr_ms_min", "sr_ms_k0_min",
@@ -171,6 +171,10 @@ def parse(argv=None):
     p.add_argument("--stall-compensate", action="store_true",
                    help="with --stall-terminal: divide the stall penalty by gamma ** window steps (never cheaper than dying now)")
     p.add_argument("--respawn-stall-s", type=float, default=None, help="stall limit of respawn lives (default --stall-s)")
+    p.add_argument("--p-early-respawn", type=float, default=1.0,
+                   help="probability of playing a respawn life whose sector the record enters before the frontier; "
+                        "otherwise the process ends and a new curriculum start follows (WorkerSpec.p_early_respawn; "
+                        "1.0 = always, the old behaviour)")
     p.add_argument("--success", choices=("cp", "finish"), default="cp")
     p.add_argument("--finish-gate", type=float, default=0.0,
                    help="the frontier also needs this LevelFinish rate over the band episodes (with --success cp)")
@@ -293,6 +297,8 @@ def stop_copies(names, log=None):
 
 def main(argv=None) -> int:
     a = parse(argv)
+    if not 0.0 <= a.p_early_respawn <= 1.0:
+        raise SystemExit(f"--p-early-respawn {a.p_early_respawn}: must be in [0, 1]")
     import torch
     from ballrain import instances
     from ballrain.curriculum import CurriculumConfig, ReverseCurriculum, TasStarts
@@ -442,7 +448,7 @@ def main(argv=None) -> int:
                           trace_sample=a.trace_sample, route_probes=json.loads(a.route_probes) if a.route_probes else {},
                           gates=json.loads(a.gates) if a.gates else {}, split_k=a.split_k,
                           split_min_ref_s=a.split_min_ref_s, split_extra=json.loads(a.split_extra) if a.split_extra else [],
-                          launcher_factory=FakeLauncher if a.fake else None)
+                          p_early_respawn=a.p_early_respawn, launcher_factory=FakeLauncher if a.fake else None)
 
     hub = None
     cu_bins = defaultdict(lambda: deque(maxlen=100))
@@ -484,7 +490,8 @@ def main(argv=None) -> int:
                                "route_probes": json.loads(a.route_probes) if a.route_probes else {},
                                "gates": json.loads(a.gates) if a.gates else {}, "split_k": a.split_k,
                                "split_min_ref_s": a.split_min_ref_s,
-                               "split_extra": json.loads(a.split_extra) if a.split_extra else []}}
+                               "split_extra": json.loads(a.split_extra) if a.split_extra else [],
+                               "p_early_respawn": a.p_early_respawn}}
         hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):
@@ -731,6 +738,8 @@ def main(argv=None) -> int:
                 for k, v in row.items():
                     if isinstance(v, (int, float)) and v is not None and np.isfinite(v):
                         log.tb.add_scalar(f"train/{k}", v, counters["steps"])
+                n_skip = sum(bool(e.get("respawn_skipped")) for e in eps)
+                log.tb.add_scalar("train/respawn_skipped", n_skip, counters["steps"])
                 for be in sorted({e.get("backend", a.backend) for e in eps}):
                     be_eps = [e for e in eps if e.get("backend", a.backend) == be]
                     be_tas = [e for e in be_eps if e["kind"] == "tas"]
@@ -790,7 +799,7 @@ def main(argv=None) -> int:
                         f"ret {row['ret_mean']:.2f} deaths {row['deaths']} stalls {row['stalls']} fin_runs {row['finish_runs']} "
                         f"sr_min {row['sr_ms_min']} ent {ustats.get('entropy', float('nan')):.3f} "
                         f"kl {ustats.get('approx_kl', float('nan')):.4f} ev {ustats.get('explained_var', float('nan')):.2f} "
-                        f"upd {row['update_s']}s reset {row['reset_frac']}")
+                        f"upd {row['update_s']}s reset {row['reset_frac']} rsp_skip {n_skip}")
                 log.flush()
                 win_eps, win_runs = [], []
             if u % a.ckpt_every == 0:

@@ -14,6 +14,10 @@ Per-episode limits (worker-side truncation, bootstrapped like a time limit, logg
 - stall: the projection's arc length has not grown by stall_progress units for stall_s seconds of game time.
 A forced truncation ends the game process (env.reset() in the middle of a life starts a new process).
 
+Early respawns (WorkerSpec.p_early_respawn < 1): after a BallOff whose respawn sector the start record enters before
+the curriculum frontier, the respawn life is skipped with probability 1 - p_early_respawn: the game process ends and the
+next episode is a new curriculum start; the dead episode's record carries respawn_skipped = True.
+
 Run directories: after a process ends its meta (.json) is read for the run statistics; with prune="finish"
 non-finishing runs are deleted and finishing runs keep only the .json, .tas and events.txt (disk: a run
 directory is about 1.8 MB, mostly level.msg); prune="none" keeps everything (evaluation).
@@ -83,6 +87,11 @@ class WorkerSpec:
     # extra reference time for segments that cross a section the reference line routes differently from the TAS:
     # [[lo_frame, hi_frame, seconds], ...]: a segment that starts before TAS frame lo and ends at or after hi gets +seconds
     split_extra: list = field(default_factory=list)
+    # early respawns: after a BallOff whose respawn sector the start record enters before the curriculum frontier (TAS
+    # cross frame < frontier: a stretch the curriculum has not reached), the respawn life is played with this probability;
+    # otherwise the game process ends and the next episode is a new curriculum start (episode record respawn_skipped).
+    # 1.0 = always play it (the old behaviour); respawns at or after the frontier are always played
+    p_early_respawn: float = 1.0
 
 
 class _Episode:
@@ -158,6 +167,7 @@ class _Episode:
         d["probes"] = sorted(self.probes_seen | {f"gate:{g}" for g in self.gates_hit})
         d["splits"] = [[int(a), round(b, 3), round(c, 3), round(e, 3)] for a, b, c, e in self.splits]
         d["death_probe"] = self.last_probe if end == "BallOff" else None
+        d["respawn_skipped"] = False  # set by the worker when this BallOff's early respawn is not played
         return d
 
 
@@ -171,6 +181,7 @@ class Worker:
         self.ctrl_q, self.data_q = ctrl_q, data_q
         self.gen = torch.Generator().manual_seed(spec.seed)
         self._trace_rng = np.random.default_rng(spec.seed + 99991)
+        self._respawn_rng = np.random.default_rng(spec.seed + 104729)
         self.env = None
         self.fx_info = {}
         self.curriculum_state = None
@@ -226,6 +237,20 @@ class Worker:
         st = self.env.starts
         m = st.sector == sector
         return int(st.valid[m][0]) if m.any() else None
+
+    def _skip_respawn(self, end, info) -> bool:
+        """True when the respawn life after this episode end is not played (WorkerSpec.p_early_respawn): a BallOff
+        with the process continuing, whose respawn sector (the sector at death: the last checkpoint reached) the start
+        record enters before the curriculum frontier, and a draw >= p_early_respawn. No draw at p >= 1."""
+        p = self.spec.p_early_respawn
+        env = self.env
+        if (p >= 1.0 or end != "BallOff" or not getattr(env, "_after_death", False) or env.curriculum is None
+                or env.starts is None):
+            return False
+        cross = self._tas_cross_frame(int(info.get("sector") or 0))
+        if cross is None or cross >= int(env.curriculum.frontier):
+            return False
+        return bool(self._respawn_rng.random() >= p)
 
     def _split_start(self, ep, info):
         """Segment start of a new life for the split bonus."""
@@ -314,13 +339,14 @@ class Worker:
         except OSError as e:
             self.errors.append(f"prune {d}: {e}")
 
-    def _reset(self):
+    def _reset(self, new_process: bool = False):
+        """new_process: end the current game process (e.g. a skipped early respawn) and start a new curriculum start."""
         fails = 0
         if self.spec.trace_sample:  # read by the env when it launches the next process
             self.env.cfg.trace = bool(self._trace_rng.random() < self.spec.trace_sample)
         while True:
             try:
-                obs, info = self.env.reset()
+                obs, info = self.env.reset(options={"new_process": True} if new_process else None)
                 self._collect_runs()
                 return obs, info
             except Exception as e:  # noqa: BLE001  launch failure, hand-over mismatches, crashed game
@@ -487,9 +513,12 @@ class Worker:
                     buf["trunc_values"][t] = self.model.value(normalize(obs2, self.rms))
                 t += 1
                 if term or trunc:
-                    episodes.append(ep.finish(info2, end or "truncated", self.env, self.env._ep_frames))
+                    skip = self._skip_respawn(end, info2)
+                    ep_d = ep.finish(info2, end or "truncated", self.env, self.env._ep_frames)
+                    ep_d["respawn_skipped"] = skip
+                    episodes.append(ep_d)
                     tr = time.perf_counter()
-                    obs, info = self._reset()
+                    obs, info = self._reset(new_process=skip)
                     t_reset += time.perf_counter() - tr
                     ep = _Episode(info, self.env, self.version, self._cap_frames(info))
                     self._split_start(ep, info)
