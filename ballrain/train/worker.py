@@ -104,7 +104,8 @@ class WorkerSpec:
     # with the wall's inward normal) and the route progress is below wall_max_progress units / s, each step pays
     # -wall_push_rate x its game seconds (term "wall_push"). Only inside the penalty zones marked "wall_push": true
     # (ball inside the zone's box below its y_below), unless wall_push_everywhere (the old behaviour: on the whole
-    # route, where it also fired along the normal section-A line and taught the policy to leave walls it needs)
+    # route, where it also fired along the normal section-A line; it was first suspected of the r6 collapse at
+    # alt-line s ~360, but the collapse came back with zone-limited wall push: see runtime EXPERIMENTS, 2026-11-17)
     wall_push_rate: float = 0.0
     wall_push_everywhere: bool = False
     # zone_stall_exempt: a life that has entered a penalty zone pays no stall penalty when it ends by stall (it still
