@@ -54,7 +54,7 @@ body {
   margin: 0; padding: 8px 14px; font: 900 18px/1.3 "Noto Serif SC", "Songti SC", "SimSun", serif;
   color: var(--amber); letter-spacing: .06em;
   text-shadow: 0 1px 0 #2a1806, 0 -1px 0 #2a1806, 1px 0 0 #2a1806, -1px 0 0 #2a1806, 0 2px 3px rgba(0, 0, 0, .7);
-  background: #6a4521 url("/assets/plank.jpg") repeat; background-size: 128px auto;
+  background: #6a4521 url("/assets/planks.jpg") repeat-x; background-size: auto 100%;
   border-top: 2px solid #9a7343; border-bottom: 3px solid #2b1a0a;
   box-shadow: inset 0 -6px 10px rgba(0, 0, 0, .35), 0 3px 6px rgba(0, 0, 0, .5);
   display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
@@ -73,7 +73,7 @@ body {
 /* parchment / floor-stone tiles */
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 8px; }
 .tile {
-  background: #cdbf9b url("/assets/stone.jpg") center / 160px auto; color: var(--parch-ink);
+  background: #cdbf9b url("/assets/stone2.jpg") 0 0 / 256px auto; color: var(--parch-ink);
   border: 1px solid #7a5a2a; box-shadow: inset 0 0 0 1px rgba(255, 245, 220, .35), inset 0 0 14px rgba(70, 45, 10, .35);
   padding: 7px 10px 8px; min-width: 0;
 }
@@ -143,3 +143,16 @@ tr.dim td { color: #8a8574; }
   .plank { font-size: 16px; }
   .mbtn { height: 36px; min-width: 64px; font-size: 13px; }
 }
+
+/* every plank header and tile starts at a different place in its texture, so neighbours never look identical */
+.sec:nth-of-type(6n+2) .plank { background-position: -1130px 0; }
+.sec:nth-of-type(6n+3) .plank { background-position: -2270px 0; }
+.sec:nth-of-type(6n+4) .plank { background-position: -560px 0; }
+.sec:nth-of-type(6n+5) .plank { background-position: -1710px 0; }
+.sec:nth-of-type(6n+6) .plank { background-position: -2890px 0; }
+.tile:nth-child(7n+2) { background-position: -97px -41px; }
+.tile:nth-child(7n+3) { background-position: -181px -133px; }
+.tile:nth-child(7n+4) { background-position: -38px -201px; }
+.tile:nth-child(7n+5) { background-position: -143px -9px; }
+.tile:nth-child(7n+6) { background-position: -219px -88px; }
+.tile:nth-child(7n+7) { background-position: -66px -157px; }
