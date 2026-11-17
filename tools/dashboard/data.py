@@ -46,6 +46,9 @@ MIN_STEP = 1.0  # world units between kept trajectory points
 BACKEND_LABEL = {"headless": "x87-soft headless", "retail": "2002 retail", "headless2002": "2002 headless"}
 
 
+BEST_NEAR_FRONTIER = 500  # TAS frames after the frontier still counted as "near" for the best-time tile
+
+
 def machine_of(backend, host, sources: dict) -> str:
     """Generic machine name of an episode for the data-source tile. `sources` maps the generic host labels the
     workers send (--host-label) to machine names, plus "learner" (episodes from the learner's own workers, which
@@ -293,7 +296,18 @@ def run_status(run: Run, off_h: float, level_n: int, machines: dict) -> dict:
             st["band_success_avg20"] = _num(tail["band_success"].mean())
         if st.get("frontier") is not None:
             st["covered_pct"] = round(100 * (level_n - st["frontier"]) / (level_n - 936), 1)
-    e = read_many(run.files("episodes*.csv"), usecols=["update", "backend", "steps", "host"], dedup=None)
+    e = read_many(run.files("episodes*.csv"), usecols=["update", "backend", "steps", "host", "finish", "sr_ms_end",
+                                                       "start_frame"], dedup=None)
+    # best full-level time among finishes that started near the current curriculum frontier: the trainer's own
+    # "best SR" mostly comes from takeovers a few frames before the airship, i.e. it is TAS's time, not the agent's
+    st.pop("best_sr_any", None)
+    fr = st.get("frontier")
+    if e is not None and len(e) and fr is not None and {"finish", "sr_ms_end", "start_frame"} <= set(e.columns):
+        near = e[(e["finish"] == 1) & (e["start_frame"] <= fr + BEST_NEAR_FRONTIER) & e["sr_ms_end"].notna()]
+        if len(near):
+            i = near["sr_ms_end"].idxmin()
+            st["best_sr_near"] = _num(near.loc[i, "sr_ms_end"])
+            st["best_sr_near_k"] = int(near.loc[i, "start_frame"])
     if e is not None and len(e) and "backend" in e:
         e = e[e["update"] >= e["update"].max() - 100]
         # share of training steps (what the learner consumes), not of episodes: retail episodes are much shorter

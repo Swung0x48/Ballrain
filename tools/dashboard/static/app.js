@@ -191,7 +191,7 @@ function renderStatus() {
     tile("回合通关率", pct(s.finish_tas), `最近 20 次平均 ${pct(s.finish_tas_avg20)}`, true),
     tile("策略熵 / KL", `${num(s.u_entropy, 3)} / ${num(s.u_approx_kl, 4)}`, "随机策略的熵为 2.20", true),
     `<div class="tile"><div class="k">训练数据来自哪台机器（按步数，近 100 次）</div><div class="v split">${share}</div></div>`,
-    tile("最佳 SR（含 TAS 前缀）", sec(s.best_sr_any), s.best_sr_k0 != null ? `从头开始最佳 ${sec(s.best_sr_k0)}` : "从 TAS 中途接手时的整关计时", true),
+    tile("开局点附近接手的最佳整关用时", sec(s.best_sr_near), s.best_sr_near_k != null ? `从 TAS 第 ${num(s.best_sr_near_k)} 帧接手，前面是 TAS；` + (s.best_sr_k0 != null ? `从出生点开始最佳 ${sec(s.best_sr_k0)}` : "还没有从出生点开始的通关") : "开局点附近还没有通关", true),
     tile("记录了轨迹的回合", num((S.traced_counts || {})[sel]), "抽样记录，供轨迹地图使用", true),
   ].join("");
   $("tiles").querySelectorAll(".gt").forEach((el) => gameText(el, el.textContent, el.closest(".split") ? 18 : 20, "dark"));
