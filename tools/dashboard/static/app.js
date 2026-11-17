@@ -191,6 +191,8 @@ function renderStatus() {
     tile("策略熵 / KL", `${num(s.u_entropy, 3)} / ${num(s.u_approx_kl, 4)}`, s.random_entropy != null ? `随机 ${num(s.random_entropy, 2)}` : "", true),
     `<div class="tile"><div class="k">训练数据来自哪台机器（按步数，近 100 次）</div><div class="v split">${share}</div></div>`,
     tile("开局点附近接手的最佳整关用时", sec(s.best_sr_near), s.best_sr_near_k != null ? `TAS 第 ${num(s.best_sr_near_k)} 帧接手` + (s.best_sr_k0 != null ? ` · 出生点起 ${sec(s.best_sr_k0)}` : "") : "", true),
+    tile("丢弃的训练步数", S.compute ? (S.compute.discarded / 1e6).toFixed(1) + " M" : "—",
+      S.compute ? `共训练 ${(S.compute.total / 1e6).toFixed(1)} M，当前模型 ${(S.compute.current / 1e6).toFixed(1)} M` : "", true),
     tile("记录了轨迹的回合", num((S.traced_counts || {})[sel]), "", true),
   ].join("");
   $("tiles").querySelectorAll(".gt").forEach((el) => gameText(el, el.textContent, el.closest(".split") ? 18 : 20, "dark"));

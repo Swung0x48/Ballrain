@@ -359,6 +359,60 @@ def run_status(run: Run, off_h: float, level_n: int, machines: dict) -> dict:
     return st
 
 
+_STEPS_MEMO: dict = {}
+_STEPS_RE = re.compile(r" u(\d+) steps (\d+)")
+_INIT_RE = re.compile(r"initialised from .*?update (\d+)")
+
+
+def run_own_steps(run: Run) -> tuple[int, int]:
+    """(steps this run trained itself, its last step counter) from its train.log. The counter carries on from the
+    checkpoint a run was initialised from; a rollback inside the run makes it drop and the stretch trained again
+    after the drop counts too (sum of the counter's increases), plus the updates before the first log line."""
+    lp = run.path / "train.log"
+    sig = _sig(lp)
+    if sig is None:
+        return 0, 0
+    hit = _STEPS_MEMO.get(str(lp))
+    if hit and hit[0] == sig:
+        return hit[1]
+    own, prev, prev_u, last, init_u, first, spu = 0, None, None, 0, 0, None, []
+    for line in lp.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = _INIT_RE.search(line)
+        if m and first is None:
+            init_u = int(m.group(1))
+        m = _STEPS_RE.search(line)
+        if not m:
+            continue
+        u, st = int(m.group(1)), int(m.group(2))
+        if first is None:
+            first = (u, st)
+        if prev is not None:
+            if st > prev:
+                own += st - prev
+                if u > prev_u:
+                    spu.append((st - prev) / (u - prev_u))
+        prev, prev_u, last = st, u, st
+    if first is not None:
+        rate = float(np.median(spu)) if spu else 0.0
+        # before the first log line: the updates since the parent checkpoint, or from zero for a fresh run
+        own += int(max(0, first[0] - init_u) * rate) if init_u else first[1]
+    res = (own, last)
+    _STEPS_MEMO[str(lp)] = (sig, res)
+    return res
+
+
+def discarded_steps(runs, current: str) -> dict:
+    """All steps trained across the runs minus the steps in the current model's lineage (its step counter):
+    abandoned runs, the part of a parent trained after the checkpoint a later run branched from, and rollbacks."""
+    total, cur = 0, 0
+    for r in runs:
+        own, last = run_own_steps(r)
+        total += own
+        if r.name == current:
+            cur = last
+    return {"total": total, "current": cur, "discarded": max(0, total - cur)}
+
+
 def curriculum_text(msg: str) -> str:
     """'curriculum: frontier -> 4886 (sector 1) after rate 0.60' -> Chinese, without CLI flags."""
     m = re.match(r"curriculum: frontier (?:->|set (\d+) ->) (\d+)(?: \(sector (\d+)\))?(?: after rate ([\d.]+))?", msg)

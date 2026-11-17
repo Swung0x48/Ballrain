@@ -391,12 +391,16 @@ class Dashboard:
                 if not self.gen["running"] and getattr(self, "_woken_for", None) != int(live):
                     self._woken_for = int(live)
                     self.wake.set()
+        try:
+            compute = D.discarded_steps(runs, D.default_run(runs))
+        except Exception:
+            compute = None
         res = {"now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "tz": D.tz_label(), "milestone": "M2",
                "runs": [r.name for r in mac], "default_run": D.default_run(runs), "status": st, "gen": gen,
                "interval_s": self.interval, "min_refresh_s": self.min_refresh, "machines": self.machines,
                "tensorboard_url": self.tensorboard_url, "data": summ.get("data") or {},
                "sr": summ.get("sr") or {}, "k0": summ.get("k0") or [],
-               "traced_counts": summ.get("traced_counts") or {}, "assets": self.assets,
+               "traced_counts": summ.get("traced_counts") or {}, "assets": self.assets, "compute": compute,
                "reports": R.public(R.load()), "highlight": highlight_public()}
         self._status = (time.time(), res)
         return res
