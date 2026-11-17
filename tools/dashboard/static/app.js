@@ -314,11 +314,39 @@ function chart(id) {
 const roamOn = {};
 function roamToggle(id, onChange) {
   if (roamOn[id] == null) roamOn[id] = !coarse;
-  return `<button type="button" class="tbtn${roamOn[id] ? " on" : ""}" data-roam="${id}">${roamOn[id] ? "拖动 / 缩放：开" : "拖动 / 缩放：关"}</button> <button type="button" class="tbtn" data-reset="${id}">复位视图</button>`;
+  const fs = $(id).closest(".panel").classList.contains("fs");
+  return `<button type="button" class="tbtn${roamOn[id] ? " on" : ""}" data-roam="${id}">${roamOn[id] ? "拖动 / 缩放：开" : "拖动 / 缩放：关"}</button> <button type="button" class="tbtn" data-reset="${id}">复位视图</button> <button type="button" class="tbtn fsbtn" data-fs="${id}">${fs ? "退出全屏" : "全屏"}</button>`;
 }
+
+/* Fullscreen for a map panel: the Fullscreen API where it exists, else a fixed overlay (iPhone Safari). */
+function setFsLabels() {
+  document.querySelectorAll("[data-fs]").forEach((b) => { b.textContent = $(b.dataset.fs).closest(".panel").classList.contains("fs") ? "退出全屏" : "全屏"; });
+}
+function exitPseudoFs() {
+  document.querySelectorAll(".panel.fs").forEach((p) => p.classList.remove("fs"));
+  document.body.classList.remove("fs-lock");
+  setFsLabels();
+}
+const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement;
+function toggleFs(id) {
+  const panel = $(id).closest(".panel");
+  if (panel.classList.contains("fs")) {
+    if (fsElement()) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    else exitPseudoFs();
+    return;
+  }
+  panel.classList.add("fs");
+  document.body.classList.add("fs-lock");
+  setFsLabels();
+  const req = panel.requestFullscreen || panel.webkitRequestFullscreen;
+  if (req) { try { const r = req.call(panel); if (r && r.catch) r.catch(() => {}); } catch (e) { /* overlay stays */ } }
+}
+["fullscreenchange", "webkitfullscreenchange"].forEach((ev) => document.addEventListener(ev, () => { if (!fsElement()) exitPseudoFs(); }));
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !fsElement() && document.querySelector(".panel.fs")) exitPseudoFs(); });
 function wireRoam(box, id, redraw) {
   box.querySelector(`[data-roam="${id}"]`).onclick = () => { roamOn[id] = !roamOn[id]; chart(id).setOption({ geo: { roam: roamOn[id] } }); const b = box.querySelector(`[data-roam="${id}"]`); b.classList.toggle("on", roamOn[id]); b.textContent = roamOn[id] ? "拖动 / 缩放：开" : "拖动 / 缩放：关"; };
   box.querySelector(`[data-reset="${id}"]`).onclick = () => redraw(true);
+  box.querySelector(`[data-fs="${id}"]`).onclick = () => toggleFs(id);
 }
 
 function tasSeries(F) {

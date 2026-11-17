@@ -23,7 +23,9 @@ body {
   background-size: cover; background-attachment: fixed; background-position: center top;
   font: 15px/1.55 "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
 }
-.wrap { max-width: 1180px; margin: 0 auto; padding: 14px 16px 48px; }
+.wrap { max-width: none; margin: 0 auto; padding: 14px clamp(16px, 2vw, 40px) 48px; }
+/* full width up to 16:9 (and narrower ratios); only ultra-wide screens get a 16:9-sized column */
+@media (min-aspect-ratio: 17/9) { .wrap { max-width: calc(100vh * 16 / 9); } }
 .top { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
 .brand { flex: 1 1 260px; min-width: 0; }
 .brand .sub { color: var(--muted); font-size: 13px; letter-spacing: .04em; margin-top: 2px; }
@@ -89,7 +91,14 @@ body {
 .bench b { color: var(--ink); }
 .chart { width: 100%; height: 320px; }
 .chart.tall { height: 860px; }
-.map { width: 100%; height: min(72vh, 640px); background: rgba(3, 6, 16, .55); border: 1px solid #2c2a33; }
+.map { width: 100%; height: min(78vh, 60vw); background: rgba(3, 6, 16, .55); border: 1px solid #2c2a33; }
+.fsbtn { margin-left: auto; }
+.panel.fs { position: fixed; inset: 0; z-index: 1000; margin: 0; border: none; display: flex; flex-direction: column;
+  background: var(--night); padding: 10px 14px; padding: max(10px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left)); }
+.panel.fs .map { flex: 1 1 auto; height: auto; min-height: 0; }
+.panel.fs .note { display: none; }
+.panel.fs .pick { flex: 0 0 auto; }
+body.fs-lock { overflow: hidden; }
 .maptools { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; margin-bottom: 8px; font-size: 13px; color: var(--muted); }
 .maptools label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
 .maptools input[type=checkbox] { accent-color: var(--brass-hi); }
