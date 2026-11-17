@@ -367,11 +367,11 @@ def curriculum_text(msg: str) -> str:
     old, new, sector, rate = m.groups()
     if old:
         return f"开局点 {old} → {new}（手动设定）"
-    out = f"开局点推进到第 {new} 帧"
+    out = f"开局点 → {new}"
     if sector:
         out += f"（第 {sector} 小节）"
     if rate:
-        out += f"，此前区间成功率 {float(rate):.0%}"
+        out += f" · 区间成功率 {float(rate):.0%}"
     return out
 
 

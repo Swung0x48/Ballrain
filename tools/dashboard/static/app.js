@@ -148,15 +148,15 @@ function renderHeader() {
   const errs = Object.entries(g.errors || {});
   $("errs").textContent = errs.length ? "部分内容计算出错：" + errs.map(([k, v]) => `${k}: ${v}`).join("；") : "";
   updateMeta();
-  $("foot").textContent = `时间均为 ${S.tz}。训练机：${S.machines.train}；评估机：${S.machines.eval}。数据只包含训练本身（课程、成功率、轨迹、曲线、SR 估计与原版评估）。`;
+  $("foot").textContent = `时间 ${S.tz} · 训练机 ${S.machines.train} · 评估机 ${S.machines.eval}`;
 }
 
 function updateMeta() {
   if (!S) return;
   const g = S.gen || {};
   const left = Math.max(0, Math.round((nextAt - Date.now()) / 1000));
-  $("meta").textContent = `现在 ${S.now.slice(5, 16)}（${S.tz}）· 图表数据每 ${Math.round(S.interval_s / 60)} 分钟重算，上次 ${g.generated_at ? g.generated_at.slice(0, 11) : "—"}` +
-    (g.seconds != null ? `（${g.seconds} 秒）` : "") + (g.running ? " · 正在重算…" : "") + ` · 页面 ${left} 秒后自动更新`;
+  $("meta").textContent = `${S.now.slice(5, 16)}（${S.tz}）· 图表更新于 ${g.generated_at ? g.generated_at.slice(6, 11) : "—"}` +
+    (g.running ? " · 正在重算…" : "") + ` · ${left} 秒后刷新`;
 }
 setInterval(updateMeta, 1000);
 
@@ -185,14 +185,14 @@ function renderStatus() {
     tile(`最后记录（${S.tz}）`, s.last_log || "—", s.last_log_age_min != null ? `${num(s.last_log_age_min, 0)} 分钟前；开始于 ${s.started || "—"}` : "", true),
     tile("更新次数", num(s.update), "", true),
     tile("训练步数", s.steps != null ? (s.steps / 1e6).toFixed(2) + " M" : "—", "", true),
-    tile("每秒步数", num(s.steps_per_s), `最近 20 次平均 ${num(s.steps_per_s_avg20)}`, true),
+    tile("每秒步数", num(s.steps_per_s), `近 20 次 ${num(s.steps_per_s_avg20)}`, true),
     tile("课程开局点（TAS 帧）", num(s.frontier), [s.frontier_sector != null ? `第 ${num(s.frontier_sector)} 小节` : "", s.covered_pct != null ? `智能体已能接手全程的 ${s.covered_pct}%` : ""].filter(Boolean).join("，"), true),
-    tile("开局区间成功率", pct(s.band_success), `${s.advance_at != null ? `推进阈值 ${pct(s.advance_at)}；` : ""}最近 20 次平均 ${pct(s.band_success_avg20)}`, true),
-    tile("回合通关率", pct(s.finish_tas), `最近 20 次平均 ${pct(s.finish_tas_avg20)}`, true),
-    tile("策略熵 / KL", `${num(s.u_entropy, 3)} / ${num(s.u_approx_kl, 4)}`, s.random_entropy != null ? `随机策略的熵为 ${num(s.random_entropy, 2)}` : "", true),
+    tile("开局区间成功率", pct(s.band_success), `${s.advance_at != null ? `阈值 ${pct(s.advance_at)} · ` : ""}近 20 次 ${pct(s.band_success_avg20)}`, true),
+    tile("回合通关率", pct(s.finish_tas), `近 20 次 ${pct(s.finish_tas_avg20)}`, true),
+    tile("策略熵 / KL", `${num(s.u_entropy, 3)} / ${num(s.u_approx_kl, 4)}`, s.random_entropy != null ? `随机 ${num(s.random_entropy, 2)}` : "", true),
     `<div class="tile"><div class="k">训练数据来自哪台机器（按步数，近 100 次）</div><div class="v split">${share}</div></div>`,
-    tile("开局点附近接手的最佳整关用时", sec(s.best_sr_near), s.best_sr_near_k != null ? `从 TAS 第 ${num(s.best_sr_near_k)} 帧接手，前面是 TAS；` + (s.best_sr_k0 != null ? `从出生点开始最佳 ${sec(s.best_sr_k0)}` : "还没有从出生点开始的通关") : "开局点附近还没有通关", true),
-    tile("记录了轨迹的回合", num((S.traced_counts || {})[sel]), "抽样记录，供轨迹地图使用", true),
+    tile("开局点附近接手的最佳整关用时", sec(s.best_sr_near), s.best_sr_near_k != null ? `TAS 第 ${num(s.best_sr_near_k)} 帧接手` + (s.best_sr_k0 != null ? ` · 出生点起 ${sec(s.best_sr_k0)}` : "") : "", true),
+    tile("记录了轨迹的回合", num((S.traced_counts || {})[sel]), "", true),
   ].join("");
   $("tiles").querySelectorAll(".gt").forEach((el) => gameText(el, el.textContent, el.closest(".split") ? 18 : 20, "dark"));
   const c = s.curriculum || [];
@@ -254,7 +254,8 @@ function renderHighlight() {
     `整关 <b>${(h.sr_ms / 1000).toFixed(3)} 秒</b>${h.tas_ms ? `（TAS ${(h.tas_ms / 1000).toFixed(3)} 秒）` : ""}`,
     `原始尝试：${esc(h.backend || "—")}${h.episode_at ? `，${esc(h.episode_at.slice(5))}` : ""}`,
     h.matched ? "原版游戏复现一致" : "原版游戏复现不一致"];
-  $("hl-cap").innerHTML = parts.join(" · ") + `<br><span class="note">上一小时内成绩最好的一次尝试（无死亡通关，优先选接手最早的），在原版游戏（2002 物理）里按原输入重放、用游戏自己的画面录制：从出生到上${esc(TERMS.airship)}，TAS 部分加智能体部分，不剪辑。</span>`;
+  $("hl-cap").innerHTML = parts.join(" · ");
+  $("hl-cap").title = `上一小时最好的一局，在原版游戏里按原输入重放录制，从出生到上${TERMS.airship}，不剪辑`;
 }
 
 /* ---------------------------------------------------------------------------------- SR chart */
@@ -267,12 +268,12 @@ function renderSR() {
   let h = "";
   if (r.estimate_s) {
     h += `<div class="big"><span class="gt" data-h="30">${r.estimate_s[0].toFixed(1)} - ${r.estimate_s[1].toFixed(1)} s</span>
-      <span class="note" style="margin:0">中位比率 ${r.ratio_range[0].toFixed(3)} – ${r.ratio_range[1].toFixed(3)}${r.alt ? `，已含鬼躲石变约 ${r.shortcut_extra_s} s × 比率` : ""}</span></div>`;
+      <span class="note" style="margin:0">中位比率 ${r.ratio_range[0].toFixed(2)} – ${r.ratio_range[1].toFixed(2)}</span></div>`;
   } else {
     h += `<p class="note">样本不足，暂无整关估计。</p>`;
   }
   h += `<div class="bench"><span>TAS <b>${sec(b.tas)}</b></span><span>人类纪录 <b>${sec(b.human_wr)}</b></span><span>精品线 <b>${sec(b.featured)}</b></span><span>上榜线 <b>${sec(b.threshold)}</b></span></div>`;
-  h += `<div class="note" style="margin:0">样本：${esc((r.runs_used || []).join(" + "))} 最近 ${r.window} 次更新（${r.update_range ? r.update_range.join(" – ") : "—"}）中，从 TAS 中途接手（k &gt; 0）且没有死亡的通关局，共 ${num(r.n)} 局${r.n_retail ? `（其中原版 2002 ${num(r.n_retail)} 局）` : ""}。</div>`;
+  h += `<div class="note" style="margin:0">样本 ${num(r.n)} 局无死亡通关（${esc((r.runs_used || []).join(" + "))}，近 ${r.window} 次更新）</div>`;
   $("sr-head").innerHTML = h;
   $("sr-head").querySelectorAll(".gt").forEach((el) => gameText(el, el.textContent, 30));
 
@@ -337,9 +338,9 @@ function renderSR() {
     for (const x of k0) k += `<tr><td>${esc(x.run)}</td><td>${esc(x.t || "")}</td><td>${num(x.update)}</td><td>${esc(x.backend)}</td><td>${x.greedy ? "贪心" : "温度 " + esc(x.temperature)}</td><td>${num(x.runs)}</td><td>${pct(x.success)}</td><td>${num(x.finished_no_death)}</td><td>${num(x.deaths_per_run, 1)}</td><td>${sec(x.sr_ms_median)}</td><td>${sec(x.sr_ms_min)}</td></tr>`;
     $("k0").innerHTML = k + "</tbody></table>";
   }
-  $("sr-note").textContent = `怎么算的：比率 = 智能体从接手帧 k 跑到终点的用时 ÷ TAS 同一段的用时（TAS 在第 k 帧的计时 = (k − c0) × 1000 / 264，c0 = 20483 − 74446 × 0.264）。` +
+  $("sr-note").innerHTML = `<details><summary>怎么算的</summary>比率 = 智能体从接手帧 k 跑到终点的用时 ÷ TAS 同一段的用时（TAS 在第 k 帧的计时 = (k − c0) × 1000 / 264，c0 = 20483 − 74446 × 0.264）。` +
     `整关估计 = ${(b.tas / 1000).toFixed(3)} s × 比率${r.alt ? ` + 鬼躲石变约 ${r.shortcut_extra_s} s × 比率` : ""}；范围取局数 ≥ ${r.min_n} 且 TAS 剩余段 ≥ ${r.min_seg_s} s 的分箱的中位比率最小值到最大值（柱状图中亮色的柱子，竖线为 p10–p90）。` +
-    `这是外推：只统计无死亡的通关局，前段还没练到的部分按后段的比率估计，近终点分箱的段很短、噪声大，无头后端与原版游戏也略有差别；最终以从头开始的原版评估为准。`;
+    `这是外推：只统计无死亡的通关局，前段还没练到的部分按后段的比率估计，近终点分箱的段很短、噪声大，无头后端与原版游戏也略有差别；最终以从头开始的原版评估为准。</details>`;
 }
 
 /* --------------------------------------------------------------------------------- the maps */
@@ -504,7 +505,7 @@ function wirePick(ch, id, pickBox) {
     const st = mapState[id];
     st.picked = d && (!st.picked || st.picked.id !== d.id) ? d : null;
     ch.setOption({ series: [pickedSeries(st)] });
-    $(pickBox).innerHTML = st.picked ? "选中：" + trajTooltip(st.picked).replace(/<br>/g, " · ") : "点击一条轨迹可高亮并查看详情。";
+    $(pickBox).innerHTML = st.picked ? "选中：" + trajTooltip(st.picked).replace(/<br>/g, " · ") : "";
   });
 }
 
@@ -522,7 +523,7 @@ async function renderAttempts(force, full) {
   const trs = A.traj.filter((d) => st.outcomes[d.end]);
   const groups = Object.entries(OUT).filter(([k]) => st.outcomes[k]).map(([k, o]) => [o.n, o.c]);
   const series = [tasSeries(F), ...trajSeries(trs, (d) => (OUT[d.end] || OUT.stopped).c, (d) => (OUT[d.end] || OUT.stopped).n, groups), pickedSeries(st)];
-  if (ch._run !== sel) { st.picked = null; $("p-attempts").textContent = "点击一条轨迹可高亮并查看详情。"; series[series.length - 1] = pickedSeries(st); }
+  if (ch._run !== sel) { st.picked = null; $("p-attempts").textContent = ""; series[series.length - 1] = pickedSeries(st); }
   apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: series.filter((s) => s.name !== "选中").map((s) => s.name) }, geo: { ...geoBase(roamOn[id]), top: 40 }, series }, full || ch._run !== sel);
   ch._run = sel;
   wirePick(ch, id, "p-attempts");
@@ -570,7 +571,7 @@ async function renderCurves(force, full) {
   if (!box.dataset.wired) {
     box.innerHTML = `<button type="button" class="tbtn${curveMode.log ? " on" : ""}" data-c="log">横轴对数</button>
       <button type="button" class="tbtn" data-c="all">全部</button><button type="button" class="tbtn" data-c="run">当前 run</button><button type="button" class="tbtn" data-c="recent">最近 1500 次更新</button>
-      <span>拖动下方滑条或滚轮缩放；点击图例开关 run；虚线为“区间开局通关率”。</span>`;
+      <span>虚线：区间开局通关率</span>`;
     box.querySelectorAll("[data-c]").forEach((b) => (b.onclick = () => {
       const c = b.dataset.c;
       if (c === "log") { curveMode.log = !curveMode.log; b.classList.toggle("on", curveMode.log); renderCurves(true, true); return; }

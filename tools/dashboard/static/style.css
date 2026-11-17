@@ -151,3 +151,6 @@ tr.dim td { color: #8a8574; }
 .tile:nth-child(7n+5) { background-position: -143px -9px; }
 .tile:nth-child(7n+6) { background-position: -219px -88px; }
 .tile:nth-child(7n+7) { background-position: -66px -157px; }
+
+#sr-note summary { cursor: pointer; color: var(--brass-hi); }
+#sr-note details[open] summary { margin-bottom: 4px; }

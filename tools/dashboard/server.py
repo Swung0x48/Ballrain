@@ -175,7 +175,7 @@ def highlight_public() -> dict | None:
         return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
 
     out = {"run": s("run", 8), "update": i("update"), "episode_at": s("episode_at", 16), "recorded_at": s("recorded_at", 16),
-           "tz": s("tz", 10), "sr_ms": i("sr_ms"), "k": i("k"), "tas_ms": i("tas_ms"), "backend": s("backend", 16),
+           "tz": s("tz", 10), "sr_ms": i("sr_ms"), "k": i("k"), "tas_ms": i("tas_ms"), "backend": s("backend", 32),
            "matched": j.get("matched") is True,
            "duration_s": j.get("duration_s") if isinstance(j.get("duration_s"), (int, float)) else None,
            "v": i("v"),
