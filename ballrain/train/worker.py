@@ -91,7 +91,9 @@ class _Episode:
         self.d = {"kind": st.get("kind"), "start_frame": int(st.get("frame") or 0), "copy": st.get("copy"),
                   "start_sector": int(info.get("sector") or 0), "start_sr_ms": float(info.get("sr_ms") or 0.0),
                   "version_start": version, "run_id": info.get("run_id"), "new_process": bool(st.get("new_process")),
-                  "cap_frames": cap_frames, "t_wall_start": time.time()}
+                  "cap_frames": cap_frames, "t_wall_start": time.time(),
+                  # headless: the contact order of this process (e.g. "retail:<seed>"); None on retail
+                  "ball_order": getattr(getattr(getattr(env, "session", None), "handle", None), "ball_order", None)}
         self.ret = 0.0
         self.steps = 0
         self.max_sector = self.d["start_sector"]
@@ -293,7 +295,7 @@ class Worker:
                                       "deaths": sum(1 for x in m.get("lives") or [] if x.get("end_reason") == "BallOff"),
                                       "framelog_match": m.get("framelog_match"),
                                       "handover_mismatches": ss.get("handover_mismatches"),
-                                      "invalid": m.get("invalid"),
+                                      "invalid": m.get("invalid"), "ball_order": m.get("ball_order"),
                                       "dir": str(p.parent)})
             self._prune(p.parent, m.get("end_reason") == "LevelFinish" and not m.get("invalid"))
 

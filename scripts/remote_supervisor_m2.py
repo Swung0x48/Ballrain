@@ -7,7 +7,8 @@ Everything after "--" goes to remote_worker_m2.py (with --tag added). Health com
 (<runtime>/m2-train/remote-<tag>/heartbeat.json, written every 30 s): the bridge is restarted when
 - its process exited,
 - the heartbeat is older than --stale-s (default 180 s: the bridge's main loop is stuck),
-- it has been connected but forwarded nothing for --idle-s (default 600 s),
+- it has been connected but forwarded nothing for --idle-s (default 600 s; not while its quiet file holds the
+  workers stopped: remote_worker_m2.py --quiet-file),
 - more than --max-fatal-per-min worker fatals per minute (crash loop, default 5).
 A restart: STOP file, wait up to 150 s, then kill the bridge's process tree (only its own PID) and stop any Player.exe left
 in its copies by path; then a new bridge process (new code). Log: remote-<tag>/supervisor.log. Stop the supervisor
@@ -46,6 +47,7 @@ def main(argv=None) -> int:
     (out / "SUPERVISOR_STOP").unlink(missing_ok=True)
     logf = open(out / "supervisor.log", "a", encoding="utf-8")
     copies = rest[rest.index("--copies") + 1].split(",") if "--copies" in rest else []
+    retail = (rest[rest.index("--backend") + 1] if "--backend" in rest else "retail") == "retail"
 
     def log(msg):
         line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
@@ -76,6 +78,9 @@ def main(argv=None) -> int:
             except subprocess.TimeoutExpired:
                 pass
         time.sleep(10)  # the workers exit on their own once their parent is gone
+        if not retail:  # headless bridges: the engines are the workers' children (taken down with the tree)
+            (out / "STOP").unlink(missing_ok=True)
+            return
         try:
             st = stop_copies(copies, log)
             if st:
@@ -109,7 +114,7 @@ def main(argv=None) -> int:
         else:
             if now - hb["t"] > a.stale_s:
                 why = f"heartbeat {now - hb['t']:.0f} s old"
-            if hb["forwarded"] != last_fwd:
+            if hb["forwarded"] != last_fwd or hb.get("quiet"):  # quiet switch: no data on purpose
                 last_fwd, t_fwd = hb["forwarded"], now
             elif hb.get("connected") and now - t_fwd > a.idle_s:
                 why = f"connected but nothing forwarded for {(now - t_fwd) / 60:.0f} min"

@@ -529,6 +529,14 @@ random = 随机粘滞动作（2–39 步换一次），curr = 从课程抽的 TA
   连接着但 10 分钟没有转发、或每分钟超过 5 次 worker 崩溃时，按 STOP → 等待 → 结束它自己的进程树 → 按路径停掉剩下的 Player.exe → 用当前代码重启。
   learner 端：10 分钟没有远程数据时 train.log 打 `WARNING remote`，tensorboard `remote/alive`、`remote/chunks_per_min`。
   桥代码比 learner 旧时不认识的模板字段被丢弃并警告（需要重启桥）。
+- **无头数据源接到远程桥**（headless-2002）：`remote_worker_m2.py --backend headless --label headless2002 --hl-bin <2002 宿主> --hl-root <游戏目录>`，
+  learner 模板不带 headless 路径，HeadlessConfig 由桥所在机器给；球序默认 `retail`（每进程抽种子），episodes.csv / runs.csv 的 `ball_order` 列记下
+  （如 `retail:3836102492`）；`--label` 进 episodes.csv 的 backend 列和 TB，`--host-label`（如 runner1 / runner2）进 host 列，也是 hub 区分连接的键（一个桥一个）。
+  共用机器的停止开关 `--quiet-file PATH`：文件存在时桥在约 5 s 内发现、给 worker 40 s 自己停（关 env，即引擎进程退出），之后杀进程树，
+  所以 60 s 内 CPU 归零；桥保持连接（learner 只是少了这些 worker），参数只留最新一份；文件删掉后 worker 用最新模板和参数重启。
+  心跳带 `quiet`，supervisor 在 quiet 时不按"连接着但没转发"重启。`--priority below_normal`：桥、worker 和引擎都以低于正常的优先级跑。
+  同一检查点、起点 4700 / 8800 / 12000：2002 宿主、零售、Mac x87-soft 的观测 greedy 40 步逐维相同；T 0.3 各 8 次，2002 与 x87-soft 结果完全相同，
+  零售在 8800 / 12000 也完全相同，4700 差在球序随机范围内（每次死亡 1.875 vs 2.0）。
 - **分段时间奖励**（`--split-k`，r5 起 k = 5）：每条命到达盘点 / LevelFinish 时付 k·(t_ref − t_agent)/max(t_ref, 5 s)，裁剪到 [−k, k]；
   t_agent 是这条命从起点或上一个盘点起的游戏时间，t_ref 是 TAS 在同一段的游戏时间（TAS 起点从交接帧算；重生 / 静止起点从盘点或起点帧算并加 1 s 静止起步的余量）。
   每秒游戏时间的价值 = 1（时间项）+ k / 该小节的 TAS 用时：k = 5 时第 1–4 小节约 1.19、1.34、1.53、1.22 / 秒。

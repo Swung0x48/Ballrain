@@ -41,7 +41,7 @@ TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "chec
          "camera_off_quarter")
 EP_COLS = ["update", "t", "wid", "backend", "host", "copy", "kind", "probes", "death_probe", "splits", "start_frame", "start_sector", "end", "end_sector", "max_sector",
            "success_cp", "finish", "ret", "steps", "frames", "sr_ms_end", "start_sr_ms", "agent_s", "s_start", "s_end",
-           "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id"] + [f"r_{k}" for k in TERMS] + ["actions"]
+           "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id", "ball_order"] + [f"r_{k}" for k in TERMS] + ["actions"]
 UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_per_s", "frontier", "frontier_sector",
                 "band_success", "band_n", "band_finish", "gate_blocked", "episodes", "ret_mean", "ret_tas", "ret_respawn", "success_cp_tas", "finish_tas",
                 "deaths", "finishes", "stalls", "caps", "camera_off_quarter", "invalid_runs", "speed_mean", "runs", "finish_runs", "sr_ms_min", "sr_ms_k0_min",
@@ -54,7 +54,7 @@ UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_pe
                + [f"u_{k}" for k in ("pg_loss", "v_loss", "entropy", "approx_kl", "clip_frac", "early_stop",
                                      "explained_var", "adv_std", "ret_mean")])
 RUN_COLS = ["update", "t", "copy", "run_id", "end_reason", "sr_ms", "start_frame", "frames", "lives", "deaths",
-            "framelog_match", "handover_mismatches", "invalid", "dir"]
+            "framelog_match", "handover_mismatches", "invalid", "ball_order", "dir"]
 
 
 def gated_curriculum(starts, cfg, finish_gate: float):

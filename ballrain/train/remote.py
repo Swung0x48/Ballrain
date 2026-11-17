@@ -160,12 +160,49 @@ class RemoteHub:
             alive["ok"] = False
 
 
+def kill_tree(pid: int) -> None:
+    """Kill a process and its children (a worker and the game / engine process it started)."""
+    import signal
+    import subprocess
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def lower_priority() -> None:
+    """Below-normal priority for this process; its children (workers, engines) inherit it."""
+    if os.name == "nt":
+        import ctypes
+        k = ctypes.windll.kernel32
+        k.SetPriorityClass(k.GetCurrentProcess(), 0x00004000)  # BELOW_NORMAL_PRIORITY_CLASS
+    else:
+        os.nice(10)
+
+
 class RemoteBridge:
     """Remote side: connects to the hub, runs local workers from its template, forwards chunks and parameters."""
 
     def __init__(self, addr, authkey: bytes, copies: list, backend: str, out_root_fn, log=print, worker_overrides=None,
-                 host: str | None = None, max_queue: int = 64):
+                 host: str | None = None, max_queue: int = 64, label: str | None = None, headless: dict | None = None,
+                 quiet_file=None, quiet_check_s: float = 5.0, quiet_stop_s: float = 40.0):
         self.addr, self.authkey, self.copies, self.backend = addr, authkey, copies, backend
+        # label: the data source name the learner logs for this bridge's episodes (episodes.csv "backend", TB), e.g.
+        # "headless2002" for the Windows host with the original 2002 physics_RT.dll; default = the env backend
+        self.label = label or backend
+        # headless: this machine's HeadlessConfig fields (the learner's template carries none: its paths are its own)
+        self.headless = headless
+        # quiet_file: while it exists every worker is stopped (their game / engine processes exit, the CPU goes idle);
+        # the connection to the learner stays up (it just sees no chunks from here); deleting it starts them again.
+        # Checked every quiet_check_s; a worker gets quiet_stop_s to stop on its own, then its process tree is killed,
+        # so a stop completes within quiet_check_s + quiet_stop_s + a few seconds (< 60 s with the defaults)
+        self.quiet_file = Path(quiet_file) if quiet_file else None
+        self.quiet_check_s, self.quiet_stop_s = quiet_check_s, quiet_stop_s
+        self.quiet = False
+        self._t_quiet_check = 0.0
         self.out_root_fn, self.log = out_root_fn, log
         self.overrides = worker_overrides or {}
         self.host = host or socket.gethostname()
@@ -193,7 +230,7 @@ class RemoteBridge:
                     try:
                         cc = Client(self.addr, authkey=self.authkey)
                         cc.send({"type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session + 1,
-                                 "backend": self.backend, "n_workers": len(self.copies)})
+                                 "backend": self.label, "n_workers": len(self.copies)})
                         if not cc.poll(30):
                             raise ConnectionError("no config within 30 s")
                         box["conn"], box["msg"] = cc, cc.recv()
@@ -242,6 +279,8 @@ class RemoteBridge:
         cfg = _copy.deepcopy(t["env"])
         cfg.copy = name
         cfg.backend = self.backend
+        if self.backend == "headless":
+            cfg.headless = dict(self.headless or {})
         cfg.out_root = str(self.out_root_fn(name))
         seed = t["seed"] * 1000 + self.wid_base + i + 100 * restart + 7919 * self.session
         cfg.seed = seed
@@ -286,6 +325,8 @@ class RemoteBridge:
             if m.get("type") == "params":
                 self._last_params = m["msg"]
                 self.counts["params"] += 1
+                if self.quiet:  # no live workers: the newest parameters go to them when they start again
+                    continue
                 for q in self.ctrl_qs:
                     q.put(m["msg"])
 
@@ -300,10 +341,75 @@ class RemoteBridge:
             self.counts["reconnects"] += 1
             threading.Thread(target=self.connect, daemon=True).start()
 
+    # --------------------------------------------------------------------------------- quiet switch
+    def quiet_requested(self) -> bool:
+        return self.quiet_file is not None and self.quiet_file.exists()
+
+    def _stop_workers(self, data_q, wait_s: float):
+        """Stop every worker: the stop command first (the worker closes its env, i.e. its game / engine process),
+        then, for any still alive after wait_s, its whole process tree."""
+        for q in self.ctrl_qs:
+            try:
+                q.put({"cmd": "stop"})
+            except Exception:  # noqa: BLE001
+                pass
+        t_end = time.time() + wait_s
+        while time.time() < t_end and any(p.is_alive() for p in self.procs):
+            try:  # keep reading: a worker cannot exit while its last messages sit in a full pipe
+                m = data_q.get(timeout=0.5)
+                self._forward(m)
+            except queue.Empty:
+                pass
+        for p in self.procs:
+            if p.is_alive():
+                kill_tree(p.pid)
+                p.join(timeout=5)
+                if p.is_alive():
+                    p.terminate()
+
+    def check_quiet(self, data_q, restarts: list, now: float | None = None) -> None:
+        """Enter / leave the quiet state when the quiet file appeared / went away (at most every quiet_check_s)."""
+        now = time.time() if now is None else now
+        if self.quiet_file is None or now - self._t_quiet_check < self.quiet_check_s:
+            return
+        self._t_quiet_check = now
+        want = self.quiet_requested()
+        if want and not self.quiet:
+            self.log(f"bridge: quiet file {self.quiet_file} present: stopping all {len(self.procs)} workers")
+            self.quiet = True
+            self._stop_workers(data_q, self.quiet_stop_s)
+            self.log("bridge: quiet: all workers stopped (still connected)")
+        elif not want and self.quiet:
+            self.log(f"bridge: quiet file gone: starting {len(self.copies)} workers")
+            self.quiet = False
+            for i, name in enumerate(self.copies):
+                restarts[i] += 1
+                self._start_worker(i, name, restarts[i])
+
+    def _forward(self, m):
+        if "fatal" in m:  # a worker that died while being stopped (quiet switch): not restarted, reported as an error
+            m = {"wid": m.get("wid"), "errors": [f"fatal while stopping: {str(m['fatal'])[-800:]}"]}
+        m["backend"] = self.label
+        c = self.conn
+        if c is None:
+            self.counts["dropped"] += 1
+            return
+        try:
+            c.send({"type": "data", "msg": m})
+            self.counts["forwarded"] += 1
+        except (OSError, EOFError, ConnectionError, ValueError):
+            self.counts["dropped"] += 1
+            self._lost(c)
+
     def run(self, ctx, data_q, should_stop=lambda: False, on_fatal=None):
         if not self.connect():
             return
-        self.start_workers(ctx, data_q)
+        self.ctx, self.data_q = ctx, data_q
+        self.quiet = self.quiet_requested()
+        if self.quiet:
+            self.log(f"bridge: quiet file {self.quiet_file} present: workers wait until it is deleted")
+        else:
+            self.start_workers(ctx, data_q)
         threading.Thread(target=self._recv_loop, daemon=True, name="bridge-recv").start()
         restarts = [0] * len(self.copies)
         t_beat = 0.0
@@ -314,10 +420,18 @@ class RemoteBridge:
                     import json as _json
                     tmp = Path(str(self.heartbeat) + ".tmp")
                     tmp.write_text(_json.dumps(dict(self.counts, t=t_beat, connected=self.conn is not None,
-                                                    pid=os.getpid())), encoding="utf-8")
+                                                    pid=os.getpid(), quiet=self.quiet)), encoding="utf-8")
                     os.replace(tmp, self.heartbeat)
                 except OSError:
                     pass
+            self.check_quiet(data_q, restarts)
+            if self.quiet:
+                self._restart_all = False  # the workers start on the newest template when the quiet file goes
+                try:
+                    self._forward(data_q.get(timeout=2.0))  # last chunks of stopping workers
+                except queue.Empty:
+                    pass
+                continue
             if getattr(self, "_restart_all", False):
                 self._restart_all = False
                 for i, p in enumerate(self.procs):
@@ -349,17 +463,7 @@ class RemoteBridge:
                     on_fatal(self.copies[i])
                 self._start_worker(i, self.copies[i], restarts[i])
                 m = {"wid": i, "errors": [f"fatal (restarted): {m['fatal'][-800:]}"]}
-            m["backend"] = self.backend
-            c = self.conn
-            if c is None:
-                self.counts["dropped"] += 1
-                continue
-            try:
-                c.send({"type": "data", "msg": m})
-                self.counts["forwarded"] += 1
-            except (OSError, EOFError, ConnectionError, ValueError):
-                self.counts["dropped"] += 1
-                self._lost(c)
+            self._forward(m)
 
     def shutdown(self, wait_s: float = 120.0):
         self.stop = True
