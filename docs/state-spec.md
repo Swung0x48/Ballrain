@@ -116,7 +116,7 @@ IPC 契约见 `agent-protocol.md`。
 
 **物理化记录**：BML 的 `OnPhysicalize` 在原 BB 执行**之前**触发，这时 IVP 物体还不存在，参数里的网格数组在回调返回后释放。
 所以回调里只能拷贝实体 ID、全部参数和网格 ID，在下一帧的 `OnProcess` 再导出网格和查找 IVP 物体 [实测]。
-地面在 PreLoadLevel 后约第 20–60 帧物理化（L11 是第 22 帧，早于 StartLevel）。机关在扇区激活时物理化，重置时 Unphysicalize 后再物理化。
+地面在 PreLoadLevel 后约第 20–60 帧物理化（L11 是第 22 帧，早于 StartLevel）。机关在小节激活时物理化，重置时 Unphysicalize 后再物理化。
 SR11 共 290 次 PHYS、306 次 UNPHYS。
 
 | 类别 | 内容 | 读法 / 导出 | 频率 |
@@ -125,27 +125,27 @@ SR11 共 290 次 PHYS、306 次 UNPHYS。
 5 条记录里玩家球离 stopper 最近时间隙只有 0.23（SR11 的 `A01_Floor_Stopper`），但始终没有对它的 mindist 或接触；而可碰撞物体在约 1.2 以内就会有 mindist。
 几何计算必须排除 stopper。全部作为 concave 网格物理化 | 一次性导出：实体 ID、世界矩阵、网格顶点（局部坐标）和三角形。L1/L3/L6/L11 分别为 22351 / 17501 / 15799 / 27214 个静态三角形。CK 网格乘以 CK 世界矩阵后，与 IVP mindist 距离一致（median 6e-8） | L |
 | 地面材质（声音类） | 属性 `Continuous Contact ID`：1 = 石面（`Sound_RollID_01`），2 = 木面（`Sound_RollID_02`），3 = 金属 / 栏杆（`Sound_RollID_03`）。另有属性 `Coll Detection ID`（`Sound_HitID_01..03`，部分机关为 4）和属性 `Floor`（结构体，读原始字节）。`BallSound` 数组按 球 × {onStone, onWood, onMetal} 给出音效名 | 按属性名读 | L |
-| 运动体 | P_Modul_*（桥、翻板、推块、秋千、箱子…）、P_Box、P_Ball_*（场景小球）、P_Dome（fixed）、PE_Balloon 平台。物理化时的 friction / mass / 阻尼 / 凸包网格 ID 见 OnPhysicalize（例如 `P_Modul_37_Bridge` 由 3 个凸网格组成，mass 3，startFrozen） | 网格一次性导出（局部坐标）；位姿每帧导出：core +0xB8 / +0xE8 的 PSI 位姿，加上实物体 +0x2C `q_core_f_object`（指向 4×f64）和 +0x30 `shift_core_f_object`（4×f32）。物体到世界的变换：`R_core·(R(q_cfo)·p + shift) + vv`。速度取 core +0xA4 / +0x94 | F（只发球附近，例如 60 单位内） |
+| 运动体 | P_Modul_*（桥、翻板、推块、秋千、箱子…）、P_Box、P_Ball_*（道具球）、P_Dome（fixed）、PE_Balloon 平台。物理化时的 friction / mass / 阻尼 / 凸包网格 ID 见 OnPhysicalize（例如 `P_Modul_37_Bridge` 由 3 个凸网格组成，mass 3，startFrozen） | 网格一次性导出（局部坐标）；位姿每帧导出：core +0xB8 / +0xE8 的 PSI 位姿，加上实物体 +0x2C `q_core_f_object`（指向 4×f64）和 +0x30 `shift_core_f_object`（4×f32）。物体到世界的变换：`R_core·(R(q_cfo)·p + shift) + vv`。速度取 core +0xA4 / +0x94 | F（只发球附近，例如 60 单位内） |
 | 运动体验证 | 用全部碰撞网格加上述 PSI 变换，球到网格的距离与 mindist 一致：median 1e-5，p95 0.011（SR11，1034 个样本）。直接用 IVP ledge 三角形（§3.2）时 median 1e-9 | — | 实测 |
 
-### 2.6 扇区、检查点、复活点 [实测]
+### 2.6 小节、盘点、重生点 [实测]
 
 | 项 | 用途 | 读法 | 频率 |
 |---|---|---|---|
-| 当前扇区 | C S H | `IngameParameter[0,1]`（Activate Sector），`[0,2]`（Deactivate Sector） | F（变化时） |
-| 当前复活点 | C Z | `CurrentLevel[0,3]`（CurrentResetpoint，4×4 矩阵）。检查点触发的同一帧会更新 | F |
-| 全部复活点 | C | `ResetPoints` 数组（每扇区一个矩阵） | L |
-| 检查点 | C S | `Checkpoints` 数组（矩阵 + 对象，例如 `PC_TwoFlames_MF`）；事件 Pre/PostCheckpoint（相隔 8–10 帧） | L + E |
-| 起点 / 终点 | C | `PS_FourFlames_*`（起点）、`PE_Balloon_*`（终点飞艇平台，本身是运动体，会与球接触） | L |
-| 占位表 | C H | `PH` 数组（行 = 占位：Sector、Type Name、Matrix、Object、Set?）和 `PH_Groups`（类型、数量、激活和重置规则）。扇区激活时，`PH[r,3]` 会改成实际实例名 | L + F |
+| 当前小节 | C S H | `IngameParameter[0,1]`（Activate Sector），`[0,2]`（Deactivate Sector） | F（变化时） |
+| 当前重生点 | C Z | `CurrentLevel[0,3]`（CurrentResetpoint，4×4 矩阵）。盘点触发的同一帧会更新 | F |
+| 全部重生点 | C | `ResetPoints` 数组（每小节一个矩阵） | L |
+| 盘点 | C S | `Checkpoints` 数组（矩阵 + 对象，例如 `PC_TwoFlames_MF`）；事件 Pre/PostCheckpoint（相隔 8–10 帧） | L + E |
+| 出生点 / 飞船 | C | `PS_FourFlames_*`（起始盘点，在出生点）、`PE_Balloon_*`（飞船平台，本身是运动体，会与球接触） | L |
+| 占位表 | C H | `PH` 数组（行 = 占位：Sector、Type Name、Matrix、Object、Set?）和 `PH_Groups`（类型、数量、激活和重置规则）。小节激活时，`PH[r,3]` 会改成实际实例名 | L + F |
 
 ### 2.7 死亡（BallOff）[实测：SR09，4 次死亡]
 
 | 项 | 用途 | 读法 | 频率 |
 |---|---|---|---|
 | BallOff | Z | BML 事件 `OnBallOff`。**以此为准** | E |
-| 死亡体积 | Z | 组 `DepthTestCubes`（L9 有 `Quader01..04`，不可见盒子），世界包围盒用网格顶点算（例如 L9 的 Quader02：x −129…548，y −232.7…−111.9）。`Gameplay_Ingame` 的 local `maxDepth`（结束时 L1 = −329.4，L9 = −432.7）是 `DepthTest` 组物体（场景小球、箱子）的掉落重置阈值，与玩家球无关 [源码推断] | L |
-| 判定 | — | **规则（用户确认）：球与关卡中的死亡盒（`DepthTestCubes`）相交即判死。** 实测：SR09 的 4 次 BallOff 帧（事件号 13373、15015、16711、18348）球心比正下方盒子的顶面高 2.2–3.0（球底高出 0.2–1.0），说明参与相交测试的不是半径 2 的球面本身（具体用哪个包围体待向用户确认，不另做探针）。奖励整形可以用"球离死亡盒顶面的高度"，终止只用事件 | — |
+| 死亡区 | Z | 组 `DepthTestCubes`（L9 有 `Quader01..04`，不可见盒子），世界包围盒用网格顶点算（例如 L9 的 Quader02：x −129…548，y −232.7…−111.9）。`Gameplay_Ingame` 的 local `maxDepth`（结束时 L1 = −329.4，L9 = −432.7）是 `DepthTest` 组物体（道具球、箱子）的掉落重置阈值，与玩家球无关 [源码推断] | L |
+| 判定 | — | **规则（用户确认）：球与关卡中的死亡区（`DepthTestCubes`）相交即判死。** 实测：SR09 的 4 次 BallOff 帧（事件号 13373、15015、16711、18348）球心比正下方盒子的顶面高 2.2–3.0（球底高出 0.2–1.0），说明参与相交测试的不是半径 2 的球面本身（具体用哪个包围体待向用户确认，不另做探针）。奖励整形可以用"球离死亡区顶面的高度"，终止只用事件 | — |
 | 死亡后续 | Z S | BallOff 同帧有 CounterInactive（SR 计时暂停）。264 帧后（264 fps 下 1.0 s）`Energy[0,1]` 减 1；686 帧后 PostSubLife；再过约 380 帧有 CounterActive 和 BallNavActive。命数为 0 时，最后一次 BallOff 后第 2 帧 GameOver | E |
 
 ### 2.8 变球器（trafo）
@@ -153,16 +153,16 @@ SR11 共 290 次 PHYS、306 次 UNPHYS。
 | 项 | 用途 | 读法 | 频率 |
 |---|---|---|---|
 | 变球器对象 | C | 组 `All_P_Trafo_Paper / _Stone / _Wood`。目标球类型 = 组名或对象名（如 `P_Trafo_Paper_MF`）。位置见 `PH` 中 Type 为 `P_Trafo_*` 的行 | L |
-| 正在变球 | C | 事件序列（HS03 第一次变球）：5200 BallNavInactive，5201 旧球（`Ball_Wood`）Unphysicalize，同时 `IngameParameter[0,0]`（Activetrafo）变为该 trafo（`P_Trafo_Paper_MF`），5799 ActiveBall 改变，5800 新球 Physicalize，5801 BallNavActive。**变球期间旧球已被 Unphysicalize，没有 IVP 物体**（`agent-protocol.md` §8.7；探针当时读到的"冻结、速度为 0、没有 mindist 的旧球"是已释放的内存）。Python 的判据：从活动球（`Ball_*` 实体）的 Unphysicalize（不在 BallOff 之后）到球的下一次 Physicalize。Activetrafo 在变球结束后**不清零**，暂停和 LevelFinish 之后 BallNav 也不活动，所以两者都不能单独当判据 | E |
+| 正在变球 | C | 事件序列（HS03 第一次变球）：5200 BallNavInactive，5201 旧球（`Ball_Wood`）Unphysicalize，同时 `IngameParameter[0,0]`（Activetrafo）变为该变球器（`P_Trafo_Paper_MF`），5799 ActiveBall 改变，5800 新球 Physicalize，5801 BallNavActive。**变球期间旧球已被 Unphysicalize，没有 IVP 物体**（`agent-protocol.md` §8.7；探针当时读到的"冻结、速度为 0、没有 mindist 的旧球"是已释放的内存）。Python 的判据：从活动球（`Ball_*` 实体）的 Unphysicalize（不在 BallOff 之后）到球的下一次 Physicalize。Activetrafo 在变球结束后**不清零**，暂停和 LevelFinish 之后 BallNav 也不活动，所以两者都不能单独当判据 | E |
 | 新球 | C | `ActiveBall` 改变；新球会有一条 OnPhysicalize 记录 | E |
 
 ### 2.9 分数球、生命球 [实测：HS03]
 
 | 项 | 用途 | 读法 | 频率 |
 |---|---|---|---|
-| 位置 | H | `PH` 中 Type 为 `P_Extra_Point` / `P_Extra_Life` 的行（扇区 + 矩阵 + 实例名） | L |
-| 分数球被吃 | H | 碰到主球时 `Energy[0,0]` +100，同一帧主球 `P_Extra_Point_Ball0[<nnn>]` 变为不可见，下一帧有 ExtraPoint 事件；随后 6 个小球 `P_Extra_Point_Ball1..6[<nnn>]` 跟着玩家球，追上的那一帧该小球不可见且 `Energy[0,0]` +20，下一帧有一次 ExtraPoint 事件（同一帧到达多个小球时只有一个事件，所以按 Points 的增量计分，不按事件数）。HS03：主球在事件号 2549，6 个小球在 3734–3771。实例是按扇区复用的（HS01 只有模板和 001–003 四个实例）。规则（用户给定）：按 Esc 暂停时小球会飞到球上被收集，计时和扣分都停止 | E + F |
-| 跟随中的小球 | H | **判据**：某实例的主球不可见、它的小球仍可见 = 正在跟随（不需要历史）。在 TAS 数据集上：增加总是 6 的倍数（命中）；HS01_4738 上逐帧与按命中历史累计的计数一致，每次减少都在同一帧伴随 Points +20 × 减少数；最后一帧的个数正好等于 HS 文件名分数与 LevelFinish 读数之差 / 20（HS04 除外，它还在检查点丢球）。检查点：PreCheckpoint 之后 2 帧仍在跟随的小球全部消失，不计分（规则：到下一个检查点时还在跟随的小球作废）。LevelFinish 时仍在跟随的小球在之后约 50–340 帧内陆续到达并计分（post-finish 探针，`benchmarks.md` "HS 读数"）。mod 每帧在 SCOR 里给出这个计数（0.3.1），Python 另从 WTCH 复算（按实例的个数、最近小球的距离） | F |
+| 位置 | H | `PH` 中 Type 为 `P_Extra_Point` / `P_Extra_Life` 的行（小节 + 矩阵 + 实例名） | L |
+| 分数球被吃 | H | 碰到主球时 `Energy[0,0]` +100，同一帧主球 `P_Extra_Point_Ball0[<nnn>]` 变为不可见，下一帧有 ExtraPoint 事件；随后 6 个分数小球 `P_Extra_Point_Ball1..6[<nnn>]` 跟着玩家球，追上的那一帧该小球不可见且 `Energy[0,0]` +20，下一帧有一次 ExtraPoint 事件（同一帧到达多个小球时只有一个事件，所以按 Points 的增量计分，不按事件数）。HS03：主球在事件号 2549，6 个小球在 3734–3771。实例是按小节复用的（HS01 只有模板和 001–003 四个实例）。规则（用户给定）：按 Esc 暂停时小球会飞到球上被收集，计时和扣分都停止 | E + F |
+| 跟随中的分数小球 | H | **判据**：某实例的主球不可见、它的分数小球仍可见 = 正在跟随（不需要历史）。在 TAS 数据集上：增加总是 6 的倍数（命中）；HS01_4738 上逐帧与按命中历史累计的计数一致，每次减少都在同一帧伴随 Points +20 × 减少数；最后一帧的个数正好等于 HS 文件名分数与 LevelFinish 读数之差 / 20（HS04 除外，它还在盘点丢球）。盘点：PreCheckpoint 之后 2 帧仍在跟随的小球全部消失，不计分（规则：到下一个盘点时还在跟随的小球作废）。LevelFinish 时仍在跟随的小球在之后约 50–340 帧内陆续到达并计分（post-finish 探针，`benchmarks.md` "HS 读数"）。mod 每帧在 SCOR 里给出这个计数（0.3.1），Python 另从 WTCH 复算（按实例的个数、最近小球的距离） | F |
 | 生命球被吃 | H | 事件 PreLifeUp，约 140 帧后 PostLifeUp；`Energy[0,1]` +1；`P_Extra_Life_Sphere` 等子对象变为不可见 | E |
 | 已收集状态 | H | 按 PH 实例累计事件，加上可见性。死亡后分数球不会再出现，生命球会重新出现（benchmarks.md） | Python 派生 |
 
@@ -175,7 +175,7 @@ SR11 共 290 次 PHYS、306 次 UNPHYS。
 | HS | H | Points + Lifes × LifeBonus + LevelBonus。读取时机见 benchmarks.md（LevelFinish 之后会结算清零） | Python |
 | SR 计时 | S | BML+ 0.3.12 规则：StartLevel 清零；CounterActive / UnpauseLevel 开始；CounterInactive / PauseLevel 暂停；运行中每帧在 PostProcess 加 `(double)GetLastDeltaTime()`，**发生事件的那一帧也算**。已逐帧核对：`(float)` 这个 double 和 == `IBML::GetSRScore()`，在 SR01、HS03 全部帧上完全相等（HS03 有 4 次暂停）。正式值为 `int64` 截断 | F |
 | SR 结尾 | S | LevelFinish 后 3 帧 CounterInactive（30 条到达 LevelFinish 的记录全部是 3 帧，132 / 240 / 264 fps）。回放在 LevelFinish 就停了；agent 模式见 `agent-protocol.md` §5 | E |
-| 结算 | H | post-finish 探针（HS01_4738、HS03、SR05、HS12、HS04_esc）：CounterInactive 之后 Points 不再变化，只有仍在跟随的小球到达时 +20；LevelFinish 后约 2900–3200 帧（L12 约 5500 帧后 PreEndLevel）开始结算：Points 逐帧扣到 0，然后每约 148 帧扣一条命（PreSubLife / PostSubLife）。结算画面的分数没有存在任何数据数组里（窗口内全部数组的变化只有 Energy、CurrentLevel、IngameParameter、LifeBalls），按 Points + Lifes × LifeBonus + LevelBonus 在结算开始时的值重建 | E + F |
+| 结算 | H | post-finish 探针（HS01_4738、HS03、SR05、HS12、HS04_esc）：CounterInactive 之后 Points 不再变化，只有仍在跟随的分数小球到达时 +20；LevelFinish 后约 2900–3200 帧（L12 约 5500 帧后 PreEndLevel）开始结算：Points 逐帧扣到 0，然后每约 148 帧扣一条命（PreSubLife / PostSubLife）。结算画面的分数没有存在任何数据数组里（窗口内全部数组的变化只有 Energy、CurrentLevel、IngameParameter、LifeBalls），按 Points + Lifes × LifeBonus + LevelBonus 在结算开始时的值重建 | E + F |
 
 ### 2.11 事件（BML 钩子）[实测]
 
@@ -320,7 +320,7 @@ PreLoadLevel、PostLoadLevel、StartLevel、CamNav*、BallNav*、CounterActive/I
 
 - 每帧二进制读取的实际耗时。
 - 俯瞰（space）时的相机特征。
-- BallOff 判定：规则已由用户确认（与死亡盒相交）；参与相交的包围体待问用户。
+- BallOff 判定：规则已由用户确认（与死亡区相交）；参与相交的包围体待问用户。
 - 纸球的几何距离（多面体 vs 三角形）。
 - 角速度的坐标系。
 - 风扇（`P_Modul_18`）的风力：有 `SetPhysicsForce`、`TT Scaleable Proximity` 类 BB，还有 `P_Modul18_ActiveSounds` 数组。纸球受风脚本 `Ball_PaperWind` 影响。力的大小、作用区域、开关状态都还没有清点，需要补探针。

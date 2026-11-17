@@ -75,7 +75,7 @@ v1 的段如下（`f32` / `f64` 原样拷贝内存，不做换算）：
 | `GLCT` | 当前在用的 PhysicsContinuousContact：u32 BB ckid、u16 输出脉冲位图、3 × {i32 active，i32 number} | 每条 |
 | `ARRS` | 自上条消息以来变化的数组单元：u16 n；每项 u32 数组 ckid、u16 行、u16 列、u8 列类型、u8 len、bytes（int/float 4 字节；字符串原文；对象写 ckid；参数写原始数据，最多 64 字节）。监视的数组：Energy、CurrentLevel、IngameParameter、PH、Checkpoints、ResetPoints（第一条消息给全量） | 变化时 |
 | `EVTS` | u16 n；每项 u32 帧号、u16 事件码（§2.3）、u16 参数（例如物理化时的序号） | 有事件时 |
-| `WTCH` | 被监视对象（分数球、生命球、trafo 等，清单见关卡消息）可见性变化：u16 n × {u32 ckid，u8 可见，f32×3 位置} | 变化时 |
+| `WTCH` | 被监视对象（分数球、生命球、变球器等，清单见关卡消息）可见性变化：u16 n × {u32 ckid，u8 可见，f32×3 位置} | 变化时 |
 | `PHYS` | 本条覆盖范围内新增的物理化记录序号。记录正文和网格追加写到关卡消息的增量文件（§3） | 有时 |
 | `TRAC` | 可选：本条覆盖的每一帧各一条 {u32 帧号，球 CK 世界矩阵 12×f32}，供奖励积分和 trace 用 | 按动作 flags bit1 |
 | `SCOR` | HS 读数、命数簿记、跟随中的分数小球数（§8.2） | 每条（非最小观测） |
@@ -96,7 +96,7 @@ frame × n_frames: f32 delta_ms, u32 keys        // 正好是 legacy .tas 的 8 
   mod 按 `Keyboard` 数组的键位映射写原始 0/1，与回放完全相同。
 - 每个列出的帧重复 `repeat` 次（≥1），action repeat 就在 mod 里完成。也可以直接列出 K 帧。两种写法都会让每一帧原样进入帧日志。
 - `stop_event_mask`：执行过程中只要发生掩码里的事件（例如 BallOff、BallNavActive、LevelFinish），就在**该帧**执行完后提前结束，并返回观测。没执行的帧作废，`frames_done` 反映实际执行到哪里。
-  用这个机制可以快进死亡和复活动画，而且快进时的按键仍由 Python 明确给出。
+  用这个机制可以快进死亡和重生动画，而且快进时的按键仍由 Python 明确给出。
 - `flags`：bit0 STOP（结束本进程的 run：写出输出文件，按 `BALLRAIN_EXIT` 决定是否退出游戏），bit1 请求本条返回 `TRAC`，bit2 请求重写关卡消息。
 - `obs_mask`：可以关掉不需要的可选段以减少开销。**不能用来改段的语义**。它是"关闭"掩码，0 = 全开：
   bit0 BODY，bit1 MIND，bit2 FRIC，bit3 CAMS，bit4 GLCT，bit5 WTCH，bit6 BALL，bit7 ARRS。TIME、EVTS、PHYS、SCOR 总是有；TRAC 由 flags bit1 打开。
@@ -167,7 +167,7 @@ frame × n_frames: f32 delta_ms, u32 keys        // 正好是 legacy .tas 的 8 
   前缀用完后发出第一条普通观测，交给 Python。不设 `PREFIX_EVENTS` 时前缀期间不发观测，前缀期间的事件全部累积在交接时那条观测的 `EVTS` 里；也不发 `frames_done = 0` 的首条观测。
   前缀帧照常进入帧日志。
 - **每条命一个 RL 回合**：BallOff 事件就是 RL 回合的边界。同一个进程、同一条连续的 .tas 里可以有多条命。
-  BallOff 之后游戏自动复活：264 帧（264 fps）后命数减 1，686 帧后 PostSubLife，再过约 380 帧有 CounterActive / BallNavActive。
+  BallOff 之后游戏自动重生：264 帧（264 fps）后命数减 1，686 帧后 PostSubLife，再过约 380 帧有 CounterActive / BallNavActive。
   这期间 Python 照样要提供帧，推荐用 `stop_event_mask = BallNavActive` 快进。
 - **进程级结束**：
   - GameOver：与回放相同，停在下一个 Time 回调，本帧的观测仍会写出。
@@ -336,7 +336,7 @@ flags：0 = 全量文件（StartLevel 时写，先写 `<path>.tmp` 再原子替�
 `BALL` 的"找到 IVP 物体"在球的 Unphysicalize 到下一次 Physicalize 之间为 0：每次死亡（SR09：13637→14436 等）和**每次变球**（HS03：5201→5800、9740→10339、17738→18337、27590→28189；SR06、SR11 同理）。
 变球开始时旧球就被 Unphysicalize 了。探针在这些帧里读到的"冻结的旧球"（state-spec.md §2.8、§3.5 中"变球期间旧球冻结、速度为 0、没有 mindist"）是**已释放的内存**：
 它的 client_data 还指着球实体，所以按 client_data 找到了它。mod 现在只在 Physicalize / Unphysicalize 钩子之间缓存球的 IVP 物体，钩子触发即作废（钩子在块执行前运行），
-缓存失效后只在管理器 +0x28 的活动物体表里找。变球和复活期间 Python 应当只用 CK 矩阵（插值位姿）或认为球不在物理中。
+缓存失效后只在管理器 +0x28 的活动物体表里找。变球和重生期间 Python 应当只用 CK 矩阵（插值位姿）或认为球不在物理中。
 
 ### 8.8 M1：Python 客户端与真实 mod 联调（2026-11-16，同一构建 9a8f1390…）
 

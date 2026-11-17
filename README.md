@@ -3,7 +3,7 @@
 在原版 Ballance（2004 零售版 Player.exe + 2002 版 physics_RT.dll）上训练强化学习 agent。硬性要求：
 轨迹来自原版物理，并且每个回合都能导出成 legacy .tas，由真正的 TASSupport（patched 0.3.12，LegacyMode 1）回放出完全相同的轨迹。
 
-两个独立目标：**SR**（出生到登上飞艇的最短游戏内时间，按 BML+ 0.3.12 的 SR 计时器）和 **HS**（结算分数）。基准见 `docs/benchmarks.md`。
+两个独立目标：**SR**（出生到登上飞船的最短游戏内时间，按 BML+ 0.3.12 的 SR 计时器）和 **HS**（结算分数）。基准见 `docs/benchmarks.md`。
 
 ## 目录
 
@@ -35,7 +35,7 @@
 | `instances.py` | 游戏拷贝管理与启动（只在 `runtime/<copy>/Bin` 下启动，只停止自己启动并核对过路径的进程），创建训练拷贝 |
 | `synth.py` | 合成测试输入 |
 | `protocol.py`、`transport.py`、`client.py` | agent 模式：线格式、共享内存 + 事件、单进程会话 |
-| `state.py`、`geometry.py`、`path.py`、`features.py` | 状态累积、几何、参考路径（TAS 参考线 / 检查点折线）、特征 |
+| `state.py`、`geometry.py`、`path.py`、`features.py` | 状态累积、几何、参考路径（TAS 参考线 / 盘点折线）、特征 |
 | `rewards.py`、`recording.py` | 奖励；每个进程的 .tas + 元数据（SR 按 BML+ 0.3.12 规则） |
 | `env.py`、`vecenv.py` | gymnasium 环境（每条命一个回合，可从 TAS 第 k 帧起步，可预启动下一个进程）、N 个拷贝的向量环境 |
 | `curriculum.py` | TAS 起点与反向课程 |
@@ -123,7 +123,7 @@ uv run python tools/dashboard/server.py --host 0.0.0.0 --port 8088   # 或在 Cl
 ```
 
 浏览器打开 `http://<本机 IP>:8088/`（手机同一局域网也可以）。页面按 Ballance 的菜单风格显示当前 run 的状态、课程推进记录、
-SR 估计（对比 TAS / 人类纪录 / 加精线 / 上榜线）、课程开局点地图、最近尝试轨迹、历史轨迹抽样和训练曲线，全部是浏览器里可缩放、
+SR 估计（对比 TAS / 人类纪录 / 精品线 / 上榜线）、课程开局点地图、最近尝试轨迹、历史轨迹抽样和训练曲线，全部是浏览器里可缩放、
 可悬停、可开关图层的交互图表；可切换 r3 / r4 / r5。页面每 60 秒自动更新，数据每 10 分钟重算（“立即刷新”全局每 5 分钟最多一次）。
 选项、工作方式以及公开 / 不公开哪些内容见 `tools/dashboard/README.md`。
 
