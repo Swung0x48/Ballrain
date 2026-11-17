@@ -12,7 +12,7 @@ set -eu
 D=${MAC_DIR:-$HOME/ballrain}
 R=$D/repo
 C=$(sed -n 's/^C=\${BMMO_COMMIT:-\([0-9a-f]*\)}$/\1/p' "$R/headless/mk_src.sh" | cut -c1-8)
-P=$(cat "$R"/headless/patches/0*.diff | shasum -a 256 | cut -c1-8)
+P=$(cat "$R"/headless/patches/0002-*.diff | shasum -a 256 | cut -c1-8)   # 0003: Windows x86 only
 A=$(cat "$R/headless/src/ballrain_agent.cpp" "$R/headless/src/ballrain_agent.h" "$R/headless/src/ballrain_wire.h" | shasum -a 256 | cut -c1-8)
 W=$D/hl/x87s-$C-$P-$A
 B=$W/build/BallanceMMOServer/BallanceMMOSimTool

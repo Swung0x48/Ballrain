@@ -74,7 +74,7 @@ socket EOF：游戏已结束时是"结束"（`wait_obs` 返回 None），否则�
 |---|---|
 | `ckid`（默认） | 产品的 CK id 键，不动它（门禁用的就是它） |
 | `reverse` | CK id 反过来（玩家球也跟着反，零售从不这样） |
-| `perm:<seed>` | 池里的球（名字 `P_Ball_*_MF*`）在它们自己的 CK id 位置之间按种子置换；其余的球（含玩家球）位置不变 |
+| `perm:<seed>` | 池里的道具球（名字 `P_Ball_*_MF*`）在它们自己的 CK id 位置之间按种子置换；其余的球（含玩家球）位置不变 |
 | `table:<名字=名次,...>` | 列出的实体在它们 `ckid` 下占的那些位置之间按名次（不能重复）重排；其余的球（Ball_Stone、Ball_Paper、纸球池等）位置不变 |
 | `retail:<seed>` | 按零售实测分布抽一个进程的顺序。第 1 关：Ball_Wood 最低；然后 P_Ball_Stone_MF / P_Ball_Wood_MF，Stone_MF 在前的概率 0.66；然后 MF001–004 的均匀随机排列；像 `table` 一样只在这 7 个球自己的 `ckid` 位置之间重排，其余的球位置不变。其它关没测过：用 `ckid`，headless.log 里警告一行 |
 
@@ -150,15 +150,15 @@ SR01_1_14_457_264、HS01_4736_1_32_258、SR06 的逐字段比较复跑结果见 
 | SR06_1_36_163_132 | 13096/13096 | 13205 / 96159 ms | 相同 | 相同 | `follower_near`；2 帧 `normal_cam[2]` |
 
 逐字段（§5 的近似字段之外）在全部记录上相同的：TIME（第 1 帧的 `mgr_step_s` 除外）、BALL 全部（含 PSI 位姿、四元数、速度、速度增量）、FRIC、MIND
-（SR06 有 16 帧 `plane` 差 1e-14）、BODY、GLCT 脉冲、SCOR（HS 记录里小球计分时刻附近除外）、EVTS（同上）、PHYS、SREN；关卡消息的物理化记录（每帧按多重集比较：
+（SR06 有 16 帧 `plane` 差 1e-14）、BODY、GLCT 脉冲、SCOR（HS 记录里分数小球计分时刻附近除外）、EVTS（同上）、PHYS、SREN；关卡消息的物理化记录（每帧按多重集比较：
 同一帧内 Physicalize 的调用顺序与零售不同，记录序号因此对应到别的实体）、网格（顶点、三角形、导出矩阵）、DepthTestCubes、监视清单、IVPO 实体、组、玩法数组
 （Energy、CurrentLevel、IngameParameter、PH、Checkpoints、ResetPoints、AllLevel、Keyboard）。
 
 仍然不同（都不影响球的物理；交给 x87-soft 会话）：
 
 - **相机矩阵**：Cam_Orient / Cam_Pos / InGameCam 最大差约 7e-4，SR01_1_14_457_264 的 Cam_OrientRef 从第 6344 帧起差到 3e-5；f5 只用它们的偏航角，SR01_1_14_457_264 上特征仍逐位相同。
-- **被监视的装饰物体位置（WTCH）**：P_Extra_Life_Sphere / SilverBall（从 3600–3900 帧起）、分数球的框和跟随的小球（最多差 4–17 单位）。不是 CRT `rand()`
-  （换种子不变），是这些动画脚本的数学。后果：`follower_near` 特征，HS 记录里小球到达的帧（ExtraPoint 事件、Points 在几十帧内不同；最终 HS 相同）。
+- **被监视的装饰物体位置（WTCH）**：P_Extra_Life_Sphere / SilverBall（从 3600–3900 帧起）、分数球的框和跟随的分数小球（最多差 4–17 单位）。不是 CRT `rand()`
+  （换种子不变），是这些动画脚本的数学。后果：`follower_near` 特征，HS 记录里分数小球到达的帧（ExtraPoint 事件、Points 在几十帧内不同；最终 HS 相同）。
 - 加载期间：第 1–2 帧挂接的相机、第 9–12 帧附近一个数组单元的瞬时值（HS 记录里 ARRS 的不同还包括上面的计分）、第 1 帧的 `mgr_step_s`（隐藏 tick 留下的物理步长）。
 - 第 0 帧的观测建在隐藏 tick 之后（§3），TIME 不可比，单独报告。
 - 关卡消息里 52 个实体的 StartLevel 矩阵不同：全是变球碎片 `Ball_*_piece*`（legacy 模式下从不物理化）；菜单类数组（Logic_Scripts 等，单元里是脚本 id）不可映射。
@@ -245,7 +245,7 @@ TraceHash 都与 §7.1 / hx1c 相同（例如 SR01_1_14_457_264 `3bf0b490e7cf7ac
 - 基准期间 Mac 上同时跑过 `uv sync` 和两次短回放（random ×10 / ×12 两档），数字可能略低。
 - 扩展：6 → 10 → 12 个实例收益递减（E 核和共享内存带宽），random 12 个实例比 10 个多约 10%，curr random 多约 11%。
 - 训练时的建议：**10 个 worker**（留出 2 个核给 learner 和主进程 Python；PPO 更新在 Mac 上每次 0.10 s，每 4096 步一次，占比很小）。
-  干跑（`train_mac.sh`，2 个 worker，6 次更新，batch 1024）在 Mac 上端到端通过：rollout、PPO 更新、课程、检查点、tensorboard、`runs.csv` 都正常，出现过一次 LevelFinish。
+  干跑（`train_mac.sh`，2 个 worker，6 次更新，batch 1024）在 Mac 上端到端通过：rollout、PPO 更新、课程、模型检查点、tensorboard、`runs.csv` 都正常，出现过一次 LevelFinish。
   10 个 worker 的负载运行（课程起点，`--world-actions --stall-terminal --stall-s 4`，2.5 分钟，31 次更新）：1000–1270 决策步/秒，PPO 更新 0.145 s，
   `camera_off_quarter` 与 `invalid_runs` 都是 0，527 个进程，episodes 目录 29 MB（worker 会清理）。
 - 进程生命周期：worker 退出（或被杀）时它的引擎因 socket EOF 在几秒内退出；**learner 被 `kill -9` 时 worker 不会退出**（成为孤儿继续开进程，需手动停掉）——
@@ -256,7 +256,7 @@ TraceHash 都与 §7.1 / hx1c 相同（例如 SR01_1_14_457_264 `3bf0b490e7cf7ac
 PC 侧（不在被跟踪文件里写主机名 / 用户 / 密钥：`BALLRAIN_MAC=<user>@<host>`，`BALLRAIN_MAC_SSH="-i <key> ..."`）：
 
 ```sh
-headless/mac/push_repo.sh -r SR01_1_14_457_264 [-c runtime/m2-train/r2/latest.pt]   # 工作树（含未提交的代码）+ 数据集记录 + 检查点
+headless/mac/push_repo.sh -r SR01_1_14_457_264 [-c runtime/m2-train/r2/latest.pt]   # 工作树（含未提交的代码）+ 数据集记录 + 模型检查点
 headless/mac/pull_run.sh r3 300        # 每 5 分钟把 Mac 上的 runtime/m2-train/r3 拉回 PC 的 runtime/m2-train-mac/r3（TensorBoard 读这里）
 ```
 
@@ -280,3 +280,53 @@ touch repo/runtime/m2-train/r3/STOP    # 停止（learner 自己的停止文件�
 - `BALLRAIN_POST_FINISH` 诊断窗口不支持。
 - 加载期间（第 1–12 帧左右）有个别观测与零售不同：第 1–2 帧挂接的相机、第 9 帧附近一个数组单元的瞬时值。之后逐位相同（§7.1）。
 - 其它关卡的帧 0 对齐（34 个隐藏 tick）由 x87-soft 会话在全部 31 条 TAS 上验证过；本门禁只跑了第 1 关的 6 条和 SR06。
+
+## 13. Windows x86：跑原版 2002 physics_RT.dll 的宿主（2026-11-17）
+
+构建与机制见 `headless/README.md`（补丁 0003、`headless/src/phys2002.*`、`headless/build_win.ps1`）。同一个 agent 模式、同一套线格式，
+IVP 段（TIME / BALL / FRIC / MIND / BODY / GLCT / IVPO）按 `BallrainIO/src/Agent.cpp` 读 2002 DLL 的内存，所以 §5 里"不可用"的
+FRIC `lt_*`、GLCT 三组计数、BALL / BODY 原始位域、IVPO 材质字节都有了；这些段不再置 `SECF_APPROX`（MIND 除外：`ledge` 是本进程的地址）。
+hello 串带 `phys2002 e72e4afcfa5c33a7`。`train_m2.py --backend headless --hl-bin <这个构建> --hl-root <装着零售 physics_RT.dll 的游戏目录>` 不用改代码
+（PC 上 2 个 worker、3 次更新的冒烟跑通：`framelog_match` 全真，`handover_mismatches` 0）。
+
+### 13.1 门禁（PC，干净树构建：src.tar + 0002 + 0003 + headless/src）
+
+| 检查 | 结果 |
+|---|---|
+| 7 条 tas-v1 记录逐字段（`headless_gate.py --phys2002`，K = 1，全部段） | 球轨迹、BALL / FRIC / MIND / BODY / GLCT / TIME（第 1 帧 `mgr_step_s` 之外）/ PHYS / SREN、关卡消息（物理化记录、网格、IVPO、数组、组、DEPT、WLST）全部相同；原来单列的 FRIC lt_*、GLCT 计数、BALL / BODY 原始位域也相同，只有 HS01_4738_1_31_317 的 `lt_point` 107 帧 / `lt_normal` 56 帧（第 16204 帧起，差约 1e-5，两边 `lt_valid` 都是 1，球轨迹不受影响） |
+| 仍不同（与 x87-soft 后端相同的 CK 侧来源） | CAMS 矩阵（SR01_1_14_457_264 14293 帧）、WTCH.pos（13872 帧）、加载期间 ARRS 2 帧和 CAMS.attached 2 帧、第 1 帧 `mgr_step_s`；HS01 三条里小分数球附近的 EVTS / SCOR / WTCH（ExtraPoint 时刻，最终 HS 相同）；关卡消息 52 个 `Ball_*_piece*` 的 StartLevel 矩阵 |
+| 只按地址 / 残值单列 | MIND `ledge`（地址）、MIND `plane[3]`（IVP 不维护）、Energy 参数单元（指针） |
+| f6 特征，训练配置（`hs_block=false, camera=world`） | SR01 ×3、SR06：**全部帧逐位相同**（x87-soft 后端在 SR06 上有 3 帧 `normal_cam[2]` 不同）；HS01 ×3 只有 `points` 14 / 94 / 59 帧 |
+| TraceHash | 7 条都与 §7.1 / x87-soft 相同（如 SR01_1_14_457_264 `3bf0b490e7cf7acb`、SR06 `1a9f686e68ac71ff`） |
+| 离线路线（轨迹对零售参照） | M1-B 13/13、`runtime/offroute-refs` 18/18（ref1–3 都相同）全部帧相同 |
+| M2 交接（`BALLRAIN_PREFIX` = 前缀帧，再逐帧动作） | 3/3 与零售参照和 BallrainIO 的 agent 轨迹都相同；`BallanceEnv`（`start_record` / `start_frame` 15538，world actions，K = 4）前缀部分到第 15538 帧与零售相同 |
+| 确定性 | SR01_1_14_457_264、SR06 各 10 次 + 5 次、L01_random_a / L01_hs_esc_random 各 5 次、3 条 M2 各 5 次：TraceHash、轨迹全同；逐字段比较观测（`det_obs`）除 MIND `ledge` / `plane[3]` 外全同；`BallanceEnv` 同种子两次特征逐字节相同 |
+| L1 球序模式（r3 抽查 run，SR01 前缀 8907 帧） | 与 §7.3 的 x87-soft 结果完全一样：`ckid`、`retail:12`、`perm:2195`、按 `ckid` 顺序的 `table` 重现 x87-soft 的无头轨迹（TraceHash `fcb350f52ebd365f`，等于那条训练 run 自己的）；MF004 在 MF002 前的 `table`、`retail:0`、`perm:1319` 重现零售回放；`reverse` 两个都不是（7386 行后分开） |
+| 同一二进制 `BALLRAIN_HL_PHYS2002=0`（源码物理） | SR01_1_14_457_264 / SR06 的 TraceHash 与 x87-soft 相同 |
+| 其余 24 条 tas-v1 记录（L2–L12，SR08 / SR09 / HS09 / HS13 除外），`--phys2002` 逐字段 | **BALL 全部字段 24/24 每帧相同**，帧日志 24/24、SR 和结束方式相同；SR 记录的 EVTS 13 条里 10 条相同。不同的：旋转机关的 BODY（SR07 / SR10 的 `P_Modul_41*`、SR03 的 `Modul17_Dreharme*` 等，同一二进制的源码物理给出一模一样的差别，所以是 CK 侧驱动，两个无头后端共有）；HS 记录的计分 / 小球（11 条里 6 条最终 HS 不同，CK 侧）；FRIC `lt_*` 零星 1–8 帧（HS04 2708 帧，跟着 BODY 走）；CAMS、WTCH、加载期间 ARRS |
+| 死亡 / 暂停 / GameOver 路径的观测（缓存失效、簇遍历、实体映射） | 6 个离线路线用例（L01 ×3、L05、L07、L09、L13）同一二进制源码物理 vs 2002：除源码给不出的字段和第 0 帧 TIME 外，所有段逐帧相同；帧日志 31/31 与零售 episode 相同，事件 21/31 相同（其余 9 条只差零售在帧数上限时多写的一行 `RecordEnd`，1 条是 L01_hs_collect 的 ExtraPoint 早 1 帧） |
+| TraceHash 与动作块大小 / obs_mask 无关 | SR01_1_14_457_264、SR06：K = 1、K = 4、K = 1000 + obs_mask 255 三种哈希相同 |
+| 错的 DLL | `BALLRAIN_HL_PHYS2002` 指向别的文件：引擎在 hello 之前报 sha256 不符并以 STATE（ERROR，last_error 2）退出；Python 侧 `TransportError: game refused to run`，不会退回源码物理 |
+
+### 13.2 吞吐（PC，同时有训练在跑，数字偏低）
+
+- agent 模式，K = 1，全部段，`replay_stub`（SR01_1_14_457_264，单实例）：2002 DLL 3.9–4.3 千帧/秒，同一二进制的源码物理 2.3–2.5 千帧/秒；
+  `--tas`（无观测）2.06–2.26 万帧/秒。
+- `headless_bench.py`（BallanceEnv，K = 4，30 s）：
+
+| 配置 | 实例 | 2002 DLL 决策步/秒 | 帧/秒 | x86-soft（`bin-x86soft`）决策步/秒 | 帧/秒 |
+|---|---|---|---|---|---|
+| random | 1 | 297 | 3392 | 149 | 1717 |
+| random | 8 | 1703 | 18380 | 1101 | 12247 |
+| curr random | 1 | 180 | 12142 | 72 | 4901 |
+| curr random | 8 | 1111 | 71014 | 462 | 32738 |
+
+### 13.3 没有解决
+
+- 第 9 关：HS09_6170_2_04_662 在 agent 模式和 `--tas` 下都在第 9725–9738 帧附近崩溃（每次相同，与球序钩子无关），SR09 只在 `--tas` 下崩（agent 模式跑完）。
+  崩在 `CKBehavior::Execute`（CKBehavior.cpp:389）读 `m_Context`：外层行为在 "physicalize new Ball"（Ball_Paper）的 Physicalize 执行期间被释放 / 清零。
+  怀疑 2002 Physicalize 经 CK2 垫片（`DestroyObject` / `CKDestroyObject` 等）的调用在 Ballanced 里语义不同，没有查实。第 1 关不受影响。
+- SR09：`--tas` 与零售 tas-v1 数据逐帧相同（源码物理到零售数据结尾 18349 帧，2002 DLL 到它在 14432 帧崩溃为止），但 **agent 模式**（2002 和源码物理给出完全相同的轨迹）
+  在第 12284 帧起球的 CK 矩阵差 1 ulp，之后分开。与观测读取（K = 1000 + obs_mask 255 也一样）、球序钩子、CRT 种子都无关，所以是 agent 模式和 `--tas` 的帧方案 / 钩子差别，
+  两个无头后端共有，只在这条（G1 不用的）记录上看到。原因没查。
+- HS01_4738_1_31_317 的 FRIC `lt_point` / `lt_normal`（§13.1）：对方是 `P_Modul_01_Pusher`（7 帧）和 `A03_Floor_02` / `A04_Floor_01`，没有解释。

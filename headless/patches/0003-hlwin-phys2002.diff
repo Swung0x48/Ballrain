@@ -1,0 +1,205 @@
+--- a/BallanceMMOServer/CMakeLists.txt
++++ b/BallanceMMOServer/CMakeLists.txt
+@@ -130,7 +130,7 @@
+     configure_file("${BMMO_PLAYER_SRC_DIR}/config.h.in" "${BMMO_PLAYER_GENERATED_DIR}/config.h" @ONLY)
+     add_library(BallanceMMOSim STATIC
+             sim/headless_engine.cpp sim/headless_engine.hpp
+-            sim/ballrain_agent.cpp sim/ballrain_agent.h sim/ballrain_wire.h
++            sim/ballrain_agent.cpp sim/ballrain_agent.h sim/ballrain_wire.h sim/phys2002.cpp sim/phys2002.hpp sim/Ivp2002.h
+             sim/null_managers.cpp sim/null_managers.hpp
+             "${CMAKE_CURRENT_LIST_DIR}/../BallanceMMOCommon/src/physics/ball_navigation.cpp"
+             sim/physics_world.cpp sim/physics_world.hpp
+@@ -158,6 +158,7 @@
+     if (BMMO_PHYSICS_PORTABLE_MATH)
+         target_compile_definitions(BallanceMMOSim PRIVATE IVP_PORTABLE_BMMO)
+     endif ()
++    target_compile_definitions(BallanceMMOSim PRIVATE BALLRAIN_PHYS2002_HOST)   # Ballrain hl-win: the 2002 physics_RT.dll
+     target_compile_features(BallanceMMOSim PUBLIC cxx_std_20)
+     # The world's resync state (step A3) uses the session core's rules and
+     # host support, whose message headers carry GameNetworkingSockets'
+--- a/BallanceMMOServer/sim/sim_tool.cpp
++++ b/BallanceMMOServer/sim/sim_tool.cpp
+@@ -50,6 +50,7 @@
+ // prop there too) or, with neither, the sector union started by --drop-sector.
+ 
+ #include "headless_engine.hpp"
++#include "phys2002.hpp"   // Ballrain hl-win
+ #include "trafo_tool.hpp"
+ #include "trafo_synth.hpp"
+ #include "crash_report.hpp"
+@@ -2061,7 +2062,9 @@
+             std::fprintf(stderr, "--tas: no frames in %s, or no --level\n", args.tas.c_str());
+             return 2;
+         }
+-        engine.set_random_patch(!args.tas_orig_random);
++        const bool phys2002 = ballrain::phys2002::loaded();
++        // hl-win: with the 2002 DLL no BMMO script patch runs (the patched explosion blocks reach the source manager).
++        engine.set_random_patch(!args.tas_orig_random && !phys2002);
+         std::string error;
+         for (int i = 0; i < args.boot_ticks; ++i)
+             if (!engine.tick(error)) { std::fprintf(stderr, "boot tick failed: %s\n", error.c_str()); return 1; }
+@@ -2101,6 +2104,15 @@
+                 physics->m_DeltaTime = engine.time_manager()->GetLastDeltaTime();
+                 std::fprintf(stderr, "tas: physics clock reset before frame %zu (delta %f)\n", f, physics->m_DeltaTime);
+             }
++            if (static_cast<int>(f) == args.tas_reset_frame && phys2002) {
++                // hl-win: TASSupport OnStart's reset on the 2002 DLL's own memory (BallrainIO ResetPhysicsTime), plus
++                // the movement-check counter and IVP_RAND_SEED as above (phys2002.hpp)
++                if (!ballrain::phys2002::reset_clock(context, engine.time_manager()->GetLastDeltaTime(),
++                                                     args.tas_movement_check, args.tas_seed, error)) {
++                    std::fprintf(stderr, "tas: %s\n", error.c_str());
++                    return 1;
++                }
++            }
+             engine.set_frame_ms(frames[f].first);
+             unsigned char keyboard[256] = {};
+             const uint32_t bits = frames[f].second;
+--- a/BallanceMMOServer/sim/headless_engine.cpp
++++ b/BallanceMMOServer/sim/headless_engine.cpp
+@@ -6,6 +6,8 @@
+ #include "InterfaceManager.h"
+ 
+ #include "bmmo_headless_plugin_registry.h"
++#include "phys2002.hpp"   // Ballrain hl-win: the 2002 physics_RT.dll (BALLRAIN_PHYS2002)
++#include <float.h>
+ 
+ // Ballanced Player (unmodified sources compiled into the sim library).
+ #include "GameConfig.h"
+@@ -50,10 +52,18 @@
+             if (!add("BallanceMMO.NullInput", nullptr, null_input_manager_plugin_info, nullptr, nullptr)
+                     || !add("BallanceMMO.NullSound", nullptr, null_sound_manager_plugin_info, nullptr, nullptr))
+                 return false;
+-            for (const auto& plugin: kHeadlessStaticPlugins)
++            const bool phys2002 = ballrain::phys2002::requested();
++            for (const auto& plugin: kHeadlessStaticPlugins) {
++                if (phys2002 && std::string_view(plugin.name) == "physics_RT") continue;   // replaced by the 2002 DLL
+                 if (!add(plugin.name, plugin.get_info_count, plugin.get_info,
+                          plugin.get_reader, plugin.register_declarations))
+                     return false;
++            }
++            if (phys2002) {
++                ballrain::phys2002::plugin p;
++                if (!ballrain::phys2002::load(p, error)) return false;
++                if (!add("physics_RT", p.count, p.info, nullptr, p.declarations)) return false;
++            }
+             return true;
+         }
+ 
+@@ -162,13 +172,20 @@
+         }
+         CKContext* context = engine->context_;
+         context->SetVirtoolsVersion(CK_VIRTOOLS_DEV, 0x2000043);
++        if (ballrain::phys2002::requested()) {
++            // Player.exe's D3D8 device (created right after the context, no FPU_PRESERVE) leaves the x87 at 24-bit
++            // precision; the 2002 DLL itself raises it to 64 bits at the process's first hull and keeps it there.
++            unsigned int ignored = 0;
++            _controlfp_s(&ignored, _PC_24 | _RC_NEAR, _MCW_PC | _MCW_RC);
++        }
+         context->SetInterfaceMode(FALSE, log_redirect, engine.get());
+ 
+         engine->time_ = context->GetTimeManager();
+         if (!engine->time_ || !context->GetRenderManager() || !context->GetMessageManager()
+                 || !context->GetManagerByGuid(INPUT_MANAGER_GUID)
+                 || !context->GetManagerByGuid(SOUND_MANAGER_GUID)
+-                || !CKIpionManager::GetManager(context)) {
++                || !(ballrain::phys2002::requested() ? ballrain::phys2002::manager(context) != nullptr
++                                                     : CKIpionManager::GetManager(context) != nullptr)) {
+             error = "headless CKContext is missing a required manager";
+             return nullptr;
+         }
+@@ -570,6 +587,7 @@
+     }
+ 
+     CKIpionManager* headless_engine::physics() const {
++        if (ballrain::phys2002::requested()) return nullptr;   // the 2002 DLL's manager is not this class
+         return CKIpionManager::GetManager(context_);
+     }
+ }
+--- a/submodule/Ballanced/Source/BuildingBlocks/physics_RT/CKIpionManager.h
++++ b/submodule/Ballanced/Source/BuildingBlocks/physics_RT/CKIpionManager.h
+@@ -92,6 +92,8 @@
+ 
+ typedef XNHashTable<PhysicsObject, CK_ID> PhysicsObjectTable;
+ 
++extern "C" int g_ballrain_phys2002_active;   // Ballrain hl-win (BallanceMMOServer/sim/phys2002.cpp)
++
+ class CKIpionManager : public CKBaseManager
+ {
+ public:
+@@ -285,6 +287,10 @@
+ 
+     static CKIpionManager *GetManager(CKContext *context)
+     {
++        // Ballrain hl-win: with the 2002 physics_RT.dll loaded (BALLRAIN_PHYS2002) the manager under this GUID is the
++        // DLL's, a different class: nobody may use it as this one.
++        if (g_ballrain_phys2002_active)
++            return NULL;
+         return (CKIpionManager *)context->GetManagerByGuid(TT_PHYSICS_MANAGER_GUID);
+     }
+ 
+--- a/submodule/Ballanced/Source/RenderEngine/src/CK3dEntity.cpp
++++ b/submodule/Ballanced/Source/RenderEngine/src/CK3dEntity.cpp
+@@ -25,9 +25,11 @@
+ #include "CK2_3DX87.h"
+ #define X87_CROSS(a, b) ck2_3d_x87_cross((a), (b))
+ #define X87_NORMALIZED_SCALED(v, s) ck2_3d_x87_scaled(ck2_3d_x87_normalized(v), (s))
++#define X87_NORMALIZE(v) ((v) = ck2_3d_x87_normalized(v))
+ #else
+ #define X87_CROSS(a, b) CrossProduct((a), (b))
+ #define X87_NORMALIZED_SCALED(v, s) (((v) * static_cast<float>(1.0 / static_cast<double>((v).Magnitude()))) * (s))
++#define X87_NORMALIZE(v) ((v).Normalize())
+ #endif
+ 
+ extern int (*g_RayIntersection)(RCKMesh *, VxVector &, VxVector &, VxIntersectionDesc *, CK_RAYINTERSECTION, VxMatrix const &);
+@@ -1599,6 +1601,9 @@
+ 
+ void RCK3dEntity::GetOrientation(VxVector *Dir, VxVector *Up, VxVector *Right, CK3dEntity *Ref) {
+     // IDA @ 0x1000758C
++    // Ballrain hl-win (VX_X87_GAME): the 2002 GetOrientation normalises each row with its x87 Normalize (0xBEC0,
++    // ck2_3d_x87_normalized); VxVector::Normalize's float formula is 1-2 ulps off (BallanceMMO engine change #10 made
++    // the source physics_RT avoid this call; the 2002 physics_RT.dll's Set Physics Hinge calls it).
+     // - If Ref: computes (Ref^-1 * thisWorld), then returns normalized axes
+     // - Else: returns normalized axes from GetWorldMatrix()
+     if (Ref) {
+@@ -1609,19 +1614,19 @@
+             Right->x = tmp[0][0];
+             Right->y = tmp[0][1];
+             Right->z = tmp[0][2];
+-            Right->Normalize();
++            X87_NORMALIZE(*Right);
+         }
+         if (Up) {
+             Up->x = tmp[1][0];
+             Up->y = tmp[1][1];
+             Up->z = tmp[1][2];
+-            Up->Normalize();
++            X87_NORMALIZE(*Up);
+         }
+         if (Dir) {
+             Dir->x = tmp[2][0];
+             Dir->y = tmp[2][1];
+             Dir->z = tmp[2][2];
+-            Dir->Normalize();
++            X87_NORMALIZE(*Dir);
+         }
+         return;
+     }
+@@ -1629,15 +1634,15 @@
+     const VxMatrix &world = GetWorldMatrix();
+     if (Right) {
+         *Right = VxVector(world[0][0], world[0][1], world[0][2]);
+-        Right->Normalize();
++        X87_NORMALIZE(*Right);
+     }
+     if (Up) {
+         *Up = VxVector(world[1][0], world[1][1], world[1][2]);
+-        Up->Normalize();
++        X87_NORMALIZE(*Up);
+     }
+     if (Dir) {
+         *Dir = VxVector(world[2][0], world[2][1], world[2][2]);
+-        Dir->Normalize();
++        X87_NORMALIZE(*Dir);
+     }
+ }
+ 

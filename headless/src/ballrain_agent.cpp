@@ -19,6 +19,12 @@
 // prototype function. Everything else follows BallrainIO/src/Agent.cpp; where the 2002 DLL's raw IVP
 // memory was read, the open IVP classes are read by member name.
 //
+// The Windows x86 build of patch 0003 (BALLRAIN_PHYS2002_HOST) runs the ORIGINAL 2002 physics_RT.dll instead
+// (phys2002.hpp; BALLRAIN_HL_PHYS2002 = its path | 0, default <root>/BuildingBlocks/physics_RT.dll): then TIME, BALL,
+// FRIC, MIND, BODY, GLCT and IVPO read the DLL's memory exactly as BallrainIO/src/Agent.cpp does (Ivp2002.h), the
+// clock reset writes it as TASSupport / SimTool --tas do, the ball-pair key goes to the DLL's hooked compare, and
+// every field below except MIND ledge (an address), bml_hs and the CK ids is the retail one.
+//
 // What the engine cannot give (marked in the data: OBS1 flag OBS_HEADLESS, docs/headless.md):
 // FRIC lt_* (transaction memory), MIND ledge (an address), IVPO material bytes, GLCT group counters,
 // BALL core_flags / core_state other than the unmoveable bits / movement state, SCOR / SREN bml_hs
@@ -75,6 +81,25 @@ typedef int sock_t;
 
 #ifndef IVP_PORTABLE_BMMO
 #error "the agent reads IVP members of the BallanceMMO build (IVP_PORTABLE_BMMO)"
+#endif
+
+// Ballrain hl-win (patches/0003, Windows x86): the engine can run the ORIGINAL 2002 physics_RT.dll (phys2002.hpp);
+// then the IVP sections read the DLL's raw memory exactly as BallrainIO/src/Agent.cpp does (layouts from its
+// Ivp2002.h, copied next to this file by the build), and nothing of the source IVP classes is touched.
+#ifdef BALLRAIN_PHYS2002_HOST
+#include "phys2002.hpp"
+#include "Ivp2002.h"
+#include <windows.h>
+bool SafeRead(const void *p, void *out, size_t n) {   // BallrainIO Agent.cpp: SEH + memcpy
+    if (!p)
+        return false;
+    __try {
+        std::memcpy(out, p, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 #endif
 
 int ivp_srand_read();      // ivu_os_dep.cxx
@@ -152,6 +177,63 @@ void PutMatrix12(Wire &w, const VxMatrix &m) {
         for (int c = 0; c < 3; ++c)
             w.F32(m[r][c]);
 }
+
+#ifdef BALLRAIN_PHYS2002_HOST
+// ---- 2002 DLL raw reads (BallrainIO Agent.cpp, unchanged)
+using namespace ivp2002;
+
+bool CoreUnmoveable(const u8 *core) {
+    uint32_t v = 0;
+    Rd(core, CO_FLAGS, v);
+    return ((v >> 2) & 3) != 0;
+}
+
+// The partner triangle of a mindist / contact feature (state-spec.md 3.2).
+struct Tri {
+    const u8 *ledge = nullptr;
+    int triIndex = -1, edgeIndex = -1;
+    float v[3][3] = {};
+};
+
+bool DecodeTri(const u8 *edge, Tri &t) {
+    if (!edge)
+        return false;
+    const u8 *tri = reinterpret_cast<const u8 *>(reinterpret_cast<uintptr_t>(edge) & ~uintptr_t(15));
+    uint32_t hdr = 0;
+    if (!Rd(tri, 0, hdr))
+        return false;
+    t.triIndex = (int) (hdr & 0xFFF);
+    t.ledge = tri - 16 * t.triIndex - 16;
+    int32_t pointOffset = 0;
+    int16_t nTri = 0;
+    if (!Rd(t.ledge, LEDGE_POINT_OFF, pointOffset) || !Rd(t.ledge, LEDGE_NTRI, nTri))
+        return false;
+    if (nTri <= 0 || t.triIndex >= nTri)
+        return false;
+    t.edgeIndex = (int) ((reinterpret_cast<uintptr_t>(edge) & 0xC) >> 2) - 1;
+    const u8 *points = t.ledge + pointOffset;
+    for (int k = 0; k < 3; ++k) {
+        uint32_t e = 0;
+        if (!Rd(tri, 4 + 4 * k, e) || !SafeRead(points + 16 * (e & 0xFFFF), t.v[k], 12))
+            return false;
+    }
+    return true;
+}
+
+const u8 *OppositeEdge(const u8 *edge) {
+    uint32_t e = 0;
+    if (!Rd(edge, 0, e))
+        return nullptr;
+    const int opp = ((int) (e << 1)) >> 17;   // signed 15 bits at 16..30
+    return edge + 4 * opp;
+}
+#endif
+
+#ifdef BALLRAIN_PHYS2002_HOST
+const char *Phys2002Sha() { return ballrain::phys2002::kSha256; }
+#else
+const char *Phys2002Sha() { return ""; }
+#endif
 
 // Raw bytes of one data-array cell, as BallrainIO's CellBytes.
 size_t CellBytes(CKDataArray *a, int r, int c, u8 *out /* >= 256 */) {
@@ -744,6 +826,17 @@ private:
                            std::unordered_set<uint64_t> &ivpoDone);
     CK3dEntity *GetActiveBall() const;
     IVP_Real_Object *BallReal(CK3dEntity *ball) const;
+    // the 2002 DLL (m_P2): BallrainIO Agent.cpp's raw readers
+    void ResetClock2002();
+    void WriteTime2002(Wire &w);
+    void WriteIvp2002(Wire &w, CK3dEntity *ball);   // BALL, FRIC, MIND, BODY
+    void WriteGlct2002(Wire &w);
+    void WriteIvpo2002(Wire &w, std::unordered_set<uint64_t> &ivpoDone);
+    u8 *FindBallReal2002(CK3dEntity *ball);
+    void WalkCluster2002(u8 *anyReal);
+    u8 *ClusterStart2002();
+    void RebuildEntityMap();
+    CK_ID CkidOf2002(const void *client) const;
     void EventsLine(const char *fmt, ...);
     void WriteFrameLog();
     void SetState(uint32_t s) { m_ModState = s; }
@@ -764,6 +857,15 @@ private:
     std::unique_ptr<bmmo::sim::headless_engine> m_Engine;
     CKIpionManager *m_Physics = nullptr;
     Channel m_Chan;
+    // the 2002 DLL (BALLRAIN_PHYS2002_HOST builds): its manager, the ball's IVP object cache, the cluster walk, the
+    // entity pointer -> CK id map, the contact blocks' IVP_Handle parameters
+    bool m_P2 = false, m_P2Hooked = false;
+    u8 *m_Mgr2 = nullptr;
+    u8 *m_BallReal2 = nullptr;
+    CK3dEntity *m_BallRealOf2 = nullptr;
+    std::vector<u8 *> m_Reals;
+    std::unordered_map<const void *, CK_ID> m_EntOf;
+    std::vector<CK_ID> m_ContactHandles;
 
     // run state
     Phase m_Phase = Phase::Idle;
@@ -1026,6 +1128,20 @@ bool Agent::Configure(const ballrain_agent_args &args) {
         if (!GetEnvS(old).empty())
             Log("warning: %s is ignored (SimTool's --tas-* / --boot-ticks flags set the recipe)", old);
     m_BallOrderSpec = GetEnvS("BALLRAIN_HL_BALL_ORDER");
+#ifdef BALLRAIN_PHYS2002_HOST
+    // The 2002 physics_RT.dll: BALLRAIN_HL_PHYS2002 = its path, or 0 for the source physics; by default the game
+    // root's own BuildingBlocks/physics_RT.dll (the engine refuses any other file than the 2002 one: no fallback).
+    {
+        std::string dll = GetEnvS("BALLRAIN_HL_PHYS2002");
+        if (dll.empty())
+            dll = GetEnvS("BALLRAIN_PHYS2002");
+        if (dll == "0")
+            dll.clear();
+        else if (dll.empty() && !m_Root.empty())
+            dll = m_Root + "/BuildingBlocks/physics_RT.dll";
+        ballrain::phys2002::select(dll);
+    }
+#endif
     const std::string radius = GetEnvS("BALLRAIN_BODY_RADIUS");
     if (!radius.empty())
         m_BodyRadius = (float) std::atof(radius.c_str());
@@ -1074,6 +1190,465 @@ IVP_Real_Object *Agent::BallReal(CK3dEntity *ball) const {
     PhysicsObject *po = m_Physics->GetPhysicsObject(ball);
     return po ? po->m_RealObject : nullptr;
 }
+
+#ifdef BALLRAIN_PHYS2002_HOST
+// ---- the 2002 DLL: BallrainIO Agent.cpp's readers (AgentFindBallReal, AgentWalkCluster, AgentRebuildEntityMap,
+// AgentCkidOf, AgentClusterStart, and the raw parts of AgentBuildState / WritePhysSections / ResetPhysicsTime)
+u8 *Agent::FindBallReal2002(CK3dEntity *ball) {
+    // The cache is dropped by OnPhysicalize of the cached entity (it runs before the block replaces or destroys the
+    // IVP object): a freed object can still hold client_data == ball for a few frames (SR09, after each death), so
+    // client_data alone does not prove it is alive. The cache is what still finds the frozen old ball during a ball
+    // transformation (it leaves the live vector).
+    if (!ball || !m_Mgr2)
+        return nullptr;
+    if (m_BallReal2 && m_BallRealOf2 == ball) {
+        void *client = nullptr;
+        if (Rd(m_BallReal2, RO_CLIENT, client) && client == ball)
+            return m_BallReal2;
+    }
+    m_BallReal2 = nullptr;
+    m_BallRealOf2 = nullptr;
+    uint16_t memsize = 0, n = 0;
+    void **elems = nullptr;
+    if (!Rd(m_Mgr2, MGR_MOVABLE_VEC, memsize) || !Rd(m_Mgr2, MGR_MOVABLE_VEC + 2, n) || !Rd(m_Mgr2, MGR_MOVABLE_VEC + 4, elems))
+        return nullptr;
+    if (!elems || n > memsize || n > 8000)
+        return nullptr;
+    for (int i = 0; i < n; ++i) {
+        u8 *ro = nullptr;
+        void *client = nullptr;
+        if (!SafeRead(elems + i, &ro, sizeof(ro)) || !ro || !Rd(ro, RO_CLIENT, client))
+            continue;
+        if (client == ball) {
+            m_BallReal2 = ro;
+            m_BallRealOf2 = ball;
+            return ro;
+        }
+    }
+    return nullptr;
+}
+
+void Agent::WalkCluster2002(u8 *anyReal) {
+    // All real objects of the ball's cluster, following next_in_cluster then prev_in_cluster (state-spec.md 2.5);
+    // cluster nodes (object_type 1) are skipped.
+    m_Reals.clear();
+    if (!anyReal)
+        return;
+    m_Reals.push_back(anyReal);
+    bool circular = false;
+    for (int dir = 0; dir < 2 && !circular; ++dir) {
+        u8 *o = nullptr;
+        Rd(anyReal, dir == 0 ? RO_NEXT : RO_PREV, o);
+        for (int guard = 0; o && guard < 20000; ++guard) {
+            if (o == anyReal) {
+                circular = true;
+                break;
+            }
+            int32_t type = 0;
+            if (!Rd(o, RO_TYPE, type))
+                break;
+            if (type != TYPE_CLUSTER && m_Reals.size() < 20000)
+                m_Reals.push_back(o);
+            u8 *nx = nullptr;
+            if (!Rd(o, dir == 0 ? RO_NEXT : RO_PREV, nx))
+                break;
+            o = nx;
+        }
+    }
+}
+
+u8 *Agent::ClusterStart2002() {
+    if (!m_Mgr2)
+        return nullptr;
+    u8 *start = FindBallReal2002(GetActiveBall());
+    if (!start) {   // no ball yet: any movable object is in the same (root) cluster
+        uint16_t memsize = 0, n = 0;
+        void **elems = nullptr;
+        if (Rd(m_Mgr2, MGR_MOVABLE_VEC, memsize) && Rd(m_Mgr2, MGR_MOVABLE_VEC + 2, n) &&
+            Rd(m_Mgr2, MGR_MOVABLE_VEC + 4, elems) && elems && n > 0 && n <= memsize && n <= 8000)
+            SafeRead(elems, &start, sizeof(start));
+    }
+    return start;
+}
+
+void Agent::RebuildEntityMap() {
+    m_EntOf.clear();
+    const XObjectPointerArray &list = Ctx()->GetObjectListByType(CKCID_3DENTITY, TRUE);
+    m_EntOf.reserve((size_t) list.Size() * 2);
+    for (int k = 0; k < list.Size(); ++k)
+        if (CKObject *o = list[k])
+            m_EntOf.emplace(o, o->GetID());
+}
+
+CK_ID Agent::CkidOf2002(const void *client) const {
+    if (!client)
+        return 0;
+    auto it = m_EntOf.find(client);
+    if (it == m_EntOf.end())
+        return 0;
+    return Ctx()->GetObject(it->second) == client ? it->second : 0;
+}
+
+void Agent::ResetClock2002() {
+    std::string error;
+    if (!ballrain::phys2002::reset_clock(Ctx(), m_Engine->time_manager()->GetLastDeltaTime(), m_Recipe.movement_check,
+                                         m_Recipe.seed, error))
+        Log("clock reset: %s", error.c_str());
+}
+
+void Agent::WriteTime2002(Wire &w) {
+    u8 *env = nullptr;
+    double cur = 0, next = 0, last = 0;
+    float c8 = 0, cc = 0, d0 = 0;
+    if (m_Mgr2) {
+        Rd(m_Mgr2, MGR_ENV, env);
+        if (env) {
+            Rd(env, ENV_CURRENT_TIME, cur);
+            Rd(env, ENV_NEXT_PSI, next);
+            Rd(env, ENV_LAST_PSI, last);
+        }
+        Rd(m_Mgr2, MGR_DELTA, c8);
+        Rd(m_Mgr2, MGR_PHYS_DELTA, cc);
+        Rd(m_Mgr2, MGR_TIME_FACTOR, d0);
+    }
+    w.Begin("TIME", 1);
+    w.F64(cur);
+    w.F64(next);
+    w.F64(last);
+    w.F32(c8);
+    w.F32(cc);
+    w.F32(d0);
+    w.F32(m_Engine->time_manager()->GetLastDeltaTime());
+    w.F64(m_Sr);
+    w.F32((float) m_Sr);
+    w.U8(m_SrRunning);
+    w.U32(m_Covered);
+    w.F32(m_Sr32);
+    w.U32((uint32_t) m_FrameIndex);
+    w.U32(m_TailFrames);
+    w.End();
+}
+
+void Agent::WriteIvp2002(Wire &w, CK3dEntity *ball) {
+    u8 *real = FindBallReal2002(ball);
+    u8 *core = nullptr;
+    if (real)
+        Rd(real, RO_CORE, core);
+
+    // ---- BALL
+    if (!(m_ObsMask & M_BALL)) {
+        w.Begin("BALL", 1);
+        w.U32(ball ? ball->GetID() : 0);
+        uint8_t type = 255;
+        if (ball) {
+            const char *n = ball->GetName();
+            type = !n ? 254 : !strcmp(n, "Ball_Wood") ? 0 : !strcmp(n, "Ball_Paper") ? 1 : !strcmp(n, "Ball_Stone") ? 2 : 254;
+        }
+        w.U8(type);
+        w.U8(real ? 1 : 0);
+        if (ball)
+            PutMatrix12(w, ball->GetWorldMatrix());
+        else
+            w.Zeros(48);
+        double pos[3] = {}, ql[4] = {}, qn[4] = {}, tpsi = 0;
+        float s[3] = {}, sc[3] = {}, rs[3] = {}, rsc[3] = {}, axis[3] = {}, curSpeed = 0, absOmega = 0, xrad = 0;
+        uint32_t cflags = 0, psif = 0;
+        if (core) {
+            SafeRead(core + CO_POS, pos, sizeof(pos));
+            SafeRead(core + CO_QL, ql, sizeof(ql));
+            SafeRead(core + CO_QN, qn, sizeof(qn));
+            Rd(core, CO_TLPSI, tpsi);
+            SafeRead(core + CO_S, s, sizeof(s));
+            SafeRead(core + CO_SC, sc, sizeof(sc));
+            SafeRead(core + CO_RS, rs, sizeof(rs));
+            SafeRead(core + CO_RSC, rsc, sizeof(rsc));
+            SafeRead(core + CO_AXIS, axis, sizeof(axis));
+            Rd(core, CO_CURSPEED, curSpeed);
+            Rd(core, CO_ABSOMEGA, absOmega);
+            Rd(core, CO_FLAGS, cflags);
+            Rd(core, CO_PSIFLAGS, psif);
+        }
+        if (real)
+            Rd(real, RO_XRAD, xrad);
+        w.Raw(pos, sizeof(pos));
+        w.Raw(ql, sizeof(ql));
+        w.Raw(qn, sizeof(qn));
+        w.F64(tpsi);
+        w.Raw(s, sizeof(s));
+        w.Raw(sc, sizeof(sc));
+        w.Raw(rs, sizeof(rs));
+        w.Raw(rsc, sizeof(rsc));
+        w.Raw(axis, sizeof(axis));
+        w.F32(curSpeed);
+        w.F32(absOmega);
+        w.U32(cflags);
+        w.U32(psif);
+        w.F32(xrad);
+        w.End();
+    }
+
+    // ---- FRIC: friction synapses of the ball -> contact points
+    if (!(m_ObsMask & M_FRIC)) {
+        w.Begin("FRIC", 1);
+        const size_t at = w.Size();
+        w.U16(0);
+        uint32_t n = 0;
+        u8 *head = nullptr;
+        if (real)
+            Rd(real, RO_FRIC, head);
+        for (u8 *s = head; s && n < 32;) {
+            int16_t cpOff = 0;
+            uint8_t st = 0;
+            Rd(s, SF_CPOFF, cpOff);
+            Rd(s, SF_STATUS, st);
+            u8 *cp = s + cpOff;
+            u8 *ps = s == cp + CP_SYN0 ? cp + CP_SYN1 : s == cp + CP_SYN1 ? cp + CP_SYN0 : nullptr;
+            u8 *po = nullptr;
+            uint8_t pst = 255, cpst = 0;
+            void *pclient = nullptr;
+            if (ps) {
+                Rd(ps, SF_LOBJ, po);
+                Rd(ps, SF_STATUS, pst);
+                if (po)
+                    Rd(po, RO_CLIENT, pclient);
+            }
+            float gap = 0, fric = 0, normal[3] = {};
+            double point[3] = {};
+            Rd(cp, CP_STATUS, cpst);
+            Rd(cp, CP_GAP, gap);
+            Rd(cp, CP_FRICTION, fric);
+            u8 *lt = nullptr;
+            const bool ltOk = Rd(cp, CP_LT, lt) && lt && SafeRead(lt + LT_NORMAL, normal, sizeof(normal)) &&
+                              SafeRead(lt + LT_POINT, point, sizeof(point));
+            if (!ltOk) {
+                std::memset(normal, 0, sizeof(normal));
+                std::memset(point, 0, sizeof(point));
+            }
+            w.U32(CkidOf2002(pclient));
+            w.U8(st);
+            w.U8(pst);
+            w.U8(cpst);
+            w.U8(0);
+            w.F32(gap);
+            w.F32(fric);
+            w.Raw(normal, sizeof(normal));
+            w.Raw(point, sizeof(point));
+            w.U8(ltOk ? 1 : 0);
+            ++n;
+            u8 *nx = nullptr;
+            if (!Rd(s, SF_NEXT, nx) || nx == s || nx == head)
+                break;
+            s = nx;
+        }
+        w.PatchU16(at, (uint16_t) n);
+        w.End();
+    }
+
+    // ---- MIND: exact synapses of the ball -> mindists
+    if (!(m_ObsMask & M_MIND)) {
+        w.Begin("MIND", 1);
+        w.SetSectionFlags(SECF_APPROX);   // ledge: an address of this process
+        const size_t at = w.Size();
+        w.U16(0);
+        uint32_t n = 0;
+        u8 *head = nullptr;
+        if (real)
+            Rd(real, RO_EXACT, head);
+        int guard = 0;
+        for (u8 *s = head; s && n < 64 && guard < 256; ++guard) {
+            int16_t mdOff = 0, st = 0;
+            Rd(s, SR_MDOFF, mdOff);
+            Rd(s, SR_STATUS, st);
+            u8 *md = s + mdOff;
+            u8 *ps = s == md + MD_SYN0 ? md + MD_SYN1 : s == md + MD_SYN1 ? md + MD_SYN0 : nullptr;
+            if (ps) {
+                u8 *po = nullptr, *pedge = nullptr;
+                int16_t pst = -1;
+                void *pclient = nullptr;
+                Rd(ps, SR_LOBJ, po);
+                Rd(ps, SR_STATUS, pst);
+                Rd(ps, SR_EDGE, pedge);
+                if (po)
+                    Rd(po, RO_CLIENT, pclient);
+                float len = 0, plane[4] = {}, sumx = 0;
+                Rd(md, MD_LEN, len);
+                SafeRead(md + MD_PLANE, plane, sizeof(plane));
+                Rd(md, MD_SUMXRAD, sumx);
+                Tri t, o;
+                uint8_t ntri = 0;
+                if (pedge && pst >= 0 && pst <= 2 && DecodeTri(pedge, t)) {
+                    ntri = 1;
+                    const u8 *oe = pst == 1 ? OppositeEdge(pedge) : nullptr;
+                    if (oe && DecodeTri(oe, o))
+                        ntri = 2;
+                }
+                w.U32(CkidOf2002(pclient));
+                w.U8((uint8_t) st);
+                w.U8((uint8_t) pst);
+                w.U16(0);
+                w.F32(len);
+                w.Raw(plane, sizeof(plane));
+                w.F32(sumx);
+                w.U32(ntri ? (uint32_t) reinterpret_cast<uintptr_t>(t.ledge) : 0);
+                w.U16(ntri ? (uint32_t) t.triIndex : 0xFFFF);
+                w.Put<int8_t>((int8_t) (ntri ? t.edgeIndex : -1));
+                w.U8(ntri);
+                if (ntri >= 1)
+                    w.Raw(t.v, sizeof(t.v));
+                else
+                    w.Zeros(36);
+                if (ntri >= 2)
+                    w.Raw(o.v, sizeof(o.v));
+                else
+                    w.Zeros(36);
+                ++n;
+            }
+            u8 *nx = nullptr;
+            if (!Rd(s, SR_NEXT, nx) || nx == s || nx == head)
+                break;
+            s = nx;
+        }
+        w.PatchU16(at, (uint16_t) n);
+        w.End();
+    }
+
+    // ---- BODY: movable bodies near the ball (PSI poses)
+    if (!(m_ObsMask & M_BODY)) {
+        w.Begin("BODY", 1);
+        const size_t at = w.Size();
+        w.U16(0);
+        uint32_t n = 0;
+        if (real && ball) {
+            WalkCluster2002(real);
+            const VxVector bp = ball->GetWorldMatrix()[3];
+            const float r2 = m_BodyRadius * m_BodyRadius;
+            for (u8 *ro : m_Reals) {
+                if (ro == real || n >= 0xFFFF)
+                    continue;
+                u8 *bcore = nullptr;
+                void *client = nullptr;
+                if (!Rd(ro, RO_CORE, bcore) || !bcore || CoreUnmoveable(bcore) || !Rd(ro, RO_CLIENT, client))
+                    continue;
+                const CK_ID id = CkidOf2002(client);
+                if (!id)
+                    continue;
+                auto *ent = (CK3dEntity *) client;
+                const VxMatrix &wm = ent->GetWorldMatrix();
+                const float dx = wm[3][0] - bp.x, dy = wm[3][1] - bp.y, dz = wm[3][2] - bp.z;
+                if (dx * dx + dy * dy + dz * dz > r2)
+                    continue;
+                double pos[3] = {}, q[4] = {}, qcf[4] = {0, 0, 0, 1};
+                float shift[3] = {}, s[3] = {}, rs[3] = {};
+                uint32_t psif = 0;
+                Rd(bcore, CO_PSIFLAGS, psif);
+                SafeRead(bcore + CO_POS, pos, sizeof(pos));
+                SafeRead(bcore + CO_QL, q, sizeof(q));
+                u8 *qp = nullptr;
+                if (Rd(ro, RO_QCF, qp) && qp)
+                    SafeRead(qp, qcf, sizeof(qcf));
+                SafeRead(ro + RO_SHIFT, shift, sizeof(shift));
+                SafeRead(bcore + CO_S, s, sizeof(s));
+                SafeRead(bcore + CO_RS, rs, sizeof(rs));
+                w.U32(id);
+                w.U32(psif);
+                w.Raw(pos, sizeof(pos));
+                w.Raw(q, sizeof(q));
+                w.Raw(qcf, sizeof(qcf));
+                w.Raw(shift, sizeof(shift));
+                w.Raw(s, sizeof(s));
+                w.Raw(rs, sizeof(rs));
+                PutMatrix12(w, wm);
+                ++n;
+            }
+        }
+        w.PatchU16(at, (uint16_t) n);
+        w.End();
+    }
+}
+
+void Agent::WriteGlct2002(Wire &w) {
+    // the PhysicsContinuousContact block in use (Sound_Manager), its group counters behind the IVP_Handle
+    CKContext *ctx = Ctx();
+    CK_ID bbId = 0;
+    uint16_t outMask = 0;
+    int32_t groups[6] = {};
+    for (size_t k = 0; k < m_ContactBBs.size() && k < m_ContactHandles.size() && !bbId; ++k) {
+        auto *b = (CKBehavior *) ctx->GetObject(m_ContactBBs[k]);
+        auto *h = (CKParameter *) ctx->GetObject(m_ContactHandles[k]);
+        if (!b || !h)
+            continue;
+        const void *hp = h->GetReadDataPtr(FALSE);
+        u8 *data = nullptr, *gout = nullptr;
+        if (!hp || !SafeRead(hp, &data, sizeof(data)) || !data)
+            continue;
+        if (!Rd(data, 0x10, gout) || !gout || !SafeRead(gout, groups, sizeof(groups)))
+            std::memset(groups, 0, sizeof(groups));
+        bbId = b->GetID();
+        for (int i = 0; i < b->GetOutputCount() && i < 16; ++i)
+            if (b->IsOutputActive(i))
+                outMask |= (uint16_t) (1u << i);
+    }
+    w.Begin("GLCT", 1);
+    w.U32(bbId);
+    w.U16(outMask);
+    w.Raw(groups, sizeof(groups));
+    w.End();
+}
+
+void Agent::WriteIvpo2002(Wire &w, std::unordered_set<uint64_t> &ivpoDone) {
+    // IVPO: IVP objects of the physicalized entities found by the cluster walk (m_Reals), each pair once.
+    CKContext *ctx = Ctx();
+    w.Begin("IVPO", 1);
+    const size_t at2 = w.Size();
+    w.U32(0);
+    uint32_t n2 = 0;
+    std::unordered_map<const void *, CK_ID> want;
+    for (size_t i = 0; i < m_Phys.size(); ++i)
+        if (m_Phys[i].kind == 0)
+            if (CKObject *o = ctx->GetObject(m_Phys[i].ent))
+                want.emplace(o, m_Phys[i].ent);
+    for (u8 *ro : m_Reals) {
+        void *client = nullptr;
+        if (!Rd(ro, RO_CLIENT, client) || !client)
+            continue;
+        auto it = want.find(client);
+        if (it == want.end())
+            continue;
+        const CK_ID id = it->second;
+        const uint64_t key = (uint64_t) id << 32 | (uint32_t) reinterpret_cast<uintptr_t>(ro);
+        if (!ivpoDone.insert(key).second)
+            continue;
+        int32_t type = 0;
+        float xrad = 0;
+        u8 *core = nullptr, *mat = nullptr;
+        u8 matRaw[32] = {};
+        Rd(ro, RO_TYPE, type);
+        Rd(ro, RO_XRAD, xrad);
+        Rd(ro, RO_CORE, core);
+        if (Rd(ro, RO_MAT, mat) && mat)
+            SafeRead(mat, matRaw, sizeof(matRaw));
+        w.U32(id);
+        w.I32(type);
+        w.U8(core && CoreUnmoveable(core) ? 1 : 0);
+        w.F32(xrad);
+        w.Raw(matRaw, sizeof(matRaw));
+        ++n2;
+    }
+    w.PatchU32(at2, n2);
+    w.End();
+}
+#else
+void Agent::ResetClock2002() {}
+void Agent::WriteTime2002(Wire &) {}
+void Agent::WriteIvp2002(Wire &, CK3dEntity *) {}
+void Agent::WriteGlct2002(Wire &) {}
+void Agent::WriteIvpo2002(Wire &, std::unordered_set<uint64_t> &) {}
+u8 *Agent::FindBallReal2002(CK3dEntity *) { return nullptr; }
+void Agent::WalkCluster2002(u8 *) {}
+u8 *Agent::ClusterStart2002() { return nullptr; }
+void Agent::RebuildEntityMap() {}
+CK_ID Agent::CkidOf2002(const void *) const { return 0; }
+#endif
 
 void Agent::OnHook(uint16_t code) {
     if (code == H_NONE)
@@ -1164,6 +1739,10 @@ void Agent::OnPhysicalize(CKBehavior *beh, bool physicalize) {
     auto *target = (CK3dEntity *) beh->GetTarget();
     if (!target)
         return;
+    if (target == m_BallRealOf2) {   // 2002 DLL: its IVP object is about to be replaced / destroyed
+        m_BallReal2 = nullptr;
+        m_BallRealOf2 = nullptr;
+    }
     PhysRec r;
     r.seq = (uint32_t) m_Phys.size();
     r.frame = (uint32_t) m_FrameIndex;
@@ -1422,7 +2001,28 @@ bool Agent::Boot() {
         return Fail(ERR_ENV, "composition: %s", error.c_str());
     // SimTool's --tas recipe (run_tas): the Random blocks, and no x87 precision reset at the level load (the 2002
     // process runs at 24 bits only until its first hull, built during the boot, then at 64 bits for good).
-    m_Engine->set_random_patch(!m_Recipe.orig_random);
+#ifdef BALLRAIN_PHYS2002_HOST
+    // the 2002 DLL: SimTool --tas's hl-win recipe (no BMMO script patch: its blocks would reach the source manager)
+    m_P2 = ballrain::phys2002::loaded();
+    if (ballrain::phys2002::requested() && !m_P2)
+        return Fail(ERR_DLL, "the 2002 physics_RT.dll was requested but is not loaded");
+    if (m_P2) {
+        m_Mgr2 = ballrain::phys2002::manager(Ctx());
+        if (!m_Mgr2)
+            return Fail(ERR_DLL, "2002 physics_RT.dll: no physics manager");
+        m_P2Hooked = ballrain::phys2002::ball_hook_installed();
+        if (!m_P2Hooked) {
+            // BALLRAIN_HL_PHYS2002_HOOK=0 (diagnostic): the DLL's own compare, i.e. this process's heap-address order
+            if (g_BallOrder.mode != BallOrder::CKID)
+                return Fail(ERR_ENV, "BALLRAIN_HL_BALL_ORDER=%s needs the ball-pair hook (BALLRAIN_HL_PHYS2002_HOOK=0)",
+                            g_BallOrder.spec.c_str());
+            Log("warning: ball-pair compare not hooked: pairs follow this process's heap addresses, not the CK id");
+        }
+        ballrain::phys2002::set_ball_key(g_BallOrder.mode == BallOrder::CKID ? &ballrain::phys2002::ball_key_ckid
+                                                                             : &BallOrderKey);
+    }
+#endif
+    m_Engine->set_random_patch(!m_Recipe.orig_random && !m_P2);
     m_Engine->set_reset_precision_on_load(m_Recipe.reset_precision);
     m_Physics = m_Engine->physics();
     g_BallOrder.ctx = Ctx();
@@ -1452,6 +2052,10 @@ void Agent::ApplyBallOrder() {
 void Agent::ResetClock() {
     // TASSupport OnStart's ResetPhysicsTime (a 1-tick timer after PreLoadLevel: before frame 1), plus the
     // IVP state Player.exe has at that point.
+    if (m_P2) {
+        ResetClock2002();
+        return;
+    }
     bmmo_physics_clock_state clock{};
     std::string error;
     if (!m_Physics || !bmmo::physics::get_clock_state(m_Physics, clock, error)) {
@@ -1614,6 +2218,9 @@ void Agent::Finish(uint32_t endReason) {
     // the pooled balls are created during the run (L1: when their sector loads): the order over all of them
     Log("ball order %s at the end: %s", g_BallOrder.spec.c_str(),
         DescribeBallOrder(Ctx(), g_BallOrder.mode == BallOrder::CKID ? nullptr : &BallOrderKey).c_str());
+    if (m_P2)   // what the unhooked 2002 compare would use: this process's CK3dEntity addresses
+        Log("ball heap-address order at the end: %s",
+            DescribeBallOrder(Ctx(), [](void *e) { return (unsigned int) (uintptr_t) e; }).c_str());
     if (m_Phase == Phase::Running || m_Phase == Phase::Tail || m_Phase == Phase::FinalPending)
         WriteFrameLog();
     Event(EV_RUNEND, (uint16_t) endReason);
@@ -1830,7 +2437,9 @@ void Agent::BuildState(bool minimal) {
         m_StateBuf.resize(1u << 20);
     Wire w(m_StateBuf.data(), m_StateBuf.size());
     // ---- TIME
-    {
+    if (m_P2)
+        WriteTime2002(w);
+    else {
         bmmo_physics_clock_state ck{};
         std::string err;
         if (m_Physics)
@@ -1860,11 +2469,13 @@ void Agent::BuildState(bool minimal) {
         return;
     }
     CK3dEntity *ball = GetActiveBall();
-    IVP_Real_Object *real = BallReal(ball);
+    if (m_P2)
+        WriteIvp2002(w, ball);   // BALL, FRIC, MIND, BODY from the 2002 DLL's memory
+    IVP_Real_Object *real = m_P2 ? nullptr : BallReal(ball);
     IVP_Core *core = real ? real->get_core() : nullptr;
 
     // ---- BALL
-    if (!(m_ObsMask & M_BALL)) {
+    if (!m_P2 && !(m_ObsMask & M_BALL)) {
         w.Begin("BALL", 1);
         w.SetSectionFlags(SECF_APPROX);   // core_flags / core_state: only the unmoveable bits / movement state
         w.U32(ball ? ball->GetID() : 0);
@@ -1902,7 +2513,7 @@ void Agent::BuildState(bool minimal) {
     }
 
     // ---- FRIC
-    if (!(m_ObsMask & M_FRIC)) {
+    if (!m_P2 && !(m_ObsMask & M_FRIC)) {
         w.Begin("FRIC", 1);
         w.SetSectionFlags(SECF_APPROX);   // lt_* not available (transaction memory)
         const size_t at = w.Size();
@@ -1933,7 +2544,7 @@ void Agent::BuildState(bool minimal) {
     }
 
     // ---- MIND
-    if (!(m_ObsMask & M_MIND)) {
+    if (!m_P2 && !(m_ObsMask & M_MIND)) {
         w.Begin("MIND", 1);
         w.SetSectionFlags(SECF_APPROX);   // ledge: 0 (an address in the 2002 DLL)
         const size_t at = w.Size();
@@ -1989,7 +2600,7 @@ void Agent::BuildState(bool minimal) {
     }
 
     // ---- BODY: movable bodies near the ball (PSI poses)
-    if (!(m_ObsMask & M_BODY)) {
+    if (!m_P2 && !(m_ObsMask & M_BODY)) {
         w.Begin("BODY", 1);
         w.SetSectionFlags(SECF_APPROX);   // core_state: movement state only; order of the movable-object list
         const size_t at = w.Size();
@@ -2059,7 +2670,9 @@ void Agent::BuildState(bool minimal) {
     }
 
     // ---- GLCT: block and output pulses only (the group counters are behind a 2002 pointer)
-    if (!(m_ObsMask & M_GLCT)) {
+    if (m_P2 && !(m_ObsMask & M_GLCT))
+        WriteGlct2002(w);
+    else if (!(m_ObsMask & M_GLCT)) {
         CK_ID bbId = 0;
         uint16_t outMask = 0;
         for (size_t k = 0; k < m_ContactBBs.size() && !bbId; ++k) {
@@ -2271,6 +2884,10 @@ void Agent::WritePhysSections(Wire &w, StrTab &strs, size_t from, size_t to, std
     w.PatchU32(at, n);
     w.End();
 
+    if (m_P2) {   // the 2002 DLL: the cluster walk itself (m_Reals, walked by the caller), material bytes included
+        WriteIvpo2002(w, ivpoDone);
+        return;
+    }
     // IVPO: as the 2002 mod's cluster walk, nothing before the first movable object exists, then every
     // (physicalized entity, IVP object) pair once. Material bytes are not available (zeros).
     w.Begin("IVPO", 1);
@@ -2307,6 +2924,10 @@ void Agent::WritePhysSections(Wire &w, StrTab &strs, size_t from, size_t to, std
 }
 
 void Agent::ExportPhysicalized() {
+    if (m_P2) {
+        RebuildEntityMap();
+        WalkCluster2002(ClusterStart2002());
+    }
     const size_t from = m_PhysExported, to = m_Phys.size();
     if (m_LevelInc) {
         std::vector<uint8_t> buf;
@@ -2326,12 +2947,34 @@ void Agent::ExportPhysicalized() {
 
 void Agent::LevelTables() {
     CKContext *ctx = Ctx();
+    if (m_P2) {   // the 2002 DLL: BallrainIO AgentLevelTables's contact blocks (with their IVP_Handle) and entity map
+        RebuildEntityMap();
+        m_ContactBBs.clear();
+        m_ContactHandles.clear();
+        const int n = ctx->GetObjectsCountByClassID(CKCID_BEHAVIOR);
+        CK_ID *ids = ctx->GetObjectsListByClassID(CKCID_BEHAVIOR);
+        for (int k = 0; k < n; ++k) {
+            auto *b = (CKBehavior *) ctx->GetObject(ids[k]);
+            if (!b || !b->GetPrototypeName() || strcmp(b->GetPrototypeName(), "PhysicsContinuousContact") != 0)
+                continue;
+            CKParameter *handle = nullptr;
+            for (int i = 0; i < b->GetLocalParameterCount() && !handle; ++i) {
+                CKParameter *p = b->GetLocalParameter(i);
+                if (p && p->GetName() && !strcmp(p->GetName(), "IVP_Handle"))
+                    handle = p;
+            }
+            if (!handle)
+                continue;
+            m_ContactBBs.push_back(b->GetID());
+            m_ContactHandles.push_back(handle->GetID());
+        }
+    }
     for (int k = 0; k < 5; ++k) {
         CKObject *o = ctx->GetObjectByNameAndParentClass((CKSTRING) kCamNames[k], CKCID_3DENTITY, nullptr);
         m_CamIds[k] = o ? o->GetID() : 0;
     }
-    m_ContactBBs.clear();
-    {
+    if (!m_P2) {
+        m_ContactBBs.clear();
         const int n = ctx->GetObjectsCountByClassID(CKCID_BEHAVIOR);
         CK_ID *ids = ctx->GetObjectsListByClassID(CKCID_BEHAVIOR);
         for (int k = 0; k < n; ++k) {
@@ -2555,6 +3198,8 @@ void Agent::WriteLevelMessage() {
         w.End();
     }
     {
+        if (m_P2)
+            WalkCluster2002(ClusterStart2002());
         std::vector<std::pair<CK_ID, CK_ID>> done;
         std::unordered_set<uint64_t> ivpoDone;
         WritePhysSections(w, strs, 0, m_Phys.size(), done, ivpoDone);
@@ -2630,7 +3275,11 @@ void Agent::WriteLevelMessage() {
     bool ok = f && std::fwrite(buf.data(), 1, buf.size(), f) == buf.size();
     if (f)
         ok = std::fclose(f) == 0 && ok;
+#ifdef _WIN32
+    ok = ok && MoveFileExA(tmp.c_str(), m_LevelMsgPath.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;   // rename won't replace
+#else
     ok = ok && std::rename(tmp.c_str(), m_LevelMsgPath.c_str()) == 0;
+#endif
     if (!ok)
         Log("cannot write level message %s", m_LevelMsgPath.c_str());
 }
@@ -2776,8 +3425,12 @@ int Agent::Run() {
 #endif
         p.obsVersions = 1u << 1;
         p.state = state;
-        std::snprintf(p.version, sizeof(p.version), "%s x87soft engine headless (approximate backend) level %d",
-                      kVersion, m_Level);
+        if (m_P2)   // the 2002 DLL: its hash prefix (the retail hello carries the physics_RT hash too)
+            std::snprintf(p.version, sizeof(p.version), "%s phys2002 %.16s engine headless level %d", kVersion,
+                          Phys2002Sha(), m_Level);
+        else
+            std::snprintf(p.version, sizeof(p.version), "%s x87soft engine headless (approximate backend) level %d",
+                          kVersion, m_Level);
         m_Chan.Send(BR_PONG, &p, sizeof(p));
     };
     if (m_Level < 1 || m_Level > 13 || m_Root.empty()) {
@@ -2834,7 +3487,12 @@ int Agent::Run() {
         // the product build's key (VX_X87_GAME): without it two balls are ordered by heap address, which changes from
         // run to run
         IVP_Environment *env = m_Physics ? m_Physics->GetEnvironment() : nullptr;
-        if (!env || !env->bmmo_ball_order_key)
+        if (m_P2) {
+            // the 2002 DLL: its one ball-pair compare runs through our key (phys2002.hpp); checked in Boot
+            Log("2002 physics_RT.dll: ball-pair key %s",
+                !m_P2Hooked ? "none (heap addresses)"
+                : g_BallOrder.mode == BallOrder::CKID ? "CK id" : g_BallOrder.spec.c_str());
+        } else if (!env || !env->bmmo_ball_order_key)
             return Fail(ERR_ENV, "the physics environment has no ball-pair key (a build without VX_X87_GAME?)") ? 0 : 2;
         if (g_BallOrder.mode != BallOrder::CKID && !g_BallOrder.built)
             BuildBallOrder();
@@ -2914,7 +3572,11 @@ int ballrain_agent_main(const ballrain_agent_args &args) {
 #ifndef _WIN32
     std::signal(SIGPIPE, SIG_IGN);
 #endif
+#ifdef _WIN32
+    std::setvbuf(stderr, nullptr, _IONBF, 0);   // the MSVC CRT has no line buffering (_IOLBF = full): keep lines up to a crash
+#else
     std::setvbuf(stderr, nullptr, _IOLBF, 1 << 14);
+#endif
     auto *agent = new Agent;   // never freed: the engine is torn down by process exit
     if (!agent->Configure(args))
         return 2;

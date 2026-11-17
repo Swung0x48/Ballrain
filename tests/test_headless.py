@@ -325,3 +325,38 @@ def test_env_records_the_ball_order_in_the_metadata(tmp_path):
     info, _ = _run_episode(env, 1)
     assert json.loads(Path(info["run_meta"]).read_text(encoding="utf-8"))["ball_order"] is None
     env.close()
+
+
+def test_phys2002_host_packaging():
+    """The Windows 2002-DLL host (headless/README.md): patch 0003 touches product files only (its own sources are in
+    headless/src, the layout is BallrainIO's Ivp2002.h), the Mac build applies 0002 alone, the agent's 2002 code is
+    compiled only under the 0003 define."""
+    root = Path(__file__).resolve().parents[1]
+    hl = root / "headless"
+    p3 = (hl / "patches" / "0003-hlwin-phys2002.diff").read_text(encoding="utf-8")
+    files = [line[6:].strip() for line in p3.splitlines() if line.startswith("+++ b/")]
+    assert files and not any("phys2002" in f or "ballrain_agent" in f for f in files)
+    assert "BALLRAIN_PHYS2002_HOST" in p3 and "sim/phys2002.cpp" in p3 and "sim/Ivp2002.h" in p3
+    for f in ("phys2002.cpp", "phys2002.hpp"):
+        assert (hl / "src" / f).is_file()
+    assert (root / "BallrainIO" / "src" / "Ivp2002.h").is_file()
+    assert 'patches/0002-*.diff' in (hl / "build_mac.sh").read_text(encoding="utf-8")
+    assert 'patches/0002-*.diff' in (hl / "mac" / "setup_mac.sh").read_text(encoding="utf-8")
+    agent = (hl / "src" / "ballrain_agent.cpp").read_text(encoding="utf-8")
+    assert '#ifdef BALLRAIN_PHYS2002_HOST\n#include "phys2002.hpp"' in agent
+    win = (hl / "build_win.ps1").read_text(encoding="utf-8")
+    assert "0003-hlwin-phys2002.diff" in win and "Ivp2002.h" in win
+    # the sha the host checks is the one the retail mod checks
+    sha = (hl / "src" / "phys2002.hpp").read_text(encoding="utf-8").split('kSha256 = "')[1][:64]
+    assert sha.startswith("e72e4afc") and len(sha) == 64
+
+
+def test_gate_phys2002_counts_the_ivp_fields_as_exact():
+    """scripts/headless_gate.py --phys2002: only per-process addresses and IVP residue stay apart."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import headless_gate as G
+    assert G.APPROX_PHYS2002 < G.APPROX
+    for key in (("FRIC", "lt_normal"), ("FRIC", "lt_point"), ("FRIC", "lt_valid"), ("GLCT", "groups"),
+                ("BALL", "core_flags_raw"), ("BALL", "core_state_raw"), ("BODY", "core_state_raw")):
+        assert key in G.APPROX and key not in G.APPROX_PHYS2002
+    assert ("MIND", "ledge") in G.APPROX_PHYS2002 and ("SCOR", "energy_param_ptr") in G.APPROX_PHYS2002

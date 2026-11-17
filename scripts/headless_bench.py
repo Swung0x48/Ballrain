@@ -42,7 +42,10 @@ def _rss_kb(pid: int) -> int | None:
 
 
 def worker(spec: dict) -> dict:
-    import resource
+    try:
+        import resource  # POSIX only (the Windows 2002-DLL host has none)
+    except ImportError:
+        resource = None
 
     from ballrain.env import BallanceEnv, EnvConfig
     rng = np.random.default_rng(spec["seed"])
@@ -123,7 +126,8 @@ def worker(spec: dict) -> dict:
         st["t_close"] = time.perf_counter() - tc
     st["t_features"] = fx_t[0]
     st["wall_s"] = time.monotonic() - t0
-    st["python_maxrss_mb"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1 << 20 if sys.platform == "darwin" else 1 << 10)
+    st["python_maxrss_mb"] = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1 << 20 if sys.platform == "darwin" else 1 << 10)
+                              if resource else None)
     return st
 
 
@@ -144,7 +148,7 @@ def run(name: str, n: int, seconds: int, out: Path, headless: dict) -> dict:
     load = []
     while any(p.poll() is None for p, _ in procs):
         time.sleep(2.0)
-        load.append(os.getloadavg()[0])
+        load.append(os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0)
     ws = [json.loads(f.read_text(encoding="utf-8")) if f.is_file() else {"errors": ["no output"]} for _, f in procs]
     tot = lambda k: sum(w.get(k, 0) for w in ws)  # noqa: E731
     wall = max(w.get("wall_s", 0) for w in ws) or 1
@@ -162,7 +166,7 @@ def run(name: str, n: int, seconds: int, out: Path, headless: dict) -> dict:
                                                                  "t_step", "t_features", "t_close", "t_reset_new")},
             "engine_rss_mb_median": round(float(np.median(rss)) / 1024, 1) if rss else None,
             "engine_rss_mb_max": round(max(rss) / 1024, 1) if rss else None,
-            "python_rss_mb_max": round(max(w.get("python_maxrss_mb", 0) for w in ws), 1),
+            "python_rss_mb_max": round(max(w.get("python_maxrss_mb") or 0 for w in ws), 1),
             "launch_s_median": round(float(np.median(launches)), 3) if launches else None,
             "loadavg_mean": round(float(np.mean(load)), 2) if load else None,
             "errors": [e for w in ws for e in w.get("errors", [])][:10]}

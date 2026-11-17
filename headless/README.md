@@ -49,6 +49,31 @@ SDL3 在 macOS 上需要两处本地修改（见 `build_mac.sh` 头部）。Wind
 正在被训练使用的二进制不要覆盖：`setup_mac.sh SRC_TAR` 把每个构建放进新目录 `~/ballrain/hl/x87s-<BallanceMMO 提交前 8 位>-<0002 哈希>-<agent 哈希>`，
 门禁通过之后再 `setup_mac.sh --activate` 写 `hl/ENGINE`（训练启动时读它）。
 
+## Windows x86：跑原版 2002 physics_RT.dll 的宿主（补丁 0003）
+
+同一个无头引擎的 32 位 Windows 构建，物理换成**零售原版** `physics_RT.dll`（sha256 `e72e4afc…`，与 BallrainIO 校验的是同一个文件）。
+CK 侧（矩阵、相机、脚本、BuildingBlocks）仍是 Ballanced 源码，所以相机 / 装饰物体的那些差异（`docs/headless.md` §7.1）照旧；IVP 侧就是 2002 的二进制。
+
+| 文件 | 内容 |
+|---|---|
+| `patches/0003-hlwin-phys2002.diff` | 只改产品文件：CMake 加 `sim/phys2002.*`、`sim/Ivp2002.h` 和宏 `BALLRAIN_PHYS2002_HOST`；`headless_engine.cpp` 在注册插件时用 2002 DLL 顶替源码的 physics_RT，在建 CKContext 处把 x87 设成 24 位（Player.exe 的 D3D8 设备留下的状态）；`sim_tool.cpp --tas` 的 2002 时钟复位；`CKIpionManager::GetManager` 在 2002 模式下返回 NULL（那个 GUID 下是另一个类）；`CK3dEntity::GetOrientation` 用 x87 的 Normalize（2002 的 Set Physics Hinge 调它） |
+| `src/phys2002.cpp`、`src/phys2002.hpp` | 装载器：先核对 sha256，`LoadLibraryEx(DONT_RESOLVE_DLL_REFERENCES)` 映射，自己填导入表（CK2 / VxMath 名字 → 静态链接的 Ballanced 上的 thiscall 垫片，`VxQuaternion::FromMatrix` → 零售 `Bin/VxMath.dll`，MSVCRT / KERNEL32 → 系统 DLL），再跑它的 DllMain，作为静态插件 "physics_RT" 注册 |
+| `src/ballrain_agent.cpp`（`BALLRAIN_PHYS2002_HOST` 下的部分） | agent 模式的 TIME / BALL / FRIC / MIND / BODY / GLCT / IVPO 按 `BallrainIO/src/Agent.cpp` 读 DLL 内存（偏移来自 `BallrainIO/src/Ivp2002.h`，构建时复制过去，不另存一份）；时钟复位写 DLL 内存（TASSupport 的复位 + nmc 4 + 种子 75^21）；不跑 BMMO 的脚本补丁；hello 串是 `BallrainIO-headless 0.1 phys2002 e72e4afcfa5c33a7 engine headless level N` |
+| `build_win.ps1` | `powershell -File headless/build_win.ps1 SRC_TAR WORK`：解包 `mk_src.sh` 的 src.tar、打 0002 + 0003、复制 `headless/src` 和 `Ivp2002.h`、x86 配置并编译。路径都来自环境变量（`VCVARS`、`CMAKE`、`NINJA`、`VCPKG_ROOT`、`VCPKG_INSTALLED`（x86-windows）、`SDL3_DIR`、`GTEST_DIR`、`YAMLCPP_DIR`、`PATCH`、`JOBS`，见脚本头部） |
+
+`build_mac.sh` / `setup_mac.sh` 只用 0002（0003 只能在 x86 上编译）。
+
+**对映射后的镜像只改一处**（文件不改，hash 照验）：IVP 里唯一一处球-球接触顺序的比较（RVA `0x164C1`，`pop0->client_data < pop1->client_data`，
+即两个 CK3dEntity 的堆地址）改成调用一个键函数，先核对原字节再改。默认键是 CK id（与 x87-soft 产品构建的 `bmmo_ball_order_key` 相同），
+`BALLRAIN_HL_BALL_ORDER` 的各模式（`docs/headless.md` §3.1）照样生效。`BALLRAIN_HL_PHYS2002_HOOK=0`（诊断）不改，按本进程堆地址排（只允许 `ckid`）。
+
+选择物理：agent 模式默认用 `<root>/BuildingBlocks/physics_RT.dll`（必须是 2002 那个文件，不对就报错退出，不会悄悄退回源码物理）；
+`BALLRAIN_HL_PHYS2002=<路径>` 换文件，`BALLRAIN_HL_PHYS2002=0` 用同一个二进制里的源码 x87-soft 物理。SimTool `--tas` 仍由 `BALLRAIN_PHYS2002=<路径>` 打开。
+所以 `train_m2.py --backend headless` 不用改：`--hl-bin` 指向这个构建、`--hl-root` 指向装着零售 physics_RT.dll 的游戏目录即可（Windows 上 socket 自动是 TCP）。
+回放驱动 `tools/replay_stub.py` 在没有 AF_UNIX 的 Python 上用 TCP，并把 hello 串写进 `summary.json`；`scripts/headless_gate.py --phys2002` 要求 hello 里有 `phys2002`，
+并把 x87-soft 引擎给不出的 IVP 字段（FRIC lt_*、GLCT 计数、BALL / BODY 原始位域）当精确字段比较，只有地址（MIND ledge、Energy 参数单元）和 IVP 不维护的残值（MIND plane w）单列。
+门禁结果和吞吐见 `docs/headless.md` §13。
+
 ## 运行
 
 - Python：`EnvConfig(backend="headless", headless={"binary": ..., "root": <游戏目录>})`，或设 `BALLRAIN_HL_BIN` / `BALLRAIN_HL_ROOT`；

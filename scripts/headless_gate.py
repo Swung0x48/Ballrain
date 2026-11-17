@@ -38,6 +38,18 @@ APPROX = {  # (section, field) the headless engine cannot give; compared apart
     ("BALL", "core_state_raw"), ("BODY", "core_state_raw"), ("TIME", "flags_headless"),
     ("SCOR", "energy_param_ptr"), ("SREN", "energy_param_ptr"), ("MIND", "plane_w"),
 }
+# --phys2002 (the Windows host running the 2002 physics_RT.dll, headless/README.md): the IVP fields are read from the
+# DLL's memory as the retail mod reads them, so only the values that are addresses of one process (MIND ledge, the
+# Energy parameter cell's pointer) or unmaintained residue (MIND plane w) stay apart; everything else counts as exact
+APPROX_PHYS2002 = {("MIND", "ledge"), ("SCOR", "energy_param_ptr"), ("SREN", "energy_param_ptr"), ("MIND", "plane_w"),
+                   ("TIME", "flags_headless")}
+_APPROX = {"set": APPROX}
+
+
+def _approx(sec, name) -> bool:
+    return (sec, name) in _APPROX["set"]
+
+
 GAMEPLAY_ARRAYS = ("Energy", "CurrentLevel", "IngameParameter", "PH", "Checkpoints", "ResetPoints", "AllLevel", "Keyboard")
 
 
@@ -163,7 +175,7 @@ def _cmp_struct(rep, sec, frame, h, r, skip=(), remap=None):
         hv, rv = h[name], r[name]
         if remap and name in remap:
             hv = remap[name](hv)
-        rep.add(f"{sec}.{name}", frame, _eq(hv, rv), (sec, name) in APPROX)
+        rep.add(f"{sec}.{name}", frame, _eq(hv, rv), _approx(sec, name))
 
 
 def _cmp_list(rep, sec, frame, h, r, idmap, keys, skip=(), approx_fields=(), sort_by=None):
@@ -179,7 +191,7 @@ def _cmp_list(rep, sec, frame, h, r, idmap, keys, skip=(), approx_fields=(), sor
     for name in h.dtype.names:
         if name in skip:
             continue
-        rep.add(f"{sec}.{name}", frame, _eq(h[name], r[name]), (sec, name) in APPROX or name in approx_fields)
+        rep.add(f"{sec}.{name}", frame, _eq(h[name], r[name]), _approx(sec, name) or name in approx_fields)
 
 
 OBJECT_PARAM_TYPES = ("entity", "object", "group", "mesh", "camera", "light", "sprite", "material", "texture")
@@ -213,8 +225,8 @@ def cmp_obs(rep: Report, frame: int, oh: P.Observation, orr: P.Observation, idma
             hb, rb = h.copy(), r.copy()
             rep.add("BALL.core_flags", frame, int(hb["core_flags"]) & 0xC == int(rb["core_flags"]) & 0xC)
             rep.add("BALL.core_state", frame, int(hb["core_state"]) & 0xFF == int(rb["core_state"]) & 0xFF)
-            rep.add("BALL.core_flags_raw", frame, int(hb["core_flags"]) == int(rb["core_flags"]), True)
-            rep.add("BALL.core_state_raw", frame, int(hb["core_state"]) == int(rb["core_state"]), True)
+            rep.add("BALL.core_flags_raw", frame, int(hb["core_flags"]) == int(rb["core_flags"]), _approx("BALL", "core_flags_raw"))
+            rep.add("BALL.core_state_raw", frame, int(hb["core_state"]) == int(rb["core_state"]), _approx("BALL", "core_state_raw"))
             _cmp_struct(rep, "BALL", frame, hb, rb, skip=("core_flags", "core_state"), remap=remap)
         elif sec == "cams":
             rep.add("CAMS.ckid", frame, [idmap(x) for x in h["cams"]["ckid"]] == list(r["cams"]["ckid"]))
@@ -223,26 +235,26 @@ def cmp_obs(rep: Report, frame: int, oh: P.Observation, orr: P.Observation, idma
         elif sec == "glct":
             rep.add("GLCT.bb", frame, idmap(h["bb"]) == int(r["bb"]))
             rep.add("GLCT.pulses", frame, int(h["pulses"]) == int(r["pulses"]))
-            rep.add("GLCT.groups", frame, _eq(h["groups"], r["groups"]), True)
+            rep.add("GLCT.groups", frame, _eq(h["groups"], r["groups"]), _approx("GLCT", "groups"))
         elif sec in ("scor", "sren"):
             # Energy column 4 (Timefactor) is a parameter cell: its raw value is a pointer, not comparable
             ptr = [i for i in range(6) if int(h["types"][i]) == P.ARR_PARAMETER]
             keep = [i for i in range(6) if i not in ptr]
             rep.add(f"{S}.energy", frame, _eq(h["energy"][keep], r["energy"][keep]))
-            rep.add(f"{S}.energy_param_ptr", frame, _eq(h["energy"][ptr], r["energy"][ptr]), True)
+            rep.add(f"{S}.energy_param_ptr", frame, _eq(h["energy"][ptr], r["energy"][ptr]), _approx(S, "energy_param_ptr"))
             _cmp_struct(rep, S, frame, h, r, skip=("energy",))
         else:
             _cmp_struct(rep, S, frame, h, r)
     _cmp_list(rep, "FRIC", frame, oh.fric, orr.fric, idmap, ["partner"])
     hm, rm = oh.mind.copy(), orr.mind.copy()
     if len(hm) == len(rm) and len(hm):
-        rep.add("MIND.plane_w", frame, _eq(hm["plane"][:, 3], rm["plane"][:, 3]), True)  # not maintained (residual)
+        rep.add("MIND.plane_w", frame, _eq(hm["plane"][:, 3], rm["plane"][:, 3]), _approx("MIND", "plane_w"))  # not maintained (residual)
         hm["plane"][:, 3] = 0
         rm["plane"][:, 3] = 0
     _cmp_list(rep, "MIND", frame, hm, rm, idmap, ["partner"])
     hb = oh.body.copy()
     rb = orr.body.copy()
-    rep.add("BODY.core_state_raw", frame, len(hb) == len(rb) and _eq(np.sort(hb["core_state"]), np.sort(rb["core_state"])), True)
+    rep.add("BODY.core_state_raw", frame, len(hb) == len(rb) and _eq(np.sort(hb["core_state"]), np.sort(rb["core_state"])), _approx("BODY", "core_state_raw"))
     if len(hb) == len(rb):
         hb["core_state"] &= 0xFF
         rb["core_state"] &= 0xFF
@@ -393,10 +405,17 @@ def main(argv=None):
     ap.add_argument("--dataset", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--no-features", action="store_true")
+    ap.add_argument("--phys2002", action="store_true", help="the 2002-DLL host: the IVP fields the x87-soft engine "
+                    "approximates count as exact (APPROX_PHYS2002); the hello must name phys2002")
     ap.add_argument("--feature-every", type=int, default=1)
     ap.add_argument("--features", default="{}", help="FeatureConfig overrides as JSON (e.g. the trainer's: "
                     '{"hs_block": false, "camera": "world"} under --world-actions)')
     a = ap.parse_args(argv)
+    if a.phys2002:
+        hello = json.loads((a.headless / "summary.json").read_text()).get("hello", "")
+        if "phys2002" not in hello:
+            ap.error(f"--phys2002: the run's hello {hello!r} does not name phys2002 (the source physics ran?)")
+        _APPROX["set"] = APPROX_PHYS2002
     ds = a.dataset or (instances.runtime_dir() / "datasets" / "tas-v1")
     rd = ds / a.record
     meta = json.loads((rd / "meta.json").read_text(encoding="utf-8"))

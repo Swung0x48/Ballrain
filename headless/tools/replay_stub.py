@@ -58,6 +58,7 @@ def main():
     ap.add_argument("--max", type=int, default=0, help="stop after this many frames (0 = the whole file)")
     ap.add_argument("--no-save", action="store_true")
     ap.add_argument("--wrap", default="", help="a launcher to run the engine under (diagnostics)")
+    ap.add_argument("--socket", choices=("auto", "tcp"), default="auto", help="auto: unix where available, else tcp")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     out = os.path.abspath(a.out)
@@ -65,14 +66,21 @@ def main():
     n = len(data) // 8
     if a.max:
         n = min(n, a.max)
-    path = os.path.join(tempfile.gettempdir(), f"brs-{os.getpid()}.sock")
-    if os.path.exists(path):
-        os.unlink(path)
-    ls = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    ls.bind(path)
+    path = None
+    if hasattr(socket, "AF_UNIX") and a.socket != "tcp":
+        path = os.path.join(tempfile.gettempdir(), f"brs-{os.getpid()}.sock")
+        if os.path.exists(path):
+            os.unlink(path)
+        ls = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        ls.bind(path)
+        sock_spec = "unix:" + path
+    else:  # Windows Python has no AF_UNIX: TCP on the loopback
+        ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ls.bind(("127.0.0.1", 0))
+        sock_spec = "tcp:127.0.0.1:%d" % ls.getsockname()[1]
     ls.listen(1)
     env = {k: v for k, v in os.environ.items() if not k.startswith("BALLRAIN_") or k.startswith("BALLRAIN_HL_")}
-    env.update(BALLRAIN_SOCK="unix:" + path, BALLRAIN_LEVEL=str(a.level), BALLRAIN_LEVELMSG=out + "/level.msg",
+    env.update(BALLRAIN_SOCK=sock_spec, BALLRAIN_LEVEL=str(a.level), BALLRAIN_LEVELMSG=out + "/level.msg",
                BALLRAIN_FRAMELOG=out + "/framelog.bin", BALLRAIN_TRACE=out + "/trace.txt",
                BALLRAIN_EVENTS=out + "/events.txt", BALLRAIN_TIMEOUT_MS="60000")
     if a.prefix:
@@ -84,9 +92,12 @@ def main():
                             stderr=log)
     ls.settimeout(60)
     s, _ = ls.accept()
+    if path is None:
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     s.sendall(FRAME_HDR.pack(BR_PING, 0))
     m = recv(s)
     assert m and m[0] == BR_PONG, m
+    hello = m[1][12:12 + 180].split(b"\0", 1)[0].decode("latin1")
     t_hello = time.perf_counter()
     obs = open(out + "/obs.bin", "wb") if not a.no_save else None
     idx = open(out + "/obs_index.txt", "w") if not a.no_save else None
@@ -141,11 +152,12 @@ def main():
         idx.close()
     summ = {"frames_file": n, "observations": n_obs, "last": last, "state": state, "rc": proc.returncode,
             "hello_s": t_hello - t0, "first_obs_s": (first_obs_t or t_end) - t0, "run_s": t_end - (first_obs_t or t_end),
-            "frames_done": last[2] if last else None}
+            "frames_done": last[2] if last else None, "hello": hello}
     summ["frames_per_s"] = (summ["frames_done"] or 0) / max(summ["run_s"], 1e-9)
     json.dump(summ, open(out + "/summary.json", "w"), indent=1)
     print(json.dumps(summ))
-    os.unlink(path)
+    if path:
+        os.unlink(path)
 
 
 if __name__ == "__main__":

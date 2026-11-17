@@ -20,7 +20,7 @@ JOBS=${JOBS:-$(( $(sysctl -n hw.ncpu 2>/dev/null || nproc) - 1 ))}
 mkdir -p "$WORK"
 rm -rf "$WORK/src"
 tar xf "$TAR" -C "$WORK"
-for p in "$HERE"/patches/0*.diff; do
+for p in "$HERE"/patches/0002-*.diff; do   # 0003 is the Windows x86 2002-DLL host (build_win.ps1)
   echo "applying $(basename "$p")"
   patch -d "$WORK/src" -p1 --forward --quiet < "$p"
 done
