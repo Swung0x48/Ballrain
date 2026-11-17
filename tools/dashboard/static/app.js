@@ -42,7 +42,7 @@ function gameText(el, text, h, tone) {
   if (!FONT.img) { el.textContent = text; return; }
   const g = FONT.meta.glyphs, cell = FONT.meta.cell, top = 2, bot = 30;
   const scale = h / (bot - top), dpr = window.devicePixelRatio || 1;
-  const chars = [...String(text)].map((ch) => g[ch.charCodeAt(0)] || g[63]);
+  const chars = [...String(text).replace(/[—–]/g, "-")].map((ch) => g[ch.charCodeAt(0)] || g[63]);
   const gap = 2;
   const w = chars.reduce((a, c) => a + (c ? c[2] + gap : 8), 0);
   const cv = document.createElement("canvas");
@@ -172,10 +172,10 @@ function renderStatus() {
   const s = S.status[sel] || {};
   $("state").textContent = s.state || "";
   const SHORT = { "无头 x87-soft": "x87-soft", "原版 2002": "2002" };
-  const share = s.backend_share ? Object.entries(s.backend_share).map(([k, v]) => `<div class="row"><span>${esc(SHORT[k] || k)}</span><span>${v}%</span></div>`).join("") : "—";
+  const share = s.backend_share ? Object.entries(s.backend_share).map(([k, v]) => `<div class="row"><span class="gt">${esc(SHORT[k] || k)}</span><span class="gt">${esc(v + "%")}</span></div>`).join("") : "—";
   $("tiles").innerHTML = [
     tile("run", sel, s.machine ? `训练机：${s.machine}` : "", true),
-    tile(`最后记录（${S.tz}）`, s.last_log || "—", s.last_log_age_min != null ? `${num(s.last_log_age_min, 0)} 分钟前；开始于 ${s.started || "—"}` : "", false),
+    tile(`最后记录（${S.tz}）`, s.last_log || "—", s.last_log_age_min != null ? `${num(s.last_log_age_min, 0)} 分钟前；开始于 ${s.started || "—"}` : "", true),
     tile("更新次数", num(s.update), "", true),
     tile("训练步数", s.steps != null ? (s.steps / 1e6).toFixed(2) + " M" : "—", "", true),
     tile("每秒步数", num(s.steps_per_s), `最近 20 次平均 ${num(s.steps_per_s_avg20)}`, true),
@@ -187,7 +187,7 @@ function renderStatus() {
     tile("最佳 SR（含 TAS 前缀）", sec(s.best_sr_any), s.best_sr_k0 != null ? `从头开始最佳 ${sec(s.best_sr_k0)}` : "从 TAS 中途接手时的整关计时", true),
     tile("记录了轨迹的回合", num((S.traced_counts || {})[sel]), "抽样记录，供轨迹地图使用", true),
   ].join("");
-  $("tiles").querySelectorAll(".gt").forEach((el) => gameText(el, el.textContent, 20, "dark"));
+  $("tiles").querySelectorAll(".gt").forEach((el) => gameText(el, el.textContent, el.closest(".split") ? 18 : 20, "dark"));
   const c = s.curriculum || [];
   $("curr").innerHTML = c.length ? c.map((l) => `<li><time>${esc(l.slice(0, 11))}</time>${esc(l.slice(13).replace("curriculum: ", ""))}</li>`).join("") : "<li>（无）</li>";
 }

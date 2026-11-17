@@ -78,7 +78,7 @@ body {
 .tile .k { font-size: 12px; color: var(--parch-muted); font-weight: 700; letter-spacing: .03em; }
 .tile .v { font-size: 20px; font-weight: 800; min-height: 26px; overflow-wrap: anywhere; color: var(--parch-ink); }
 .tile .v.split { font-size: 17px; line-height: 1.35; }
-.tile .v.split .row { display: flex; justify-content: space-between; gap: 8px; }
+.tile .v.split .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .tile .s { font-size: 12px; color: var(--parch-muted); overflow-wrap: anywhere; }
 .log { margin: 0; padding: 0 0 0 18px; font-size: 13px; color: var(--ink); }
 .log li { margin: 2px 0; overflow-wrap: anywhere; }
