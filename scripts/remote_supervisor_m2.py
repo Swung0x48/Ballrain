@@ -9,7 +9,7 @@ Everything after "--" goes to remote_worker_m2.py (with --tag added). Health com
 - the heartbeat is older than --stale-s (default 180 s: the bridge's main loop is stuck),
 - it has been connected but forwarded nothing for --idle-s (default 600 s),
 - more than --max-fatal-per-min worker fatals per minute (crash loop, default 5).
-A restart: STOP file, wait up to 90 s, then kill the bridge's process tree (only its own PID) and stop any Player.exe left
+A restart: STOP file, wait up to 150 s, then kill the bridge's process tree (only its own PID) and stop any Player.exe left
 in its copies by path; then a new bridge process (new code). Log: remote-<tag>/supervisor.log. Stop the supervisor
 (and the bridge): create remote-<tag>/SUPERVISOR_STOP.
 """
@@ -67,7 +67,7 @@ def main(argv=None) -> int:
         log(f"restarting the bridge: {why}")
         (out / "STOP").write_text("supervisor", encoding="utf-8")
         try:
-            proc.wait(timeout=90)
+            proc.wait(timeout=150)  # the bridge waits up to 120 s for its workers
         except subprocess.TimeoutExpired:
             log(f"bridge pid {proc.pid} did not stop: killing its process tree")
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)

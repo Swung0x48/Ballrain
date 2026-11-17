@@ -107,6 +107,10 @@ class EnvConfig:
     # draw after the curriculum frontier moved past it
     rehearse_starts: list | None = None
     p_rehearse: float = 0.0
+    # record frames [lo, hi) that are never used as start states (e.g. the TAS on a route the training does not
+    # follow: L1 shortcut 2 while the reference line takes shortcut 1); applied to TasStarts, so curriculum draws,
+    # rehearsal and at-rest starts all skip them
+    exclude_starts: list | None = None
     rest_speed: float = 0.5
     rest_max_frames: int = 600
     warm_pool: bool = False  # pre-launch the next process on warm_copy while the current one runs
@@ -217,6 +221,12 @@ class BallanceEnv(gym.Env):
             raise ValueError("start_record and prefix are exclusive")
         self.starts = (TasStarts(c.start_record, camera_tol=c.camera_quarter_tol, camera_grace_ms=c.camera_turn_grace_ms)
                        if c.start_record else None)
+        if self.starts is not None and c.exclude_starts:
+            v = self.starts.valid
+            keep = np.ones(len(v), bool)
+            for lo, hi in c.exclude_starts:
+                keep &= ~((v >= int(lo)) & (v < int(hi)))
+            self.starts.restrict(keep)
         if self.starts is not None and self.starts.level != c.level:
             raise ValueError(f"start record {c.start_record} is level {self.starts.level}, not {c.level}")
         self.curriculum = None

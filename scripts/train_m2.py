@@ -37,9 +37,9 @@ sys.path.insert(0, str(REPO))
 import numpy as np  # noqa: E402
 
 RECORD = "SR01_1_14_457_264"
-TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "checkpoint", "stall_penalty", "gate_bonus",
+TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "checkpoint", "stall_penalty", "gate_bonus", "split_bonus",
          "camera_off_quarter")
-EP_COLS = ["update", "t", "wid", "backend", "host", "copy", "kind", "probes", "death_probe", "start_frame", "start_sector", "end", "end_sector", "max_sector",
+EP_COLS = ["update", "t", "wid", "backend", "host", "copy", "kind", "probes", "death_probe", "splits", "start_frame", "start_sector", "end", "end_sector", "max_sector",
            "success_cp", "finish", "ret", "steps", "frames", "sr_ms_end", "start_sr_ms", "agent_s", "s_start", "s_end",
            "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id"] + [f"r_{k}" for k in TERMS] + ["actions"]
 UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_per_s", "frontier", "frontier_sector",
@@ -113,6 +113,11 @@ def parse(argv=None):
     p.add_argument("--hl-socket", default=None, help="headless: unix | tcp (default $BALLRAIN_HL_SOCKET)")
     p.add_argument("--hl-ball-order", default=None,
                    help="headless: ball-ball contact order (ckid | reverse | perm:<seed> | table:... | retail[:<seed>])")
+    p.add_argument("--split-k", type=float, default=0.0, help="split bonus scale (0 = off; WorkerSpec.split_k)")
+    p.add_argument("--split-min-ref-s", type=float, default=5.0)
+    p.add_argument("--split-extra", default="", help="JSON [[lo_frame, hi_frame, seconds], ...] (WorkerSpec.split_extra)")
+    p.add_argument("--exclude-starts", default="", help="record frame ranges lo-hi never used as starts")
+    p.add_argument("--path-dir", default=None, help="directory of the reference line assets (FeatureConfig.path_dir)")
     p.add_argument("--gates", default="", help="JSON sub-goal gates (ballrain.train.worker.WorkerSpec.gates)")
     p.add_argument("--route-probes", default="", help='JSON {name: [xmin, xmax, zmin, zmax]}: per-route visit / death stats')
     p.add_argument("--remote-listen", default=None,
@@ -241,7 +246,7 @@ def make_env_config(a, out_root: Path):
     rc = RewardConfig(mode="sr", **json.loads(a.reward))
     fl = lambda x: tuple(float(v) for v in x.split(",") if v.strip()) if x else ()  # noqa: E731
     fc = FeatureConfig(hs_block=a.hs_block, camera="world" if a.world_actions else "orient_ref",
-                       far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at))
+                       far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=a.path_dir)
     cu = {"start_back": a.start_back, "step": a.cu_step, "band": a.cu_band, "recent": a.cu_recent,
           "advance_at": a.advance_at, "min_episodes": a.min_episodes, "p_level_start": a.p_level_start}
     hl = None
@@ -255,7 +260,8 @@ def make_env_config(a, out_root: Path):
                      rest_starts=[[int(v) for v in r.split("-")] for r in a.rest_starts.split(",") if r.strip()] or None,
                      p_rest=a.p_rest,
                      rehearse_starts=[[int(v) for v in r.split("-")] for r in a.rehearse_starts.split(",") if r.strip()] or None,
-                     p_rehearse=a.p_rehearse)
+                     p_rehearse=a.p_rehearse,
+                     exclude_starts=[[int(v) for v in r.split("-")] for r in a.exclude_starts.split(",") if r.strip()] or None)
 
 
 def stop_copies(names, log=None):
@@ -316,6 +322,12 @@ def main(argv=None) -> int:
         cu_cfg = env_cfg.curriculum
         env_cfg.curriculum = None
     starts = TasStarts(RECORD)
+    if a.exclude_starts:
+        keep = np.ones(len(starts.valid), bool)
+        for r in a.exclude_starts.split(","):
+            lo, hi = (int(v) for v in r.split("-"))
+            keep &= ~((starts.valid >= lo) & (starts.valid < hi))
+        starts.restrict(keep)
     cu = gated_curriculum(starts, CurriculumConfig(**(env_cfg.curriculum or cu_cfg), seed=a.seed), a.finish_gate)
     hidden = tuple(int(x) for x in a.hidden.split(","))
     from ballrain.env import BallanceEnv
@@ -420,7 +432,8 @@ def main(argv=None) -> int:
                           stall_extra=a.stall_extra, stall_compensate=a.stall_compensate, gamma=a.gamma,
                           stall_speed=a.stall_speed, stall_max_s=a.stall_max_s,
                           trace_sample=a.trace_sample, route_probes=json.loads(a.route_probes) if a.route_probes else {},
-                          gates=json.loads(a.gates) if a.gates else {},
+                          gates=json.loads(a.gates) if a.gates else {}, split_k=a.split_k,
+                          split_min_ref_s=a.split_min_ref_s, split_extra=json.loads(a.split_extra) if a.split_extra else [],
                           launcher_factory=FakeLauncher if a.fake else None)
 
     hub = None
@@ -461,7 +474,9 @@ def main(argv=None) -> int:
                                "stall_speed": a.stall_speed, "stall_max_s": a.stall_max_s,
                                "trace_sample": a.trace_sample,
                                "route_probes": json.loads(a.route_probes) if a.route_probes else {},
-                               "gates": json.loads(a.gates) if a.gates else {}}}
+                               "gates": json.loads(a.gates) if a.gates else {}, "split_k": a.split_k,
+                               "split_min_ref_s": a.split_min_ref_s,
+                               "split_extra": json.loads(a.split_extra) if a.split_extra else []}}
         hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):
@@ -726,6 +741,12 @@ def main(argv=None) -> int:
                     log.tb.add_scalar(f"train_{be}/dropped_chunks", counters.get(f"dropped_{be}", 0), counters["steps"])
                     log.tb.add_scalar(f"train_{be}/dropped_step_frac",
                                       counters.get(f"dropped_steps_{be}", 0) / max(counters.get(sk, 0), 1), counters["steps"])
+                if a.split_k:
+                    sp_rows = [x for e in eps for x in (e.get("splits") or [])]
+                    if sp_rows:
+                        log.tb.add_scalar("split/ratio_mean", float(np.mean([x[1] / max(x[2], 1e-3) for x in sp_rows])),
+                                          counters["steps"])
+                        log.tb.add_scalar("split/bonus_mean", float(np.mean([x[3] for x in sp_rows])), counters["steps"])
                 if a.gates:
                     for name in json.loads(a.gates):
                         hits = sum(f"gate:{name}" in (e.get("probes") or []) for e in eps)

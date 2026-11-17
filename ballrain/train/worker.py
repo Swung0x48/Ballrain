@@ -73,6 +73,16 @@ class WorkerSpec:
     # an episode the ball is within radius of center and meets the speed / heading conditions, the step's reward gets
     # +bonus (term "gate_bonus"); each gate pays at most once per episode
     gates: dict = field(default_factory=dict)
+    # split bonus (off when split_k = 0): at every checkpoint / LevelFinish reached in a life, k * (t_ref - t_agent) /
+    # max(t_ref, split_min_ref_s) clipped to [-k, k]; t_agent = IGT of the life since its start or the previous checkpoint,
+    # t_ref = the start record's IGT over the same stretch (TAS starts: from the hand-over frame; respawn / at-rest
+    # starts: from the checkpoint crossing / the start frame + split_rest_allow_s for starting at rest)
+    split_k: float = 0.0
+    split_min_ref_s: float = 5.0
+    split_rest_allow_s: float = 1.0
+    # extra reference time for segments that cross a section the reference line routes differently from the TAS:
+    # [[lo_frame, hi_frame, seconds], ...]: a segment that starts before TAS frame lo and ends at or after hi gets +seconds
+    split_extra: list = field(default_factory=list)
 
 
 class _Episode:
@@ -95,6 +105,9 @@ class _Episode:
         self.probes_seen: set = set()
         self.last_probe = None
         self.gates_hit: set = set()
+        self.splits: list = []  # (sector reached, t_agent s, t_ref s, bonus)
+        self.max_sector_seen = self.d["start_sector"]
+        self.seg = None  # (agent IGT ms at the segment start, TAS IGT ms at the segment start)
 
     def step(self, a, r, info, finfo):
         self.ret += r
@@ -141,6 +154,7 @@ class _Episode:
                  actions=self.actions.tolist())
         d["success_cp"] = bool(d["finish"] or self.max_sector > d["start_sector"])
         d["probes"] = sorted(self.probes_seen | {f"gate:{g}" for g in self.gates_hit})
+        d["splits"] = [[int(a), round(b, 3), round(c, 3), round(e, 3)] for a, b, c, e in self.splits]
         d["death_probe"] = self.last_probe if end == "BallOff" else None
         return d
 
@@ -187,6 +201,67 @@ class Worker:
             self.rec_ms = st.sr_final / max(self.lf - int(st.valid[0]), 1) if np.isfinite(st.sr_final) else 1000 / 264
         if self.curriculum_state is not None and self.env.curriculum is not None:
             self.env.set_start_state(self.curriculum_state)
+
+    def _tas_igt(self, k: int) -> float | None:
+        """The start record's SR double sum (ms) at frame k (nearest valid frame)."""
+        st = self.env.starts
+        if st is None:
+            return None
+        i = int(np.clip(np.searchsorted(st.valid, k), 0, len(st.valid) - 1))
+        return float(st.sr_double[i])
+
+    def _tas_cross(self, sector: int) -> float | None:
+        """TAS IGT (ms) when the record entered `sector` (sector 1: its first control frame); LevelFinish = sector 0."""
+        st = self.env.starts
+        if st is None:
+            return None
+        if sector == 0:
+            return float(st.sr_final)
+        m = st.sector == sector
+        return float(st.sr_double[m][0]) if m.any() else None
+
+    def _tas_cross_frame(self, sector: int):
+        st = self.env.starts
+        m = st.sector == sector
+        return int(st.valid[m][0]) if m.any() else None
+
+    def _split_start(self, ep, info):
+        """Segment start of a new life for the split bonus."""
+        if not self.spec.split_k or self.env.starts is None:
+            return
+        kind, k, sec = ep.d["kind"], ep.d["start_frame"], ep.d["start_sector"]
+        agent = ep.d["start_sr_ms"]
+        if kind == "tas" and k > 0:
+            ref = self._tas_igt(k)
+        elif kind == "tas_rest":
+            ref = self._tas_igt(k) - 1000 * self.spec.split_rest_allow_s
+        elif kind == "respawn":
+            c = self._tas_cross(sec)
+            ref = None if c is None else c - 1000 * self.spec.split_rest_allow_s
+        else:
+            ref = self._tas_cross(1)  # from level load: the TAS's first control
+        k0 = {"respawn": self._tas_cross_frame(sec)}.get(kind, k if k > 0 else int(self.env.starts.valid[0]))
+        ep.seg = None if ref is None else (agent, ref, k0)
+
+    def _split_bonus(self, ep, info, finished: bool) -> float:
+        if ep.seg is None or not self.spec.split_k:
+            return 0.0
+        sec = 0 if finished else int(info.get("sector") or 0)
+        end_ref = self._tas_cross(sec)
+        sr = info.get("sr_ms")
+        if end_ref is None or sr is None:
+            return 0.0
+        t_agent = (float(sr) - ep.seg[0]) / 1000.0
+        t_ref = (end_ref - ep.seg[1]) / 1000.0
+        end_frame = self._tas_cross_frame(sec) if sec else (self.env.starts.levelfinish_frame or 10 ** 9)
+        for lo, hi, extra in self.spec.split_extra:
+            if ep.seg[2] is not None and end_frame is not None and ep.seg[2] < lo and end_frame >= hi:
+                t_ref += float(extra)
+        k = self.spec.split_k
+        b = float(np.clip(k * (t_ref - t_agent) / max(t_ref, self.spec.split_min_ref_s), -k, k))
+        ep.splits.append((sec if sec else 99, t_agent, t_ref, b))
+        ep.seg = (float(sr), end_ref, end_frame)
+        return b
 
     def _cap_frames(self, info) -> int | None:
         st = self.env.starts
@@ -309,6 +384,7 @@ class Worker:
         n_obs = self.env.observation_space.shape[0]
         obs, info = self._reset()
         ep = _Episode(info, self.env, self.version, self._cap_frames(info))
+        self._split_start(ep, info)
         stall_all = int(1000 * sp.stall_s / sp.env.delta_ms)
         stall_rsp = int(1000 * (sp.respawn_stall_s or sp.stall_s) / sp.env.delta_ms)
         stall_max = int(1000 * sp.stall_max_s / sp.env.delta_ms)
@@ -347,9 +423,18 @@ class Worker:
                     obs, info = self._reset()
                     t_reset += time.perf_counter() - tr
                     ep = _Episode(info, self.env, self.version, self._cap_frames(info))
+                    self._split_start(ep, info)
                     continue
                 frames += int(info2.get("frames_done", f0)) - f0
                 ep.step(a, r, info2, self.fx_info)
+                if sp.split_k and (int(info2.get("sector") or 0) > ep.max_sector_seen
+                                   or info2.get("episode_end") == "LevelFinish"):
+                    sb = self._split_bonus(ep, info2, info2.get("episode_end") == "LevelFinish")
+                    if sb:
+                        r += sb
+                        ep.ret += sb
+                        ep.terms["split_bonus"] = ep.terms.get("split_bonus", 0.0) + sb
+                ep.max_sector_seen = max(ep.max_sector_seen, int(info2.get("sector") or 0))
                 if (sp.route_probes or sp.gates) and self.env.session is not None:
                     o = self.env.session.tracker.obs
                     if o is not None and o.ball is not None and bool(o.ball["found"]):
@@ -405,6 +490,7 @@ class Worker:
                     obs, info = self._reset()
                     t_reset += time.perf_counter() - tr
                     ep = _Episode(info, self.env, self.version, self._cap_frames(info))
+                    self._split_start(ep, info)
                 else:
                     obs, info = obs2, info2
             buf["last_value"] = self.model.value(normalize(obs, self.rms))
