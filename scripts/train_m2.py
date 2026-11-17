@@ -38,10 +38,10 @@ import numpy as np  # noqa: E402
 
 RECORD = "SR01_1_14_457_264"
 TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "checkpoint", "stall_penalty", "gate_bonus", "split_bonus",
-         "camera_off_quarter")
+         "camera_off_quarter", "zone_penalty", "wall_push")
 EP_COLS = ["update", "t", "wid", "backend", "host", "copy", "kind", "probes", "death_probe", "splits", "start_frame", "start_sector", "end", "end_sector", "max_sector",
            "success_cp", "finish", "ret", "steps", "frames", "sr_ms_end", "start_sr_ms", "agent_s", "s_start", "s_end",
-           "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id", "ball_order", "respawn_skipped"] + [f"r_{k}" for k in TERMS] + ["actions"]
+           "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id", "ball_order", "respawn_skipped", "zone_entries", "zones"] + [f"r_{k}" for k in TERMS] + ["actions"]
 UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_per_s", "frontier", "frontier_sector",
                 "band_success", "band_n", "band_finish", "gate_blocked", "episodes", "ret_mean", "ret_tas", "ret_respawn", "success_cp_tas", "finish_tas",
                 "deaths", "finishes", "stalls", "caps", "camera_off_quarter", "invalid_runs", "speed_mean", "runs", "finish_runs", "sr_ms_min", "sr_ms_k0_min",
@@ -119,6 +119,13 @@ def parse(argv=None):
     p.add_argument("--exclude-starts", default="", help="record frame ranges lo-hi never used as starts")
     p.add_argument("--path-dir", default=None, help="directory of the reference line assets (FeatureConfig.path_dir)")
     p.add_argument("--gates", default="", help="JSON sub-goal gates (ballrain.train.worker.WorkerSpec.gates)")
+    p.add_argument("--zones", default="",
+                   help='JSON penalty zones {name: {"box": [xmin, xmax, zmin, zmax], "y_below": y, "penalty": p}} '
+                        '(WorkerSpec.zones: one-off penalty per entry, the life goes on)')
+    p.add_argument("--wall-push-rate", type=float, default=0.0,
+                   help="penalty per game second while pushing into an unclimbable wall (WorkerSpec.wall_push_rate; 0 = off)")
+    p.add_argument("--wall-min-rise", type=float, default=2.0, help="wall height above the ball's lowest point that counts as unclimbable")
+    p.add_argument("--wall-max-progress", type=float, default=2.0, help="wall push: only below this route progress (units / s)")
     p.add_argument("--route-probes", default="", help='JSON {name: [xmin, xmax, zmin, zmax]}: per-route visit / death stats')
     p.add_argument("--remote-listen", default=None,
                    help="HOST:PORT: accept remote rollout workers (scripts/remote_worker_m2.py, ballrain.train.remote)")
@@ -448,7 +455,9 @@ def main(argv=None) -> int:
                           trace_sample=a.trace_sample, route_probes=json.loads(a.route_probes) if a.route_probes else {},
                           gates=json.loads(a.gates) if a.gates else {}, split_k=a.split_k,
                           split_min_ref_s=a.split_min_ref_s, split_extra=json.loads(a.split_extra) if a.split_extra else [],
-                          p_early_respawn=a.p_early_respawn, launcher_factory=FakeLauncher if a.fake else None)
+                          p_early_respawn=a.p_early_respawn, zones=json.loads(a.zones) if a.zones else {},
+                          wall_push_rate=a.wall_push_rate, wall_min_rise=a.wall_min_rise,
+                          wall_max_progress=a.wall_max_progress, launcher_factory=FakeLauncher if a.fake else None)
 
     hub = None
     cu_bins = defaultdict(lambda: deque(maxlen=100))
@@ -491,7 +500,9 @@ def main(argv=None) -> int:
                                "gates": json.loads(a.gates) if a.gates else {}, "split_k": a.split_k,
                                "split_min_ref_s": a.split_min_ref_s,
                                "split_extra": json.loads(a.split_extra) if a.split_extra else [],
-                               "p_early_respawn": a.p_early_respawn}}
+                               "p_early_respawn": a.p_early_respawn,
+                               "zones": json.loads(a.zones) if a.zones else {}, "wall_push_rate": a.wall_push_rate,
+                               "wall_min_rise": a.wall_min_rise, "wall_max_progress": a.wall_max_progress}}
         hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):
@@ -769,6 +780,12 @@ def main(argv=None) -> int:
                         hits = sum(f"gate:{name}" in (e.get("probes") or []) for e in eps)
                         log.tb.add_scalar(f"gate/{name}_hits", hits, counters["steps"])
                         log.tb.add_scalar(f"gate/{name}_hit_rate", hits / max(len(eps), 1), counters["steps"])
+                if a.zones or a.wall_push_rate:
+                    row["zone_entries"] = sum(int(e.get("zone_entries") or 0) for e in eps)
+                    row["wall_push"] = float(sum((e.get("terms") or {}).get("wall_push", 0.0) for e in eps))
+                    log.tb.add_scalar("zone/entries", row["zone_entries"], counters["steps"])
+                    log.tb.add_scalar("zone/entries_per_episode", row["zone_entries"] / max(len(eps), 1), counters["steps"])
+                    log.tb.add_scalar("zone/wall_push", row["wall_push"], counters["steps"])
                 if a.route_probes:
                     for name in json.loads(a.route_probes):
                         vis = [e for e in eps if name in (e.get("probes") or [])]

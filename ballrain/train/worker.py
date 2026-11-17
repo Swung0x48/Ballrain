@@ -92,6 +92,81 @@ class WorkerSpec:
     # otherwise the game process ends and the next episode is a new curriculum start (episode record respawn_skipped).
     # 1.0 = always play it (the old behaviour); respawns at or after the frontier are always played
     p_early_respawn: float = 1.0
+    # penalty zones (off when empty): {name: {"box": [xmin, xmax, zmin, zmax], "y_below": y, "penalty": p}}: each time the
+    # ball centre enters the box below y_below (e.g. L1's sector-2 pit, where the ball cannot reach the TAS line again),
+    # the step's reward gets -penalty (default 1.5, term "zone_penalty") and the life goes on; the zone re-arms once the
+    # ball has left it (outside the box or zone_rearm above y_below). Counted per episode (zone_entries)
+    zones: dict = field(default_factory=dict)
+    zone_rearm: float = 1.0
+    # unclimbable-wall push (off when wall_push_rate = 0): while the ball touches a wall (mindist gap <= wall_gap, contact
+    # normal |n_y| <= wall_max_ny) whose top is more than wall_min_rise above the ball's lowest point (user: a wall higher
+    # than about half a ball can never be climbed; ball radius ~2), the action pushes into it (cosine >= wall_push_cos
+    # with the wall's inward normal) and the route progress is below wall_max_progress units / s, each step pays
+    # -wall_push_rate x its game seconds (term "wall_push")
+    wall_push_rate: float = 0.0
+    wall_gap: float = 0.1
+    wall_max_ny: float = 0.5
+    wall_min_rise: float = 2.0
+    wall_push_cos: float = 0.5
+    wall_max_progress: float = 2.0
+
+
+def in_zone(pos, zone: dict, margin: float = 0.0) -> bool:
+    """Ball centre inside the zone's box and below its y_below (+ margin)."""
+    x0, x1, z0, z1 = zone["box"]
+    return bool(x0 <= pos[0] <= x1 and z0 <= pos[2] <= z1 and pos[1] < zone["y_below"] + margin)
+
+
+def push_direction(keys: int, world_actions: bool, cam_matrix=None) -> np.ndarray:
+    """Horizontal unit world direction the arrow keys push (zeros without arrows). world_actions: the keys are world
+    directions (UP +z, DOWN -z, RIGHT +x, LEFT -x, ballrain.env); otherwise camera arrows under cam_matrix."""
+    from ballrain import tas
+    from ballrain.env import key_push_dirs
+    if not isinstance(keys, (int, np.integer)):
+        return np.zeros(3)
+    if world_actions or cam_matrix is None:
+        v = np.array([bool(keys & tas.KEY_RIGHT) - bool(keys & tas.KEY_LEFT), 0.0,
+                      bool(keys & tas.KEY_UP) - bool(keys & tas.KEY_DOWN)], np.float64)
+    else:
+        dirs = key_push_dirs(cam_matrix)
+        v = sum((dirs[b] for b in (tas.KEY_UP, tas.KEY_DOWN, tas.KEY_LEFT, tas.KEY_RIGHT) if keys & b), np.zeros(3))
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-9 else np.zeros(3)
+
+
+def unclimbable_walls(pos, radius: float, normals, gaps, ray_down, gap: float = 0.1, max_ny: float = 0.5,
+                      min_rise: float = 2.0, probe_up: float = 6.5) -> list:
+    """Horizontal unit normals (pointing from the wall to the ball) of the walls the ball touches that rise more than
+    min_rise above its lowest point. normals / gaps: the mindist entries (ballrain.features.mind_normals, MIND gap);
+    ray_down(P) -> (y, tri) of the static geometry (TriangleSet.ray_down). The wall top: a vertical ray just behind the
+    contact point, from probe_up above the ball's lowest point (walls taller than probe_up, or movable bodies, which
+    are not in the static geometry, are not counted)."""
+    pos = np.asarray(pos, np.float64)
+    bottom = pos[1] - radius
+    out = []
+    for n, g in zip(np.asarray(normals, np.float64).reshape(-1, 3), np.asarray(gaps, np.float64).ravel()):
+        if g > gap or abs(n[1]) > max_ny:
+            continue
+        nh = np.array([n[0], 0.0, n[2]])
+        ln = np.linalg.norm(nh)
+        if ln < 1e-9:
+            continue
+        nh /= ln
+        cp = pos - n * (radius + g)
+        probe = cp - nh * 0.25
+        probe[1] = bottom + probe_up
+        y, _ = ray_down(probe[None, :])
+        top = float(y[0])
+        if not np.isnan(top) and top > bottom + min_rise:
+            out.append(nh)
+    return out
+
+
+def wall_push_hit(push, walls, cos_min: float = 0.5) -> bool:
+    """The push direction points into one of the walls (cosine with the wall's inward normal >= cos_min)."""
+    if not np.any(push):
+        return False
+    return any(float(np.dot(push, -w)) >= cos_min for w in walls)
 
 
 class _Episode:
@@ -119,6 +194,8 @@ class _Episode:
         self.splits: list = []  # (sector reached, t_agent s, t_ref s, bonus)
         self.max_sector_seen = self.d["start_sector"]
         self.seg = None  # (agent IGT ms at the segment start, TAS IGT ms at the segment start)
+        self.zone_in: dict = {}  # penalty zone name -> the ball is inside (not re-armed yet)
+        self.zone_counts: dict = {}  # penalty zone name -> entries this episode
 
     def step(self, a, r, info, finfo):
         self.ret += r
@@ -167,6 +244,8 @@ class _Episode:
         d["probes"] = sorted(self.probes_seen | {f"gate:{g}" for g in self.gates_hit})
         d["splits"] = [[int(a), round(b, 3), round(c, 3), round(e, 3)] for a, b, c, e in self.splits]
         d["death_probe"] = self.last_probe if end == "BallOff" else None
+        d["zone_entries"] = int(sum(self.zone_counts.values()))
+        d["zones"] = ",".join(f"{k}:{v}" for k, v in sorted(self.zone_counts.items()))
         d["respawn_skipped"] = False  # set by the worker when this BallOff's early respawn is not played
         return d
 
@@ -237,6 +316,44 @@ class Worker:
         st = self.env.starts
         m = st.sector == sector
         return int(st.valid[m][0]) if m.any() else None
+
+    def _zone_wall(self, ep, a: int, s_before, frames: int) -> float:
+        """Penalty zones and the unclimbable-wall push for the step just taken (WorkerSpec.zones / wall_push_rate);
+        returns the reward to add (<= 0) and books the terms on the episode."""
+        sp = self.spec
+        o = self.env.session.tracker.obs
+        if o is None or o.ball is None or not bool(o.ball["found"]):
+            return 0.0
+        pos = np.asarray(o.ball["pos"], np.float64)
+        out = 0.0
+        for name, z in sp.zones.items():
+            inside = in_zone(pos, z)
+            if inside and not ep.zone_in.get(name):
+                pen = -float(z.get("penalty", 1.5))
+                out += pen
+                ep.terms["zone_penalty"] = ep.terms.get("zone_penalty", 0.0) + pen
+                ep.zone_counts[name] = ep.zone_counts.get(name, 0) + 1
+                ep.zone_in[name] = True
+            elif ep.zone_in.get(name) and not in_zone(pos, z, sp.zone_rearm):
+                ep.zone_in[name] = False
+        if sp.wall_push_rate and len(o.mind) and "mind_normals" in self.fx_info:
+            dt = frames * float(sp.env.delta_ms) / 1000.0
+            s = self.env.reward.s
+            prog = (s - s_before) / dt if (s is not None and s_before is not None and dt > 0) else 0.0
+            keys = self.env.actions[int(a)]
+            if dt > 0 and prog < sp.wall_max_progress and isinstance(keys, (int, np.integer)) and keys:
+                from ballrain.features import level_geometry
+                cam = o.cams["cams"][0]["matrix"] if o.cams is not None else None
+                push = push_direction(keys, bool(sp.env.world_actions), cam)
+                radius = float(o.ball["extra_radius"]) or 2.0
+                walls = unclimbable_walls(pos, radius, self.fx_info["mind_normals"], o.mind["gap"],
+                                          level_geometry(self.env.session.tracker).tris.ray_down, gap=sp.wall_gap,
+                                          max_ny=sp.wall_max_ny, min_rise=sp.wall_min_rise)
+                if walls and wall_push_hit(push, walls, sp.wall_push_cos):
+                    pen = -sp.wall_push_rate * dt
+                    out += pen
+                    ep.terms["wall_push"] = ep.terms.get("wall_push", 0.0) + pen
+        return out
 
     def _skip_respawn(self, end, info) -> bool:
         """True when the respawn life after this episode end is not played (WorkerSpec.p_early_respawn): a BallOff
@@ -433,6 +550,7 @@ class Worker:
                 a, logp, v = self.model.act(x, gen=self.gen)
                 a = int(a)
                 f0 = self.env.session.frames_done if self.env.session is not None else 0
+                s_before = self.env.reward.s
                 try:
                     obs2, r, term, trunc, info2 = self.env.step(a)
                 except Exception as e:  # noqa: BLE001  should not happen (the env truncates on PeerGone / Timeout)
@@ -455,6 +573,11 @@ class Worker:
                     continue
                 frames += int(info2.get("frames_done", f0)) - f0
                 ep.step(a, r, info2, self.fx_info)
+                if (sp.zones or sp.wall_push_rate) and not term and self.env.session is not None:
+                    sh = self._zone_wall(ep, a, s_before, int(info2.get("frames_done", f0)) - f0)
+                    if sh:
+                        r += sh
+                        ep.ret += sh
                 if sp.split_k and (int(info2.get("sector") or 0) > ep.max_sector_seen
                                    or info2.get("episode_end") == "LevelFinish"):
                     sb = self._split_bonus(ep, info2, info2.get("episode_end") == "LevelFinish")
