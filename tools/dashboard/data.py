@@ -191,12 +191,32 @@ def default_run(runs) -> str | None:
     return (act or m)[-1].name
 
 
-def run_uses_alt(run: Run) -> bool:
+def run_config(run: Run) -> dict:
     try:
         c = json.loads((run.path / "config.json").read_text(encoding="utf-8"))
+        return c if isinstance(c, dict) else {}
     except Exception:
-        return False
-    return "refpaths-alt" in str(c.get("path_dir") or "")
+        return {}
+
+
+def run_uses_alt(run: Run) -> bool:
+    return "refpaths-alt" in str(run_config(run).get("path_dir") or "")
+
+
+def shortcut_extra_s(run: Run) -> float:
+    """Extra seconds of the alternative route over the TAS line, from the run's own split_extra setting
+    ([[from_frame, to_frame, seconds], ...]); SHORTCUT_EXTRA_S only if the run does not record it."""
+    v = run_config(run).get("split_extra")
+    try:
+        v = json.loads(v) if isinstance(v, str) else v
+        return round(sum(float(x[2]) for x in v), 2) if v else SHORTCUT_EXTRA_S
+    except Exception:
+        return SHORTCUT_EXTRA_S
+
+
+def n_actions(c: dict) -> int:
+    """Size of the policy's action set (ballrain.env: 9 arrows, +2 camera turns, +1 Esc)."""
+    return 9 + (2 if c.get("camera_actions") else 0) + (1 if c.get("esc") else 0)
 
 
 # ---------------------------------------------------------------------------------- clocks
@@ -259,6 +279,10 @@ def fmt(t: dt.datetime) -> str:
 def run_status(run: Run, off_h: float, level_n: int, machines: dict) -> dict:
     lines = log_lines(run)
     st: dict = {"run": run.name, "machine": machines["train" if run.remote else "eval"]}
+    cfg = run_config(run)
+    if cfg.get("advance_at") is not None:
+        st["advance_at"] = float(cfg["advance_at"])
+    st["random_entropy"] = round(math.log(n_actions(cfg)), 2)
     last_ts = None
     curr = []
     first_ts = None
@@ -470,7 +494,7 @@ def sr_estimate(runs, sel: str) -> dict:
     parts = [d for d in (read_many(r.files("runs*.csv"), usecols=cols, dedup=None) for r in use) if d is not None]
     out: dict = {"runs_used": [r.name for r in use], "window": SR_WINDOW_UPDATES, "bins": [],
                  "benchmarks": benchmarks(), "alt": run_uses_alt(m[i]),
-                 "shortcut_extra_s": SHORTCUT_EXTRA_S, "min_n": SR_MIN_N, "min_seg_s": SR_MIN_SEG_S}
+                 "shortcut_extra_s": shortcut_extra_s(m[i]), "min_n": SR_MIN_N, "min_seg_s": SR_MIN_SEG_S}
     if not parts:
         out["error"] = "无数据"
         return out
@@ -514,7 +538,7 @@ def sr_estimate(runs, sel: str) -> dict:
         out["bins"].append(row)
     if keep:
         lo, hi = min(keep), max(keep)
-        extra = SHORTCUT_EXTRA_S if out["alt"] else 0.0
+        extra = out["shortcut_extra_s"] if out["alt"] else 0.0
         tas_s = out["benchmarks"]["tas"] / 1000
         out["estimate_s"] = [round(tas_s * lo + extra * lo, 1), round(tas_s * hi + extra * hi, 1)]
         out["ratio_range"] = [lo, hi]
