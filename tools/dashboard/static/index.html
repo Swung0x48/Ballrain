@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ballrain 训练进度</title>
+<link rel="icon" href="/assets/ball.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@700;900&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <span class="gt title" data-text="BALLRAIN" data-h="38">BALLRAIN</span>
+      <div class="sub">第 1 关 · 速通（SR）训练进度 · 里程碑 <span id="milestone">M2</span></div>
+    </div>
+    <nav class="menu" id="runs" aria-label="选择 run"></nav>
+    <div class="menu tools">
+      <button class="mbtn" id="refresh" type="button"><span>立即刷新</span></button>
+      <a class="mbtn" id="tb" target="_blank" rel="noopener"><span>TensorBoard</span></a>
+    </div>
+  </header>
+  <div class="meta" id="meta">载入中…</div>
+  <div class="err" id="errs"></div>
+
+  <section class="sec" id="s-status">
+    <h2 class="plank">当前状态<span class="state" id="state"></span></h2>
+    <div class="panel">
+      <div class="tiles" id="tiles"></div>
+      <h3>课程推进记录</h3>
+      <ol class="log" id="curr"></ol>
+    </div>
+  </section>
+
+  <section class="sec" id="s-sr">
+    <h2 class="plank">整关用时估计（SR）</h2>
+    <div class="panel">
+      <div id="sr-head"></div>
+      <div class="chart" id="c-sr"></div>
+      <div class="tw" id="sr-table"></div>
+      <h3>从头开始（k = 0）的原版游戏评估</h3>
+      <div class="tw" id="k0"></div>
+      <p class="note" id="sr-note"></p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-frontier">
+    <h2 class="plank">课程开局点地图</h2>
+    <div class="panel">
+      <div class="maptools" id="t-frontier"></div>
+      <div class="map" id="m-frontier"></div>
+      <p class="note">课程从关卡末尾往前推：智能体从 TAS 轨迹的“开局点”帧接手。点越靠近起点，智能体自己跑完的部分越长。悬停查看帧号与时间，点击图例开关图层，滚轮 / 双指缩放、拖动平移。</p>
+    </div>
+  </section>
+
+  <section class="sec" id="s-attempts">
+    <h2 class="plank">最近的尝试轨迹 · <span class="rn"></span></h2>
+    <div class="panel">
+      <div class="maptools" id="t-attempts"></div>
+      <div class="map" id="m-attempts"></div>
+      <div class="pick" id="p-attempts">点击一条轨迹可高亮并查看详情。</div>
+    </div>
+  </section>
+
+  <section class="sec" id="s-curves">
+    <h2 class="plank">训练曲线</h2>
+    <div class="panel">
+      <div class="maptools" id="t-curves"></div>
+      <div class="chart tall" id="c-curves"></div>
+    </div>
+  </section>
+
+  <section class="sec" id="s-history">
+    <h2 class="plank">历史尝试抽样</h2>
+    <div class="panel">
+      <div class="maptools" id="t-history"></div>
+      <div class="map" id="m-history"></div>
+      <div class="pick" id="p-history">颜色表示开始训练后的时间（越亮越新）。点击一条轨迹可高亮并查看详情。</div>
+    </div>
+  </section>
+
+  <footer class="foot" id="foot"></footer>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

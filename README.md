@@ -19,6 +19,7 @@
 | `scripts/m2_start_states.py` | TAS 起点的开销、吞吐、导出验收（启动游戏，结果在 `runtime/m2-results/`） |
 | `scripts/train_m2.py` | M2 训练：PPO + 反向课程，L1 SR（启动游戏，输出在 `runtime/m2-train/<run>/`，见 `docs/observations.md` §9） |
 | `scripts/eval_m2.py` | M2 评估（从关卡加载闭环运行）与导出验收（真 TASSupport 回放 3 次） |
+| `tools/dashboard/` | 训练进度网页（局域网可访问，自动刷新），见下文“训练进度网页” |
 | `docs/` | `benchmarks.md` 基准，`state-spec.md` 游戏状态清单，`agent-protocol.md` IPC 契约，`observations.md` 观测 / 奖励 / 录制，`headless.md` 无头后端 |
 | `tests/` | `uv run pytest`；不启动游戏（`BALLRAIN_LIVE=1` 时才跑 `test_live.py`） |
 | `reference/TASSupport/` | 参考 TASSupport 源码 |
@@ -114,6 +115,17 @@ Windows 把这第一次调用换成 SW_HIDE，之后窗口模式下它不会再�
 - 游戏自己的音量选项（`Database.tdb` 的 `DB_Options.Volume`，原值 1.0）不起作用：设成 0 后（只改这 4 个字节，trace 照样相同）
   BallrainIO 和 TASSupport 回放的声音和原来一样响，所以拷贝里保持原值。工具留着：`instances.tdb_volume` / `set_tdb_volume`，
   `scripts/make_copies.py --volume V [--also ref]`；`verify_copy_matches` 现在也比较 `.tdb` 的 sha256。
+
+## 训练进度网页
+
+```bash
+uv run python tools/dashboard/server.py --host 0.0.0.0 --port 8088   # 或在 Claude 预览里启动 launch.json 的 "dashboard"
+```
+
+浏览器打开 `http://<本机 IP>:8088/`（手机同一局域网也可以）。页面按 Ballance 的菜单风格显示当前 run 的状态、课程推进记录、
+SR 估计（对比 TAS / 人类纪录 / 加精线 / 上榜线）、课程开局点地图、最近尝试轨迹、历史轨迹抽样和训练曲线，全部是浏览器里可缩放、
+可悬停、可开关图层的交互图表；可切换 r3 / r4 / r5。页面每 60 秒自动更新，数据每 10 分钟重算（“立即刷新”全局每 5 分钟最多一次）。
+选项、工作方式以及公开 / 不公开哪些内容见 `tools/dashboard/README.md`。
 
 ## 使用
 
