@@ -102,8 +102,14 @@ class WorkerSpec:
     # normal |n_y| <= wall_max_ny) whose top is more than wall_min_rise above the ball's lowest point (user: a wall higher
     # than about half a ball can never be climbed; ball radius ~2), the action pushes into it (cosine >= wall_push_cos
     # with the wall's inward normal) and the route progress is below wall_max_progress units / s, each step pays
-    # -wall_push_rate x its game seconds (term "wall_push")
+    # -wall_push_rate x its game seconds (term "wall_push"). Only inside the penalty zones marked "wall_push": true
+    # (ball inside the zone's box below its y_below), unless wall_push_everywhere (the old behaviour: on the whole
+    # route, where it also fired along the normal section-A line and taught the policy to leave walls it needs)
     wall_push_rate: float = 0.0
+    wall_push_everywhere: bool = False
+    # zone_stall_exempt: a life that has entered a penalty zone pays no stall penalty when it ends by stall (it still
+    # ends there, terminal with --stall-terminal, and keeps the one-off zone penalty): a pit life costs less than a death
+    zone_stall_exempt: bool = False
     wall_gap: float = 0.1
     wall_max_ny: float = 0.5
     wall_min_rise: float = 2.0
@@ -326,8 +332,11 @@ class Worker:
             return 0.0
         pos = np.asarray(o.ball["pos"], np.float64)
         out = 0.0
+        wp_here = bool(getattr(sp, "wall_push_everywhere", False))  # getattr: a WorkerSpec pickled by older code
         for name, z in sp.zones.items():
             inside = in_zone(pos, z)
+            if inside and z.get("wall_push"):
+                wp_here = True
             if inside and not ep.zone_in.get(name):
                 pen = -float(z.get("penalty", 1.5))
                 out += pen
@@ -336,7 +345,7 @@ class Worker:
                 ep.zone_in[name] = True
             elif ep.zone_in.get(name) and not in_zone(pos, z, sp.zone_rearm):
                 ep.zone_in[name] = False
-        if sp.wall_push_rate and len(o.mind) and "mind_normals" in self.fx_info:
+        if sp.wall_push_rate and wp_here and len(o.mind) and "mind_normals" in self.fx_info:
             dt = frames * float(sp.env.delta_ms) / 1000.0
             s = self.env.reward.s
             prog = (s - s_before) / dt if (s is not None and s_before is not None and dt > 0) else 0.0
@@ -354,6 +363,19 @@ class Worker:
                     out += pen
                     ep.terms["wall_push"] = ep.terms.get("wall_push", 0.0) + pen
         return out
+
+    def _stall_penalty(self, ep, win_frames: int) -> float:
+        """Reward (<= 0) of a stall that ends the life (WorkerSpec.stall_terminal): a death's penalty plus the
+        sector's progress back (+ stall_extra), divided by gamma ** (stall window in steps) with stall_compensate;
+        0 with zone_stall_exempt for a life that entered a penalty zone (its zone penalty was the price)."""
+        sp = self.spec
+        if getattr(sp, "zone_stall_exempt", False) and ep.zone_counts:  # getattr: a WorkerSpec pickled by older code
+            return 0.0
+        rc = self.env.reward.cfg
+        pen = -(rc.death_penalty + rc.death_refund * max(self.env.reward.sector_paid, 0.0) + sp.stall_extra)
+        if sp.stall_compensate:
+            pen /= sp.gamma ** (win_frames / max(sp.env.action_repeat, 1))
+        return pen
 
     def _skip_respawn(self, end, info) -> bool:
         """True when the respawn life after this episode end is not played (WorkerSpec.p_early_respawn): a BallOff
@@ -619,11 +641,7 @@ class Worker:
                     elif s is not None and since >= win:
                         trunc, end = True, "stall"
                         if sp.stall_terminal:  # stuck = a failure like a death: penalty + the sector's progress back
-                            rc = self.env.reward.cfg
-                            pen = -(rc.death_penalty + rc.death_refund * max(self.env.reward.sector_paid, 0.0) + sp.stall_extra)
-                            if sp.stall_compensate:
-                                win = stall_rsp if ep.d["kind"] == "respawn" else stall_all
-                                pen /= sp.gamma ** (win / max(sp.env.action_repeat, 1))
+                            pen = self._stall_penalty(ep, stall_rsp if ep.d["kind"] == "respawn" else stall_all)
                             r += pen
                             ep.ret += pen
                             ep.terms["stall_penalty"] = ep.terms.get("stall_penalty", 0.0) + pen

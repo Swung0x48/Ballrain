@@ -120,10 +120,16 @@ def parse(argv=None):
     p.add_argument("--path-dir", default=None, help="directory of the reference line assets (FeatureConfig.path_dir)")
     p.add_argument("--gates", default="", help="JSON sub-goal gates (ballrain.train.worker.WorkerSpec.gates)")
     p.add_argument("--zones", default="",
-                   help='JSON penalty zones {name: {"box": [xmin, xmax, zmin, zmax], "y_below": y, "penalty": p}} '
-                        '(WorkerSpec.zones: one-off penalty per entry, the life goes on)')
+                   help='JSON penalty zones {name: {"box": [xmin, xmax, zmin, zmax], "y_below": y, "penalty": p, '
+                        '"wall_push": true}} (WorkerSpec.zones: one-off penalty per entry, the life goes on; '
+                        '"wall_push": the wall push applies inside this zone)')
     p.add_argument("--wall-push-rate", type=float, default=0.0,
-                   help="penalty per game second while pushing into an unclimbable wall (WorkerSpec.wall_push_rate; 0 = off)")
+                   help="penalty per game second while pushing into an unclimbable wall (WorkerSpec.wall_push_rate; 0 = off); "
+                        'only inside zones with "wall_push": true unless --wall-push-everywhere')
+    p.add_argument("--wall-push-everywhere", action="store_true",
+                   help="wall push on the whole route (the behaviour before zone-limited wall push)")
+    p.add_argument("--zone-stall-exempt", action="store_true",
+                   help="a life that entered a penalty zone pays no stall penalty when it ends by stall (WorkerSpec.zone_stall_exempt)")
     p.add_argument("--wall-min-rise", type=float, default=2.0, help="wall height above the ball's lowest point that counts as unclimbable")
     p.add_argument("--wall-max-progress", type=float, default=2.0, help="wall push: only below this route progress (units / s)")
     p.add_argument("--route-probes", default="", help='JSON {name: [xmin, xmax, zmin, zmax]}: per-route visit / death stats')
@@ -457,7 +463,8 @@ def main(argv=None) -> int:
                           split_min_ref_s=a.split_min_ref_s, split_extra=json.loads(a.split_extra) if a.split_extra else [],
                           p_early_respawn=a.p_early_respawn, zones=json.loads(a.zones) if a.zones else {},
                           wall_push_rate=a.wall_push_rate, wall_min_rise=a.wall_min_rise,
-                          wall_max_progress=a.wall_max_progress, launcher_factory=FakeLauncher if a.fake else None)
+                          wall_max_progress=a.wall_max_progress, wall_push_everywhere=a.wall_push_everywhere,
+                          zone_stall_exempt=a.zone_stall_exempt, launcher_factory=FakeLauncher if a.fake else None)
 
     hub = None
     cu_bins = defaultdict(lambda: deque(maxlen=100))
@@ -502,7 +509,8 @@ def main(argv=None) -> int:
                                "split_extra": json.loads(a.split_extra) if a.split_extra else [],
                                "p_early_respawn": a.p_early_respawn,
                                "zones": json.loads(a.zones) if a.zones else {}, "wall_push_rate": a.wall_push_rate,
-                               "wall_min_rise": a.wall_min_rise, "wall_max_progress": a.wall_max_progress}}
+                               "wall_min_rise": a.wall_min_rise, "wall_max_progress": a.wall_max_progress,
+                               "wall_push_everywhere": a.wall_push_everywhere, "zone_stall_exempt": a.zone_stall_exempt}}
         hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):

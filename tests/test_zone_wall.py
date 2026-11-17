@@ -133,13 +133,13 @@ def test_train_m2_options_reach_spec_and_remote_template():
     assert "zone_entries" in train_m2.EP_COLS
 
 
-def _worker(zones, rate, pos, keys, s_before, s_after, normals=((-1.0, 0, 0),), gaps=(0.0,)):
+def _worker(zones, rate, pos, keys, s_before, s_after, normals=((-1.0, 0, 0),), gaps=(0.0,), **spec_kw):
     from types import SimpleNamespace
     from ballrain import protocol as P
     from ballrain.train.worker import Worker, _Episode
     w = object.__new__(Worker)
     w.spec = WorkerSpec(wid=0, copy="x", env=SimpleNamespace(delta_ms=1000 / 132, world_actions=True), seed=0,
-                        zones=zones, wall_push_rate=rate)
+                        zones=zones, wall_push_rate=rate, **spec_kw)
     mind = np.zeros(len(gaps), P.MIND_DT)
     mind["gap"] = gaps
     ball = {"pos": np.asarray(pos, np.float64), "found": 1, "extra_radius": 2.0}
@@ -171,12 +171,79 @@ def test_worker_wall_push_rate_progress_and_direction(monkeypatch):
     ts = _floor_and_block(4.4)
     monkeypatch.setattr(FX, "level_geometry", lambda tracker: SimpleNamespace(tris=ts))
     dt = 2 / 132
-    w, ep = _worker({}, 0.5, [8.0, 2.0, 0.0], tas.KEY_RIGHT, 10.0, 10.0)  # pushing +x into the face at x = 10
+    w, ep = _worker({}, 0.5, [8.0, 2.0, 0.0], tas.KEY_RIGHT, 10.0, 10.0, wall_push_everywhere=True)  # pushing +x into the face at x = 10
     assert w._zone_wall(ep, 1, 10.0, 2) == pytest.approx(-0.5 * dt)
     assert ep.terms["wall_push"] == pytest.approx(-0.5 * dt)
-    w, ep = _worker({}, 0.5, [8.0, 2.0, 0.0], tas.KEY_LEFT, 10.0, 10.0)  # pushing away
+    w, ep = _worker({}, 0.5, [8.0, 2.0, 0.0], tas.KEY_LEFT, 10.0, 10.0, wall_push_everywhere=True)  # pushing away
     assert w._zone_wall(ep, 1, 10.0, 2) == 0.0
-    w, ep = _worker({}, 0.5, [8.0, 2.0, 0.0], tas.KEY_RIGHT, 10.0, 10.0 + 3 * dt)  # progressing 3 u/s: allowed
+    w, ep = _worker({}, 0.5, [8.0, 2.0, 0.0], tas.KEY_RIGHT, 10.0, 10.0 + 3 * dt,
+                    wall_push_everywhere=True)  # progressing 3 u/s: allowed
     assert w._zone_wall(ep, 1, 10.0, 2) == 0.0
-    w, ep = _worker({}, 0.5, [8.0, 2.0, 0.0], 0, 10.0, 10.0)  # no keys
+    w, ep = _worker({}, 0.5, [8.0, 2.0, 0.0], 0, 10.0, 10.0, wall_push_everywhere=True)  # no keys
     assert w._zone_wall(ep, 1, 10.0, 2) == 0.0
+
+
+def test_worker_wall_push_only_inside_wall_push_zones(monkeypatch):
+    """Default: the wall push fires only inside a zone marked "wall_push" (box and below y_below); a zone without the
+    flag, or the same push outside the zone, pays nothing; wall_push_everywhere restores the route-wide push."""
+    from types import SimpleNamespace
+    import ballrain.features as FX
+    ts = _floor_and_block(4.4)
+    monkeypatch.setattr(FX, "level_geometry", lambda tracker: SimpleNamespace(tris=ts))
+    dt = 2 / 132
+    assert WorkerSpec(wid=0, copy="x", env=None, seed=0).wall_push_everywhere is False
+    outside = {"pit": {"box": [100.0, 120.0, 100.0, 120.0], "y_below": -5.0, "penalty": 1.5, "wall_push": True}}
+    w, ep = _worker(outside, 0.5, [8.0, 2.0, 0.0], tas.KEY_RIGHT, 10.0, 10.0)  # pushing the wall, not in the zone
+    assert w._zone_wall(ep, 1, 10.0, 2) == 0.0 and "wall_push" not in ep.terms and not ep.zone_counts
+    w, ep = _worker({}, 0.5, [8.0, 2.0, 0.0], tas.KEY_RIGHT, 10.0, 10.0)  # no zones at all: off
+    assert w._zone_wall(ep, 1, 10.0, 2) == 0.0
+    flagged = {"pit": {"box": [0.0, 9.9, -5.0, 5.0], "y_below": 3.0, "penalty": 1.5, "wall_push": True}}
+    w, ep = _worker(flagged, 0.5, [8.0, 2.0, 0.0], tas.KEY_RIGHT, 10.0, 10.0)  # inside the flagged zone
+    assert w._zone_wall(ep, 1, 10.0, 2) == pytest.approx(-1.5 - 0.5 * dt)
+    assert ep.terms["wall_push"] == pytest.approx(-0.5 * dt) and ep.zone_counts == {"pit": 1}
+    assert w._zone_wall(ep, 1, 10.0, 2) == pytest.approx(-0.5 * dt)  # still inside: the push again, no new entry
+    unflagged = {"pit": dict(flagged["pit"], wall_push=False)}
+    w, ep = _worker(unflagged, 0.5, [8.0, 2.0, 0.0], tas.KEY_RIGHT, 10.0, 10.0)
+    assert w._zone_wall(ep, 1, 10.0, 2) == pytest.approx(-1.5) and "wall_push" not in ep.terms
+    w, ep = _worker(outside, 0.5, [8.0, 2.0, 0.0], tas.KEY_RIGHT, 10.0, 10.0, wall_push_everywhere=True)
+    assert w._zone_wall(ep, 1, 10.0, 2) == pytest.approx(-0.5 * dt)
+
+
+def test_stall_penalty_zone_exemption():
+    """zone_stall_exempt: a life that entered a penalty zone pays no stall penalty (it still ends by stall); other
+    lives, or the option off, pay a death's penalty + refund (stall_compensate divides by gamma ** window)."""
+    from types import SimpleNamespace
+    from ballrain.train.worker import Worker, _Episode
+    def mk(exempt, counts, compensate=False):
+        w = object.__new__(Worker)
+        w.spec = WorkerSpec(wid=0, copy="x", env=SimpleNamespace(action_repeat=2), seed=0, stall_terminal=True,
+                            stall_extra=0.5, stall_compensate=compensate, gamma=0.99, zone_stall_exempt=exempt)
+        w.env = SimpleNamespace(reward=SimpleNamespace(cfg=SimpleNamespace(death_penalty=5.0, death_refund=0.4),
+                                                       sector_paid=10.0))
+        ep = object.__new__(_Episode)
+        ep.terms, ep.zone_in, ep.zone_counts = {}, {}, dict(counts)
+        return w, ep
+    full = -(5.0 + 0.4 * 10.0 + 0.5)
+    w, ep = mk(True, {"pit": 1})
+    assert w._stall_penalty(ep, 528) == 0.0
+    w, ep = mk(True, {"pit": 1}, compensate=True)
+    assert w._stall_penalty(ep, 528) == 0.0
+    w, ep = mk(True, {})
+    assert w._stall_penalty(ep, 528) == pytest.approx(full)
+    w, ep = mk(False, {"pit": 2})
+    assert w._stall_penalty(ep, 528) == pytest.approx(full)
+    w, ep = mk(False, {}, compensate=True)
+    assert w._stall_penalty(ep, 528) == pytest.approx(full / 0.99 ** 264)
+    assert WorkerSpec(wid=0, copy="x", env=None, seed=0).zone_stall_exempt is False
+
+
+def test_train_m2_zone_limited_wall_push_and_stall_exempt_options():
+    sys.path.insert(0, str(instances.REPO_ROOT / "scripts"))
+    import train_m2
+    a = train_m2.parse(["--run", "x", "--wall-push-rate", "0.5"])
+    assert a.wall_push_everywhere is False and a.zone_stall_exempt is False
+    a = train_m2.parse(["--run", "x", "--wall-push-rate", "0.5", "--wall-push-everywhere", "--zone-stall-exempt"])
+    assert a.wall_push_everywhere and a.zone_stall_exempt
+    src = (instances.REPO_ROOT / "scripts" / "train_m2.py").read_text(encoding="utf-8")
+    assert src.count("wall_push_everywhere=a.wall_push_everywhere") == 1  # local workers
+    assert '"wall_push_everywhere": a.wall_push_everywhere, "zone_stall_exempt": a.zone_stall_exempt' in src  # remote
