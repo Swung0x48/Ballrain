@@ -39,11 +39,16 @@ PROTOCOL = 1  # ballrain.train.remote.PROTOCOL
 HOST_LABEL = "pool"  # the learner's host / backend label of pool data (no names, no hosts)
 
 
-def chunk_message(c: "P.Chunk", version: int) -> dict:
-    """A decoded pool chunk -> the learner's chunk message (ballrain.train.worker.Worker.run's buffer layout)."""
+def chunk_message(c: "P.Chunk", version: int, reach_patch=None) -> dict:
+    """A decoded pool chunk -> the learner's chunk message (ballrain.train.worker.Worker.run's buffer layout).
+    reach_patch (server_verify.read_reach_patch): f7 rows whose reach block the verifier computed otherwise get the
+    verifier's values (docs/f7-native-port.md 7)."""
     A = c.arrays
     T = int(c.header["steps"])
-    obs = np.asarray(A["obs"], np.float32)  # (T + 1, n_obs): the rows before each step and the one after the last
+    obs = np.array(A["obs"], np.float32)  # (T + 1, n_obs): the rows before each step and the one after the last
+    if reach_patch is not None:
+        rows, reach, start = reach_patch
+        obs[rows, start:start + reach.shape[1]] = reach
     values = np.asarray(A["values"], np.float32)
     flags = np.asarray(A["flags"], np.uint8)
     term = (flags & P.FLAG_TERMINATED) != 0
@@ -237,8 +242,10 @@ class LearnerLink:
                 other.append((r["task_id"], r["seq"]))
                 continue
             try:
-                c = P.decode_chunk((self.pool_dir / "chunks" / r["file"]).read_bytes())
-                m = chunk_message(c, ver)
+                from .server_verify import read_reach_patch
+                cf = self.pool_dir / "chunks" / r["file"]
+                c = P.decode_chunk(cf.read_bytes())
+                m = chunk_message(c, ver, read_reach_patch(cf))
             except Exception as e:  # noqa: BLE001
                 self.counts["errors"] += 1
                 self.last_error = f"chunk {r['task_id'][:8]}/{r['seq']}: {type(e).__name__}: {str(e)[:120]}"

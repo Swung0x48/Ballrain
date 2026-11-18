@@ -289,6 +289,12 @@ class Store:
             db.execute("UPDATE tasks SET state='failed' WHERE task_id=?", (task_id,))
         self.tx(fn)
 
+    def reject_chunk(self, task_id: str, seq: int, reason: dict) -> None:
+        """Reject one held chunk with its reason, nothing else (f7: too many reach-deviant rows; not the player's
+        fault: the account is not flagged and the task's other chunks are decided normally)."""
+        self.q("UPDATE chunks SET verify='failed', status='rejected', reason=? WHERE task_id=? AND seq=? AND status='held'",
+               (json.dumps(reason, ensure_ascii=False), task_id, int(seq)))
+
     def take_escalation(self, forum_id: int) -> bool:
         """True (and one used up) when the account has escalated tasks left."""
         with self.lock:

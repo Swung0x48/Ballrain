@@ -46,6 +46,16 @@ from .sampling import action_consistent, sample_u
 
 LOGP_TOL = 1e-3  # |logp - replayed logp| allowed (float32 MLP on another CPU / BLAS)
 VALUE_TOL = 1e-3  # |v - replayed v| <= VALUE_TOL * max(1, |v|)
+# f7 reach block (docs/f7-native-port.md 7): fastreach is an approximate model, its flags may flip at a threshold between
+# the client's port and this replay. A row whose reach entries differ beyond OBS_TOL ("reach-deviant") is checked on the
+# hybrid row (this replay's features, reach replaced by the submitted values: what the client's policy saw) with the
+# float16-copy tolerances of the cheap check, and the steering bound applies; per chunk, at most REACH_MAX_ROW_FRAC of
+# the rows may deviate. PROVISIONAL defaults until the native port's measured flip / jump rates set them
+REACH_MAX_ROW_FRAC = 0.02
+REACH_MAX_LOGP_SHIFT = 1.0  # |log pi(a | submitted reach) - log pi(a | replayed reach)| of the taken action, nats
+REACH_LOGP_TOL = 0.05  # on a deviant row the policy runs on float16 reach values: the cheap check's tolerances
+REACH_VALUE_TOL = 0.02
+REACH_CDF_TOL = 0.01
 
 
 class TaskEnded(RuntimeError):
@@ -448,14 +458,30 @@ def _bits_equal(a, b) -> bool:
     return a.dtype == b.dtype and a.shape == b.shape and a.tobytes() == b.tobytes()
 
 
-def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = None) -> Mismatch | None:
+def reach_slice_of(env):
+    """The f7 reach block's slice of the observation (features.reach), or None (f6)."""
+    sl = env.fx.slices().get("reach") if getattr(env.fx.cfg, "reach", False) else None
+    return sl if isinstance(sl, slice) else None
+
+
+def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = None, reach_slice=None,
+                reach_max_row_frac: float = REACH_MAX_ROW_FRAC, reach_max_logp_shift: float = REACH_MAX_LOGP_SHIFT,
+                report: dict | None = None) -> Mismatch | None:
     """Verifier: replay a task's chunks (decoded protocol.Chunk, seq 0, 1, ... consecutive) in runner's env and compare
     step by step; returns the first Mismatch (earliest step; within a step: observation, log-prob, value, then the
     step's reward, flags and optional arrays) or None. upto: replay chunks 0..upto only. Raises EngineFailure when the
-    local engine fails (replay_failed, not the player's fault)."""
+    local engine fails (replay_failed, not the player's fault).
+
+    f7 (reach_slice: the reach block, default the env's): reach-deviant rows are tolerated as described at
+    REACH_MAX_ROW_FRAC. They are not mismatches: report (when given) gets, per chunk seq with any, {"rows": [row index
+    j in the chunk], "reach": float32 (n, width) this replay's reach values of those rows, "start": slice start,
+    "excess": None or why the chunk exceeds the bounds (too many rows / the steering bound)}. The caller rejects an
+    excess chunk without holding it against the account, and patches the passed ones' rows for the learner."""
     if upto is not None:
         chunks = chunks[:upto + 1]
     task = runner.task
+    sl = reach_slice if reach_slice is not None else reach_slice_of(runner.env)
+    rep = report if report is not None else {}
     prev = P.chain_seed(task.task_id)
     row = runner.start()
     greedy = bool(task.greedy)
@@ -465,6 +491,7 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
         last_chunk = bool(h["final"])
         if h["chain_prev"] != prev.hex() or step0 != runner.steps:
             return Mismatch(Reason.REPLAY_MISMATCH, s, step0, "chunk does not continue the replay")
+        dev_rows, dev_reach, excess = [], [], None
         for j in range(T + 1):
             i = step0 + j
             # ---- observation row i: the engine-state chain value (exact) and the float16 copy (within tolerance of
@@ -473,30 +500,51 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
             hv = hashlib.sha256(prev + runner.digest).digest()
             if hv != bytes(A["obs_hash"][j]):
                 return Mismatch(Reason.REPLAY_MISMATCH, s, i, "engine state")
-            if not P.obs_close(A["obs"][j], r32):
-                d = np.abs(np.asarray(A["obs"][j], np.float64) - r32.astype(np.float16).astype(np.float64))
+            sub = A["obs"][j]
+            rest = np.ones(len(r32), bool)
+            if sl is not None:
+                rest[sl] = False
+            if not P.obs_close(sub[rest], r32[rest]):  # everything but the reach block: strict
+                d = np.where(rest, np.abs(np.asarray(sub, np.float64) - r32.astype(np.float16).astype(np.float64)), -1)
                 k = int(np.argmax(d))
                 return Mismatch(Reason.REPLAY_MISMATCH, s, i, "observation",
-                                {"index": k, "submitted": float(A["obs"][j][k]), "replayed": float(r32[k]),
+                                {"index": k, "submitted": float(sub[k]), "replayed": float(r32[k]),
                                  "tolerance": f"one float16 ulp + {P.OBS_TOL} x max(1, |v|)"})
-            x = policy.normalize(r32)
+            deviant = sl is not None and not P.obs_close(sub[sl], r32[sl])
+            if deviant:  # the client's policy saw its own reach values: check it on the hybrid row
+                x_own = policy.normalize(r32)
+                hyb = r32.copy()
+                hyb[sl] = np.asarray(sub[sl], np.float32)
+                x = policy.normalize(hyb)
+                if j < T or last_chunk:  # row T of a non-final chunk is the next chunk's row 0 (counted there)
+                    dev_rows.append(j)
+                    dev_reach.append(np.asarray(r32[sl], np.float32))
+            else:
+                x = policy.normalize(r32)
+            v_tol, lp_tol = (REACH_VALUE_TOL, REACH_LOGP_TOL) if deviant else (VALUE_TOL, LOGP_TOL)
             v = float(policy.value(x))
-            if abs(v - float(A["values"][j])) > VALUE_TOL * max(1.0, abs(v)):
+            if abs(v - float(A["values"][j])) > v_tol * max(1.0, abs(v)):
                 return Mismatch(Reason.REPLAY_VALUE_MISMATCH, s, i, "value",
                                 {"submitted": float(A["values"][j]), "replayed": v,
-                                 "tolerance": VALUE_TOL * max(1.0, abs(v))})
+                                 "tolerance": v_tol * max(1.0, abs(v))})
             if j == T:  # the row after the chunk's last step (= the next chunk's first row)
                 break
             prev = hv
             a = int(A["actions"][j])
             lp = policy.log_probs(x)
-            if abs(float(np.clip(lp[a], P.MIN_LOGP, 0.0)) - float(A["logp"][j])) > LOGP_TOL:
+            if abs(float(np.clip(lp[a], P.MIN_LOGP, 0.0)) - float(A["logp"][j])) > lp_tol:
                 return Mismatch(Reason.REPLAY_LOGP_MISMATCH, s, i, "logp",
                                 {"submitted": float(A["logp"][j]), "replayed": float(np.clip(lp[a], P.MIN_LOGP, 0.0)),
-                                 "tolerance": LOGP_TOL})
-            if greedy and float(lp[a]) < float(lp.max()) - LOGP_TOL:
+                                 "tolerance": lp_tol})
+            if greedy and float(lp[a]) < float(lp.max()) - lp_tol:
                 return Mismatch(Reason.REPLAY_LOGP_MISMATCH, s, i, "greedy task, not the argmax action")
-            if not greedy and not action_consistent(lp, sample_u(task.sample_seed, i), a):
+            if deviant and excess is None:  # the steering bound: the client's reach values may not move its action
+                shift = abs(float(lp[a]) - float(policy.log_probs(x_own)[a]))
+                if shift > reach_max_logp_shift:
+                    excess = (f"row {i}: the submitted reach moves the taken action's log-prob by {shift:.3f} "
+                              f"> {reach_max_logp_shift}")
+            if not greedy and not (action_consistent(lp, sample_u(task.sample_seed, i), a, REACH_CDF_TOL) if deviant
+                                   else action_consistent(lp, sample_u(task.sample_seed, i), a)):
                 from .sampling import ACTION_EPS, sample_action
                 return Mismatch(Reason.REPLAY_ACTION_MISMATCH, s, i, "not the action of the task's sample_seed",
                                 {"submitted": a, "replayed": sample_action(lp, sample_u(task.sample_seed, i)),
@@ -538,4 +586,10 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
                                 {"submitted": float(A["arc"][j]), "replayed": float(st.arc),
                                  "tolerance": P.ARC_TOL * max(1.0, abs(float(st.arc)))})
             row = st.next_obs
+        if dev_rows:  # the chunk's reach-deviant rows: within the bounds, or the chunk alone is rejected
+            n_rows = T + (1 if last_chunk else 0)
+            if excess is None and len(dev_rows) > reach_max_row_frac * n_rows:
+                excess = f"{len(dev_rows)} of {n_rows} rows with reach beyond tolerance > {reach_max_row_frac:g}"
+            rep[s] = {"rows": dev_rows, "reach": np.stack(dev_reach).astype(np.float32), "start": int(sl.start),
+                      "excess": excess}
     return None
