@@ -378,7 +378,8 @@ Bytes ChunkAssembler::cut(const std::string &end) {
 }
 
 std::string sample_task(TaskRunner &runner, const Policy &policy, const Task &task,
-                        const std::function<void(const Bytes &)> &on_chunk, const std::function<std::string()> &stop) {
+                        const std::function<void(const Bytes &)> &on_chunk, const std::function<std::string()> &stop,
+                        const std::function<int(int64_t, const std::vector<float> &)> &choose) {
     ChunkAssembler asm_(task, policy.n_obs, policy.n_act, policy.sha);
     std::vector<float> obs = runner.start();
     std::vector<float> x = policy.normalize(obs);
@@ -389,6 +390,7 @@ std::string sample_task(TaskRunner &runner, const Policy &policy, const Task &ta
         int a;
         if (task.greedy) a = int(std::max_element(lp.begin(), lp.end()) - lp.begin());
         else a = sample_action(lp, sample_u(task.sample_seed, uint64_t(runner.steps)));
+        if (choose) a = choose(runner.steps, lp);
         StepResult st;
         try {
             st = runner.step(a, stop);

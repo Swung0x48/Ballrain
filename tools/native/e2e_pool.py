@@ -95,6 +95,7 @@ def main(argv=None) -> int:
     ap.add_argument("--tasks", type=int, default=3)
     ap.add_argument("--max-steps", type=int, default=3000)
     ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--heartbeat-s", type=int, default=5, help="the gateway's heartbeat interval (5: heartbeats during tasks)")
     a = ap.parse_args(argv)
     a.client, a.engine, a.game = (str(Path(x).resolve()) for x in (a.client, a.engine, a.game))
     a.client_engine = str(Path(a.client_engine).resolve()) if a.client_engine else a.engine
@@ -119,7 +120,7 @@ def main(argv=None) -> int:
     cfg = PoolConfig(pool_dir=d / "pool", public_base_url=gateway, forum=ForumConfig(
         base_url=forum.base_url, client_id="ballrain-pool-e2e", client_secret="e2e-secret", redirect_uri=redirect),
         run="r7", datasets_dir=ds, path_dirs=[Path(a.path_dir).resolve()], max_steps=a.max_steps, max_frames=60000,
-        deadline_s=3600, engines={"x87soft": engine})
+        deadline_s=3600, heartbeat_s=a.heartbeat_s, engines={"x87soft": engine})
     from tools_pool_gateway import build  # noqa: E402  (tools/pool/gateway.py, imported by path below)
     app, store, policies, verifier = build(cfg)
     if a.client_engine != a.engine:  # the client runs another build of the x87-soft engine: allow its sha256 too
@@ -155,11 +156,14 @@ def main(argv=None) -> int:
         log(f"client exit {p.returncode}: {p.stderr[-2000:]}")
         return 1
     ends = [e for e in events if e["event"] == "task_end"]
+    beats = sum(1 for e in events if e["event"] == "heartbeat")
+    other = [e for e in events if e["event"] in ("refused", "task_failed", "error")]
     chunks = [e for e in events if e["event"] == "chunk"]
     log(f"client: {len(ends)} tasks in {time.time() - t0:.0f} s: " + ", ".join(
         f"{e['end']} {e['steps']} steps {e['steps_per_s']:.0f}/s" for e in ends))
     bad = [c for c in chunks if c["status"] != "accepted"]
-    if bad or len(ends) != a.tasks:
+    log(f"client: {beats} heartbeats; refusals / failures: {other[:3]}")
+    if bad or len(ends) != a.tasks or other or (a.heartbeat_s <= 10 and beats == 0):
         log(f"refused chunks / missing tasks: {bad[:3]}")
         return 1
 
@@ -204,7 +208,7 @@ def main(argv=None) -> int:
     srv.shutdown()
     forum.shutdown()
     store.close()
-    result = {"tasks": ends, "chunks": len(rows), "verify": verdict, "steps_verified": st["steps_verified"],
+    result = {"tasks": ends, "heartbeats": beats, "chunks": len(rows), "verify": verdict, "steps_verified": st["steps_verified"],
               "forged_caught": caught, "passed": bool(ok and caught)}
     (d / "result.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
     log("PASSED" if result["passed"] else "FAILED")

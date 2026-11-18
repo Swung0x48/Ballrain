@@ -10,7 +10,7 @@
 
 namespace ballrain {
 
-const char *const CLIENT_VERSION = "0.1.0";
+const char *const CLIENT_VERSION = "0.2.0";  // 0.2: chunk format 2 (the engine-state chain)
 static const size_t MAX_RESPONSE = 64 * 1024, MAX_MANIFEST = 256 * 1024, MAX_DOWNLOAD = 64 * 1024 * 1024;
 
 GatewayRefusal::GatewayRefusal(Json r, int st)

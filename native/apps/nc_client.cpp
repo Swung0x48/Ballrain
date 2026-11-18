@@ -82,6 +82,11 @@ static int cmd_login(int argc, char **argv) {
         if (s == "pending") continue;
         if (s == "ok") {
             write_file(dir + "/token", st.at("token").as_string());
+#ifndef _WIN32
+            std::error_code pe;  // the token is a credential: owner only (the Python controller writes it 0600)
+            std::filesystem::permissions(dir + "/token", std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                         std::filesystem::perm_options::replace, pe);
+#endif
             Json g = Json::object();
             g.set("user", st.at("user"));
             event("login_ok", g);
@@ -163,7 +168,30 @@ static int cmd_run(int argc, char **argv) {
     std::string lb = arg(argc, argv, "--leaderboard", "");
     platform::make_dirs(dir + "/cache");
     platform::make_dirs(dir + "/runs");
-    Json hello = api.hello(platform_name(), engine_info(engine_bin, kind), hash_game_files(game, kind), 1);
+    Json engine_json = engine_info(engine_bin, kind), files_json = hash_game_files(game, kind);
+    Json hello = api.hello(platform_name(), engine_json, files_json, 1);
+    auto rehello = [&]() {  // session_expired: the gateway forgot the session (idle / restarted): a new hello
+        hello = api.hello(platform_name(), engine_json, files_json, 1);
+        event("rehello", make_message("x"));
+    };
+    bool fatal = false;
+    // a refusal outside a chunk: fatal (token) stops the client, session_expired renews the session, others are shown
+    auto refused = [&](const GatewayRefusal &e, const char *where) {
+        Json f = Json::object();
+        f.set("where", Json::string(where));
+        f.set("reason", e.reason);
+        event("refused", f);
+        std::fprintf(stderr, "%s\n", e.message.c_str());
+        if (e.fatal) fatal = true, g_stop = true;
+        else if (e.code == "session_expired") {
+            try {
+                rehello();
+            } catch (const GatewayRefusal &e2) {
+                if (e2.fatal) fatal = true, g_stop = true;
+            } catch (const GatewayUnavailable &) {
+            }
+        }
+    };
     {
         Json f = Json::object();
         f.set("user", hello.at("user"));
@@ -188,7 +216,17 @@ static int cmd_run(int argc, char **argv) {
         Json list = Json::array();
         list.push(inst);
         double el = platform::monotonic_s() - t_start;
-        Json r = api.heartbeat(running, list, el > 0 ? double(total_steps + steps) / el : 0.0);
+        Json r;
+        try {
+            r = api.heartbeat(running, list, el > 0 ? double(total_steps + steps) / el : 0.0);
+        } catch (const GatewayUnavailable &e) {  // the next one will tell; the task goes on
+            std::fprintf(stderr, "heartbeat: %s\n", e.what());
+            return;
+        } catch (const GatewayRefusal &e) {
+            refused(e, "heartbeat");
+            return;
+        }
+        event("heartbeat", make_message("x"));
         if (const Json *rv = r.find("revoked")) {
             std::fprintf(stderr, "%s\n", rv->get_string("message", "").c_str());
             Json f = Json::object();
@@ -198,8 +236,32 @@ static int cmd_run(int argc, char **argv) {
         }
     };
     int64_t done = 0;
+    int failures = 0;  // consecutive failed tasks / fetches: backoff, give up after 8
+    auto backoff = [&](const std::string &why) {
+        ++failures;
+        Json f = Json::object();
+        f.set("error", Json::string(why));
+        f.set("failures", Json::integer(failures));
+        event("task_failed", f);
+        std::fprintf(stderr, "%s\n", why.c_str());
+        if (failures >= 8) {
+            g_stop = true;
+            return;
+        }
+        sleep_s(std::min(300.0, 2.0 * double(1 << std::min(failures, 8))));
+    };
     while (!g_stop && (max_tasks <= 0 || done < max_tasks)) {
-        Json tm = api.task();
+        Json tm;
+        try {
+            tm = api.task();
+        } catch (const GatewayUnavailable &e) {
+            backoff(e.what());
+            continue;
+        } catch (const GatewayRefusal &e) {
+            refused(e, "task");
+            if (!fatal && e.code != "session_expired") sleep_s(30);
+            continue;
+        }
         if (tm.at("type").as_string() == "no_task") {
             Json f = Json::object();
             f.set("reason", tm.at("reason"));
@@ -208,6 +270,7 @@ static int cmd_run(int argc, char **argv) {
             sleep_s(double(tm.at("retry_s").as_int()));
             continue;
         }
+        try {
         Task task = Task::from_json(tm.at("task"));
         double deadline = platform::monotonic_s() + double(task.deadline_s) - std::min(30.0, double(task.deadline_s) / 10);
         {
@@ -289,10 +352,19 @@ static int cmd_run(int argc, char **argv) {
         f.set("steps_per_s", Json::number(dt > 0 ? double(runner.steps) / dt : 0.0));
         event("task_end", f);
         if (up.failed && !up.refusal_message.empty()) std::fprintf(stderr, "%s\n", up.refusal_message.c_str());
-        if (up.fatal) {
-            event("stopped", make_message("token_fatal"));
-            return 3;
+        if (up.fatal) fatal = true, g_stop = true;
+        failures = 0;
+        } catch (const GatewayRefusal &e) {  // a download refused, or the policy / assets of the task
+            refused(e, "task");
+            ++done;
+        } catch (const std::exception &e) {  // an engine failure at the start, a mismatching asset, ...: next task
+            ++done;
+            backoff(std::string("task: ") + e.what());
         }
+    }
+    if (fatal) {
+        event("stopped", make_message("token_fatal"));
+        return 3;
     }
     return 0;
 }

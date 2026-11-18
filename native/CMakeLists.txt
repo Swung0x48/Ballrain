@@ -78,6 +78,8 @@ if(BALLRAIN_APPS)
     target_link_libraries(nc_runner PRIVATE ballrain_engine)
     add_executable(nc_client apps/nc_client.cpp)
     target_link_libraries(nc_client PRIVATE ballrain_engine)
+    add_executable(nc_task apps/nc_task.cpp)
+    target_link_libraries(nc_task PRIVATE ballrain_engine)
 endif()
 
 # tests: the engine-free self test always; the golden replays when BALLRAIN_GOLDEN_DIR names a directory of

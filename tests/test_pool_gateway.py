@@ -82,7 +82,7 @@ class Gw:
         return json.loads(r.body)
 
     def start_login(self):
-        r = self.call("POST", "/pool/login", P.encode_message("login_start", client_version="0.1.0"))
+        r = self.call("POST", "/pool/login", P.encode_message("login_start", client_version="0.2.0"))
         assert r.status == 200
         return P.parse_message("login_started", r.body)
 
@@ -127,7 +127,7 @@ class Gw:
         return st, page, ls
 
     def hello(self, token, **over):
-        m = dict(client_version="0.1.0", platform="windows", engine={"kind": "x87soft", "sha256": ENGINE_SHA, "version": "1"},
+        m = dict(client_version="0.2.0", platform="windows", engine={"kind": "x87soft", "sha256": ENGINE_SHA, "version": "1"},
                  game_files={n: GAME[n] for n in P.GAME_FILE_LIST}, instances=2)
         m.update(over)
         return self.call("POST", "/pool/hello", P.encode_message("hello", **m) if "raw" not in over else over["raw"],
@@ -316,7 +316,8 @@ def test_hello_checks(gw):
     assert (c, p["file"]) == ("game_files_mismatch", "BuildingBlocks/physics_RT.dll")
     assert code(gw.hello(tok, instances=9))[1:] == ("too_many_instances", {"max_instances": 8})
     assert code(gw.hello(tok, client_version="0.0.9"))[1] == "client_too_old"
-    raw = json.loads(P.encode_message("hello", client_version="0.1.0", platform="linux",
+    assert code(gw.hello(tok, client_version="0.1.0"))[1] == "client_too_old"  # chunk format 1 (the float32 chain)
+    raw = json.loads(P.encode_message("hello", client_version="0.2.0", platform="linux",
                                       engine={"kind": "x87soft", "sha256": ENGINE_SHA, "version": "1"},
                                       game_files={n: GAME[n] for n in P.GAME_FILE_LIST}, instances=1))
     assert code(gw.hello(tok, raw=P.dumps(dict(raw, extra=1))))[1] == "bad_message"
@@ -357,7 +358,7 @@ def test_rate_limits(tmp_path):
     try:
         g.app.rl = RateLimiter({"login": (1.0, 3), "public": (1.0, 2), "badauth": (1.0, 2), "api": (1.0, 2),
                                 "chunk": (1.0, 2)}, clock=lambda: t[0])
-        body = P.encode_message("login_start", client_version="0.1.0")
+        body = P.encode_message("login_start", client_version="0.2.0")
         assert [g.call("POST", "/pool/login", body).status for _ in range(4)] == [200, 200, 200, 429]
         r = g.call("POST", "/pool/login", body)
         assert g.js(r)["reason"]["code"] == "rate_limited" and dict(r.headers)["Retry-After"] == "1"
@@ -541,7 +542,7 @@ def test_login_polls_do_not_use_up_the_callback_budget(tmp_path):
 
 
 def test_unencodable_refusal_parameters_still_get_an_answer(gw):
-    body = b'{"protocol":100000000000000000000,"type":"login_start","client_version":"0.1.0"}'
+    body = b'{"protocol":100000000000000000000,"type":"login_start","client_version":"0.2.0"}'
     r = gw.call("POST", "/pool/login", body)
     assert r.status == 400 and gw.js(r)["reason"]["code"] == "protocol_unsupported"
     assert gw.js(r)["reason"]["params"]["got"] == "100000000000000000000"[:20]

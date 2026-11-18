@@ -139,8 +139,10 @@ private:
 
 // rollout.sample_task: play the task with the policy (the task's deterministic draws), hand every encoded chunk to
 // on_chunk as soon as it is complete; returns the end. stop(): "" or "stopped" / "deadline".
+// choose (tests only): the action of step t instead of the policy's draw (forced actions; a gateway refuses them)
 std::string sample_task(TaskRunner &runner, const Policy &policy, const Task &task,
                         const std::function<void(const Bytes &)> &on_chunk,
-                        const std::function<std::string()> &stop = nullptr);
+                        const std::function<std::string()> &stop = nullptr,
+                        const std::function<int(int64_t, const std::vector<float> &)> &choose = nullptr);
 
 }  // namespace ballrain

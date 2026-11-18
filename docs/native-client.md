@@ -103,13 +103,18 @@ Python 同种子跑两次（`policy_s1` / `policy_s1b`），C++ 与 Python 之�
 
 ### 5.1 校验方式改了（Python 侧，链 v2）
 
+**适用范围先说清楚**：本机上原生客户端算出的特征和 Python 逐位相同，所以端到端测试里验证器的容差其实**没有被原生客户端用到**；
+容差确实能放过跨 CPU 级别的舍入、又抓得住伪造，证据只有 Python 测试（`test_float_noise_of_another_cpu_is_tolerated` 和伪造测试）。
+
 以前数据段的哈希链覆盖每行的 float32 特征，验证器重放时要逐位复现——这等于要求志愿者的 CPU / 编译器算出的特征和服务端逐位相同。现在（`pool-prototype.md` §3.2、§10.6）：
 
 - **链覆盖引擎原始字节**：每行的引擎摘要 = 上一行之后收到的全部 OBS1 消息和关卡消息读取（规范化：去掉带地址的 SCOR、SREN、IVPO），
   `h(i) = sha256(h(i-1) || d_i)`（`ballrain/pool/engine_chain.py`，`native/core/src/engine_chain.cpp`）。引擎是确定的，验证器的重放必须逐位复现这条链。
 - **验证器自己算特征**，float16 观测在一个 float16 ulp + 1e-4 内即可；log-prob / 价值用验证器自己的特征和原有的 `LOGP_TOL` / `VALUE_TOL` 比；
   动作必须是服务端种子的抽取，或者 `u` 落在累积分布边界的 `ACTION_EPS` 内；奖励、env_rewards 在 1e-4 × max(1, |r|) 内，弧长在 1e-3 × max(1, |arc|) 内；flags、end、sector、帧数、IGT 逐位。
-- 数据段格式号 `CHUNK_FORMAT` 改成 2（旧的段在新链上本来就对不上）。
+- 数据段格式号 `CHUNK_FORMAT` 改成 2（旧的段在新链上本来就对不上），客户端版本号改成 0.2.0，网关默认 `min_client_version = "0.2.0"`：
+  旧的 0.1.0 主控程序在 hello 时就收到 `client_too_old`，而不是之后每段都 `bad_chunk`。正在用的网关如果在 `config.toml` 里自己写了 `min_client_version`，要改成 0.2.0；
+  已经存在网关目录里的格式 1 数据段，验证器解不开，会停在 `replay_failed`（不影响账号）。
 - Python 主控程序（`client_sampler`）和验证器（`rollout`）同步改了；测试：`tests/test_pool_engine_chain.py`（规范记录、字节布局）、
   `test_pool_verifier.py` 新增“另一种 CPU 的浮点噪声照常通过”和“伪造引擎状态并重算链”两项。池子相关测试 102 项通过、4 项跳过
   （`test_http_layer_refuses_before_reading_and_bounds_connections` 在一次全量运行里因负载超时失败过一次，单独和再跑两遍都通过；没动过那部分代码）。
@@ -138,7 +143,25 @@ Python 同种子跑两次（`policy_s1` / `policy_s1b`），C++ 与 Python 之�
 | 客户端 `bin-x86p2002d` + `BALLRAIN_HL_PHYS2002=0`，验证器 `bin-x86soft`（两个不同的 x87-soft 构建） | 4 个，都 LevelFinish（1645 / 3877 / 2729 / 1495 步） | 40 段全部接收 | **40/40 通过**，9746 步通过验证 |
 | 伪造：把一段原生数据段第 10 步的奖励加 0.25 并重新封装，交给验证器的 `replay_task` | — | — | 报 `replay_reward_mismatch`，第 10 步 |
 
-客户端在任务里约 300–640 步/秒（含每段上传）；验证器重放约 200 步/秒。
+第三次运行（3 个任务、41 段，网关心跳间隔设成 5 秒）：客户端发了 2 次心跳都被接受，41/41 通过。客户端在任务里约 300–990 步/秒（含每段上传）；验证器重放约 200–350 步/秒。
+
+### 5.4 任务结束方式的差分测试（`tools/native/task_diff.py`，`native/apps/nc_task`）
+
+诚实的策略很少走到的分支（一旦和验证器不一致就是 `token_revoked_replay`，吊销的是诚实玩家）：原生客户端按强制动作（`idle` / 随机粘滞动作）或策略抽样跑一个任务，
+Python 验证器的 `replay_task` 重放它的数据段；强制动作时只跳过“动作是不是种子抽样”这一项，其余（引擎状态链、观测、log-prob、价值、奖励、flags、end、可选数组）照常比。
+
+| 场景 | 开局 k | 动作 | 结束 | 步数 / 回合 | 结果 |
+|---|---|---|---|---|---|
+| idle_spawn | 0 | idle | stall（stall_terminal + stall_compensate，罚分 -7.51） | 276 / 1 | 通过 |
+| sticky_spawn | 0 | 随机粘滞 | GameOver（3 次重生） | 738 / 4 | 通过 |
+| sticky_mid | 9900 | 随机粘滞 | GameOver（TAS 起点，重生是 respawn 类型） | 545 / 4 | 通过 |
+| sticky_late | 13500 | 随机粘滞 | GameOver | 694 / 4 | 通过 |
+| policy_frames | 9900 | 策略 | max_frames | 450 / 1 | 通过 |
+| policy_stop | 13500 | 策略 | stopped（玩家停止） | 77 / 1 | 通过 |
+| cap_gates | 9900 | 策略 | cap（另导出一个 cap_mult = 0.05、带两个门的策略版本） | 800 / 1 | 通过，门奖励出现 |
+| sticky_cap_gates | 0 | 随机粘滞 | GameOver | 624 / 4 | 通过，门奖励出现 |
+
+没有覆盖的：`error`（任务中途引擎崩溃）、`deadline`、`truncated`（引擎自己的截断、相机守卫）。
 
 ```sh
 $PY tools/native/e2e_pool.py --dir runtime/nc/e2e --ckpt runtime/nc/ckpt/r7_latest.pt     --record <main checkout>/runtime/datasets/tas-v1/SR01_1_14_457_264     --engine runtime/nc/engine-x86soft/BallanceMMOSimTool.exe --game runtime/nc/game     --client build/native-Release/nc_client.exe --tasks 2 --max-steps 3000
@@ -149,9 +172,11 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 
 ## 6. 还没有做 / 限制
 
+- **https 没有实测过**：Windows 的 WinHTTP https 分支没跑过（端到端都是本机 http）；POSIX 的 http 客户端只编译过，没有运行过。
 - **POSIX 上没有 https**：macOS / Linux / Android 的 `http_request` 只支持 http（本机测试网关）。真网关在 https 隧道后面，这几个平台要接系统 TLS（macOS Security / Network 框架、Android 的 Java HTTP，Linux 用 libcurl 或 OpenSSL）。
 - **跨引擎构建的字节一致**只在两个 Windows x86 构建之间验证过；Mac arm64 / Linux 引擎构建之间要先核对（§4.1）。另外容差只能吸收舍入，特征里的离散判定在另一种 CPU 上翻转会被当成不一致（`pool-prototype.md` §8）。
 - **只有一个实例、没有界面、登录要自己打开浏览器**：M3（TUI、多实例、Job Object / 进程组、系统浏览器 + 本机回调、单文件发布）。
+- 令牌文件：POSIX 上写成 0600；Windows 上靠用户目录的权限（同 Python 主控程序）。
 - 网关响应只做了轻量的结构检查（类型和必需字段），没有照搬 `protocol.MESSAGES` 的完整 schema。
 - 上传是同步的（每段在本步结束时直接 POST）；Python 主控程序是后台线程。本机回环上没有影响，慢网络下会拖慢采样。
 - 只支持 SR 策略（与网关导出的限制相同）；`route_probes` 只是记账，没有移植。
