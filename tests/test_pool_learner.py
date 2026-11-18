@@ -389,3 +389,34 @@ def test_policy_consistency_tolerances_cover_float16_noise_and_catch_gross_chang
         if k == "actions":
             bad["logp"] = np.clip(lp[np.arange(T), bad["actions"].astype(int)], -60, 0).astype(np.float32)
         assert policy_consistency(SimpleNamespace(header={"steps": T}, arrays=bad), pol, task, 10) == why
+
+
+# ============================================================================================== capability gate
+
+def test_capability_refusal_explains_what_changed_with_an_existing_code():
+    """A client lacking a capability gets no_task with the existing code client_too_old (old clients know it), and a
+    message that names what was added, why this program cannot take part, and what to update to."""
+    from ballrain.pool.capabilities import missing, refusal
+    assert missing(None, None) == [] and missing(["branch_v1"], ["task_format3", "branch_v1", "x"]) == []
+    assert missing(["task_format3", "branch_v1"], ["task_format3"]) == ["branch_v1"]
+    r = refusal("0.3.0", ["branch_v1"])
+    assert r["code"] == "client_too_old" and r["params"]["missing"] == "branch_v1" and r["params"]["min_version"] == "0.4.0"
+    m = r["message"]
+    assert "0.3.0" in m and "石头分支" in m and "验证不会通过" in m and "0.4.0" in m and len(m) <= 1000
+    # what an old client receives parses with today's schema (no new code, no new field)
+    msg = P.parse_message("no_task", P.encode_message("no_task", reason=r, retry_s=600))
+    assert msg["reason"]["message"] == m
+    assert "新功能 future_x" in refusal("0.4.0", ["future_x"])["message"]
+
+
+@win_only
+def test_policies_needing_a_capability_go_only_to_clients_that_have_it(pool, tmp_path):
+    from test_pool_verifier import Player
+    pl = Player(pool, "eligible", tmp_path)
+    assert pl.task().policy_sha == pool.pub.policy_sha  # no requires: every client
+    pool.policies.current.manifest["requires"] = ["branch_v1"]
+    r = pool.call("GET", "/pool/task", token=pl.token, session=pl.sid)
+    nt = P.parse_message("no_task", r.body)
+    assert r.status == 200 and nt["reason"]["code"] == "client_too_old" and "石头分支" in nt["reason"]["message"]
+    pool.store.q("UPDATE sessions SET capabilities=? WHERE session_id=?", (json.dumps(["branch_v1"]), pl.sid))
+    assert pl.task().policy_sha == pool.pub.policy_sha
