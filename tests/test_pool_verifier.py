@@ -879,3 +879,37 @@ def test_revoke_and_unflag_are_manual_admin_actions(pool, tmp_path, capsys):
     assert me["token_state"] == "revoked" and me["revoke_reason"]["code"] == "token_revoked_replay"
     assert me["revoke_reason"]["params"]["task_id"] == t.task_id
     assert list((pool.cfg.pool_dir / "alerts").glob("*-revoked-acct-*.json"))
+
+
+def test_prefetch_sessions_may_hold_three_tasks_per_instance(pool, tmp_path):
+    """task_prefetch_v1 (0.5.1): a session may hold 3 open tasks per hello instance (playing, prepared, the previous
+    one's upload tail), the account 3 x max_instances; a session without it keeps the account-wide max_instances."""
+    pl = Player(pool, "eligible", tmp_path)
+
+    def hello(**over):
+        return P.parse_message("hello_ok", pool.hello(pl.token, **over).body)["session_id"]
+
+    def get(sid):
+        r = pool.call("GET", "/pool/task", token=pl.token, session=sid)
+        return r.status, pool.js(r)
+    mi = int(pool.cfg.max_instances)
+    pre = hello(instances=2, capabilities=["task_prefetch_v1"])
+    st, js = get(pre)
+    assert st == 200
+    fid = pool.store.task(js["task"]["task_id"])["forum_id"]
+    for _ in range(5):
+        assert get(pre)[0] == 200
+    st, js = get(pre)
+    assert st == 400 and js["reason"]["code"] == "too_many_instances" and js["reason"]["params"]["open_limit"] == 6
+    # the old rule on the same account: the account's open tasks (6 so far) against max_instances
+    old = hello(instances=2)
+    while pool.store.open_tasks(fid, 90) < mi:
+        assert get(old)[0] == 200
+    st, js = get(old)
+    assert st == 400 and js["reason"]["code"] == "too_many_instances" and "open_limit" not in js["reason"]["params"]
+    # a big prefetch session: its own limit is 3 x instances, the account's 3 x max_instances
+    big = hello(instances=mi, capabilities=["task_prefetch_v1"])
+    while pool.store.open_tasks(fid, 90) < 3 * mi:
+        assert get(big)[0] == 200
+    st, js = get(big)
+    assert st == 400 and js["reason"]["params"]["open_limit"] == 3 * mi

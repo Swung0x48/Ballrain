@@ -155,6 +155,9 @@ DEFAULT_RULES = {
 
 # ============================================================================================== the app
 
+PREFETCH_TASKS_PER_INSTANCE = 3  # task_prefetch_v1: open tasks per instance (playing, prepared, uploading tail)
+
+
 class PoolApp:
     def __init__(self, cfg: PoolConfig, store: Store, policies: PolicySource, forum: ForumClient,
                  clock=time.time, rate_rules: dict | None = None, monotonic=time.monotonic, log=None):
@@ -528,7 +531,17 @@ class PoolApp:
     def task(self, acct, sess) -> Response:
         self.store.touch_session(sess["session_id"])
         live = max(3 * self.cfg.heartbeat_s, 90)  # a session without heartbeats for this long holds no instances
-        if self.store.open_tasks(acct["forum_id"], live) >= self.cfg.max_instances:
+        caps = json.loads(sess["capabilities"] or "[]")
+        if "task_prefetch_v1" in caps:
+            # prefetch (0.5.1): per instance one task playing, one prepared and the previous one's last chunks still
+            # uploading; bounded per session (its hello.instances) and per account
+            lim_s = PREFETCH_TASKS_PER_INSTANCE * max(1, int(sess["instances"] or 1))
+            lim_a = PREFETCH_TASKS_PER_INSTANCE * int(self.cfg.max_instances)
+            if self.store.open_tasks_of_session(sess["session_id"]) >= lim_s:
+                raise _err(Reason.TOO_MANY_INSTANCES, max_instances=self.cfg.max_instances, open_limit=lim_s)
+            if self.store.open_tasks(acct["forum_id"], live) >= lim_a:
+                raise _err(Reason.TOO_MANY_INSTANCES, max_instances=self.cfg.max_instances, open_limit=lim_a)
+        elif self.store.open_tasks(acct["forum_id"], live) >= self.cfg.max_instances:
             raise _err(Reason.TOO_MANY_INSTANCES, max_instances=self.cfg.max_instances)
         if (self.store.held_bytes(acct["forum_id"]) > self.cfg.max_pending_bytes_per_account
                 or self.store.held_bytes() > self.cfg.max_total_bytes):
