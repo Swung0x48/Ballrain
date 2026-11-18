@@ -56,8 +56,8 @@ def test_off_episode_bytes(tmp_path):
 
 
 def route():
-    main = ReferencePath.load(REFPATH_DIR / "L02.npz")
-    return load_branch(main, 2, "benchmarks/refpaths-alt/L02-stone", None)
+    main = ReferencePath.load(REFPATH_DIR.parent / "refpaths-v2" / "L02.npz")
+    return load_branch(main, 2, "benchmarks/refpaths-alt/L02-stone", "benchmarks/refpaths-v2")
 
 
 def test_switch_and_respawn():
