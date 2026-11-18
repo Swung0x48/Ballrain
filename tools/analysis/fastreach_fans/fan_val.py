@@ -276,7 +276,9 @@ for r in fan:
 
 # ---- false alarms: doomed states in [lo, hi] not followed by a BallOff within 420 frames
 def false_alarms(lo, hi):
+    """Agent states only (after each episode's start_state; the replayed TAS prefix is the TAS part above)."""
     fa, n, eps, ex = 0, 0, set(), []
+    n_doom, n_unk, codes, reasons = 0, 0, {}, {}
     for name, k0, end, f, nm, pos, dd in EP:
         last = f.max()
         rows = series(f, nm, pos, max(lo, k0 + 4), min(hi, last - 420))
@@ -285,12 +287,20 @@ def false_alarms(lo, hi):
                 continue  # respawn jumps, the respawn itself
             n += 1
             vec, info = q(p, v, bt)
+            fc = info["dbg"].get("fan", float("nan"))
+            if fc == fc:
+                codes[int(fc)] = codes.get(int(fc), 0) + 1
+            n_doom += int(vec[F["doomed"]] > .5)
+            n_unk += int(vec[F["unknown_zone"]] > .5)
+            rs = reason(info)
+            reasons[rs] = reasons.get(rs, 0) + 1
             if vec[F["doomed"]] > .5 and not any(0 <= x - ff <= 420 for x in dd):
                 fa += 1
                 eps.add(name)
                 if len(ex) < 12:
                     ex.append((name[-24:], int(ff), reason(info), bt, [round(float(c), 1) for c in p]))
-    return {"states": n, "false_alarm_states": fa, "episodes": len(eps), "examples": ex}
+    return {"states": n, "false_alarm_states": fa, "episodes": len(eps), "examples": ex, "doomed_states": n_doom,
+            "unknown_states": n_unk, "fan_codes": codes, "doom_reasons": reasons}
 
 
 R["false_alarms_18500_22500"] = false_alarms(18500, 22500)

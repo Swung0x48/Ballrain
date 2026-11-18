@@ -83,8 +83,16 @@ def exact_in(p, Rm, name):
     return False
 
 
-rows = []  # name, frame, observed on (1/0), exact_in(k), exact_in(k+1), dist(k), dist(k+1)
+import json  # noqa: E402
+
+# The traces replay the TAS from the level start up to the episode's start_state frame and then the agent plays:
+# a TAS-prefix state is counted once (the first episode that has it), agent states (after start_state) per episode.
+rows = []  # name, frame, observed on (1/0), exact(k), exact(k-1), dist(k), dist(k-1), exact(k+1), dist(k+1), acc
+# before / at / after, prefix flag
+seen_prefix = set()
 for t in sorted(glob.glob(str(TR / "*" / "*" / "trace.txt"))):
+    js = list(Path(t).parent.glob("*.json"))
+    k0 = int((json.loads(js[0].read_text(encoding="utf-8")).get("start_state") or {}).get("frame") or 0) if js else 0
     fr_, nm, pos, mat = [], [], [], []
     for line in open(t, encoding="utf-8", errors="replace"):
         s = line.split()
@@ -99,12 +107,26 @@ for t in sorted(glob.glob(str(TR / "*" / "*" / "trace.txt"))):
     if len(fr_) < 4:
         continue
     fr_ = np.array(fr_); pos = np.array(pos); mat = np.array(mat).reshape(-1, 3, 3)
+    def acc_at(j):
+        """Vertical impulse at PSI j (between the steps j-1 -> j and j -> j+1); nan without both."""
+        if j < 1 or j + 1 >= len(fr_) or fr_[j] - fr_[j - 1] != 2 or fr_[j + 1] - fr_[j] != 2 or nm[j] not in MASS:
+            return float("nan")
+        lam_ = 1 - DAMP[nm[j]] / 66
+        return (pos[j + 1, 1] - pos[j, 1]) * 66 - lam_ * (pos[j, 1] - pos[j - 1, 1]) * 66
+
     for k in range(len(fr_) - 2):
         if fr_[k + 1] - fr_[k] != 2 or fr_[k + 2] - fr_[k + 1] != 2 or not (nm[k] == nm[k + 1] == nm[k + 2]):
             continue
         name = nm[k]
         if name not in MASS:
             continue
+        f1 = int(fr_[k + 1])
+        prefix = f1 <= k0
+        if prefix:
+            if f1 in seen_prefix:
+                continue
+        elif f1 <= k0 + 4:
+            continue  # the hand-over itself
         p0, p1, p2 = pos[k], pos[k + 1], pos[k + 2]
         if box_dist(p0) > 6.0:
             continue
@@ -121,9 +143,13 @@ for t in sorted(glob.glob(str(TR / "*" / "*" / "trace.txt"))):
         if abs(on_acc + G) < 0.02:
             continue  # stone: indistinguishable
         # the push on the step p1 -> p2 (v0 is the step p0 -> p1's velocity: the impulse between them acts at p1)
-        rows.append((name, int(fr_[k + 1]), obs, exact_in(p1, mat[k + 1], name), exact_in(p0, mat[k], name),
-                     box_dist(p1), box_dist(p0), exact_in(p2, mat[k + 2], name), box_dist(p2)))
-print("free-flight PSI steps within 6 of a fan box:", len(rows),
+        if prefix:
+            seen_prefix.add(f1)
+        rows.append((name, f1, obs, exact_in(p1, mat[k + 1], name), exact_in(p0, mat[k], name),
+                     box_dist(p1), box_dist(p0), exact_in(p2, mat[k + 2], name), box_dist(p2),
+                     (acc_at(k), acc, acc_at(k + 2)), prefix, Path(t).parent.name))
+print("free-flight PSI steps within 6 of a fan box:", len(rows), "(TAS prefix, once:",
+      sum(1 for r in rows if r[10]), "; agent:", sum(1 for r in rows if not r[10]), ")",
       "by ball:", {b: sum(1 for r in rows if r[0] == b) for b in MASS})
 obs = np.array([r[2] for r in rows])
 ex1 = np.array([r[3] for r in rows]); ex0 = np.array([r[4] for r in rows]); ex2 = np.array([r[7] for r in rows])
@@ -142,10 +168,10 @@ for r_ in (1.95, 2.0, 2.5, 2.7, 3.0, 3.53, 3.6):
           f"free with dist(k) <= r {int(((obs == 0) & (d1 <= r_)).sum())}")
 pushed = d1[obs == 1]
 print("pushed steps: dist(k) max %.3f; free steps: dist(k) min %.3f" % (pushed.max(), d1[obs == 0].min()))
-odd = [r for r in rows if r[2] == 1 and not r[3]]
-print("pushes the exact test calls outside:", len(odd), "in", len(set(r[1] // 1 for r in odd)), "frames; dist(k) "
-      "quartiles", np.round(np.percentile([r[5] for r in odd], [0, 25, 50, 75, 100]), 2) if odd else None)
-from collections import Counter
-print("odd frames", Counter((r[1], round(r[5], 2)) for r in odd))
-for r in odd[:: max(1, len(odd) // 3)]:
-    print("   ", r[0], "frame", r[1], "dist k-1 %.2f k %.2f k+1 %.2f" % (r[6], r[5], r[8]), "exact k-1/k+1", r[4], r[7])
+print("every disagreement of the exact test at k (impulses at k-1, k, k+1; a push is +%.3f, free flight %.3f):"
+      % (-G + 0.5, -G))
+for r in rows:
+    if bool(r[2]) != bool(r[3]):
+        print("   ", "push&out" if r[2] else "free&in ", r[11][-26:], "frame", r[1], "prefix" if r[10] else "agent ",
+              "dist k-1 %.2f k %.2f k+1 %.2f" % (r[6], r[5], r[8]), "exact k-1/k+1", r[4], r[7],
+              "impulses %+.3f %+.3f %+.3f" % r[9])

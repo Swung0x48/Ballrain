@@ -41,10 +41,12 @@ Fields (all static geometry, stoppers excluded; moving bodies are not modelled):
   most). The Kollisionsquader mesh is not physicalized, so the level message has no vertices for it: its extent is
   the mesh in 3D Entities/PH/P_Modul_18.nmo (Modul_18_Kollisionsquader_Mesh, x, z -1..1, y 0..16 in the entity
   frame; FAN_LOCAL_*; tools/analysis/fastreach_fans/), placed by each entity's world matrix (004, 006, 007 are
-  turned about y). On the r8 traces (80 937 free-flight paper PSIs within 6 of a box) the exact OBB test at the PSI
-  the push acts from agrees with the observed impulse for 99.8 % (the rest: one-PSI contact impulses that happen to
-  equal +0.2); the rotation-free rule "centre within FAN_R_NOM = 2.8 of the box" for 98 %; no push ever beyond the
-  circumscribed radius, none missing within the inscribed one. Stone is ignored (FAN_MIN_DV).
+  turned about y). On the r8 traced episodes (672 distinct free-flight paper PSIs within 6 of a box: the replayed TAS
+  prefix counted once, 650, and 22 agent PSIs; tools/analysis/fastreach_fans/fan_fit.py) the exact OBB test at the
+  PSI the push acts from agrees with the observed impulse for 98.8 %; each of the 8 others is next to a ground-contact
+  impulse; the rotation-free rule "centre within FAN_R_NOM = 2.85 of the box" agrees for 96.1 %; free flight never
+  within the inscribed radius, a push beyond the circumscribed one only next to a contact. No wood or stone sample
+  exists near a fan (TAS or traces). Stone is ignored (FAN_MIN_DV).
 
 Query (perceive): no key enumeration, no trajectory search.
 * Air: the height after n PSIs does not depend on the keys, y(n) = y0 + vy S1(n) - g S2(n); the key-free
@@ -74,7 +76,8 @@ Query (perceive): no key enumeration, no trajectory search.
   the key-free flight with the pushes (_fan_profile: v' = lam v - g + dv while the centre is within FAN_R_NOM, the
   closed form piecewise, per PSI) is scanned, with its height replaced after the first apex by its non-increasing
   upper envelope (a hover at the box top counts as staying at the top); its landing gives the air features (dbg fan
-  1), else the fan-free landing is kept (fan 2), else unknown_zone (fan 3, doom_reason 5): such a flight is never
+  1), else the fan-free landing is kept (fan 2; also when both fan-free landings come before the key-free flight's
+  first push), else unknown_zone (fan 3, doom_reason 5): such a flight is never
   doomed. That is the documented conservative choice: entering / leaving a box within the horizon is not solved
   exactly over all key plans, so a ball that could still reach a push box before it dies is unknown, not doomed (also
   wood, which a fan only slows). Takeoff scans of the grounded test (brake departure, jump) that can reach a push box
@@ -180,7 +183,7 @@ FAN_MIN_DV = 0.02  # pushes below this per PSI are ignored (stone: 0.01, 3 % of 
 # tools/analysis/fastreach_fans/fan_fit.py).
 FAN_R_IN = 1.95
 FAN_R_OUT = 3.6
-FAN_R_NOM = 2.8
+FAN_R_NOM = 2.85
 FAN_COLS = 18  # fans array row: centre (3), half-extents (3), local axes as rows (9), world AABB half-extents (3)
 
 DIR_NAMES = ("up", "down", "left", "right", "up_left", "up_right", "down_left", "down_right")
@@ -1367,6 +1370,13 @@ def _perceive(tiles, Hh, P1, P2, Pd, Poff, Pdim, Rr, Rl, Rn, Rf, bidx, bricks, s
                 found0 = res[0] > 0.0
                 res0 = res.copy()
                 pushed = _fan_profile(fans, xf, zf, py, vy, lam_a, fdv, FAN_R_NOM, N, yy, fins)
+                n_push = N + 1
+                for n in range(N + 1):
+                    if fins[n] > 0.5:
+                        n_push = n
+                        break
+                if found0 and max(res0[1], res0[5]) < n_push:
+                    pushed = 0  # the fan-free landings come before the key-free flight's first push: keep them
                 if pushed > 0:
                     stamp_id += 1
                     _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, oz, boxes, void_y,
