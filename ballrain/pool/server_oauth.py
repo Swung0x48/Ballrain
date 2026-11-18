@@ -102,6 +102,31 @@ class ForumClient:
         return {k: o.get(k) for k in USER_FIELDS}  # nothing else (email) survives this line
 
 
+def parse_joined(j) -> datetime:
+    """The forum's joined_at in any of the forms a forum API serialises a date in: ISO 8601 (with or without zone,
+    fraction, "Z"), "YYYY-MM-DD HH:MM:SS", or a Unix time in seconds / milliseconds (number or digit string). A
+    failure names only the value's type and length (never the value: it is user data)."""
+    try:
+        if isinstance(j, bool):
+            raise ValueError
+        if isinstance(j, str) and j.strip().lstrip("-").replace(".", "", 1).isdigit():
+            j = float(j.strip())
+        if isinstance(j, (int, float)):
+            t = float(j)
+            if not math.isfinite(t) or t <= 0:
+                raise ValueError
+            if t > 1e11:  # milliseconds
+                t /= 1000.0
+            return datetime.fromtimestamp(t, timezone.utc)
+        if not isinstance(j, str) or not j.strip():
+            raise ValueError
+        d = datetime.fromisoformat(j.strip().replace("Z", "+00:00").replace("z", "+00:00"))
+        return d if d.tzinfo is not None else d.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        raise ForumError(f"forum joined_at ({type(j).__name__}"
+                         + (f", length {len(j)}" if isinstance(j, str) else "") + ")") from None
+
+
 def parse_user(u: dict) -> dict:
     """The forum fields -> the pool's user record (protocol USER) + eligibility inputs; ForumError when malformed."""
     try:
@@ -116,19 +141,18 @@ def parse_user(u: dict) -> dict:
     nickname = _clean(u.get("nickname"), 64) or username
     av = u.get("avatar_url")
     av = _clean(av, 500) if isinstance(av, str) and av.startswith(("https://", "http://")) else None
-    j = u.get("joined_at")
-    try:
-        joined = datetime.fromisoformat(str(j).replace("Z", "+00:00"))
-        if joined.tzinfo is None:
-            joined = joined.replace(tzinfo=timezone.utc)
-    except ValueError:
-        raise ForumError("forum joined_at") from None
-    confirmed = u.get("is_email_confirmed")
+    joined = parse_joined(u.get("joined_at"))
+    confirmed = u.get("is_email_confirmed")  # a bool, or 0 / 1 (as a number or a string) from some serialisers
     if not isinstance(confirmed, bool):
-        raise ForumError("forum is_email_confirmed")
-    cc = u.get("comment_count")
+        if confirmed in (0, 1) or confirmed in ("0", "1"):
+            confirmed = str(confirmed) == "1"
+        else:
+            raise ForumError(f"forum is_email_confirmed ({type(confirmed).__name__})")
+    cc = u.get("comment_count")  # an int, or a digit string
+    if isinstance(cc, str) and cc.strip().isdigit():
+        cc = int(cc.strip())
     if isinstance(cc, bool) or not isinstance(cc, int) or cc < 0:
-        raise ForumError("forum comment_count")
+        raise ForumError(f"forum comment_count ({type(cc).__name__})")
     return {"user": {"forum_id": fid, "username": username, "nickname": nickname, "avatar_url": av},
             "joined": joined.timestamp(), "email_confirmed": confirmed, "comments": cc}
 
