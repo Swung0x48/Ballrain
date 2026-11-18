@@ -24,6 +24,9 @@ MAX_FORUM_RESPONSE = 64 * 1024
 # /oauth/token and /api/user): every server-side forum request names the gateway with a generic agent instead
 USER_AGENT = "ballrain-pool-gateway/1.0"
 USER_FIELDS = ("id", "username", "nickname", "avatar_url", "is_email_confirmed", "joined_at", "comment_count")
+# USER_FIELDS -> the Flarum user profile's attribute (/api/users/<id>), for the fields /api/user leaves out
+PROFILE_FIELDS = {"nickname": "displayName", "avatar_url": "avatarUrl", "is_email_confirmed": "isEmailConfirmed",
+                  "joined_at": "joinTime", "comment_count": "commentCount"}
 
 
 @dataclass(frozen=True)
@@ -168,7 +171,42 @@ class ForumClient:
         if isinstance(o.get("data"), dict):  # JSON:API wrapping ({"data": {"id", "attributes": {...}}})
             d = o["data"]
             o = dict(d.get("attributes") or {}, id=d.get("id"))
-        return {k: o.get(k) for k in USER_FIELDS}  # nothing else (email) survives this line
+        u = {k: o.get(k) for k in USER_FIELDS}  # nothing else (email) survives this line
+        if any(u.get(k) is None for k in PROFILE_FIELDS):
+            # the forum's OAuth /api/user gives some clients only id and username: the rest from the forum's own
+            # (Flarum) user profile /api/users/<id>, the same user's public record
+            self._fill_from_profile(u, access_token)
+        return u
+
+    def _fill_from_profile(self, u: dict, access_token: str) -> None:
+        """Fill the fields /api/user left out (None) from /api/users/<id> (with the token first, then without: the
+        profile is public on this forum). Silently nothing when it is unavailable: the eligibility rules then decide
+        what an unknown field means."""
+        try:
+            fid = int(u.get("id"))
+        except (TypeError, ValueError):
+            return
+        if fid <= 0:
+            return
+        o = None
+        for auth in ({"Authorization": f"Bearer {access_token}"}, {}):
+            req = urllib.request.Request(f"{self.cfg.base_url}/api/users/{fid}", method="GET",
+                                         headers={**auth, "Accept": "application/vnd.api+json", "User-Agent": USER_AGENT})
+            try:
+                o = self._json(req)
+                break
+            except ForumError:
+                o = None
+        if o is None:
+            return
+        self._debug("api/users", o)
+        d = o.get("data")
+        if not isinstance(d, dict) or str(d.get("id")) != str(fid) or not isinstance(d.get("attributes"), dict):
+            return  # not this user's record
+        a = d["attributes"]
+        for k, pk in PROFILE_FIELDS.items():
+            if u.get(k) is None and a.get(pk) is not None:
+                u[k] = a[pk]
 
 
 def parse_joined(j) -> datetime | None:
