@@ -201,27 +201,48 @@ SR01 全程平均 5.8 → 1.4 ms，HS01 6.7 → 1.5 ms（每 4 帧取 1 帧，`t
 - 缩放：0/1 标志和单位法向原样；`air_t_first`、`air_t_near`（秒，视界 3 s）/ 3；长度和速度差（`air_first_dy`、`air_near_r/f/dy`、
   各方向 `edge`、`brake_margin`、`gap_deficit`、`obst`、`obst_deficit`；fastreach 本身截断在 ±20）/ 20；最后截断到 [−1, 1]，NaN 置 0。
   未接地时方向量是 fastreach 的默认值（edge、brake_margin、obst = 1，两个 deficit = −1）。
-- 场：`FastReach.fields_for_tracker`，只取决于静态几何（停止器除外的固定实体三角形、DepthTestCubes、构建参数、物理常数、`BUILD_VERSION`），
+- 场：`FastReach.fields_for_tracker`，只取决于静态几何（停止器除外的固定实体三角形、DepthTestCubes、风扇推力盒 `fan_boxes`（L2 有 9 个，
+  按实体名排序）、构建参数、物理和风扇常数、`BUILD_VERSION`），
   按名字 + 坐标的规范顺序哈希（`canonical_geometry`：零售和无头 SimTool 的 L2 静态实体和网格逐位相同，但 CK id 和 id 顺序不同，按 id 顺序的
   `static_key` 会不一样），所以各引擎、各主机的键相同。文件 `<runtime>/fastreach/L<nn>-<键的 sha256 前 16 位>.npz`（`$BALLRAIN_FASTREACH_DIR` 可改），
-  同一主机上多个 worker 同时需要时只有一个在锁文件下构建（`O_EXCL`，构建者每 5 s 刷新锁的 mtime，120 s 不动的锁视为残留），其余等待后读取；
+  同一主机上多个 worker 同时需要时只有一个在锁文件下构建（`O_EXCL`，构建者的线程每 5 s 刷新锁的 mtime，内核是 numba `nogil`，冷启动的 L2
+  构建里心跳最长间隔 0.16 s（不加 nogil 时 2.2 s）；25 s 不动的锁视为残留，接管时先改名再复查，另一个进程刚放上的新锁会保留），其余等待后读取；
   写入是临时文件 + `os.replace`，不会读到半个文件。L2 的 TAS 一共用到两份场（第 3–4 小节的模块机关物理化时静态几何不同），每份 58 MB，
   构建约 4–5 s；每个进程最多在内存里留 2 份。
 - 未知区（`unknown_zone`）：物理化的非固定实体（移动平台、箱子、桥、变球器的碎球）的静止包围盒 + 4，每次关卡数据变化时从 tracker 重算，
   不进场的键（`FastReach.tracker_key` 把它们也哈希进去，L2 TAS 上一共 7 个不同的键，而且玩家球每次变球 / 重生都会换一个）。玩家球（`Ball_*`）不算未知区。
-- 需要 numba（可选依赖组 `fastreach`）：没有 numba 时 `FeatureExtractor` 直接报错，不会悄悄走慢 1000 倍的纯 Python 路径。
-- 原生客户端和资源池不支持 f7（`native-client.md`）：`pool.weights.export_state` 拒绝导出，原生 `FeatureConfig::from_json` 拒绝 `reach: true` / `"f7"`。
+- `doomed` 与 `unknown_zone`：`unknown_zone` 优先。`fastreach.perceive` 在置 `unknown_zone`（未知区、8 以内的运动体、视界内既没落点也没到死亡高度、
+  风扇）时把 `doomed` 清零，两者不会同时为 1（`dbg doom_reason` 仍保留原因）。L2 TAS 原来的 152 个 doomed 状态全部在未知区里，现在为 0。
+- 风扇（`fastreach` 模块文档 "Fans in the query"）：腾空时先用无风扇公式；可达集合在落地 / 死亡前能碰到推力盒时，用无按键飞行的风扇高度剖面找落点
+  （按实际高度测接触；第一次被推之后，离开推力柱的落点只有在"上次被推以来能从柱边到达"时才算，否则悬停高度会被套用到远处）；两条剖面都没有落点时
+  用所有按键方案的高度带（下界 = 无推力公式，上界 = 从首次可触及起每个 PSI 都被推）判断：带里有可达落点或上界不死 = `unknown_zone`，否则 doomed
+  （木球被风扇减速但托不住、下面是虚空）。接地起飞扫描（刹车离开、全推起跳）同样用这条带。
+- 版本钉：`FeatureConfig.reach_version`（`reach` 打开时自动填 `reach_features.reach_version()`，现为 `fastreach5.2-block1` =
+  `BUILD_VERSION` . `QUERY_VERSION` - `BLOCK_VERSION`），学习器的配置把它带给每个 worker / 桥；版本不同的 worker 在构建特征提取器时就拒绝
+  （`ReachVersionError`，与参考路径的 `path_sha256` 一样），不会悄悄算另一种 reach 块。`tests/test_reach_obs.py` 把名字、顺序、缩放的摘要钉在版本上。
+- 需要 numba（可选依赖组 `fastreach`）：没有 numba 时 `FeatureExtractor` 直接报错，不会悄悄走慢 1000 倍的纯 Python 路径。学习器不需要 numba：
+  `train_m2.py` 的 n_obs 和各块的切片只从 `make_layout` 来（`features.layout_size` / `layout_slices`），从不构建特征提取器。
+- 原生客户端和资源池不支持 f7（`native-client.md`）：`pool.weights.export_state` 拒绝导出（`reach_version` 也不写进 f6 清单），原生
+  `FeatureConfig::from_json` 拒绝 `reach: true` / `"f7"`；`tools/export_model.py` 对 f7 检查点只导出 `.pt`，README 注明没有 `plain/`。
+  移植要照的完整定义见 `docs/f7-native-port.md`。
 
 f7 的 L2 实测（SR02 TAS 回放，每 2 帧一步，11412 个有控制的状态，本机）：特征计算中位数 1.80 → 1.91 ms（均值 2.01 → 2.14 ms），
 reach 块本身中位数 145 µs、p99 490 µs；f7 向量的前 208 维与 f6 逐位相同；与 `runtime/fastreach/L02.npz`（按 CK id 顺序构建）逐位相同（9630 个同几何状态）。
-TAS 上 `doomed` 在 152 个状态里出现，全部同时 `unknown_zone` = 1（第 3 小节 11466–11514 帧的移动机关，终点 24132–24392 帧的飞船平台）。
+TAS 上 `doomed` 原来在 152 个状态里出现，全部同时 `unknown_zone` = 1（第 3 小节 11466–11514 帧的移动机关，终点 24132–24392 帧的飞船平台），
+`unknown_zone` 优先之后为 0；`unknown_zone` 533 个状态（风扇段 18900–22400 里 19 个）；没有非有限值，整块在 [−1, 1] 内。场带风扇以后
+（BUILD_VERSION 5，QUERY_VERSION 2）：L2 两份场 `L02-66e8d101e6cd97d4.npz`、`L02-86886f7d56fff7a5.npz`，零售与 6 份无头 SimTool 关卡消息的风扇盒逐位相同、
+场键相同；f7 一步特征计算中位数 1.43 ms、p99 11 ms，reach 块中位数 92 µs、p99 3.3 ms（风扇状态更慢：fan 1 中位 0.68 ms、p99 6.4 ms）。
+风扇段 TAS 上 fan 1 状态的落点 PSI 与 TAS 下一次真实落地相比：最早落点误差中位 28（p90 40），最省力落点 60（p90 90）；合并时的悬停包络是 242（p90 317），
+有 374 个最省力落点被推到视界末端，现在 0。L2 坑（盘点 4 之后）：75 次死亡全部提前标为 doomed（提前中位 0.55 s），80 条通过的命里 1 条误报，与合并时相同。
 
 **观测扩展（`ballrain/train/grow.py`）**：检查点的条目比当前配置少时（f6 前瞻块、f7 reach 块都是追加在末尾），第一层（`pi.0.weight`、`v.0.weight`）补零列，
-Adam 的一阶 / 二阶矩对应列补 0（其余参数和 step 不变，优化器接着原来的状态走），观测统计量补 (均值 0, 方差 1, 原 count)。旧布局必须是新布局的前缀
+Adam 的一阶矩对应列补 0、二阶矩补同一行旧列的平均值（其余参数和 step 不变，优化器接着原来的状态走），观测统计量补 (均值 0, 方差 1, 原 count)。旧布局必须是新布局的前缀
 （按检查点里的 `env_config.features` 核对），缩小或非前缀直接拒绝。worker 一次算一个观测：扩展后的策略在任意新块取值下 logits、采样动作、log-prob、
 value 逐位相同；批量前向（学习器的 minibatch）只差 float32 求和顺序（GEMM 对 208 和 267 长的点积分块不同，logits 约 1e-8），float64 下差 1e-15 量级
 （`tests/test_grow.py`）。`--reach` 是粘性的：从带 reach 的检查点 `--resume` 时自动保持。`--teacher` 可以是不带 reach 块的旧检查点（它读前 n_obs 维）。
-注意：新列的二阶矩从 0 开始而共享的 step 很大，按 Adam 公式（恒定梯度）新列的有效步长在前 300 个优化步里是学习率的 2–6.5 倍（第 10 步 6.5，第 100 步 3.2，第 1000 步 1.3；r8 每次更新 32 步，即前约 10 次更新）；新块的观测统计量带着原来约 5.5e8 的
+二阶矩为什么不补 0：共享的 step 很大（r8 最新检查点 3.07e5 步，偏差校正已经没有了），补 0 时按 Adam 公式新列的有效步长在前几百步是学习率的 2–6.5 倍；
+补行平均以后，r8 最新检查点扩展到 f7、新列给旧列均方根大小的梯度，前 5 步每步只动 0.10–0.41 倍学习率（`tests/test_grow.py` 用补 0 作对照）；
+扩展后的 r8 检查点逐行前向 500/500 logits 和 value 逐位相同。新块的观测统计量带着原来约 5.5e8 的
 count，要很久才会离开 (0, 1)，所以 reach 块事先缩放到 [−1, 1]。
 
 **参考路径**（`path.py`，f4）。两种来源，`FeatureConfig.path_source` 选择：
