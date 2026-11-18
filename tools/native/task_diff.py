@@ -101,6 +101,48 @@ def main(argv=None) -> int:
             "early_respawn_draw": (m_er, 0, "sticky:5", 3000, 60000, 0, 40, "early-respawn draw (p 0.5) from level load",
                                    None, int(np.percentile(st.valid, 60))),
         }
+        if a.branch_dir and (Path(a.branch_dir) / "branches.json").is_file():
+            # multi-branch routes (wire v2): each member's measured rest starts (rest-starts.txt), the legacy member's
+            # unqualified rest, TAS starts upstream of every entrance, sticky actions through the phases
+            from ballrain.branch_assets import read_bundle, validate
+            bd = Path(a.branch_dir)
+            ba = read_bundle(level, bd)
+            pin = validate(ba, level, psha)
+            ec = dict(state["env_config"], features=dict(state["env_config"]["features"], branch_sha256=pin,
+                                                         branch_dir=None))
+            m_v2 = export(dict(state, env_config=ec, branch_assets=ba), out / "weights", "r8multi")
+            assert "multi_branch_v2" in m_v2["requires"] and m_v2["features"]["branch_sha256"] == pin
+            bsha, bpack = T.export_branch_pack(ba, level, out / "assets", psha)
+            branch = {pin: {"sha": bsha, "pack": bpack,
+                            "dir": T.install_branch_pack(bpack, out / "cache", level, bsha, pin, psha)}}
+            prefix = {}
+            for e in json.loads(ba["manifest"])["branches"]:
+                with np.load(bd / e["id"] / "drive.npz", allow_pickle=False) as dz:
+                    prefix[e["id"]] = int(dz["prefix_frame"])
+            rests = []
+            txt = (bd / "rest-starts.txt").read_text(encoding="utf-8") if (bd / "rest-starts.txt").is_file() else ""
+            for item in txt.replace("\n", ",").split(","):
+                if "@branch:" in item:
+                    rng_, tgt = item.strip().split("@branch:")
+                    key, _, station = tgt.rpartition(":")
+                    rests.append((int(rng_.split("-")[0]), key, float(station)))
+            scenarios = {}
+            for n, (k, key, station) in enumerate(rests):
+                scenarios[f"multi_rest_{key}_{station:.0f}"] = (
+                    m_v2, k, "policy" if n % 2 == 0 else f"sticky:{10 + n}", 2500, 60000, 0, 60 + n,
+                    f"rest start on {key} at {station:.1f} m", {"target": None, "branch_s": station, "branch_id": key})
+            scenarios["multi_rest_legacy"] = (m_v2, prefix["south-loop"], "policy", 2500, 60000, 0, 80,
+                                              "the unqualified rest: the legacy south loop",
+                                              {"target": None, "branch_s": 1700.0})
+            scenarios["multi_rest_fallback"] = (m_v2, prefix["back-to-wood"], "policy", 2000, 60000, 0, 81,
+                                                "a member rest outside its drive falls back to the TAS start",
+                                                {"target": None, "branch_s": 99999.0, "branch_id": "back-to-wood"})
+            for n, (key, k) in enumerate(sorted(prefix.items())):
+                scenarios[f"multi_tas_{key}"] = (m_v2, st.nearest_valid(k - 300), "policy", 3000, 60000, 0, 90 + n,
+                                                 f"TAS start upstream of {key} + the policy")
+                scenarios[f"multi_tas_sticky_{key}"] = (m_v2, st.nearest_valid(k), f"sticky:{20 + n}", 3000, 60000, 0,
+                                                        95 + n, f"TAS start at {key}'s drive prefix + sticky actions")
+            return run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir, np, branch)
         if a.branch_dir:  # the stone branch: its measured rest start, and TAS starts upstream of the trafo
             bd = Path(a.branch_dir)
             with np.load(bd / "drive.npz", allow_pickle=False) as dz:
