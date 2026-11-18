@@ -632,6 +632,10 @@ def main(argv=None) -> int:
                                "rail_gate": json.loads(a.rail_gate) if a.rail_gate else {},
                                "respawn_level_starts": a.respawn_level_starts,
                                "counter_rand": json.loads(a.counter_rand) if a.counter_rand else {}}}
+        if getattr(env_cfg, "branch_assets", None):
+            # the same raw bytes the checkpoint holds ({level, line_npz, desc_json, drive_npz, sha256}); the pool's
+            # learner link carries them into the exported policy state
+            template["branch_assets"] = env_cfg.branch_assets
         hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):
