@@ -211,6 +211,10 @@ bool BallanceEnv::handover_ok(int64_t k) const {
 struct BranchRestFailed : Error {
     explicit BranchRestFailed(const std::string &m) : Error(m) {}
 };
+// the brake lost the ball (env._brake's RuntimeError; the process is already stopped): a game outcome, not a fault
+struct BallLostBraking : Error {
+    explicit BallLostBraking(const std::string &m) : Error(m) {}
+};
 
 int BallanceEnv::launch_checked(int64_t k) {
     int mismatches = 0;
@@ -352,7 +356,11 @@ void BallanceEnv::branch_rest(double station) {
     RestStart r;
     r.drive = true, r.x = target[0], r.z = target[2];
     drive(r, rules);
-    brake(rules);
+    try {
+        brake(rules);
+    } catch (const BallLostBraking &e) {  // env._prepare catches it like the drive's own checks: the TAS fallback
+        throw BranchRestFailed(e.what());
+    }
     FeatureInfo fi;
     fx.compute(s.tracker(), &fi);
     const Observation *o = s.obs();
@@ -427,7 +435,7 @@ void BallanceEnv::brake(const BranchRules &rules) {
     const GameTracker &t = s.tracker();
     if (s.ended() || t.flags.ball_off || !t.flags.ball_nav) {
         finish_process();
-        throw Error("at-rest start at frame " + std::to_string(start_frame_) + ": the ball was lost while braking");
+        throw BallLostBraking("at-rest start at frame " + std::to_string(start_frame_) + ": the ball was lost while braking");
     }
 }
 
