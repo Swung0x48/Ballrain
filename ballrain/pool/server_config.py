@@ -23,8 +23,10 @@
     unknown_join_date = "refuse"       # the forum gives no join date: "refuse" (a clear message) or "allow" (only
                                        # the age check is skipped)
     email_confirmed = true
+    unknown_email = "refuse"           # the same when the forum gives no email-confirmed flag
     replies = true
     min_replies = 5                    # (old configs: [pool] min_replies)
+    unknown_replies = "refuse"         # the same when the forum gives no reply count
 
     [policy]
     run = "r6"
@@ -190,10 +192,13 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
         min_account_days=max(0, int(el.get("min_account_days", po.get("min_account_days", 30)))),
         unknown_join_date=str(el.get("unknown_join_date", "refuse")),
         email_confirmed=bool(el.get("email_confirmed", True)),
+        unknown_email=str(el.get("unknown_email", "refuse")),
         replies=bool(el.get("replies", True)),
-        min_replies=max(0, int(el.get("min_replies", po.get("min_replies", 5)))))
-    if rules.unknown_join_date not in UNKNOWN_JOIN_DATE:
-        raise ValueError(f"[eligibility] unknown_join_date must be one of {list(UNKNOWN_JOIN_DATE)}")
+        min_replies=max(0, int(el.get("min_replies", po.get("min_replies", 5)))),
+        unknown_replies=str(el.get("unknown_replies", "refuse")))
+    for k in ("unknown_join_date", "unknown_email", "unknown_replies"):
+        if getattr(rules, k) not in UNKNOWN_JOIN_DATE:
+            raise ValueError(f"[eligibility] {k} must be one of {list(UNKNOWN_JOIN_DATE)}")
     for k in ("account_age", "email_confirmed", "replies"):
         if k in el and not isinstance(el[k], bool):
             raise ValueError(f"[eligibility] {k} must be true or false")

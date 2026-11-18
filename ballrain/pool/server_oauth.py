@@ -30,14 +30,17 @@ USER_FIELDS = ("id", "username", "nickname", "avatar_url", "is_email_confirmed",
 class EligibilityRules:
     """Which forum-account checks the gateway applies before it hands out a pool token ([eligibility] in
     runtime/pool/config.toml, server_config.load_config), in this order: account age, email, replies. Each can be
-    switched off; unknown_join_date says what happens when the forum gives no join date (joined_at null: some forum
-    accounts, e.g. imported ones, have none): "refuse" (a clear message) or "allow" (only the age check is skipped)."""
+    switched off. The forum may give a field as null (some accounts have no join date; some OAuth clients get only
+    the basic fields): unknown_join_date / unknown_email / unknown_replies say what a switched-on check does then:
+    "refuse" (a clear message) or "allow" (that check is skipped). A switched-off check never needs its field."""
     account_age: bool = True
     min_account_days: int = 30
     unknown_join_date: str = "refuse"
     email_confirmed: bool = True
+    unknown_email: str = "refuse"
     replies: bool = True
     min_replies: int = 5
+    unknown_replies: str = "refuse"
 
     def describe(self) -> str:
         """The conditions in force, for the login page (Chinese)."""
@@ -46,9 +49,10 @@ class EligibilityRules:
             parts.append(f"论坛注册满 {int(self.min_account_days)} 天"
                          + ("（论坛没有提供注册时间的账号不受这条限制）" if self.unknown_join_date == "allow" else ""))
         if self.email_confirmed:
-            parts.append("邮箱已验证")
+            parts.append("邮箱已验证" + ("（论坛没有提供验证状态的账号不受这条限制）" if self.unknown_email == "allow" else ""))
         if self.replies and self.min_replies > 0:
-            parts.append(f"至少 {int(self.min_replies)} 条回复")
+            parts.append(f"至少 {int(self.min_replies)} 条回复"
+                         + ("（论坛没有提供回复数的账号不受这条限制）" if self.unknown_replies == "allow" else ""))
         return "、".join(parts) if parts else "任何论坛账号都可以"
 
 
@@ -173,16 +177,16 @@ def parse_user(u: dict) -> dict:
     av = u.get("avatar_url")
     av = _clean(av, 500) if isinstance(av, str) and av.startswith(("https://", "http://")) else None
     joined = parse_joined(u.get("joined_at"))
-    confirmed = u.get("is_email_confirmed")  # a bool, or 0 / 1 (as a number or a string) from some serialisers
-    if not isinstance(confirmed, bool):
+    confirmed = u.get("is_email_confirmed")  # a bool, or 0 / 1 (as a number or a string); null: unknown
+    if confirmed is not None and not isinstance(confirmed, bool):
         if confirmed in (0, 1) or confirmed in ("0", "1"):
             confirmed = str(confirmed) == "1"
         else:
             raise ForumError(f"forum is_email_confirmed ({type(confirmed).__name__})")
-    cc = u.get("comment_count")  # an int, or a digit string
+    cc = u.get("comment_count")  # an int, or a digit string; null: unknown
     if isinstance(cc, str) and cc.strip().isdigit():
         cc = int(cc.strip())
-    if isinstance(cc, bool) or not isinstance(cc, int) or cc < 0:
+    if cc is not None and (isinstance(cc, bool) or not isinstance(cc, int) or cc < 0):
         raise ForumError(f"forum comment_count ({type(cc).__name__})")
     return {"user": {"forum_id": fid, "username": username, "nickname": nickname, "avatar_url": av},
             "joined": joined.timestamp() if joined is not None else None, "email_confirmed": confirmed,
@@ -207,8 +211,21 @@ def eligibility(rec: dict, now: float, min_days: int = 30, min_replies: int = 5,
             days = int(math.floor((now - rec["joined"]) / 86400))
             if days < r.min_account_days:
                 return payload(Reason.ACCOUNT_TOO_NEW, days=max(days, 0), min_days=int(r.min_account_days))
-    if r.email_confirmed and not rec["email_confirmed"]:
-        return payload(Reason.EMAIL_NOT_VERIFIED)
-    if r.replies and rec["comments"] < r.min_replies:
+    if r.email_confirmed:
+        if rec.get("email_confirmed") is None:
+            if r.unknown_email != "allow":
+                return {"code": Reason.EMAIL_NOT_VERIFIED.value,
+                        "message": "论坛没有提供这个账号的邮箱验证状态，无法核对“邮箱已验证”的条件，暂时不能领取算力池令牌。"
+                                   "请联系算力池管理员。",
+                        "params": {"email": "unknown"}}
+        elif not rec["email_confirmed"]:
+            return payload(Reason.EMAIL_NOT_VERIFIED)
+    if r.replies and r.min_replies > 0 and rec.get("comments") is None:
+        if r.unknown_replies != "allow":
+            return {"code": Reason.TOO_FEW_REPLIES.value,
+                    "message": f"论坛没有提供这个账号的回复数，无法核对“至少 {int(r.min_replies)} 条回复”的条件，"
+                               "暂时不能领取算力池令牌。请联系算力池管理员。",
+                    "params": {"min_replies": int(r.min_replies), "replies": "unknown"}}
+    elif r.replies and rec["comments"] < r.min_replies:
         return payload(Reason.TOO_FEW_REPLIES, replies=rec["comments"], min_replies=int(r.min_replies))
     return None

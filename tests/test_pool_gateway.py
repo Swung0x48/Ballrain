@@ -870,3 +870,22 @@ def test_eligibility_rules_from_the_config(tmp_path):
         with pytest.raises(ValueError):
             load_config(cfg, pool_dir=tmp_path)
     assert EligibilityRules(account_age=False, email_confirmed=False, replies=False).describe() == "任何论坛账号都可以"
+    # a forum that gives only the basic fields: every switched-on check refuses with its own message, or allows
+    good = {"id": 7, "username": "u", "nickname": "n", "avatar_url": None, "is_email_confirmed": None,
+            "joined_at": None, "comment_count": None}
+    bare = parse_user(good)
+    assert bare["email_confirmed"] is None and bare["comments"] is None and bare["joined"] is None
+    off_age = EligibilityRules(account_age=False)
+    r = eligibility(bare, now, rules=off_age)
+    assert r["code"] == "email_not_verified" and "没有提供" in r["message"] and r["params"]["email"] == "unknown"
+    r = eligibility(bare, now, rules=EligibilityRules(account_age=False, unknown_email="allow"))
+    assert r["code"] == "too_few_replies" and "没有提供" in r["message"] and r["params"]["replies"] == "unknown"
+    assert eligibility(bare, now, rules=EligibilityRules(account_age=False, unknown_email="allow",
+                                                         unknown_replies="allow")) is None
+    assert eligibility(bare, now, rules=EligibilityRules(account_age=False, email_confirmed=False, replies=False)) is None
+    cfg.write_text('[eligibility]\nunknown_email = "allow"\nunknown_replies = "allow"\n', encoding="utf-8")
+    c = load_config(cfg, pool_dir=tmp_path).eligibility
+    assert c.unknown_email == c.unknown_replies == "allow" and "验证状态" in c.describe()
+    cfg.write_text('[eligibility]\nunknown_replies = "sure"\n', encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_config(cfg, pool_dir=tmp_path)
