@@ -90,17 +90,18 @@ def test_too_many_reach_rows_reject_that_chunk_only_and_flag_nobody(pool, tmp_pa
     assert not [r for r in pool.store.to_ingest(100) if r["seq"] == 0 and r["task_id"] == t.task_id]
 
 
-def test_steering_bound_rejects_a_chunk_without_a_flag(pool, tmp_path, monkeypatch):
-    """One deviant row whose reach values move the taken action's log-prob beyond the bound: that chunk is rejected,
-    nobody is flagged; with a wide bound the same task passes."""
+@pytest.mark.parametrize("bound,rejected", [(1e-9, True), (100.0, False)])
+def test_steering_bound_rejects_a_chunk_without_a_flag(pool, tmp_path, monkeypatch, bound, rejected):
+    """One deviant row whose reach values move the taken action's log-prob: beyond the bound that chunk is rejected,
+    nobody is flagged; with a wide bound the same situation passes."""
     pl, t, chunks = _play_and_send(pool, tmp_path)
     pool.verifier.reach_slice, pool.verifier.reach_max_row_frac = SL, 0.05
-    pool.verifier.reach_max_logp_shift = 1e-9
+    pool.verifier.reach_max_logp_shift = bound
     _perturb_replay(monkeypatch, {4}, 3.0)
     assert pool.verifier.run_once() == 1
     rows = pool.store.chunks(t.task_id)
-    assert rows[0]["status"] == "rejected" and not pool.store.is_suspect(rows[0]["forum_id"])
-    assert any("moves the taken action's log-prob" in x for x in pool.logs)
+    assert (rows[0]["status"] == "rejected") is rejected and not pool.store.is_suspect(rows[0]["forum_id"])
+    assert any("moves the taken action's log-prob" in x for x in pool.logs) is rejected
 
 
 def test_outside_the_reach_block_stays_strict(pool, tmp_path, monkeypatch):
@@ -139,3 +140,63 @@ def test_replay_reports_deviant_rows_and_f6_is_unchanged(pool, tmp_path):
     rows = pool.store.chunks(t.task_id)
     assert all(r["verify"] == "passed" for r in rows)
     assert all(read_reach_patch(pool.cfg.pool_dir / "chunks" / r["file"]) is None for r in rows)
+
+
+def test_a_forged_action_on_a_deviant_row_is_still_strict(pool, tmp_path, monkeypatch):
+    """Policy checks are not skipped on reach-deviant rows: a forged action there fails (and flags) like anywhere."""
+    pl = Player(pool, "eligible", tmp_path)
+    t = pl.task()
+    chunks, _, pol = pl.play(t)
+
+    def flip(a):
+        a = a.copy()
+        a[3] = (int(a[3]) + 1) % pol.n_act
+        return a
+    forged = reseal(chunks[0], actions=flip)
+    for c in [forged] + chunks[1:]:
+        assert pl.send(c).status == 200
+    pool.verifier.reach_slice, pool.verifier.reach_max_row_frac = SL, 0.5
+    _perturb_replay(monkeypatch, {3}, 0.01)
+    assert pool.verifier.run_once() == 1
+    rows = pool.store.chunks(t.task_id)
+    code = json.loads([r for r in rows if r["verify"] == "failed"][0]["reason"])["code"]
+    assert code in ("replay_action_mismatch", "replay_logp_mismatch", "replay_mismatch", "replay_reward_mismatch")
+    assert pool.store.is_suspect(rows[0]["forum_id"])
+
+
+def test_short_final_chunk_allows_one_row_and_the_bootstrap_row_is_patched(pool, tmp_path, monkeypatch):
+    """A final chunk shorter than 1 / frac rows still tolerates one deviant row (the steering bound still applies); a
+    deviant row at a chunk boundary is patched in both chunks (row T = raw_last of the first, row 0 of the next) and
+    counted once."""
+    pl, t, chunks = _play_and_send(pool, tmp_path)
+    dec = [P.decode_chunk(c) for c in chunks]
+    last = dec[-1]
+    boundary = int(dec[1].header["step0"])  # row T of chunk 0 = row 0 of chunk 1
+    # a fraction under which the plain rule allows no row in any chunk of this task: only the floor lets it pass
+    frac = 0.5 / (max(int(d.header["steps"]) for d in dec) + 1)
+    pool.verifier.reach_slice, pool.verifier.reach_max_row_frac = SL, frac
+    assert all(int(frac * (int(d.header["steps"]) + 1)) == 0 for d in dec)
+    _perturb_replay(monkeypatch, {boundary, int(last.header["step0"]) + 1}, 0.01)
+    assert pool.verifier.run_once() == 1
+    rows = pool.store.chunks(t.task_id)
+    assert all(r["verify"] == "passed" for r in rows), [(r["seq"], r["reason"]) for r in rows]
+    p0 = read_reach_patch(pool.cfg.pool_dir / "chunks" / rows[0]["file"])
+    p1 = read_reach_patch(pool.cfg.pool_dir / "chunks" / rows[1]["file"])
+    assert int(dec[0].header["steps"]) in list(p0[0]) and 0 in list(p1[0])
+    m = LL.chunk_message(dec[0], 1, p0)
+    assert np.allclose(m["raw_last"][SL], p0[1][list(p0[0]).index(int(dec[0].header["steps"]))])
+    pl_ = read_reach_patch(pool.cfg.pool_dir / "chunks" / rows[-1]["file"])
+    assert pl_ is not None and 1 in list(pl_[0])
+
+
+def test_the_default_slice_is_the_real_f7_reach_block():
+    """reach_slice_of finds the block in a real f7 layout: the last 59 entries (fastreach.FEATURE_NAMES)."""
+    from types import SimpleNamespace
+    pytest.importorskip("numba")
+    from ballrain import fastreach as FR
+    from ballrain.features import FeatureConfig, FeatureExtractor
+    fx = FeatureExtractor(FeatureConfig(reach=True, far_waypoints=(20.0, 30.0, 45.0), ref_speed_at=(0.0, 15.0, 30.0)))
+    sl = R.reach_slice_of(SimpleNamespace(fx=fx))
+    assert sl is not None and sl.stop - sl.start == len(FR.FEATURE_NAMES) == 59 and sl.stop == fx.size
+    f6 = FeatureExtractor(FeatureConfig(far_waypoints=(20.0, 30.0, 45.0), ref_speed_at=(0.0, 15.0, 30.0)))
+    assert R.reach_slice_of(SimpleNamespace(fx=f6)) is None

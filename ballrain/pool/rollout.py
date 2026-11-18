@@ -50,7 +50,7 @@ VALUE_TOL = 1e-3  # |v - replayed v| <= VALUE_TOL * max(1, |v|)
 # the client's port and this replay. A row whose reach entries differ beyond OBS_TOL ("reach-deviant") is checked on the
 # hybrid row (this replay's features, reach replaced by the submitted values: what the client's policy saw) with the
 # float16-copy tolerances of the cheap check, and the steering bound applies; per chunk, at most REACH_MAX_ROW_FRAC of
-# the rows may deviate. PROVISIONAL defaults until the native port's measured flip / jump rates set them
+# the rows (at least one) may deviate. PROVISIONAL defaults until the native port's measured flip / jump rates set them
 REACH_MAX_ROW_FRAC = 0.02
 REACH_MAX_LOGP_SHIFT = 1.0  # |log pi(a | submitted reach) - log pi(a | replayed reach)| of the taken action, nats
 REACH_LOGP_TOL = 0.05  # on a deviant row the policy runs on float16 reach values: the cheap check's tolerances
@@ -491,7 +491,7 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
         last_chunk = bool(h["final"])
         if h["chain_prev"] != prev.hex() or step0 != runner.steps:
             return Mismatch(Reason.REPLAY_MISMATCH, s, step0, "chunk does not continue the replay")
-        dev_rows, dev_reach, excess = [], [], None
+        dev_rows, dev_reach, n_counted, excess = [], [], 0, None
         for j in range(T + 1):
             i = step0 + j
             # ---- observation row i: the engine-state chain value (exact) and the float16 copy (within tolerance of
@@ -516,9 +516,10 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
                 hyb = r32.copy()
                 hyb[sl] = np.asarray(sub[sl], np.float32)
                 x = policy.normalize(hyb)
-                if j < T or last_chunk:  # row T of a non-final chunk is the next chunk's row 0 (counted there)
-                    dev_rows.append(j)
-                    dev_reach.append(np.asarray(r32[sl], np.float32))
+                dev_rows.append(j)  # patched for the learner (row T too: the chunk's bootstrap row, raw_last)
+                dev_reach.append(np.asarray(r32[sl], np.float32))
+                if j < T or last_chunk:  # row T of a non-final chunk is the next chunk's row 0: counted there
+                    n_counted += 1
             else:
                 x = policy.normalize(r32)
             v_tol, lp_tol = (REACH_VALUE_TOL, REACH_LOGP_TOL) if deviant else (VALUE_TOL, LOGP_TOL)
@@ -588,8 +589,10 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
             row = st.next_obs
         if dev_rows:  # the chunk's reach-deviant rows: within the bounds, or the chunk alone is rejected
             n_rows = T + (1 if last_chunk else 0)
-            if excess is None and len(dev_rows) > reach_max_row_frac * n_rows:
-                excess = f"{len(dev_rows)} of {n_rows} rows with reach beyond tolerance > {reach_max_row_frac:g}"
+            allowed = max(1, int(reach_max_row_frac * n_rows))  # at least one row: short final chunks (finishes,
+            if excess is None and n_counted > allowed:          # deaths) would otherwise allow none
+                excess = (f"{n_counted} of {n_rows} rows with reach beyond tolerance > {allowed} "
+                          f"({reach_max_row_frac:g}, at least 1)")
             rep[s] = {"rows": dev_rows, "reach": np.stack(dev_reach).astype(np.float32), "start": int(sl.start),
                       "excess": excess}
     return None
