@@ -1098,10 +1098,13 @@ L2 是原生客户端第一次在第 2 关上通过验证（纸球、风扇）�
 **H 255 上**（Windows；同一台机器上的 Python 桥先停掉）
 1. 停 r8 的 Python runner2：按它自己的停止方式（`C:\ballrain\ops` 里的脚本）停桥和 worker，确认没有 `BallanceMMOSimTool` 还在跑。
 2. 把原生客户端 0.4.0 发布版的 zip（原生客户端会话的 `package_win.py` 打出来的 `BallrainPool-0.4.0-windows-x64.zip`）解压到 `C:\ballrain-pool\app`。
-   zip 里的引擎 sha256 要在网关的 `[engines.x87soft]` 白名单里：打包脚本会打印它；没有 `[engines]` 一节时，网关默认用本机的 `runtime/hl-win/bin-x86soft`，两边是同一个文件时 sha 一致。
+   内部测试版：zip 的 sha256 是 `f070b5e7…f136c`（7 884 023 字节），没有预填网关地址（命令里传 `--gateway`）。
+   zip 里的引擎就是训练用的 x87-soft 引擎 `runtime/hl-win/bin-x86soft`（sha256 `acd867e2…c68b`），也是网关的默认引擎，所以不用写 `[engines]` 一节。
 3. 游戏目录用 `C:\ballrain\game`：它的 `base.cmo` 和网关参照目录 `runtime/hl-win/game-min` 的逐字节相同，已经核对过。其余三项（`Database.tdb`、`3D Entities/`、`Text/`）不一致时，hello 会回 `game_files_mismatch` 并指出是哪一项。
-4. 数据目录：不传 `--data-dir`，客户端用数据根 `%USERPROFILE%\.ballrain`（第 13 节第 4 步）。这台机器的用户目录如果不是纯英文路径，就设 `BALLRAIN_WORK_DIR` 指向一个纯英文的文件夹，下面的命令都在设了它的环境里跑。
-   以前用 `--data-dir C:\ballrain-pool\data` 登录过的话，可以把 `BALLRAIN_WORK_DIR` 设成这个文件夹，令牌和缓存照用。
+4. 数据根：登录和 `start-pool.ps1` 里都设 `$env:BALLRAIN_WORK_DIR = 'C:\ballrain-pool\data'`，不传 `--data-dir`（第 13 节第 4 步）。
+   - 这样登录、运行、诊断导出和界面找的都是同一个目录。`--data-dir` 仍然可用，给的是同一个根，但每条命令都得记得传。
+   - 根下面有 `token`、`config.json`、`logs/`、`queue/`、`runs/`、`cache/`（素材、`branch/`、`fastreach/`），`engine-work/` 只在路径不是纯英文时才用。
+   - 磁盘：`cache/fastreach` 约 120 MB（L2 两份场，每份解压后 58.5 MB，各下载一次，压缩后约 4 MB）。
 5. 登录（由用户完成）：
    `C:\ballrain-pool\app\nc_client.exe login --gateway https://<仪表盘主机名>`
    它在标准输出打一行 JSON，里面有 `browser_url` 和 `user_code`。用户在任意浏览器打开这个地址，核对登录代码，用论坛账号授权。成功后令牌存在 `<数据根>\token`。
@@ -1118,6 +1121,8 @@ L2 是原生客户端第一次在第 2 关上通过验证（纸球、风扇）�
   - `task_end` 是每个任务的结束原因和步数；
   - `chunk` 的 `status` 应该都是 `accepted`；
   - `refused`、`error`、`task_failed` 不应该出现，出现时原文就是原因。可达性场下载失败、校验失败、版本不对都会在这里；
+  - `task_failed` 写着 “no reach fields for this geometry”：下发的场没有覆盖这局走到的某种几何。不是玩家的错，告诉原生客户端会话；
+  - `no_task` 带 `client_too_old` 和缺少能力的说明：策略需要客户端没报的能力。0.4.0 跑 r8 时不应该出现；
   - `heartbeat` 应该一直有。
 - **网关日志**：`verify …: passed up to chunk N` 是正常的。下面几行要注意：
   - `policy-consistency check failed` 是便宜检查不通过，这个任务和账号接下来的任务会整段重放；
