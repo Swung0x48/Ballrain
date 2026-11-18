@@ -12,6 +12,11 @@
 //   nc_reach_diff leaf --fields <a.npz> --name <helper> --in <args.npz> --out <out.bin> [--libm system|crt]
 //     args.npz: args (n, k) f8; out.bin: i64 n, i64 m, then n x m f8 (fastreach::leaf of each row).
 #include <algorithm>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+#include <immintrin.h>
+#include <cmath>
 #include <chrono>
 #include <limits>
 #include <map>
@@ -23,6 +28,7 @@
 #include <vector>
 
 #include "ballrain/fastreach.h"
+#include "ballrain/reach_block.h"
 #include "ballrain/npz.h"
 #include "ballrain/util.h"
 
@@ -135,6 +141,85 @@ static int run_perceive(int argc, char **argv) {
     return 0;
 }
 
+// check: the client's call pattern (one workspace, no dbg / pdd, this executable's libm unless --libm system) on a
+// state file, against expected raw outputs (expect.npz "out" (n, 59): Python's on the reference machine); prints a
+// short report (cross-machine check: run the same files on two machines, compare the reports)
+static int run_check(int argc, char **argv) {
+    std::string lm = arg(argc, argv, "--libm", "crt");
+    install_libm(lm);
+    std::vector<std::shared_ptr<const fr::Fields>> fields;
+    for (auto &p : split(arg(argc, argv, "--fields"))) fields.push_back(fr::Fields::load(p));
+    auto z = load_npz(arg(argc, argv, "--in"));
+    auto e = load_npz(arg(argc, argv, "--expect"));
+    std::vector<double> pos = get(z, "pos").f64(), vel = get(z, "vel").f64(), zones = get(z, "zones").f64();
+    std::vector<int64_t> ball = get(z, "ball").ints(), quarter = get(z, "quarter").ints(), fi = get(z, "field").ints(),
+                         zoff = get(z, "zoff").ints();
+    std::vector<double> want = get(e, "out").f64();
+    const size_t n = ball.size(), nf = size_t(fr::N_FEATURES);
+    if (want.size() != n * nf) throw Error("expect.npz: out is not (n, 59)");
+    for (auto &f : fields)
+        std::printf("field %s\n", f->key.substr(f->key.size() - 20).c_str());
+#if defined(_M_X64) || defined(__x86_64__)
+    {  // the machine: CPU brand and features, the floating-point control (MXCSR: rounding, FTZ / DAZ)
+        int r[4];
+        char brand[49] = {};
+        for (int k = 0; k < 3; ++k) {
+            __cpuid(r, int(0x80000002u + unsigned(k)));
+            std::memcpy(brand + 16 * k, r, 16);
+        }
+        __cpuid(r, 1);
+        int fma = (r[2] >> 12) & 1, avx = (r[2] >> 28) & 1;
+        __cpuidex(r, 7, 0);
+        int avx2 = (r[1] >> 5) & 1, avx512f = (r[1] >> 16) & 1;
+        std::printf("cpu %s | fma %d avx %d avx2 %d avx512f %d | mxcsr 0x%04x\n", brand, fma, avx, avx2, avx512f,
+                    unsigned(_mm_getcsr()));
+    }
+#endif
+    fr::Workspace ws;
+    const int flags[6] = {0, 1, 2, 3, 11, 12};  // grounded doomed unknown_zone air_any air_near_can_stop air_near_clear
+    size_t differ = 0, flipped = 0, jumped = 0;
+    double max_raw = 0, max_scaled = 0;
+    std::vector<size_t> first;
+    std::vector<double> o(nf), so(nf), sw(nf);
+    for (size_t i = 0; i < n; ++i) {
+        std::vector<double> uz(zones.begin() + zoff[i] * 6, zones.begin() + zoff[i + 1] * 6);
+        fr::perceive(*fields[size_t(fi[i])], ws, uz, int(ball[i]), int(quarter[i]), &pos[3 * i], &vel[3 * i], o.data());
+        const double *w = &want[i * nf];
+        if (std::memcmp(o.data(), w, nf * sizeof(double)) == 0) continue;
+        bool bitdiff = false;
+        for (size_t k = 0; k < nf; ++k)
+            if (!(o[k] == w[k] || (o[k] != o[k] && w[k] != w[k]))) bitdiff = true;
+            else if (std::memcmp(&o[k], &w[k], 8) != 0) bitdiff = true;  // -0 / +0
+        if (!bitdiff) continue;
+        ++differ;
+        bool flip = false;
+        for (int f : flags) flip = flip || (o[size_t(f)] != w[size_t(f)]);
+        flipped += flip;
+        reach_scale(o.data(), so.data());
+        reach_scale(w, sw.data());
+        bool jump = false;
+        for (size_t k = 0; k < nf; ++k) {
+            double d = std::abs(so[k] - sw[k]);
+            max_scaled = std::max(max_scaled, d);
+            jump = jump || d > 1e-4 * std::max(1.0, std::abs(sw[k]));
+            if (std::isfinite(o[k]) && std::isfinite(w[k])) max_raw = std::max(max_raw, std::abs(o[k] - w[k]));
+        }
+        jumped += jump;
+        if (first.size() < 20) first.push_back(i);
+    }
+    std::printf("libm %s: %zu states, differing in any bit %zu, flag flips %zu, scaled jumps > 1e-4 %zu, "
+                "max raw |d| %.3g, max scaled |d| %.3g\n", lm.c_str(), n, differ, flipped, jumped, max_raw, max_scaled);
+    for (size_t i : first) {
+        fr::perceive(*fields[size_t(fi[i])], ws, std::vector<double>(zones.begin() + zoff[i] * 6, zones.begin() + zoff[i + 1] * 6),
+                     int(ball[i]), int(quarter[i]), &pos[3 * i], &vel[3 * i], o.data());
+        std::printf("  state %zu:", i);
+        for (size_t k = 0; k < nf; ++k)
+            if (std::memcmp(&o[k], &want[i * nf + k], 8) != 0) std::printf(" [%zu] %.17g vs %.17g", k, o[k], want[i * nf + k]);
+        std::printf("\n");
+    }
+    return 0;
+}
+
 static int run_leaf(int argc, char **argv) {
     install_libm(arg(argc, argv, "--libm", "system"));
     auto f = fr::Fields::load(arg(argc, argv, "--fields"));
@@ -171,6 +256,7 @@ int main(int argc, char **argv) {
         std::string mode = argv[1];
         if (mode == "perceive") return run_perceive(argc, argv);
         if (mode == "leaf") return run_leaf(argc, argv);
+        if (mode == "check") return run_check(argc, argv);
         std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
         return 2;
     } catch (const std::exception &e) {
