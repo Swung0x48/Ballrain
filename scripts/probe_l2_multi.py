@@ -11,7 +11,7 @@ from ballrain.headless import HeadlessConfig, HeadlessLauncher
 from ballrain.env import world_to_camera_keys, EPISODE_STOP
 from ballrain.protocol import Ev
 
-LIVE = Path("D:/repos/Ballrain/runtime")
+LIVE = Path(__import__("os").environ.get("BALLRAIN_RUNTIME") or Path(__file__).resolve().parents[1] / "runtime")
 OUT = LIVE / "viz/l2branch2"
 REC = LIVE / "datasets/tas-v1/SR02_1_28_992_264"
 # (x,z) gates, optionally requiring material or minimum altitude
