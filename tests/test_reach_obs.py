@@ -34,6 +34,75 @@ def test_f6_layout_unchanged_and_f7_appends_the_block_last():
     assert FeatureConfig(**{k: v for k, v in asdict(f6).items() if k != "reach"}).reach is False
 
 
+def test_reach_version_pinned_in_the_config_and_checked_by_the_worker(monkeypatch):
+    """FeatureConfig.reach_version records the block version when reach is on (the learner's config pins it for every
+    worker); an extractor of another version is refused before anything is computed (like path_sha256)."""
+    f7 = FeatureConfig(**R8, reach=True)
+    want = f"fastreach{FR.BUILD_VERSION}.{FR.QUERY_VERSION}-block{RF.BLOCK_VERSION}"
+    assert f7.reach_version == RF.reach_version() == want
+    assert FeatureConfig(**asdict(f7)).reach_version == f7.reach_version  # the dict a worker receives keeps it
+    assert FeatureConfig(**R8).reach_version is None and FeatureConfig(**R8, reach_version="x").reach_version is None
+    with pytest.raises(RF.ReachVersionError, match="reach_version"):
+        FeatureExtractor(FeatureConfig(**R8, reach=True, reach_version="fastreach5.1-block1"))
+    monkeypatch.setattr(FR, "QUERY_VERSION", FR.QUERY_VERSION + 1)  # a worker with other fastreach code
+    with pytest.raises(RF.ReachVersionError):
+        FeatureExtractor(f7)
+    monkeypatch.setattr(FR, "HAVE_NUMBA", False)  # the mismatch is reported before the numba requirement
+    with pytest.raises(RF.ReachVersionError):
+        FeatureExtractor(f7)
+
+
+def test_block_definition_digest_matches_the_block_version():
+    """The names, their order and the scales of the block (and the constants the scaling uses): any change must bump
+    BLOCK_VERSION (reach_features) or QUERY_VERSION (fastreach), and this digest with it (docs/f7-native-port.md)."""
+    import hashlib
+    h = hashlib.sha256(json.dumps([list(FR.FEATURE_NAMES), list(FR.DIR_NAMES), RF.SCALE.tolist(), FR.N_PSI, FR.L_MAX,
+                                   FR.CLIP_V]).encode()).hexdigest()[:16]
+    assert (RF.reach_version(), h) == ("fastreach5.2-block1", "3a67104b827836b8")
+
+
+_SUB_LEARNER = r"""
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1]); sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+import train_m2
+a = train_m2.parse(["--run", "x", "--reach", "--world-actions", "--level", "2", "--far-waypoints", "20,30,45",
+                    "--ref-speed-at", "0,15,30"])
+fc = train_m2.make_env_config(a, Path(sys.argv[2])).features
+n_obs, sl = train_m2.obs_layout(fc)
+from ballrain import fastreach as F
+from ballrain.features import FeatureExtractor
+from ballrain.train.grow import check_prefix
+from dataclasses import asdict
+f6 = asdict(fc); f6.update(reach=False, version="f6", reach_version=None)
+check_prefix(f6, asdict(fc), 208, n_obs)
+try:
+    FeatureExtractor(fc)
+    refused = False
+except RuntimeError:
+    refused = True
+print(json.dumps({"n_obs": n_obs, "reach": [sl["reach"].start, sl["reach"].stop], "numba": "numba" in sys.modules,
+                  "have": F.HAVE_NUMBA, "refused": refused, "version": fc.reach_version}))
+"""
+
+
+def test_learner_layout_needs_no_numba(tmp_path):
+    """The learner (train_m2: n_obs, the path_progress slice of --watch-s / --teacher, the growth check) takes the
+    layout from make_layout, never from a FeatureExtractor: it runs with BALLRAIN_NO_NUMBA=1, where an extractor with
+    the reach block is refused."""
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, BALLRAIN_NO_NUMBA="1")
+    r = subprocess.run([sys.executable, "-I", "-c", _SUB_LEARNER, str(root), str(tmp_path)], env=env,
+                       capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, r.stderr[-3000:]
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    n7 = sum(k for _, k in make_layout(FeatureConfig(**R8, reach=True)))
+    assert out == {"n_obs": n7, "reach": [n7 - FR.N_FEATURES, n7], "numba": False, "have": False, "refused": True,
+                   "version": RF.reach_version()}
+    src = (root / "scripts" / "train_m2.py").read_text(encoding="utf-8")
+    assert "FeatureExtractor(" not in src
+
+
 def test_reach_directions_are_the_action_directions():
     # direction slot q of fastreach is reach.KEY_COMBOS[q] = action q + 1 (ARROWS9[0] is "no key")
     assert tuple(reach.KEY_COMBOS) == tuple(ARROWS9[1:])
@@ -285,4 +354,4 @@ def test_pool_refuses_f7_and_f6_manifests_have_no_reach_field(tmp_path):
     with pytest.raises(ValueError, match="f7"):
         W.export_state(state(FeatureConfig(camera="world", reach=True)), tmp_path / "a", "r-test")
     m = W.export_state(state(FeatureConfig(camera="world")), tmp_path / "b", "r-test")
-    assert "reach" not in m["features"] and m["features"]["version"] == "f6"
+    assert "reach" not in m["features"] and "reach_version" not in m["features"] and m["features"]["version"] == "f6"

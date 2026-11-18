@@ -174,6 +174,7 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     feats["path_dir"] = None  # the client installs the asset itself (task assets, sha256 below)
     # feature version gate: the native client (native/core/src/features.cpp) and the verifier compute f6 only; the f7
     # reach block (FeatureConfig.reach, ballrain/fastreach.py) has no native port yet (docs/native-client.md)
+    feats.pop("reach_version", None)  # (None for f6)
     if feats.pop("reach", False) or feats.get("version") == "f7":
         raise ValueError(f"feature version {feats.get('version')!r}: the pool serves f6 policies only (the f7 reach "
                          "block needs a native port of ballrain/fastreach.py, docs/native-client.md)")

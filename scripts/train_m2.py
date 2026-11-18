@@ -332,6 +332,12 @@ class Logger:
         self.log.flush()
 
 
+def obs_layout(fc):
+    """(n_obs, {block: slice}) of a FeatureConfig from the layout alone (no FeatureExtractor, no numba)."""
+    from ballrain.features import layout_size, layout_slices
+    return layout_size(fc), layout_slices(fc)
+
+
 def make_env_config(a, out_root: Path):
     from ballrain.env import EnvConfig
     from ballrain.features import FeatureConfig
@@ -439,11 +445,13 @@ def main(argv=None) -> int:
     hidden = tuple(int(x) for x in a.hidden.split(","))
     from ballrain.env import BallanceEnv
     from ballrain.fakegame import FakeLauncher
+    # the observation size from the layout alone: the learner never builds a FeatureExtractor (with the f7 block that
+    # would need numba and the fields); --fake runs its toy env here (and its local workers), which does
+    n_obs = obs_layout(env_cfg.features)[0]
     probe = BallanceEnv(env_cfg, launcher=FakeLauncher()) if a.fake else None
-    n_obs = probe.observation_space.shape[0] if probe else None
-    if probe is None:
-        from ballrain.features import FeatureExtractor
-        n_obs = FeatureExtractor(env_cfg.features).size
+    if probe is not None and probe.observation_space.shape[0] != n_obs:
+        raise SystemExit(f"layout says {n_obs} observation entries, the fake env has "
+                         f"{probe.observation_space.shape[0]}")
     n_act = 9
     model = ActorCritic(n_obs, n_act, hidden, a.activation).to(a.device)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
@@ -466,6 +474,10 @@ def main(argv=None) -> int:
 
     if ck is not None:
         load_policy(ck, load_opt=True)
+        rv_old = ((ck.get("env_config") or {}).get("features") or {}).get("reach_version")
+        if rv_old and rv_old != env_cfg.features.reach_version:
+            log.msg(f"reach block version {rv_old} -> {env_cfg.features.reach_version}: the policy continues on the "
+                    "current block (FeatureConfig.reach_version pins it for every worker)")
         for g in opt.param_groups:
             g["lr"] = a.lr
         cu.load_state_dict(ck["curriculum"])
@@ -696,10 +708,9 @@ def main(argv=None) -> int:
 
     watch = None
     if a.watch_s:
-        from ballrain.features import FeatureExtractor
         from ballrain.path import ReferencePath, asset_path, resolve_path_dir
         lo_s, hi_s = (float(v) for v in a.watch_s.split(","))
-        sl = FeatureExtractor(env_cfg.features).slices().get("path_progress")
+        sl = obs_layout(env_cfg.features)[1].get("path_progress")
         asset = asset_path(env_cfg.level, resolve_path_dir(env_cfg.features.path_dir)) if env_cfg.features.path_dir else None
         if sl is None or asset is None or not asset.is_file():
             raise SystemExit("--watch-s needs the path_progress feature and a reference line asset (--path-dir)")
@@ -709,12 +720,12 @@ def main(argv=None) -> int:
 
     teacher = None
     if a.teacher:
-        from ballrain.features import FeatureExtractor
         from ballrain.path import ReferencePath, asset_path, resolve_path_dir
         tck = torch.load(a.teacher, weights_only=False)
         mine, theirs = asdict(env_cfg)["features"], tck["env_config"]["features"]
         # a teacher without the f7 reach block reads the first n_obs entries (the block is appended at the end)
-        appended = {"reach", "version"} if (mine.get("reach") and not theirs.get("reach")) else set()
+        appended = ({"reach", "reach_version", "version"} if (mine.get("reach") and not theirs.get("reach"))
+                    else set())
         diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k) and k not in appended)
         t_obs = int(tck["n_obs"])
         if (t_obs != n_obs and not appended) or int(tck["n_act"]) != n_act or diff:
@@ -729,7 +740,7 @@ def main(argv=None) -> int:
         tmodel = ActorCritic(t_obs, n_act, tuple(int(x) for x in ta["hidden"].split(",")), ta["activation"]).to(a.device)
         tmodel.load_state_dict(tck["model"])
         tmodel.eval()
-        sl = FeatureExtractor(env_cfg.features).slices()["path_progress"]
+        sl = obs_layout(env_cfg.features)[1]["path_progress"]
         length = ReferencePath.load(asset_path(env_cfg.level, resolve_path_dir(env_cfg.features.path_dir))).length
         teacher = {"model": tmodel, "rms": tck["rms"], "col": sl.start, "lo": a.teacher_s_min / length,
                    "u0": counters["update"], "n_obs": t_obs}

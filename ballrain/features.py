@@ -77,12 +77,22 @@ class FeatureConfig:
     # f7: the fastreach block (ballrain.reach_features, 59 entries scaled to [-1, 1]) appended after every other entry,
     # so an f6 policy is extended with zero input weights; version becomes "f7". Needs numba (refused without)
     reach: bool = False
+    # f7 pin: what defines the block's values (reach_features.reach_version(): fastreach BUILD_VERSION and
+    # QUERY_VERSION, reach_features.BLOCK_VERSION). Filled with this code's version when reach is on and none is given
+    # (the learner's config then pins it for every worker); a worker whose fastreach computes another version refuses
+    # to build the extractor (as path_sha256 for the reference line). None without the block.
+    reach_version: str | None = None
 
     def __post_init__(self):
         if self.reach:
             self.version = REACH_FEATURE_VERSION
-        elif self.version == REACH_FEATURE_VERSION:  # an f7 label without the block: the f6 layout
-            self.version = FEATURE_VERSION
+            if self.reach_version is None:
+                from .reach_features import reach_version
+                self.reach_version = reach_version()
+        else:
+            self.reach_version = None
+            if self.version == REACH_FEATURE_VERSION:  # an f7 label without the block: the f6 layout
+                self.version = FEATURE_VERSION
 
     def to_dict(self):
         return asdict(self)
@@ -301,6 +311,20 @@ def make_layout(c: FeatureConfig) -> list:
     return L
 
 
+def layout_slices(c: FeatureConfig) -> dict:
+    """{block name: slice} of the vector under config c, from make_layout only (no extractor: the learner never needs
+    numba or the fields, also with the f7 block)."""
+    out, o = {}, 0
+    for n, k in make_layout(c):
+        out[n] = slice(o, o + k)
+        o += k
+    return out
+
+
+def layout_size(c: FeatureConfig) -> int:
+    return sum(k for _, k in make_layout(c))
+
+
 class FeatureExtractor:
     def __init__(self, config: FeatureConfig | None = None):
         self.cfg = config or FeatureConfig()
@@ -312,7 +336,7 @@ class FeatureExtractor:
         self.reach = None
         if self.cfg.reach:  # cheap: the numba check only; the fields are loaded at the first state with a ball
             from .reach_features import ReachBlock
-            self.reach = ReachBlock(body_radius=self.cfg.body_radius)
+            self.reach = ReachBlock(body_radius=self.cfg.body_radius, expect_version=self.cfg.reach_version)
 
     # layout -------------------------------------------------------------------------------
     def _make_layout(self):

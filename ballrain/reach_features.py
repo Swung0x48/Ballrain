@@ -13,6 +13,10 @@ Scaling (docs/observations.md, f7): flags and normals as they are; times (air_t_
 lengths and speed deficits (fastreach caps them at +-L_MAX = +-CLIP_V = 20) / 20; then clipped to [-1, 1].
 Directions: the 8 key directions of fastreach (DIR_NAMES: up, down, left, right, up_left, up_right, down_left,
 down_right = reach.KEY_COMBOS = env.ARROWS9[1:]) under the camera quarter of the policy's actions (0 with world actions).
+
+Version pin: reach_version() names everything that defines the block's values (fastreach BUILD_VERSION: the fields;
+QUERY_VERSION: perceive; BLOCK_VERSION here: names, order, scaling, zones, bodies); FeatureConfig.reach_version records
+it and ReachBlock refuses another (tests/test_reach_obs.py pins a digest of the names and scales to BLOCK_VERSION).
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ import numpy as np
 from . import fastreach as FR
 from .state import BALL_NAME_TYPES, G_STOPPER
 
+BLOCK_VERSION = 1  # bump with any change of this module's output for the same perceive vector (scaling, zones, bodies)
 N_REACH = FR.N_FEATURES
 REACH_NAMES = FR.FEATURE_NAMES
 T_SCALE = FR.N_PSI / 132.0  # air times are n PSI / 132 (s): the 3 s horizon -> 1
@@ -53,6 +58,11 @@ SCALE = _scale_vector()
 _FIELDS: "OrderedDict[str, FR.FastReach]" = OrderedDict()
 _FIELDS_MAX = 2
 _STATE: dict = {}  # (id(LevelData), version) -> (LevelData, fields key, zone array, canonical triangles or None)
+
+
+def reach_version() -> str:
+    """The f7 block version of this code (FeatureConfig.reach_version)."""
+    return f"fastreach{FR.BUILD_VERSION}.{FR.QUERY_VERSION}-block{BLOCK_VERSION}"
 
 
 def require_numba() -> None:
@@ -121,8 +131,18 @@ def scale(raw) -> np.ndarray:
     return np.clip(v, -1.0, 1.0)
 
 
+class ReachVersionError(RuntimeError):
+    pass
+
+
 class ReachBlock:
-    def __init__(self, cache_dir=None, body_radius: float = 60.0):
+    def __init__(self, cache_dir=None, body_radius: float = 60.0, expect_version: str | None = None):
+        """expect_version: FeatureConfig.reach_version (None: unchecked); another version than this code's is refused
+        before anything is computed."""
+        if expect_version is not None and expect_version != reach_version():
+            raise ReachVersionError(f"FeatureConfig.reach_version {expect_version!r}: this worker's reach block is "
+                                    f"{reach_version()!r} (ballrain/fastreach.py, ballrain/reach_features.py); the "
+                                    "policy was trained on another block, update the worker's code")
         require_numba()
         self.cache_dir = cache_dir
         self.body_radius = body_radius
