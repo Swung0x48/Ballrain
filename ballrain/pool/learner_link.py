@@ -93,6 +93,20 @@ def state_from_params(template: dict, msg: dict) -> dict:
     return state
 
 
+# what makes a chunk's observations and rewards mean the same to the learner: the feature version, the reference
+# line, the route bundle (branch pin, v1 or multi-branch v2) and the reach block version. A chunk whose policy pinned
+# other values (a re-pinned learner: --branch-update) is never fed.
+IDENTITY_KEYS = ("version", "path_sha256", "branch_sha256", "reach_version")
+
+
+def feature_identity(features) -> tuple | None:
+    """IDENTITY_KEYS of a manifest's features dict or the template's FeatureConfig; None when there is none."""
+    if features is None:
+        return None
+    get = features.get if isinstance(features, dict) else (lambda k: getattr(features, k, None))
+    return tuple(get(k) or None for k in IDENTITY_KEYS)
+
+
 DEFAULT_MAX_LAG = 300  # train_m2 --pool-max-lag's default (the template's pool_max_lag when the learner sends it)
 
 
@@ -114,6 +128,7 @@ class LearnerLink:
         self._published_t = -1e18
         self.version = None  # newest learner update seen
         self._versions: dict = {}  # policy_sha -> learner update of its weights (manifest source.update)
+        self._identity: dict = {}  # policy_sha -> feature_identity of its manifest
         self.stop_event = threading.Event()
         self.learner_ingests = False  # the hub's template says the learner runs with --pool-ingest
         self._refused_logged = False
@@ -199,20 +214,46 @@ class LearnerLink:
         instead of being decoded, sent and dropped. Returns the number marked."""
         self._stale_pass_done = True
         lim = version - self.max_lag()
-        old = []
+        old, other_pin = [], []
         for sha in self.store.releasable_policies():
             try:
                 run, v = self._version_of(sha)
+                same = self._same_identity(sha)
             except Exception:  # noqa: BLE001  (an unreadable manifest: feed_once marks those -1)
                 continue
-            if run == self.run and v < lim:
+            if run != self.run:
+                continue
+            if not same:
+                other_pin.append(sha)
+            elif v < lim:
                 old.append(sha)
         n, st = self.store.mark_stale_policies(old)
+        n2, st2 = self.store.mark_stale_policies(other_pin)
         if n:
-            self.counts["stale"] = self.counts.get("stale", 0) + n
             self.log(f"learner link: {n} released chunks ({st} steps) more than {self.max_lag()} updates behind the "
                      f"learner (update {version}) marked stale, not fed")
-        return n
+        if n2:
+            self.log(f"learner link: {n2} released chunks ({st2} steps) of {len(other_pin)} policies with other "
+                     f"features than the learner's {self._learner_identity()} (a re-pinned route or reference line) "
+                     "marked stale, not fed")
+        self.counts["stale"] = self.counts.get("stale", 0) + n + n2
+        return n + n2
+
+    def _learner_identity(self):
+        env = (self.template or {}).get("env")
+        feats = env.get("features") if isinstance(env, dict) else getattr(env, "features", None)
+        return feature_identity(feats)
+
+    def _same_identity(self, sha: str) -> bool:
+        """The chunk policy's features (manifest) pin what the learner's template pins (IDENTITY_KEYS); True when
+        the template carries no features (nothing to compare)."""
+        want = self._learner_identity()
+        if want is None:
+            return True
+        if sha not in self._identity:
+            m = W.read_manifest(self.pool_dir / "weights" / f"{sha}.json")
+            self._identity[sha] = feature_identity(m.get("features"))
+        return self._identity[sha] == want
 
     def _lost(self):
         c, self.conn = self.conn, None
@@ -294,8 +335,8 @@ class LearnerLink:
             if run != self.run:  # a chunk of another run (an older gateway policy): never this learner's data
                 other.append((r["task_id"], r["seq"]))
                 continue
-            if version - ver > self.max_lag():  # the learner would drop it (lag > pool_max_lag): not sent
-                stale.append((r["task_id"], r["seq"]))
+            if version - ver > self.max_lag() or not self._same_identity(r["policy_sha"]):
+                stale.append((r["task_id"], r["seq"]))  # the learner would drop it (lag), or another route: not sent
                 continue
             try:
                 from .server_verify import read_reach_patch
