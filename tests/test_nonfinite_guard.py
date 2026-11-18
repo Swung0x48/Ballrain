@@ -398,13 +398,13 @@ def test_nonfinite_keys_names_what_must_not_be_saved_or_published():
 # ============================================================================================== the learner (fake run)
 
 DRIVER = r"""
-import functools, sys
+import sys
 import numpy as np
 sys.path.insert(0, sys.argv[1])
 import ballrain.train.nonfinite as nonfinite
 import ballrain.train.ppo as ppo
 import train_m2
-first_bad, last_bad, limit = (int(x) for x in sys.argv[2:5])
+first_bad, last_bad, raw_bad, limit = (int(x) for x in sys.argv[2:6])
 gae, normalize, update = ppo.gae, ppo.normalize, [1]  # the first batch only fits the statistics (no normalize call)
 def counting_normalize(*a, **kw):  # the learner normalises each batch once: the number of the update it builds
     update[0] += 1
@@ -414,20 +414,27 @@ def bad_gae(*a, **kw):  # a NaN advantage in every chunk of the updates first_ba
     if first_bad <= update[0] <= last_bad:
         adv[0] = np.nan
     return adv, ret
-ppo.normalize, ppo.gae = counting_normalize, bad_gae
-nonfinite.NonFiniteGuard = functools.partial(nonfinite.NonFiniteGuard, max_consecutive=limit)
-raise SystemExit(train_m2.main(sys.argv[5:]))
+class Guard(nonfinite.NonFiniteGuard):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, max_consecutive=limit, **kw)
+    def check(self, update, chunks, arrays, *a, **kw):
+        if update == raw_bad and "raw" in arrays:  # an inf in the array the learner is about to give its statistics
+            arrays["raw"][3, 0] = np.inf
+        return super().check(update, chunks, arrays, *a, **kw)
+ppo.normalize, ppo.gae, nonfinite.NonFiniteGuard = counting_normalize, bad_gae, Guard
+raise SystemExit(train_m2.main(sys.argv[6:]))
 """
 
 
-def _learner(tmp_path, record, first_bad, last_bad, limit, *extra):
-    """scripts/train_m2.py --fake (one worker, about six updates) with NaN advantages in some updates. Returns (exit
-    code, output, run directory)."""
+def _learner(tmp_path, record, first_bad, last_bad, limit, *extra, raw_bad=0, steps=3000):
+    """scripts/train_m2.py --fake (one worker, a checkpoint per update) with NaN advantages in the updates first_bad ..
+    last_bad and an inf raw observation in update raw_bad. Returns (exit code, output, run directory)."""
     import os
     env = dict(os.environ, BALLRAIN_RUNTIME=str(tmp_path / "rt"))
-    args = [sys.executable, "-c", DRIVER, str(REPO / "scripts"), str(first_bad), str(last_bad), str(limit),
-            "--run", "nan", "--fake", "--workers", "1", "--total-steps", "3000", "--batch-steps", "512", "--chunk", "64",
-            "--minibatch", "256", "--epochs", "1", "--log-every", "1", "--ckpt-every", "1", "--record", str(record), *extra]
+    args = [sys.executable, "-c", DRIVER, str(REPO / "scripts"), str(first_bad), str(last_bad), str(raw_bad), str(limit),
+            "--run", "nan", "--fake", "--workers", "1", "--total-steps", str(steps), "--batch-steps", "512",
+            "--chunk", "64", "--minibatch", "256", "--epochs", "1", "--log-every", "1", "--ckpt-every", "1",
+            "--ckpt-keep-every", "1", "--record", str(record), *extra]
     p = subprocess.run(args, env=env, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        encoding="utf-8", timeout=600)
     return p.returncode, p.stdout, tmp_path / "rt" / "m2-train" / "nan"
@@ -441,29 +448,35 @@ def record(tmp_path_factory):
     return dev.fake_record(tmp_path_factory.mktemp("nonfinite-record"))
 
 
-def test_learner_skips_a_non_finite_update_and_goes_on(tmp_path, record):
-    code, out, run = _learner(tmp_path, record, 4, 4, MAX_CONSECUTIVE)
+def test_learner_skips_non_finite_updates_and_goes_on(tmp_path, record):
+    # eight updates: 1 fits the statistics, 4 has NaN advantages, 6 an inf raw observation, the others train
+    code, out, run = _learner(tmp_path, record, 4, 4, MAX_CONSECUTIVE, raw_bad=6, steps=3600)
     assert code == 0, out[-3000:]
     assert "NON-FINITE batch at u4 (adv): update skipped, parameters unchanged; own rows 8 (workers 0), pool rows 0; " \
            "dump nonfinite-u4.npz; skipped 1, in a row 1" in out
-    assert [f.name for f in run.glob("nonfinite-u*.npz")] == ["nonfinite-u4.npz"]
+    assert "NON-FINITE batch at u6 (raw): update skipped, parameters unchanged; own rows 1 (workers 0), pool rows 0; " \
+           "dump nonfinite-u6.npz; skipped 2, in a row 1" in out
+    assert sorted(f.name for f in run.glob("nonfinite-u*.npz")) == ["nonfinite-u4.npz", "nonfinite-u6.npz"]
     d = _load(run / "nonfinite-u4.npz")
     assert d["obs"].shape[0] == d["adv"].shape[0] == d["values"].shape[0] >= 512 and int(d["bad_rows"].sum()) == 8
-    ck = {u: torch.load(run / f"ckpt_{u:06d}.pt", weights_only=False) for u in (3, 4, 5)}
-    for k in ("model", "opt", "rms"):  # the skipped update left policy, optimiser and statistics alone; the next one trains
-        assert _eq(ck[4][k], ck[3][k]), k
-        assert not _eq(ck[5][k], ck[4][k]), k
-    assert ck[3]["counters"]["nonfinite_skipped"] == 0 and ck[4]["counters"]["nonfinite_skipped"] == 1
-    assert ck[4]["counters"]["update"] == 4 and ck[4]["counters"]["steps"] > ck[3]["counters"]["steps"]
+    d = _load(run / "nonfinite-u6.npz")
+    assert np.isinf(d["raw"][3, 0]) and np.flatnonzero(d["bad_rows"]).tolist() == [3] and "obs" not in d
+    ck = {u: torch.load(run / f"ckpt_{u:06d}.pt", weights_only=False) for u in range(2, 9)}
+    for u in range(3, 9):  # a skipped update leaves policy, optimiser and observation statistics alone; the others train
+        for k in ("model", "opt", "rms"):
+            assert _eq(ck[u][k], ck[u - 1][k]) == (u in (4, 6)), (u, k)
+        assert ck[u]["counters"]["update"] == u and ck[u]["counters"]["steps"] > ck[u - 1]["counters"]["steps"]
+    assert [ck[u]["counters"]["nonfinite_skipped"] for u in range(2, 9)] == [0, 0, 1, 1, 2, 2, 2]
     last = torch.load(run / "latest.pt", weights_only=False)
-    assert last["counters"]["update"] >= 5 and last["counters"]["nonfinite_skipped"] == 1
+    assert last["counters"]["update"] == 8 and last["counters"]["nonfinite_skipped"] == 2
     assert not nonfinite_keys({k: last[k] for k in ("model", "opt", "rms")})
     with open(run / "updates.csv", encoding="utf-8") as fh:
         rows = {int(r["update"]): r for r in csv.DictReader(fh)}
-    assert [rows[u]["nonfinite_skipped"] for u in (3, 4, 5)] == ["0", "1", "1"]
-    assert rows[3]["u_pg_loss"] and not rows[4]["u_pg_loss"] and rows[5]["u_pg_loss"]  # no losses for the skipped one
-    logs = {u: next(s for s in out.splitlines() if f" u{u} steps " in s) for u in (3, 4, 5)}
+    assert [rows[u]["nonfinite_skipped"] for u in range(3, 8)] == ["0", "1", "1", "2", "2"]
+    assert [bool(rows[u]["u_pg_loss"]) for u in range(3, 8)] == [True, False, True, False, True]  # no losses when skipped
+    logs = {u: next(s for s in out.splitlines() if f" u{u} steps " in s) for u in range(3, 8)}
     assert "nonfinite" not in logs[3] and logs[4].endswith(" nonfinite_skipped 1") and logs[5].endswith(" nonfinite_skipped 1")
+    assert logs[6].endswith(" nonfinite_skipped 2") and logs[7].endswith(" nonfinite_skipped 2")
 
     # a checkpoint with a non-finite parameter is refused before any worker starts
     last["model"]["pi.0.weight"][0, 0] = float("nan")
