@@ -124,6 +124,12 @@ class WorkerSpec:
     # respawn_level_starts: in a process started from level load (k = 0) every respawn life is played, whatever
     # p_early_respawn says (from-spawn training: the agent's own approach, deaths and respawns included); getattr-read
     respawn_level_starts: bool = False
+    # counter randomisation (off when empty): in a game process not started from level load (TAS / at-rest starts and
+    # their respawns) every life draws one set of counter-feature values and the observations of that life carry them
+    # instead of the true ones: {"lives": {"values": [...], "p": [...]} (replaced), "sr_s": [lo, hi], "points": [lo, hi]
+    # (uniform offsets added)}, raw feature units. Level-start processes keep their true counters. L1 r7: TAS starts
+    # always see 3 lives, and a from-spawn life with fewer took the 小节-4 spiral corners fatally. getattr-read
+    counter_rand: dict = field(default_factory=dict)
     wall_gap: float = 0.1
     wall_max_ny: float = 0.5
     wall_min_rise: float = 2.0
@@ -284,6 +290,8 @@ class Worker:
         self.gen = torch.Generator().manual_seed(spec.seed)
         self._trace_rng = np.random.default_rng(spec.seed + 99991)
         self._respawn_rng = np.random.default_rng(spec.seed + 104729)
+        self._counter_rng = np.random.default_rng(spec.seed + 130363)
+        self._cr: dict | None = None  # feature slice -> ("set" | "add", value) of the current life (counter_rand)
         self.env = None
         self.fx_info = {}
         self.curriculum_state = None
@@ -308,7 +316,7 @@ class Worker:
         def compute(tracker):
             o, fi = orig(tracker)
             self.fx_info = fi
-            return o, fi
+            return self._counter_apply(o), fi
         self.env.fx.compute = compute
         st = self.env.starts
         if st is not None:
@@ -514,6 +522,34 @@ class Worker:
         except OSError as e:
             self.errors.append(f"prune {d}: {e}")
 
+    def _counter_draw(self) -> dict | None:
+        """counter_rand: the counter values of the life that just started (None: true counters). Off in processes started
+        from level load (process_start_frame 0) and when the layout has no such feature."""
+        cr = getattr(self.spec, "counter_rand", None) or {}
+        st = getattr(self.env, "_start", None) or {}
+        if not cr or int(st.get("process_start_frame") or 0) == 0:
+            return None
+        sl = self.env.fx.slices()
+        draw, out = {}, {}
+        if "lives" in cr and "lives" in sl:
+            vals = [float(v) for v in cr["lives"]["values"]]
+            p = cr["lives"].get("p")
+            draw["lives"] = float(vals[int(self._counter_rng.choice(len(vals), p=p))])
+            out[sl["lives"]] = ("set", draw["lives"])
+        for k in ("sr_s", "points"):
+            if k in cr and k in sl:
+                draw[k] = float(self._counter_rng.uniform(float(cr[k][0]), float(cr[k][1])))
+                out[sl[k]] = ("add", draw[k])
+        st["counter_rand"] = draw
+        return out or None
+
+    def _counter_apply(self, o):
+        if self._cr and o is not None:
+            o = np.array(o, copy=True)
+            for s_, (op, v) in self._cr.items():
+                o[s_] = v if op == "set" else o[s_] + v
+        return o
+
     def _reset(self, new_process: bool = False):
         """new_process: end the current game process (e.g. a skipped early respawn) and start a new curriculum start."""
         fails = 0
@@ -521,7 +557,10 @@ class Worker:
             self.env.cfg.trace = bool(self._trace_rng.random() < self.spec.trace_sample)
         while True:
             try:
+                self._cr = None  # the reset observation is computed with the true counters, then the new life's set
                 obs, info = self.env.reset(options={"new_process": True} if new_process else None)
+                self._cr = self._counter_draw()
+                obs = self._counter_apply(obs)
                 self._collect_runs()
                 return obs, info
             except Exception as e:  # noqa: BLE001  launch failure, hand-over mismatches, crashed game

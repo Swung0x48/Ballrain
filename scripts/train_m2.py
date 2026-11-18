@@ -202,6 +202,10 @@ def parse(argv=None):
     p.add_argument("--stall-max-s", type=float, default=15.0, help="with --stall-speed: max time without new arc progress")
     p.add_argument("--rest-starts", default="", help="at-rest starts: lo-hi record frame ranges, e.g. 11760-11900,13450-13650; "
                    "lo-hi@x:z:jitter drives the ball to a target in [x +- jitter] x [z +- jitter] before braking")
+    p.add_argument("--counter-rand", default="",
+                   help='counter randomisation on TAS / at-rest starts (WorkerSpec.counter_rand), JSON, e.g. '
+                   '{"lives": {"values": [0.0, 0.1, 0.2, 0.3], "p": [0.2, 0.2, 0.2, 0.4]}, "sr_s": [0, 0.3], '
+                   '"points": [-0.05, 0.45]}')
     p.add_argument("--respawn-level-starts", action="store_true",
                    help="play every respawn of a process started from level load (WorkerSpec.respawn_level_starts)")
     p.add_argument("--p-rest", type=float, default=0.0, help="probability of an at-rest start for a new process")
@@ -516,6 +520,7 @@ def main(argv=None) -> int:
                           wall_max_progress=a.wall_max_progress, wall_push_everywhere=a.wall_push_everywhere,
                           zone_stall_exempt=a.zone_stall_exempt, rail_gate=json.loads(a.rail_gate) if a.rail_gate else {},
                           respawn_level_starts=a.respawn_level_starts,
+                          counter_rand=json.loads(a.counter_rand) if a.counter_rand else {},
                           launcher_factory=FakeLauncher if a.fake else None)
 
     hub = None
@@ -564,7 +569,8 @@ def main(argv=None) -> int:
                                "wall_min_rise": a.wall_min_rise, "wall_max_progress": a.wall_max_progress,
                                "wall_push_everywhere": a.wall_push_everywhere, "zone_stall_exempt": a.zone_stall_exempt,
                                "rail_gate": json.loads(a.rail_gate) if a.rail_gate else {},
-                               "respawn_level_starts": a.respawn_level_starts}}
+                               "respawn_level_starts": a.respawn_level_starts,
+                               "counter_rand": json.loads(a.counter_rand) if a.counter_rand else {}}}
         hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):
