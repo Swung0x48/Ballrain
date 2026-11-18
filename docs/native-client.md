@@ -95,25 +95,32 @@ Python 同种子跑两次（`policy_s1` / `policy_s1b`），C++ 与 Python 之�
 其余段（TIME、BALL、FRIC、MIND、BODY、CAMS、ARRS、EVTS、WTCH、PHYS、HASH，以及全量 level.msg 和其它增量段）逐字节相同。
 所以 M2 的哈希链不能直接哈希引擎原始字节：要么把 SCOR / SREN 的 Energy 第 4 列置零、跳过 IVPO（特征不读它们），要么只哈希特征读到的那些段。
 
+后来查到的跨机器 / 跨安装差别（Android 会话在 Windows 引擎和 3 台手机之间逐字段比过；本机用另一个游戏目录复现了后两项）：
+- WTCH 的装饰物体位置在 MSVC CRT 和 bionic 之间差 1 ulp（3 台手机之间相同）；
+- level.msg 的 GameSettings 第 0 行第 3 列是游戏目录的路径串；
+- level.msg 的 GRPS 里 All_Musicfiles 组的成员取决于 Sounds/ 里有哪些文件；
+- IVPO 的漏发取决于堆的历史（同一台手机换一份游戏数据也会变）。
+链 v3 把这些都去掉了（`pool-prototype.md` §3.2）；其余段（BALL / FRIC / MIND / BODY / GLCT / CAMS / ARRS 数值 / TIME / EVTS）、帧日志、事件和 f6 特征在 Windows 和手机之间逐位相同。
+
 跨引擎构建：同一组动作在另一个构建 `bin-x86soft`（x87-soft 构建，`runtime/hl-win`）上回放，结果与上面完全一样（只有同样的指针字段不同，TraceHash 相同）。
 但两个都是 Windows x86 MSVC 构建；**Mac arm64 / Linux 的引擎构建之间这些段是否逐字节相同还没验证**——CK 侧（相机、WTCH 装饰物体）是原生浮点代码，
 `headless.md` §7 里零售与无头的差异正出在这些段上。M2 的链设计要先把这一点查清（或者只哈希物理侧的段）。
 
 ## 5. M2：池协议客户端，校验不再依赖跨 CPU 逐位一致
 
-### 5.1 校验方式改了（Python 侧，链 v2）
+### 5.1 校验方式改了（Python 侧，链 v3）
 
 **适用范围先说清楚**：本机上原生客户端算出的特征和 Python 逐位相同，所以端到端测试里验证器的容差其实**没有被原生客户端用到**；
 容差确实能放过跨 CPU 级别的舍入、又抓得住伪造，证据只有 Python 测试（`test_float_noise_of_another_cpu_is_tolerated` 和伪造测试）。
 
 以前数据段的哈希链覆盖每行的 float32 特征，验证器重放时要逐位复现——这等于要求志愿者的 CPU / 编译器算出的特征和服务端逐位相同。现在（`pool-prototype.md` §3.2、§10.6）：
 
-- **链覆盖引擎原始字节**：每行的引擎摘要 = 上一行之后收到的全部 OBS1 消息和关卡消息读取（规范化：去掉带地址的 SCOR、SREN、IVPO），
+- **链覆盖引擎原始字节**：每行的引擎摘要 = 上一行之后收到的全部 OBS1 消息和关卡消息读取（规范化：去掉随机器、进程或安装变化的 SCOR、SREN、WTCH、IVPO、GRPS 和字符串单元的内容），
   `h(i) = sha256(h(i-1) || d_i)`（`ballrain/pool/engine_chain.py`，`native/core/src/engine_chain.cpp`）。引擎是确定的，验证器的重放必须逐位复现这条链。
 - **验证器自己算特征**，float16 观测在一个 float16 ulp + 1e-4 内即可；log-prob / 价值用验证器自己的特征和原有的 `LOGP_TOL` / `VALUE_TOL` 比；
   动作必须是服务端种子的抽取，或者 `u` 落在累积分布边界的 `ACTION_EPS` 内；奖励、env_rewards 在 1e-4 × max(1, |r|) 内，弧长在 1e-3 × max(1, |arc|) 内；flags、end、sector、帧数、IGT 逐位。
-- 数据段格式号 `CHUNK_FORMAT` 改成 2（旧的段在新链上本来就对不上），客户端版本号改成 0.2.0，网关默认 `min_client_version = "0.2.0"`：
-  旧的 0.1.0 主控程序在 hello 时就收到 `client_too_old`，而不是之后每段都 `bad_chunk`。正在用的网关如果在 `config.toml` 里自己写了 `min_client_version`，要改成 0.2.0；
+- 数据段格式号 `CHUNK_FORMAT` 改成 3（2 是链 v2：它还包含 WTCH、GRPS 和路径单元，游戏目录路径不同的诚实玩家都会对不上），客户端版本号 0.3.0，网关默认 `min_client_version = "0.3.0"`：
+  旧的 0.1.0 / 0.2.0 主控程序在 hello 时就收到 `client_too_old`，而不是之后每段都 `bad_chunk`。正在用的网关如果在 `config.toml` 里自己写了 `min_client_version`，要改成 0.3.0；
   已经存在网关目录里的格式 1 数据段，验证器解不开，会停在 `replay_failed`（不影响账号）。
 - Python 主控程序（`client_sampler`）和验证器（`rollout`）同步改了；测试：`tests/test_pool_engine_chain.py`（规范记录、字节布局）、
   `test_pool_verifier.py` 新增“另一种 CPU 的浮点噪声照常通过”和“伪造引擎状态并重算链”两项。池子相关测试 102 项通过、4 项跳过
@@ -142,6 +149,7 @@ Python 同种子跑两次（`policy_s1` / `policy_s1b`），C++ 与 Python 之�
 | 客户端 `bin-x86soft`，验证器 `bin-x86soft` | 2 个（LevelFinish 2738 步；max_steps 3000 步），开局 k 来自 r7 的课程（前沿 4100 附近） | 23 段全部接收 | **23/23 通过**，5738 步通过验证 |
 | 客户端 `bin-x86p2002d` + `BALLRAIN_HL_PHYS2002=0`，验证器 `bin-x86soft`（两个不同的 x87-soft 构建） | 4 个，都 LevelFinish（1645 / 3877 / 2729 / 1495 步） | 40 段全部接收 | **40/40 通过**，9746 步通过验证 |
 | 伪造：把一段原生数据段第 10 步的奖励加 0.25 并重新封装，交给验证器的 `replay_task` | — | — | 报 `replay_reward_mismatch`，第 10 步 |
+| 链 v3 之后：客户端用 `bin-x86p2002d` + 另一个游戏目录（另一路径、只有 base.cmo / Database.tdb / 3D Entities / Text / Bin\VxMath.dll，没有 Sounds），验证器用 `bin-x86soft` + 完整目录 | 3 个（LevelFinish ×2、max_steps） | 30 段 | **30/30 通过**（链 v2 下同样的组合每一行都对不上） |
 
 第三次运行（3 个任务、41 段，网关心跳间隔设成 5 秒）：客户端发了 2 次心跳都被接受，41/41 通过。客户端在任务里约 300–990 步/秒（含每段上传）；验证器重放约 200–350 步/秒。
 

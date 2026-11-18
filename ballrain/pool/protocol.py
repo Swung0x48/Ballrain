@@ -22,7 +22,7 @@ choose them. A zstd section is decompressed with an output bound equal to the ex
 at most 8 MiB; its stored size may not exceed zstd_bound(decoded size) (no padded frames), a raw section's stored size
 is exactly its decoded size.
 
-Engine-state hash chain (chain v2, per task, across its chunks; ballrain.pool.engine_chain): h(-1) =
+Engine-state hash chain (chain v3, per task, across its chunks; ballrain.pool.engine_chain): h(-1) =
 chain_seed(task_id), h(i) = sha256(h(i-1) || d_i), d_i = the digest of the canonical engine messages (OBS1 and LVL1
 bytes, address-carrying fields left out) received after row i-1 up to row i, over the task's observation rows (the
 observation before each step, plus the one after the last step). Chunk seq s carries rows i = step0 .. step0 + steps
@@ -46,7 +46,7 @@ import numpy as np
 from .reasons import Reason, payload
 
 PROTOCOL_VERSION = 1
-CHUNK_FORMAT = 2  # 2: the obs_hash chain is over the engine state (chain v2), not the float32 rows
+CHUNK_FORMAT = 3  # 2: the obs_hash chain over the engine state (chain v2); 3: chain v3 (machine-dependent fields out)
 CHUNK_MAGIC = b"BRPC"
 _PREAMBLE = struct.Struct("<4sHHI")
 

@@ -110,7 +110,7 @@ def test_chunk_round_trip_and_chain(task_chunks):
     d = _digests(obs)
     assert bytes(chain[0]) == hashlib.sha256(P.chain_seed(TID) + d[0]).digest()
     assert bytes(chain[1]) == hashlib.sha256(bytes(chain[0]) + d[1]).digest()
-    assert P.chain_seed(TID) == hashlib.sha256(b"ballrain-pool/engine-chain/v2\0" + TID.encode()).digest()
+    assert P.chain_seed(TID) == hashlib.sha256(b"ballrain-pool/engine-chain/v3\0" + TID.encode()).digest()
     # the float16 copy is checked with a tolerance against the verifier's own float32 features
     assert P.obs_close(c1.arrays["obs"][3], r1[3])
     near = r1[3] + np.float32(5e-5)  # another CPU's rounding: within OBS_TOL beyond the float16 step
@@ -314,7 +314,7 @@ def test_oversize_rejected(task_chunks):
 # ============================================================================================== messages
 
 def _hello(**over):
-    d = dict(client_version="0.2.0", platform="windows",
+    d = dict(client_version="0.3.0", platform="windows",
              engine={"kind": "2002", "sha256": "c" * 64, "version": "1.0"},
              game_files={n: "d" * 64 for n in P.GAME_FILE_LIST_2002}, instances=4)
     d.update(over)
@@ -354,7 +354,7 @@ def test_every_message_kind_has_a_valid_example():
             "greedy": False, "assets": {"starts": "c" * 64, "path": "d" * 64}}
     stats = {"steps_accepted": 1, "steps_pending": 0, "steps_verified": 1, "chunks_accepted": 1, "chunks_rejected": 0}
     examples = {
-        "login_start": dict(client_version="0.2.0"),
+        "login_start": dict(client_version="0.3.0"),
         "login_started": dict(login_id="L" * 16, poll_secret="s" * 32, browser_url="https://example.invalid/pool/login", user_code="ABCD-EF23",
                               expires_in_s=600, poll_s=2),
         "login_poll": dict(login_id="L" * 16, poll_secret="s" * 32),

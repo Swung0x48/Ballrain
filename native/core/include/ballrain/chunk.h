@@ -1,4 +1,4 @@
-// Pool chunks (ballrain/pool/protocol.py encode_chunk, CHUNK_FORMAT 2): b"BRPC", u16 format, u16 flags, u32 hlen,
+// Pool chunks (ballrain/pool/protocol.py encode_chunk, CHUNK_FORMAT 3): b"BRPC", u16 format, u16 flags, u32 hlen,
 // the canonical JSON header, the array sections (raw or zstd), sha256 over everything before it.
 #pragma once
 
@@ -12,7 +12,7 @@
 
 namespace ballrain {
 
-constexpr uint16_t CHUNK_FORMAT = 2;
+constexpr uint16_t CHUNK_FORMAT = 3;
 constexpr int PROTOCOL_VERSION = 1;
 constexpr double MIN_LOGP = -60.0;
 constexpr uint8_t FLAG_TERMINATED = 1, FLAG_TRUNCATED = 2;

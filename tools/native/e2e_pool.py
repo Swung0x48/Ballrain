@@ -91,6 +91,8 @@ def main(argv=None) -> int:
     ap.add_argument("--game", required=True)
     ap.add_argument("--client", required=True)
     ap.add_argument("--client-engine", help="the client's engine binary (default --engine; the verifier always uses --engine)")
+    ap.add_argument("--client-game", help="the client's Ballance folder (default --game; another path / install = the "
+                    "machine-dependent parts of the level message differ)")
     ap.add_argument("--client-engine-env", action="append", default=[], help="NAME=VALUE for the client's engine")
     ap.add_argument("--tasks", type=int, default=3)
     ap.add_argument("--max-steps", type=int, default=3000)
@@ -99,6 +101,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     a.client, a.engine, a.game = (str(Path(x).resolve()) for x in (a.client, a.engine, a.game))
     a.client_engine = str(Path(a.client_engine).resolve()) if a.client_engine else a.engine
+    a.client_game = str(Path(a.client_game).resolve()) if a.client_game else a.game
     d = Path(a.dir).resolve()
     if d.exists():
         shutil.rmtree(d)
@@ -145,7 +148,7 @@ def main(argv=None) -> int:
 
     # ---- the native client plays tasks
     t0 = time.time()
-    p = subprocess.run([a.client, "run", "--gateway", gateway, "--data-dir", str(client_dir), "--ballance-dir", a.game,
+    p = subprocess.run([a.client, "run", "--gateway", gateway, "--data-dir", str(client_dir), "--ballance-dir", a.client_game,
                         "--engine", a.client_engine, "--tasks", str(a.tasks)]
                        + [x for kv in a.client_engine_env for x in ("--engine-env", kv)], capture_output=True, text=True, encoding="utf-8",
                        timeout=3600)

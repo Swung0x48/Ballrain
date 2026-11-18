@@ -11,7 +11,7 @@
     min_account_days = 30
     min_replies = 5
     max_instances = 8
-    min_client_version = "0.2.0"     # 0.2: chunk format 2 (engine-state chain); older clients get client_too_old
+    min_client_version = "0.3.0"     # 0.3: chunk format 3 (engine-state chain v3); older clients get client_too_old
     heartbeat_s = 30
     task_poll_s = 10
     trust_forwarded = true             # required when public_base_url is https (the tunnel): rate limits per
@@ -89,7 +89,7 @@ class PoolConfig:
     min_account_days: int = 30
     min_replies: int = 5
     max_instances: int = 8
-    min_client_version: str = "0.2.0"  # chunk format 2
+    min_client_version: str = "0.3.0"  # chunk format 3
     heartbeat_s: int = 30
     task_poll_s: int = 10
     session_ttl_s: int = 900
@@ -147,7 +147,7 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
     return PoolConfig(
         pool_dir=pool_dir, public_base_url=public, forum=forum,
         min_account_days=int(po.get("min_account_days", 30)), min_replies=int(po.get("min_replies", 5)),
-        max_instances=min(int(po.get("max_instances", 8)), 64), min_client_version=str(po.get("min_client_version", "0.2.0")),
+        max_instances=min(int(po.get("max_instances", 8)), 64), min_client_version=str(po.get("min_client_version", "0.3.0")),
         heartbeat_s=int(po.get("heartbeat_s", 30)), task_poll_s=int(po.get("task_poll_s", 10)),
         trust_forwarded=bool(po.get("trust_forwarded", False)),
         run=str(pl.get("run", "r6")),

@@ -305,7 +305,7 @@
 
 ```
 magic   "BRPC"                   4 字节
-format  u16 = 2                  2    （2：哈希链改成引擎状态链 v2，第 3.2 节）
+format  u16 = 3                  2    （2：引擎状态链 v2；3：链 v3，去掉随机器变的字段，第 3.2 节）
 flags   u16 = 0                  2
 hlen    u32                      4
 header  JSON（UTF-8，规范形式）    hlen 字节，上限 16 KiB
@@ -349,17 +349,22 @@ digest  sha256                   32 字节，覆盖它前面的全部内容
 9. 每段解码后的大小必须精确等于预期（zstd 解压时输出上限就是预期大小，防解压炸弹；窗口最大 8 MiB，`window_log_max = 23`），再核对 sha256。raw 段的存储大小必须等于解码大小；zstd 段的存储大小不能超过 `zstd_bound(解码大小) = n + n/128 + 64`（高于 libzstd 的 compressBound），所以不能用空块把一段撑大；
 10. 内容：浮点有限、动作小于 n_act、log-prob 在范围内、flags 位合法、最后一段的最后一步必须结束。
 
-### 3.2 引擎状态哈希链（链 v2，2026-11-17 起；原生客户端 M2）
+### 3.2 引擎状态哈希链（链 v3，2026-11-18 起；原生客户端 M2）
 
 链覆盖的是**引擎发来的原始字节**，不是从它算出来的 float32 特征。原因：志愿者可能用原生 C++ 客户端，或者在另一种 CPU / 编译器上算特征，
 float 的舍入会有极小的差别；引擎（x87-soft）本身是确定的，同一组按键给出同样的字节。
 
-- `h(-1) = sha256("ballrain-pool/engine-chain/v2\0" + task_id)`；
+- `h(-1) = sha256("ballrain-pool/engine-chain/v3\0" + task_id)`；
 - `h(i) = sha256(h(i-1) || d_i)`，`d_i` 是第 i 行的**引擎摘要**：从第 i-1 行形成之后到第 i 行形成为止（第 0 行：从进程启动起，含开局交接和开场）收到的全部引擎消息的规范记录，
-  `sha256("ballrain-pool/engine-row/v2\0" + 记录…)`（`ballrain/pool/engine_chain.py`，原生实现 `native/core/src/engine_chain.cpp`）：
-  - `"O"` + 一条 OBS1：magic、u16 版本、u16 flags、u32 frames_done、u32 段数，然后每段 u32 tag、u16 版本、u16 flags、u32 长度、内容；**去掉 SCOR、SREN**；
-  - `"F"` + level.msg（读到的那一条 LVL1，同样的布局）、`"I"` + 一次读 `.inc` 消费掉的完整增量消息：u32 条数，每条同上，**去掉 IVPO**。
-  - 去掉的三段里有地址：SCOR / SREN 的 Energy 第 4 列是参数指针，IVPO 按 IVP 对象地址去重（`headless.md` §5、`native-client.md` §4.1：同一输入跑两次只有这三处不同）。特征不读它们（`hs_block` 关）；HS 策略要先给 SCOR 的跟随计数单独处理。
+  `sha256("ballrain-pool/engine-row/v3\0" + 记录…)`（`ballrain/pool/engine_chain.py`，原生实现 `native/core/src/engine_chain.cpp`）：
+  - `"O"` + 一条 OBS1：magic、u16 版本、u16 flags、u32 frames_done、u32 段数，然后每段 u32 tag、u16 版本、u16 flags、u32 长度、内容；**去掉 SCOR、SREN、WTCH**；
+  - `"F"` + level.msg（读到的那一条 LVL1，同样的布局）、`"I"` + 一次读 `.inc` 消费掉的完整增量消息：u32 条数，每条同上，**去掉 IVPO、GRPS**；
+  - ARRS 段（关卡消息里的数组定义和观测里的单元增量）中**字符串类型单元的内容去掉**（长度写 0），其余照原样。
+  - 去掉的都是同样的输入在不同机器、不同进程或不同安装下会变的部分（Windows 引擎和 3 台 Android 手机逐字段比过，`native-client.md` §4.1）：
+    SCOR / SREN 的 Energy 第 4 列是参数指针（每个进程不同）；IVPO 按 IVP 对象地址去重（新对象落在旧地址时漏发，取决于堆）；
+    WTCH 的装饰物体位置在 MSVC CRT 和 bionic 之间差 1 ulp；字符串单元里有游戏目录的路径（GameSettings，每个玩家不同）；
+    GRPS 的组成员取决于安装（All_Musicfiles 列的是 Sounds/ 里现有的文件）。SR 特征都不读它们；HS 策略要另外处理 SCOR 的跟随计数和 WTCH。
+  - 链 v2（2026-11-17，数据段格式 2）包含了 WTCH、GRPS 和路径单元：游戏目录路径不同（或者装了不同的 Sounds/）的诚实玩家都会被判为不一致；v3 修正了这一点。
 - 读关卡消息的时刻同 AgentSession（StartLevel 或未加载时读全量，有 PHYS 或 StartLevel 时读增量）；交接检查不通过而重开的进程，摘要从新进程重新开始。
 
 观测是每一步之前的那一行，加上最后一步之后的一行。第 s 段带第 `step0 .. step0+steps` 行（共 steps+1 行），`chain_prev = h(step0-1)`，所以第 s 段的最后一行就是第 s+1 段的第一行（`check_chain_link`）。
@@ -522,7 +527,7 @@ r6 当前的权重文件约 0.97 MB。
 - **zstd：** 开发环境是 Python 3.14，用标准库的 `compression.zstd`，所以客户端目前需要 Python 3.14。给旧版 Python 准备的 `zstandard` 回退分支（有输出上限的流式读取）没有在本机测试过，因为本机没有装这个包；它也不检查帧后面的多余数据（解码后的 sha256 仍然要对上）。
 - **`build_env` 只负责建环境：** `max_steps`、`max_frames`、`deadline_s`、`greedy` 由客户端的采样循环执行。
 - **k = 0：** 从关卡加载开始，没有前缀重放。第 1 关的教程跳过（按 Q 直到 CamNavActive）由 env 自己完成，同样的配置重放时会重复同样的操作。
-- **跨机器：** 链 v2 不再要求特征逐位相同（第 3.2 节），只要求引擎字节相同；不同引擎构建（Windows x86 / Mac arm64 / Linux）之间的引擎字节还没有核对过。
+- **跨机器：** 链 v3 不再要求特征逐位相同（第 3.2 节），只要求规范化后的引擎字节相同；Windows 引擎和 Android 手机之间逐字段比过（除了 v3 去掉的部分都相同），Mac arm64 / Linux 引擎构建还没有核对过。
   容差能吸收的只是舍入；特征里的离散判定（射线擦边、投影重新捕获、stall / cap 的帧数阈值）在另一种 CPU 上翻转时，奖励或结束方式会差出容差，这种情况会被当成不一致，现在只能靠概率很小来接受。
 - **奖励语义：** 数据段里的 `rewards` 是 worker 的训练奖励，包括 stall、split、gate 等塑形项，参数取自清单的 `rollout`。客户端的采样循环要和 `ballrain/train/worker.py` 一致，验证器才能在容差内复现（Python 主控程序的 `client_sampler` 和原生客户端的 `native/core/src/task_runner.cpp` 都照 `rollout.TaskRunner` 实现）。
 - **只支持 SR：** 原型不支持 Esc / collect 动作（HS 模式），导出时会直接拒绝。
@@ -790,7 +795,7 @@ python tools/pool/mock_forum.py --port 8098 --redirect-uri http://127.0.0.1:8099
 
 - **没有接真论坛测过。** OAuth 只在模拟论坛上测过。真论坛的 `/api/user` 如果是 JSON:API 包装（`data.attributes`）也能解析，但字段名没有实际核对过。
 - **自己挑动作已经查得出（第 10.6 节的 `sample_seed`）**，但只对被重放的段有效；过了试用期，没抽中的段仍然只按规则放行。
-- **跨机器**（第 8 节）：链 v2 只要求引擎字节相同；实测都在同一台机器上（原生客户端 + Python 验证器，两个 x87-soft 构建）。
+- **跨机器**（第 8 节）：链 v3 只要求规范化后的引擎字节相同；端到端实测在同一台机器上（原生客户端 + Python 验证器，两个 x87-soft 构建，客户端换了另一个游戏目录）。
 - **任务循环有两份：** `rollout.TaskRunner`（验证器）和 `client_sampler.TaskSampler`（主控程序）实现同一套规则，靠对照测试保持一致，以后应合并成一份。有一处值得注意：死亡那一步的 `arc` 记的是重生之后那一行的弧长。主控程序是这样记录的，验证器照样比较。
 - **有选择地放弃任务查不出来：** 玩家可以只交“跑得好”的任务，把其余的停掉或丢掉，这会让结果分布偏向好局。重放只能证明交上来的数据是真的。
 - **实例上限按活着的会话计算：** 一个会话超过 max(3 × 心跳间隔, 90) 秒没有动静，它名下没结束的任务就不再占用 8 个实例的名额（主控程序被强杀后重启，最多等这么久）；这些任务仍然到期限才过期，验证器再验证已到的段。
