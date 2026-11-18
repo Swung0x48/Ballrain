@@ -156,9 +156,34 @@ file = f"L{level_no:02d}-{hex(sha256(key.utf8))[:16]}.npz"
 
 ## 8. 未决问题
 
-- **谁为 C++ 客户端构建场**：(a) 服务器或学习器用 Python 构建，按键内容寻址（文件名即键的哈希，再带 sha256）作为任务资源下发，客户端只做查询和
-  `canonical_geometry` / 键（判断当前几何用哪份场：L2 一局里会换两次）；(b) 把 `FastReach.build`（轨道管拟合、SDF、支撑场）也移植过来。
-  (a) 简单得多，58 MB × 每关 1–2 份需要下载和缓存；(b) 要另一套逐位验证。
+- **谁为 C++ 客户端构建场：已定（2026-11-18，方案 (a)）。** 网关用 Python 构建场，作为任务素材下发；客户端只做查询，以及算 `canonical_geometry` 和场键（判断当前几何用哪份场：L2 一局里会换两次）。通信格式由算力池会话和原生客户端会话商定：
+
+  **任务**（protocol `TASK.assets`，可选的 `reach`）：最多 8 项，每项对应这一关可能用到的一份场（L2 两份）：
+
+  | 字段 | 类型 | 含义 |
+  |---|---|---|
+  | `level` | 整数 | 关卡 |
+  | `key_sha256` | 64 位小写十六进制 | `sha256(fields_key 的 UTF-8)`（§3.2）：客户端按当前几何算出键，用它找到对应的这一项 |
+  | `sha256` | 64 位十六进制 | **未压缩** `.npz` 的 sha256 |
+  | `size` | 整数 ≤ 128 MiB | 未压缩的字节数 |
+  | `zsha256` | 64 位十六进制 | zstd 压缩文件的 sha256 |
+  | `zsize` | 整数 ≤ 32 MiB | 压缩后的字节数 |
+
+  - **下载地址不进任务**，和其他素材一样由 sha 推出：`GET /pool/assets/<zsha256>.zst`（公开、不可变、`Cache-Control: immutable`，可以让 Cloudflare 缓存）。以后要换 CDN，另加一个单独评审的字段。
+  - **客户端**：
+    1. 核对 `zsize` 和 `zsha256`；
+    2. zstd 解压，输出上限就是 `size`（防解压炸弹）；
+    3. 核对 `sha256`；
+    4. 存为 `<根目录>/fastreach/L<nn>-<key_sha256 前 16 位>.npz`，与 Python 缓存的文件名相同。根目录是 `BALLRAIN_WORK_DIR`，默认 `~/.ballrain`。客户端只写在这个根目录下，不另设路径环境变量；
+    5. 读入后要求 `info.key` 等于自己算出的 `fields_key`。
+
+    当前几何的键在 `assets.reach` 里没有对应项时，这个任务无法计算，以 `error` 结束（不算不一致）。
+  - **清单**（`weights.export_state`）：保留 `features.reach` 和 `features.reach_version`（§6 的版本钉）；`requires` 写 `"reach_" + reach_version`（`.` 换成 `_`），例如 `reach_fastreach5_2-block1`（`weights.reach_capability()`），最低客户端 0.4.0。
+    以后 `QUERY_VERSION` / `BLOCK_VERSION` 提升，旧客户端会被按能力挡下，收到说明为什么要更新的提示，而不是领到任务后才在版本钉检查上失败。
+    场的 sha 不进清单：场属于关卡几何，不属于策略，所以在任务里。
+  - **网关**：发布 f7 策略时，按策略的开局记录（`level.msg` / `.inc` 和观测）像 `tools/reach_warmup.py` 一样回放，用 `FastReach.fields_for_tracker` 在服务端缓存 `<runtime>/fastreach` 里构建或载入这一关的场（L2 两种几何都会走到）。键末尾的 `BUILD_VERSION` 不是版本钉里那个的文件一律不下发。然后用 zstd 压缩放进素材库，把这些项写进这个策略的每个任务。
+    实测：L2 一份场原始 58.5 MB，zstd 9 级后 4.0 MB。场按几何而不是按策略区分，所以策略更新时 sha 不变，客户端只下载一次。
+  - **验证器**：用同一个服务端缓存 `<runtime>/fastreach` 重放。重放前核对任务列出的每一项在缓存里的文件 sha256，缺文件或不一致时记 `replay_failed`，之后重试。所以客户端和验证器用的是逐字节相同的场。
 - 风扇模型的近似：推力判定用无旋转的 `FAN_R_NOM` 规则（r8 追踪上 96.1 % 一致，精确 OBB 规则 98.8 %）；fan 1 / 2 的特征只沿无按键飞行；
   高度带测试对 doomed 是保守的（带里每个高度都算可能），所以木球在风扇旁有落点在带里时是 unknown 而不是 doomed。
 - 只有 L2 有风扇和实测；其他关卡的移动机关只作为未知区，不进场。

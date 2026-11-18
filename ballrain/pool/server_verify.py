@@ -135,6 +135,11 @@ class Verifier:
             if eng is None or (self.launcher_factory is None and not eng.binary):
                 raise R.EngineFailure(f"no {task.engine} engine configured for the verifier")
             sdir, pdir, bdir = self._assets(task, manifest)
+            if task.assets.get("reach"):  # f7: replay from the same field files the client got (byte-identical)
+                from .reach_assets import check_cache
+                why = check_cache(task.assets["reach"], self.pool_dir / "assets")
+                if why is not None:
+                    raise R.EngineFailure(f"reach fields: {why}")
             lg = T.LocalGame(engine=task.engine, binary=eng.binary, root=eng.root)
             launcher = self.launcher_factory() if self.launcher_factory else None
             env = T.build_env(task, manifest, lg, sdir, pdir, out_root, copy="verify-00", launcher=launcher,

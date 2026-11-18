@@ -491,8 +491,8 @@ def test_capability_refusal_explains_what_changed_with_an_existing_code():
     msg = P.parse_message("no_task", P.encode_message("no_task", reason=r, retry_s=600))
     assert msg["reason"]["message"] == m
     assert "新功能 future_x" in refusal("0.4.0", ["future_x"])["message"]
-    f7 = refusal("0.3.0", ["reach_f7"])
-    assert "可达性" in f7["message"] and f7["params"]["min_version"] == "0.4.0"
+    f7 = refusal("0.3.0", ["reach_fastreach5_2-block1"])
+    assert "可达性" in f7["message"] and "fastreach5.2-block1" in f7["message"] and f7["params"]["min_version"] == "0.4.0"
     br = refusal("0.3.0", ["branch_v1", "branch_rules_v1"])
     assert "规则" in br["message"] and br["params"]["missing"] == "branch_v1,branch_rules_v1"
 
