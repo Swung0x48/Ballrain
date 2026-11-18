@@ -41,6 +41,7 @@ int main(int argc, char **argv) {
         starts.exclude(ec.exclude_starts);
         FeatureConfig fc = FeatureConfig::from_json(m.at("features"));
         fc.path_dir = arg(argc, argv, "--path-dir");
+        fc.branch_dir = arg(argc, argv, "--branch-dir", "");  // the ball-type diversion assets (tests: out of band)
         EngineConfig eng;
         eng.binary = platform::absolute_path(arg(argc, argv, "--engine"));
         eng.root = platform::absolute_path(arg(argc, argv, "--root"));

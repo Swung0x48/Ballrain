@@ -56,6 +56,9 @@ struct RestStart {
     bool drive = false;
     double x = 0.0, z = 0.0;
     std::optional<int64_t> max_frames;
+    // the stone branch's at-rest start (env._branch_rest): replay <branch_dir>/drive.npz's verified key stream from the
+    // prefix frame through the trafo to this arc length of the branch line, drive onto it and brake
+    std::optional<double> branch_s;
     static std::optional<RestStart> from_json(const Json *rest);  // nullptr / null: no at-rest start
 };
 
@@ -66,6 +69,7 @@ struct StartInfo {
     bool new_process = true;
     int handover_mismatches = 0;
     int64_t drive_frames = 0, rest_frames = 0;
+    std::optional<double> branch_s;
 };
 
 struct StepInfo {
@@ -76,6 +80,9 @@ struct StepInfo {
     std::string episode_end;  // "" while the episode goes on
     bool camera_off_quarter = false;
     bool process_ended = false;
+    // env._info with a branch: the route's branch / local_s / reference clock, else the branch's last timing
+    bool has_branch = false, branch = false;
+    double local_s = 0, ref_elapsed_ms = 0, ref_remaining_ms = 0;
     std::optional<std::string> error;
     FeatureInfo feat;
 };
@@ -117,6 +124,7 @@ private:
     void init_held(int64_t k);
     void drive(const RestStart &r);
     void brake();
+    void branch_rest(double station);
     void intro();
     void finish_process();
     std::vector<float> features(StepInfo *info);

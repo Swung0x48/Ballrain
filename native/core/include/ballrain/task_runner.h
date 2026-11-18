@@ -115,13 +115,14 @@ private:
         double seg_agent = 0, seg_ref = 0;
         std::optional<int64_t> seg_k0;
         std::set<std::string> gates_hit;
+        std::optional<bool> cap_branch;  // the branch flag the cap was last computed for (worker ep.d["cap_branch"])
     };
     void new_episode(const StepInfo &info);
     std::optional<int64_t> cap_frames(const StepInfo &info) const;
     double tas_igt(int64_t k) const;
     std::optional<double> tas_cross(int sector) const;
     std::optional<int64_t> tas_cross_frame(int sector) const;
-    void split_start(Episode &ep);
+    void split_start(Episode &ep, const StepInfo &info);
     std::vector<float> new_life(std::vector<float> obs);
     bool skip_respawn(int sector) const;
     double split_bonus(Episode &ep, const StepInfo &info, bool finished);

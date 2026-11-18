@@ -306,6 +306,9 @@ class BallanceEnv(gym.Env):
         if self.curriculum is not None:
             return self.curriculum.sample(self._start_rng)
         if c.start_rest is not None and (c.start_frame or 0) > 0:  # a given at-rest start (pool task): not snapped
+            if c.start_rest.get("branch_s") is not None:  # the stone branch's measured drive (rest_starts lo-hi@branch:s)
+                self._rest_next = {"branch_s": float(c.start_rest["branch_s"])}
+                return int(c.start_frame)
             t = c.start_rest.get("target")
             mf = c.start_rest.get("max_frames")
             self._rest_next = True if t is None else ((float(t[0]), float(t[1])) + ((int(mf),) if mf else ()))

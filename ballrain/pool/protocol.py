@@ -366,7 +366,10 @@ TASK = Obj({
     # format 3 (docs/pool-prototype.md 5): an at-rest start after the hand-over at start_frame (the env's rest_starts):
     # drive to target (x, z) within max_frames, then brake; target null = brake only. Drawn by the server
     # (max_frames absent = the env's rest_max_frames)
-    "rest": Obj({"target": List(Float(-1e6, 1e6), 2, 2, nullable=True)}, {"max_frames": Int(1, 10 ** 6)}, nullable=True),
+    # branch_s (target null): the stone branch's at-rest start, the measured drive.npz replay to this arc length of
+    # the branch line (env._branch_rest; rest_starts lo-hi@branch:s)
+    "rest": Obj({"target": List(Float(-1e6, 1e6), 2, 2, nullable=True)},
+                {"max_frames": Int(1, 10 ** 6), "branch_s": Float(0, 1e6)}, nullable=True),
     # the per-life draws (ballrain.pool.counters): counter randomisation (the manifest's rollout.counter_rand) and the
     # early-respawn draw (rollout.p_early_respawn)
     "life_seed": Int(0, 2 ** 53 - 1),

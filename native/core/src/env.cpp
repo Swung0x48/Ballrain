@@ -3,7 +3,9 @@
 #include <cmath>
 #include <limits>
 
+#include "ballrain/npz.h"
 #include "ballrain/policy.h"
+#include "ballrain/sha256.h"
 #include "platform.h"
 
 namespace ballrain {
@@ -73,6 +75,10 @@ std::optional<RestStart> RestStart::from_json(const Json *r) {
         if (t.items().size() != 2) throw Error("task rest.target must be [x, z]");
         s.drive = true, s.x = t.at(size_t(0)).as_double(), s.z = t.at(size_t(1)).as_double();
     }
+    if (const Json *b = r->find("branch_s"); b && !b->is_null()) {
+        if (s.drive) throw Error("task rest: a target or branch_s, not both");
+        s.branch_s = b->as_double();
+    }
     if (const Json *m = r->find("max_frames"); m && !m->is_null()) {
         s.max_frames = m->as_int();
         if (*s.max_frames < 1) throw Error("task rest.max_frames");
@@ -121,7 +127,7 @@ BallanceEnv::BallanceEnv(EnvConfig cfg, FeatureConfig features, EngineConfig eng
     : cfg_(std::move(cfg)), eng_(std::move(engine)), run_root_(std::move(run_root)), rec_(rec), fx_(std::move(features)),
       starts_(starts), start_frame_(start_frame), rest_(rest), reward_(reward) {
     // an at-rest start with a drive target may hand over in an excluded range (TasStarts.expected knows it)
-    bool any = rest_ && rest_->drive;
+    bool any = rest_ && (rest_->drive || rest_->branch_s);
     if (start_frame_ > 0 && (!starts_ || !(any ? starts_->expected(start_frame_).has_value()
                                                 : starts_->index_of(start_frame_).has_value())))
         throw Error("start frame " + std::to_string(start_frame_) + " is not a valid start frame of the record");
@@ -214,6 +220,19 @@ void BallanceEnv::start_process() {
     start_.frame = k;
     start_.new_process = true;
     start_.handover_mismatches = mismatches;
+    if (rest_ && k > 0 && rest_->branch_s) {  // env._prepare: the stone branch's measured drive, then a closed loop
+        try {
+            branch_rest(*rest_->branch_s);
+        } catch (...) {
+            if (sess_) sess_->close(true), sess_.reset();
+            after_death_ = false;
+            throw;
+        }
+        start_.kind = "tas_rest";
+        start_.branch_s = rest_->branch_s;
+        init_held(0);
+        return;
+    }
     if (rest_ && k > 0) {  // env._prepare: drive (with a target), then brake; _init_held then holds nothing
         uint32_t f0 = sess_->frames_done();
         if (rest_->drive) drive(*rest_);
@@ -248,6 +267,67 @@ static bool episode_event(const GameTracker &t, size_t ev0) {
         if (t.events[i].code == Ev::BallOff || t.events[i].code == Ev::LevelFinish || t.events[i].code == Ev::GameOver)
             return true;
     return false;
+}
+
+// env._branch_rest: replay the measured drive through the trafo, then close the loop on an arc target of the branch
+// line. Never a synthesized transform or a teleport; a paper ball or an unsupported hand-over is refused. A private
+// extractor (its projection state is not the episode's)
+void BallanceEnv::branch_rest(double station) {
+    const FeatureConfig &fc = fx_.config();
+    if (fc.branch_dir.empty()) throw Error("branch rest start needs branch_dir");
+    Session &s = *sess_;
+    FeatureExtractor fx(fc);
+    fx.reference_path(s.tracker());
+    const BranchFollower *br = fx.branch();
+    if (!br) throw Error("no matching branch at handover");
+    auto z = load_npz(fc.branch_dir + "/drive.npz");
+    char ln[16];
+    std::snprintf(ln, sizeof ln, "/L%02d.npz", cfg_.level);
+    if (z.at("record_sha256").unicode() != starts_->record_sha256 ||
+        z.at("branch_sha256").unicode() != file_sha256(fc.branch_dir + ln))
+        throw Error("drive replay does not match TAS recording or branch asset");
+    const NpyArray &sa = z.at("samples");
+    std::vector<double> samples = sa.f64();
+    int64_t prefix = z.at("prefix_frame").ints().at(0);
+    size_t ns = samples.size() / 2;
+    if (sa.shape.size() != 2 || sa.shape[1] != 2 || ns == 0) throw Error("drive.npz: samples");
+    double lo = samples[1], hi = samples[1];
+    for (size_t i = 0; i < ns; ++i) lo = std::min(lo, samples[2 * i + 1]), hi = std::max(hi, samples[2 * i + 1]);
+    if (start_frame_ != prefix || !(lo <= station && station <= hi))
+        throw Error("prefix frame or target outside the recorded stone drive");
+    size_t best = 0;  // np.argmin(abs(samples[:, 1] - station)): the first minimum
+    for (size_t i = 1; i < ns; ++i)
+        if (std::abs(samples[2 * i + 1] - station) < std::abs(samples[2 * best + 1] - station)) best = i;
+    int64_t offset = int64_t(samples[2 * best]);
+    const NpyArray &fr = z.at("frames");
+    size_t nf = fr.data.size() / 8;
+    if (offset < 0 || size_t(offset) > nf) throw Error("drive.npz: offset outside the frames");
+    std::vector<Frame> frames(static_cast<size_t>(offset));
+    for (size_t i = 0; i < frames.size(); ++i)
+        std::memcpy(&frames[i].delta, fr.data.data() + 8 * i, 4), std::memcpy(&frames[i].keys, fr.data.data() + 8 * i + 4, 4);
+    for (size_t b = 0; b < frames.size(); b += 512) {
+        std::vector<Frame> blk(frames.begin() + std::ptrdiff_t(b), frames.begin() + std::ptrdiff_t(std::min(frames.size(), b + 512)));
+        s.act(blk, 1, episode_stop());
+        if (s.ended() || s.tracker().flags.ball_off) throw Error("ball lost during branch drive replay");
+    }
+    V3 target = br->alt->point_at(station);
+    if (s.tracker().ball_type() != br->ball_type || s.tracker().sector() != br->sector)
+        throw Error("branch drive did not produce the required ball type and sector");
+    RestStart r;
+    r.drive = true, r.x = target[0], r.z = target[2];
+    drive(r);
+    brake();
+    FeatureInfo fi;
+    fx.compute(s.tracker(), &fi);
+    const Observation *o = s.obs();
+    double d = 1e9;
+    if (o && o->ball)
+        d = std::sqrt((o->ball->pos[0] - target[0]) * (o->ball->pos[0] - target[0]) +
+                      (o->ball->pos[1] - target[1]) * (o->ball->pos[1] - target[1]) +
+                      (o->ball->pos[2] - target[2]) * (o->ball->pos[2] - target[2]));
+    double vxz = std::sqrt(fi.vel[0] * fi.vel[0] + fi.vel[2] * fi.vel[2]);
+    if (!fi.supported || !(fi.has_branch && fi.branch) || d > 2 || vxz > cfg_.rest_speed)
+        throw Error("branch rest target not reached at rest on the correct surface");
 }
 
 // env._drive: push the ball with world arrows towards (x, z), aiming at a velocity proportional to the remaining
@@ -362,7 +442,18 @@ std::vector<float> BallanceEnv::features(StepInfo *info) {
     FeatureInfo fi;
     std::vector<float> v = fx_.compute(sess_->tracker(), &fi);
     if (rec_) rec_->put(K_FEAT, v.data(), v.size() * 4);
-    if (info) info->feat = std::move(fi);
+    if (info) {
+        // env._info: the route's branch fields, else (no IVP ball: transforms, finish) the branch's last timing, so
+        // the route clock is never compared with the absolute TAS IGT
+        if (fi.has_branch) {
+            info->has_branch = true, info->branch = fi.branch, info->local_s = fi.local_s;
+            info->ref_elapsed_ms = fi.ref_elapsed_ms, info->ref_remaining_ms = fi.ref_remaining_ms;
+        } else if (const BranchFollower *b = fx_.branch(); b && b->timing.set) {
+            info->has_branch = true, info->branch = b->timing.branch;
+            info->ref_elapsed_ms = b->timing.ref_elapsed_ms, info->ref_remaining_ms = b->timing.ref_remaining_ms;
+        }
+        info->feat = std::move(fi);
+    }
     return v;
 }
 

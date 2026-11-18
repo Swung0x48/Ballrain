@@ -163,6 +163,10 @@ std::optional<int64_t> TaskRunner::tas_cross_frame(int sector) const {
 }
 
 std::optional<int64_t> TaskRunner::cap_frames(const StepInfo &info) const {
+    if (info.has_branch) {  // Worker._cap_frames with a route clock: the active line's budget
+        double budget = (info.ref_elapsed_ms + info.ref_remaining_ms) * sp_.cap_mult;
+        return int64_t((budget + 1000 * sp_.cap_extra_s) / delta_ms_);
+    }
     if (!st_) return std::nullopt;
     const StartInfo &s = env_.start_info();
     int64_t k;
@@ -176,8 +180,12 @@ std::optional<int64_t> TaskRunner::cap_frames(const StepInfo &info) const {
     return int64_t((sp_.cap_mult * rem_ms + 1000 * sp_.cap_extra_s) / delta_ms_);
 }
 
-void TaskRunner::split_start(Episode &ep) {
+void TaskRunner::split_start(Episode &ep, const StepInfo &info) {
     if (!sp_.split_k || !st_) return;
+    if (info.has_branch) {  // Worker._split_start: the route clock replaces the TAS IGT reference
+        ep.has_seg = true, ep.seg_agent = ep.start_sr_ms, ep.seg_ref = info.ref_elapsed_ms, ep.seg_k0.reset();
+        return;
+    }
     std::optional<double> ref;
     if (ep.kind == "tas_rest" && ep.start_frame > 0 && !st_->index_of(ep.start_frame)) {
         ep.has_seg = false;  // handed over in an excluded range (off the TAS's route): no reference time
@@ -199,7 +207,7 @@ void TaskRunner::split_start(Episode &ep) {
 double TaskRunner::split_bonus(Episode &ep, const StepInfo &info, bool finished) {
     if (!ep.has_seg || !sp_.split_k) return 0.0;
     int sec = finished ? 0 : info.sector;
-    auto end_ref = tas_cross(sec);
+    auto end_ref = info.has_branch ? std::optional<double>(info.ref_elapsed_ms) : tas_cross(sec);
     if (!end_ref || !info.sr_ms) return 0.0;
     double sr = *info.sr_ms;
     double t_agent = (sr - ep.seg_agent) / 1000.0;
@@ -260,7 +268,7 @@ void TaskRunner::new_episode(const StepInfo &info) {
     auto rs = env_.reward().s;
     ep.mark_s = rs ? *rs : -std::numeric_limits<double>::infinity();
     ep.max_sector_seen = ep.start_sector;
-    split_start(ep);
+    split_start(ep, info);
     ep_ = std::move(ep);
     ++episodes;
 }
@@ -337,6 +345,10 @@ StepResult TaskRunner::step(int a, const std::function<std::string()> &stop) {
         }
     }
     std::string wend = (term || trunc) ? info2.episode_end : "";
+    if (info2.has_branch && ep.cap_branch != info2.branch) {  // Worker.run: a switch re-budgets the frame cap
+        ep.cap_frames = cap_frames(info2);
+        ep.cap_branch = info2.branch;
+    }
     if (!(term || trunc)) {
         int64_t ef = env_.ep_frames();
         auto s = env_.reward().s;

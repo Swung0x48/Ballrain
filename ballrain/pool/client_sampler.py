@@ -390,6 +390,9 @@ class TaskSampler(_worker_base()):
                             ep.ret += gb
                             ep.terms["gate_bonus"] = ep.terms.get("gate_bonus", 0.0) + gb
             end = info2.get("episode_end") if (term or trunc) else None
+            if "branch" in info2 and ep.d.get("cap_branch") != info2["branch"]:  # as Worker.run (route clock cap)
+                ep.d["cap_frames"] = self._cap_frames(info2)
+                ep.d["cap_branch"] = info2["branch"]
             if not (term or trunc):
                 ef = env._ep_frames
                 s = env.reward.s

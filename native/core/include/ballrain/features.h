@@ -83,10 +83,11 @@ public:
         if (branch_) branch_->reset();
     }
     const BranchFollower *branch() const { return branch_.get(); }
+    // the level's reference line for this tracker (loads it and the branch; features.reference_path)
+    const ReferencePath *reference_path(const GameTracker &t);
 
 private:
     struct Slices;
-    const ReferencePath *reference_path(const GameTracker &t);
     bool needs_asset(const GameTracker &t) const;
     void check_route(const GameTracker &t) const;
     LevelGeometry &geometry(const GameTracker &t);

@@ -221,6 +221,9 @@ class TaskRunner:
                         r += gb
                         ep.ret += gb
         end = info2.get("episode_end") if (term or trunc) else None
+        if "branch" in info2 and ep.d.get("cap_branch") != info2["branch"]:  # as Worker.run: a switch re-budgets
+            ep.d["cap_frames"] = self.sh._cap_frames(info2)
+            ep.d["cap_branch"] = info2["branch"]
         if not (term or trunc):
             ef = env._ep_frames
             s = env.reward.s

@@ -412,7 +412,7 @@ def build_env(task: Task, manifest: dict, local: LocalGame, starts_dir, path_dir
             raise TaskMismatch("the env's observation size differs from the policy's")
         k = int(task.start_frame)
         # an at-rest start with a drive target may hand over in an excluded range (TasStarts.expected knows it)
-        drive = task.rest is not None and task.rest.get("target") is not None
+        drive = task.rest is not None and (task.rest.get("target") is not None or task.rest.get("branch_s") is not None)
         if k and (e.starts is None or (e.starts.expected(k) is None if drive else e.starts.index_of(k) is None)):
             raise TaskMismatch(f"start frame {k} is not a valid start frame of {task.record}")
         if task.rest is not None and not k:

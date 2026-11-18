@@ -46,6 +46,8 @@ def main(argv=None) -> int:
     ap.add_argument("--nc-task", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--only", help="comma-separated scenario names")
+    ap.add_argument("--branch-dir", help="the stone branch assets for client and verifier (features.branch_dir, given "
+                    "out of band until the manifest carries the branch); adds the branch scenarios")
     a = ap.parse_args(argv)
     a.nc_task, a.engine, a.game = (str(Path(x).resolve()) for x in (a.nc_task, a.engine, a.game))
     out = Path(a.out).resolve()
@@ -98,6 +100,19 @@ def main(argv=None) -> int:
             "early_respawn_draw": (m_er, 0, "sticky:5", 3000, 60000, 0, 40, "early-respawn draw (p 0.5) from level load",
                                    None, int(np.percentile(st.valid, 60))),
         }
+        if a.branch_dir:  # the stone branch: its measured rest start, and TAS starts upstream of the trafo
+            with np.load(Path(a.branch_dir) / "drive.npz", allow_pickle=False) as dz:
+                kb = int(dz["prefix_frame"])
+            scenarios = {
+                "branch_rest_policy": (m_r7, kb, "policy", 2500, 60000, 0, 41,
+                                       "stone rest start (drive.npz replay, drive, brake) + the policy", {"target": None, "branch_s": 1700.0}),
+                "branch_rest_sticky": (m_r7, kb, "sticky:6", 2500, 60000, 0, 42,
+                                       "stone rest start + sticky actions (deaths, respawns: the follower resets)",
+                                       {"target": None, "branch_s": 1750.0}),
+                "branch_tas_policy": (m_r7, st.nearest_valid(kb), "policy", 2500, 60000, 0, 43, "TAS start upstream of the trafo + the policy"),
+                "branch_tas_sticky": (m_r7, st.nearest_valid(kb - 600), "sticky:7", 2500, 60000, 0, 44,
+                                      "TAS start in 小节 3-4 + sticky actions"),
+            }
         return run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir, np)
     k_mid, k_late = st.nearest_valid(9900), st.nearest_valid(13500)
     k_ex = st.nearest_any(2000)  # inside r7's exclude_starts
@@ -150,8 +165,9 @@ def run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir
         t0 = time.time()
         p = subprocess.run([a.nc_task, "--task", str(d / "task.json"), "--manifest", str(mp), "--starts", str(spack),
                             "--path-dir", str(pdir), "--engine", a.engine, "--root", a.game, "--out", str(d / "native"),
-                            "--actions", actions, "--stop-after", str(stop_after)], capture_output=True, text=True,
-                           encoding="utf-8", timeout=3600)
+                            "--actions", actions, "--stop-after", str(stop_after)]
+                           + (["--branch-dir", str(Path(a.branch_dir).resolve())] if a.branch_dir else []),
+                           capture_output=True, text=True, encoding="utf-8", timeout=3600)
         if p.returncode != 0:
             log(f"{name}: nc_task failed: {p.stderr[-500:]}")
             failed += 1
@@ -160,7 +176,10 @@ def run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir
         chunks = [P.decode_chunk(f.read_bytes()) for f in sorted((d / "native").glob("*.brpc"))]
         # the verifier's replay of those chunks
         pol = W.load_policy(mp.with_suffix(".npz"), m, expect_sha=m["policy_sha"])
-        env = T.build_env(task, m, T.LocalGame(engine="x87soft", binary=a.engine, root=a.game), sdir, pdir, d / "replay")
+        mv = m
+        if a.branch_dir:  # the verifier's env with the same branch (in memory: the manifest file is the policy's)
+            mv = dict(m, features=dict(m["features"], branch_dir=str(Path(a.branch_dir).resolve())))
+        env = T.build_env(task, mv, T.LocalGame(engine="x87soft", binary=a.engine, root=a.game), sdir, pdir, d / "replay")
         runner = R.TaskRunner(env, task, m)
         real = R.action_consistent
         if actions != "policy":

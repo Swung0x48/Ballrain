@@ -297,6 +297,20 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
   新的结束原因 `respawn_skipped`；新接口 `POST /pool/task`（`task_end`）。
 - **第 2 关**：r8 的 `L02.npz` 没有 `t_ms`，网关导出参考线现在接受它；注意这时 `ref_speed` 特征恒为 0（学习器一侧的事实，不是客户端的问题）。
 
+## 10a. 第 2 关小节 4 的石球分线（`docs/l2-stone-branch.md`，`ballrain/branch.py` 的移植）
+
+- **`core/branch`**：`BranchFollower` 维护两条线（主线 `L02.npz`、石线 `L02-stone/L02.npz`）的投影，按 `L02.json` 的站点把石线米数换成主线米数；
+  只有在可见球是石球、在小节 4、并且投影落在石线区间内时用石线。进度 `path.s` 是本命单调的主线进度，换线那一拍不付进度，之后线性追回到下一个共同站点；
+  参考时钟只积分新走过区间的活动线 `t_ms`（主线没有 `t_ms` 时用描述文件里的 `main_span_t_ms` 拼出来）。`load_branch` 核对关卡和主线 sha256。
+- **特征**：`FeatureConfig.branch_dir`；路径块（路标、切线、剩余距离、参考速度、小节除数）用活动线，`path_progress` 用主线总长归一化；没开时布局和数值都不变。
+- **环境**：每步信息带 `branch` / `local_s` / `ref_elapsed_ms` / `ref_remaining_ms`（看不到球时用跟随器上一次的时钟）；石球静止开局（`RestStart.branch_s`）
+  回放 `drive.npz` 已验证的按键流到对应站点，核对石球和小节，再闭环开到目标、制动，检查支撑、位置和速度。
+- **奖励整形**：分段奖励用活动线参考时钟，帧数上限用 `(ref_elapsed + ref_remaining) × cap_mult`，换线时重算（Python 的 `rollout.TaskRunner`、`client_sampler` 也补上了这一步）。
+- **对照**：`golden.py branch`（SR02 录像到 `drive.npz` 的前缀帧，再接上它的按键流，球经变球器变石球、走南环）：22402 帧、11202 行特征 C++ 与 Python
+  **逐位相同**；同一条流不带分线回放时最大差 10，3204 行读到了石线的 `t_ms`，说明确实走在石线上。`task_diff.py --branch-dir`（r8 检查点，分线目录暂时在清单之外给两边）4 个场景全部通过：石球静止开局 + 策略（723 行全是石球，417 行在石线上）、石球静止开局 + 随机粘滞动作（994 行全在石线上）、变球器上游的 TAS 开局 + 策略（277 行在石线上）、小节 3–4 的 TAS 开局 + 随机粘滞动作（1127 行石球但不在石线区间内，走主线）。
+- **还没做**（等和池 → 学习器会话商定）：清单里怎样带分线（三份文件的 sha256）、分线资源包的分发和安装、任务 `rest.branch_s`（协议里先加成了可选字段）、
+  网关按 `rest_starts` 的 `branch:` 条目抽开局。
+
 ## 11. 还没有做 / 限制
 
 - **https 没有对真网关实测过**：Windows 的 WinHTTP https 分支、POSIX 的 libcurl 分支都只编译过（端到端都是本机 http）。Android 仍然只有 http。
