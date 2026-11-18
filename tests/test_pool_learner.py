@@ -504,3 +504,39 @@ def test_policies_needing_a_capability_go_only_to_clients_that_have_it(pool, tmp
     assert r.status == 200 and nt["reason"]["code"] == "client_too_old" and "石头分支" in nt["reason"]["message"]
     pool.store.q("UPDATE sessions SET capabilities=? WHERE session_id=?", (json.dumps(["branch_v1"]), pl.sid))
     assert pl.task().policy_sha == pool.pub.policy_sha
+
+
+def test_gateway_start_draw_equals_the_env_draw_with_rehearse_always(tmp_path):
+    """server_tasks.PolicySource.pick_start draws exactly what BallanceEnv._draw_start draws for the same generator:
+    rehearsal entries clipped to the frontier, rehearse_always entries never clipped, brake-only and driven at-rest
+    starts, then the curriculum."""
+    from ballrain.env import BallanceEnv, EnvConfig
+    from ballrain.pool.server_tasks import PolicySource
+    starts = SimpleNamespace(nearest_valid=lambda k: int(k), nearest_any=lambda k: int(k),
+                             expected=lambda k: {"frame": k})
+    cu = SimpleNamespace(frontier=5000, sample=lambda rng: int(rng.integers(5000, 6000)))
+    kw = dict(rehearse_starts=[[0, 0], [1000, 9000]], rehearse_always=[[2000, 2100]], p_rehearse=0.4,
+              rehearse_behind_frontier=True, rest_starts=[[3000, 3100], [4000, 4010, 1.0, -2.0, 0.5, 77]], p_rest=0.3)
+    env = object.__new__(BallanceEnv)
+    env.cfg, env.starts, env.curriculum = EnvConfig(**kw), starts, cu
+    env._start_rng = np.random.default_rng(5)
+    ps = PolicySource(tmp_path, "r", tmp_path, [])
+    ps.rng = np.random.default_rng(5)
+    pub = SimpleNamespace(draws=dict(kw), starts=starts, curriculum=cu, valid=np.arange(0, 30000))
+    seen = set()
+    for _ in range(3000):
+        k_env = env._draw_start()
+        r_env = env._rest_next
+        k, rest = ps.pick_start(pub)
+        assert k == k_env
+        if r_env is False:
+            assert rest is None
+        elif r_env is True:
+            assert rest == {"target": None}
+        else:
+            assert rest["target"] == list(r_env[:2]) and rest["max_frames"] == r_env[2]
+        if 2000 <= k <= 2100:
+            seen.add("always")  # below the frontier: only rehearse_always reaches it
+        if rest is not None:
+            seen.add("drive" if rest["target"] else "brake")
+    assert seen == {"always", "drive", "brake"}
