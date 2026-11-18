@@ -31,7 +31,7 @@ def _manifest(doc):
     for item in entries:
         name = item["id"]
         if (
-            not re.fullmatch("[a-z][a-z0-9-]*", name)
+            not re.fullmatch("[a-z][a-z0-9-]{0,31}", name)
             or name in seen
             or re.fullmatch(r"con|prn|aux|nul|(?:com|lpt)[1-9]", name)
         ):
