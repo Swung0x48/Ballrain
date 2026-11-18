@@ -76,6 +76,7 @@ FLAG_TRUNCATED = 2
 HEX64 = re.compile(r"[0-9a-f]{64}")
 HEX32 = re.compile(r"[0-9a-f]{32}")
 ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+BRANCH_ID_RE = re.compile(r"[a-z][a-z0-9-]*")  # a multi-branch manifest member id (ballrain.multi_branch)
 VERSION_RE = re.compile(r"[0-9A-Za-z.+_-]{1,32}")
 USER_CODE_RE = re.compile(r"[A-Z2-9]{4}-[A-Z2-9]{4}")
 
@@ -373,9 +374,12 @@ TASK = Obj({
     # drive to target (x, z) within max_frames, then brake; target null = brake only. Drawn by the server
     # (max_frames absent = the env's rest_max_frames)
     # branch_s (target null): the stone branch's at-rest start, the measured drive.npz replay to this arc length of
-    # the branch line (env._branch_rest; rest_starts lo-hi@branch:s)
+    # the branch line (env._branch_rest; rest_starts lo-hi@branch:s); branch_id (multi-branch policies only, wire v2,
+    # docs/pool-prototype.md 15): the manifest member whose drive it is (lo-hi@branch:<id>:s), absent = the unique
+    # legacy member
     "rest": Obj({"target": List(Float(-1e6, 1e6), 2, 2, nullable=True)},
-                {"max_frames": Int(1, 10 ** 6), "branch_s": Float(0, 1e6)}, nullable=True),
+                {"max_frames": Int(1, 10 ** 6), "branch_s": Float(0, 1e6), "branch_id": Str(32, BRANCH_ID_RE, min_len=1)},
+                nullable=True),
     # the per-life draws (ballrain.pool.counters): counter randomisation (the manifest's rollout.counter_rand) and the
     # early-respawn draw (rollout.p_early_respawn)
     "life_seed": Int(0, 2 ** 53 - 1),

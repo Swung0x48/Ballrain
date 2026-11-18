@@ -177,6 +177,8 @@ class PolicySource:
                 rest = {"target": None}
                 if len(e) == 3 and isinstance(e[2], dict):  # lo-hi@branch:s (the env: the measured branch drive)
                     rest["branch_s"] = float(e[2]["branch_s"])
+                    if e[2].get("id") is not None:  # lo-hi@branch:<id>:s, a multi-branch member (wire v2)
+                        rest["branch_id"] = str(e[2]["id"])
                     k = st.nearest_any(int(rng.integers(int(lo), int(hi) + 1)))
                 elif len(e) >= 5:
                     j = float(e[4])

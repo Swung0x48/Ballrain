@@ -198,8 +198,9 @@ def export_state(state: dict, out_dir, run: str) -> dict:
         if feats.get("branch_sha256") not in (None, key):
             raise ValueError("the learner's branch_assets are not the files its features pin (branch_sha256)")
         feats["branch_sha256"] = key
-        requires.append("branch_v1")
-        if rules_changed:  # rules other than the v1 defaults: only clients that read L<nn>.json rules
+        # v1: branch_v1; a multi-branch route (wire v2, docs/pool-prototype.md 15): multi_branch_v2 instead
+        requires.append("multi_branch_v2" if bundle.get("version") == 2 else "branch_v1")
+        if rules_changed:  # rules other than the v1 defaults (any member): only clients that read L<nn>.json rules
             requires.append("branch_rules_v1")
     else:
         feats.pop("branch_sha256", None)

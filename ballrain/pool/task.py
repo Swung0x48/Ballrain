@@ -58,6 +58,13 @@ MAX_ASSET_BYTES = 64 * 1024 * 1024
 # the branch pack: the learner's files as raw bytes (uint8, 1-d); the manifest pins them by features.branch_sha256
 # (ballrain.branch_assets: the sha256 of the three raw 32-byte digests in this order)
 BRANCH_PACK_ARRAYS = ("line_npz", "desc_json", "drive_npz")
+# multi-branch routes (wire v2, docs/pool-prototype.md 15): the v2 pack holds manifest_json (branches.json as sent) and,
+# per member i in manifest order, m{i:02d}_line_npz / _desc_json / _drive_npz; member ids come from the manifest only
+MAX_BRANCH_MEMBERS = 16
+
+
+def branch_pack_v2_arrays(n: int) -> tuple:
+    return ("manifest_json",) + tuple(f"m{i:02d}_{k}" for i in range(n) for k in BRANCH_PACK_ARRAYS)
 DRIVE_ARRAYS = {"branch_sha256": (np.dtype("<U64"), 0), "record_sha256": (np.dtype("<U64"), 0),
                 "prefix_frame": (np.dtype("<i8"), 0), "frames": (RECORD_FRAME_DTYPE, 1),
                 "samples": (np.dtype("<f8"), 2)}
@@ -426,13 +433,34 @@ def branch_bundle(ba: dict, level: int, main_sha256: str | None) -> tuple[dict, 
     """The learner's state["branch_assets"] ({level, line_npz, desc_json, drive_npz} raw bytes, sha256 optional: it is
     recomputed and, when given, must agree) checked as the learner's workers check it (ballrain.branch_assets.validate:
     level, digests, the main line pairing, the rules) plus the native client's structure checks. Returns (bundle with
-    sha256, features.branch_sha256, whether the rules differ from the v1 defaults)."""
-    from ballrain.branch_assets import filenames, validate, bundle_rules
+    sha256, features.branch_sha256, whether the rules differ from the v1 defaults).
+
+    A v2 envelope ({version: 2, level, manifest: bytes, members: [v1 envelope, ...]}, docs/l2-branches.md) is checked
+    member by member the same way, then as a whole (the manifest's rules, the v2 pin); rules_changed is whether any
+    member's rules differ (branch_assets.uses_custom_rules)."""
+    from ballrain.branch_assets import filenames, validate, bundle_rules, uses_custom_rules
     from ballrain.branch_rules import DEFAULT_RULES
     from ballrain.path import RouteError
     from .weights import assert_public
     if not isinstance(ba, dict) or ba.get("level") != int(level):
         raise ValueError(f"the learner's branch assets are not for level {level}")
+    if "version" in ba:
+        if ba["version"] != 2:
+            raise ValueError(f"the learner's branch assets: unsupported version {ba['version']!r}")
+        raw = _raw(ba.get("manifest"), "manifest")
+        members = ba.get("members")
+        if not isinstance(members, list) or not 1 <= len(members) <= MAX_BRANCH_MEMBERS:
+            raise ValueError(f"the learner's branch assets: 1..{MAX_BRANCH_MEMBERS} members expected")
+        if any(not isinstance(c, dict) or "version" in c for c in members):
+            raise ValueError("the learner's branch assets: a member is not a single-line bundle")
+        checked = [branch_bundle(c, level, main_sha256)[0] for c in members]
+        bundle = dict(version=2, level=int(level), manifest=raw, members=checked)
+        try:
+            key = validate(bundle, int(level), main_sha256)  # the manifest's rules, member count, the v2 pin
+        except (RouteError, ValueError, KeyError) as e:
+            raise ValueError(f"branch assets: {e}") from None
+        assert_public(json.loads(raw))
+        return bundle, key, uses_custom_rules(bundle)
     blobs = {k: _raw(ba.get(k), k) for k in filenames(level)}
     digests = {k: hashlib.sha256(v).hexdigest() for k, v in blobs.items()}
     if ba.get("sha256") not in (None, digests):
@@ -452,7 +480,12 @@ def export_branch_pack(ba: dict, level: int, out_dir, main_sha256: str | None) -
     """Server side: the learner's branch bundle -> <out_dir>/<sha>.npz (sha = the file's sha256), the three files'
     bytes as uint8 arrays (deterministic npz: the same bundle gives the same sha)."""
     bundle, _, _ = branch_bundle(ba, level, main_sha256)
-    arrays = {k: np.frombuffer(bundle[k], np.uint8).copy() for k in BRANCH_PACK_ARRAYS}
+    if bundle.get("version") == 2:
+        arrays = {"manifest_json": np.frombuffer(bundle["manifest"], np.uint8).copy()}
+        for i, c in enumerate(bundle["members"]):
+            arrays.update({f"m{i:02d}_{k}": np.frombuffer(c[k], np.uint8).copy() for k in BRANCH_PACK_ARRAYS})
+    else:
+        arrays = {k: np.frombuffer(bundle[k], np.uint8).copy() for k in BRANCH_PACK_ARRAYS}
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / f".branch.{os.getpid()}.npz"
@@ -469,19 +502,42 @@ def install_branch_pack(pack, cache_dir, level: int, expect_sha: str, branch_sha
     features.branch_sha256) and lay it out as <cache_dir>/branch/<sha>/ with L<nn>.npz, L<nn>.json and drive.npz;
     returns the directory. Idempotent."""
     from ballrain.branch_assets import filenames
-    a = _load_checked(Path(pack), {k: (np.dtype("|u1"), 1) for k in BRANCH_PACK_ARRAYS}, expect_sha)
-    bundle, key, _ = branch_bundle(dict(level=int(level), **{k: a[k].tobytes() for k in BRANCH_PACK_ARRAYS}), level,
-                                   main_sha256)
+    from ballrain.multi_branch import manifest as read_manifest
+    pack = Path(pack)
+    with np.load(pack, allow_pickle=False) as z:
+        names = set(z.files)
+    if "manifest_json" in names:  # v2 (docs/pool-prototype.md 15): the member count from the array names, then exact
+        n = len(names - {"manifest_json"}) // len(BRANCH_PACK_ARRAYS)
+        if not 1 <= n <= MAX_BRANCH_MEMBERS:
+            raise ValueError(f"branch pack: {n} members (1..{MAX_BRANCH_MEMBERS})")
+        a = _load_checked(pack, {k: (np.dtype("|u1"), 1) for k in branch_pack_v2_arrays(n)}, expect_sha)
+        ba = dict(version=2, level=int(level), manifest=a["manifest_json"].tobytes(),
+                  members=[dict(level=int(level), **{k: a[f"m{i:02d}_{k}"].tobytes() for k in BRANCH_PACK_ARRAYS})
+                           for i in range(n)])
+    else:
+        a = _load_checked(pack, {k: (np.dtype("|u1"), 1) for k in BRANCH_PACK_ARRAYS}, expect_sha)
+        ba = dict(level=int(level), **{k: a[k].tobytes() for k in BRANCH_PACK_ARRAYS})
+    bundle, key, _ = branch_bundle(ba, level, main_sha256)
     if key != branch_sha256:
         raise ValueError("branch pack: not the policy's branch (features.branch_sha256)")
     d = Path(cache_dir) / "branch" / expect_sha
     if (d / ".complete").is_file():
         return d
     d.mkdir(parents=True, exist_ok=True)
-    for k, name in filenames(level).items():
-        tmp = d / f".{name}.{os.getpid()}.tmp"
-        tmp.write_bytes(bundle[k])
-        os.replace(tmp, d / name)
+
+    def put(sub: Path, name: str, data: bytes):
+        sub.mkdir(parents=True, exist_ok=True)
+        tmp = sub / f".{name}.{os.getpid()}.tmp"
+        tmp.write_bytes(data)
+        os.replace(tmp, sub / name)
+    if bundle.get("version") == 2:  # the on-disk layout ballrain.branch_assets.read_bundle reads
+        put(d, "branches.json", bundle["manifest"])
+        for e, c in zip(read_manifest(bundle["manifest"]), bundle["members"], strict=True):
+            for k, name in filenames(level).items():
+                put(d / e["id"], name, c[k])
+    else:
+        for k, name in filenames(level).items():
+            put(d, name, bundle[k])
     (d / ".complete").write_text(expect_sha, encoding="utf-8")
     return d
 
@@ -490,11 +546,21 @@ def read_branch_dir(branch_dir, level: int, branch_sha256: str, main_sha256: str
     """The installed branch directory as the env's EnvConfig.branch_assets bundle, checked against the manifest's pin
     (TaskMismatch otherwise)."""
     from ballrain.branch_assets import filenames
+    from ballrain.multi_branch import manifest as read_manifest
+    from ballrain.path import RouteError
     d = Path(branch_dir)
+
+    def one(sub: Path) -> dict:
+        return dict(level=int(level), **{k: (sub / name).read_bytes() for k, name in filenames(level).items()})
     try:
-        ba = dict(level=int(level), **{k: (d / name).read_bytes() for k, name in filenames(level).items()})
+        if (d / "branches.json").is_file():  # v2: the manifest and one directory per member, in manifest order
+            raw = (d / "branches.json").read_bytes()
+            ba = dict(version=2, level=int(level), manifest=raw,
+                      members=[one(d / e["id"]) for e in read_manifest(raw)])
+        else:
+            ba = one(d)
         bundle, key, _ = branch_bundle(ba, level, main_sha256)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RouteError) as e:
         raise TaskMismatch(f"the branch directory: {e}") from None
     if key != branch_sha256:
         raise TaskMismatch("the branch directory is not the policy's branch (features.branch_sha256)")
