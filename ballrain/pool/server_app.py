@@ -528,6 +528,11 @@ class PoolApp:
             return _json("no_task", reason=payload(Reason.SERVER_BUSY), retry_s=300)
         if self.policies.current is None:
             return _json("no_task", reason=payload(Reason.NO_TASK), retry_s=max(30, self.cfg.task_poll_s))
+        # capability gate: a policy's tasks only for clients that can run them (manifest.requires vs hello.capabilities)
+        from .capabilities import missing, refusal
+        lacking = missing(self.policies.current.manifest.get("requires"), json.loads(sess["capabilities"] or "[]"))
+        if lacking:
+            return _json("no_task", reason=refusal(sess["client_version"], lacking), retry_s=600)
         t = self.policies.new_task(sess["engine_kind"], self.now(), self.cfg.max_steps, self.cfg.max_frames,
                                    self.cfg.deadline_s)
         d = t.to_dict()
