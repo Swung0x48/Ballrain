@@ -323,6 +323,12 @@ class Store:
                      (int(forum_id), now, now - int(live_s)))
         return int(r["n"])
 
+    def open_tasks_of_session(self, session_id: str) -> int:
+        """Open, unexpired tasks issued to this session (the task_prefetch_v1 per-session limit)."""
+        r = self.one("SELECT COUNT(*) AS n FROM tasks WHERE session_id=? AND state='open' AND deadline>?",
+                     (str(session_id), self.now()))
+        return int(r["n"])
+
     def add_chunk(self, task_id: str, seq: int, forum_id: int, steps: int, nbytes: int, file: str, selected: bool,
                   final: bool, end: str | None) -> None:
         """Insert a chunk and advance its task, in one IMMEDIATE transaction that re-checks what the gateway checked
