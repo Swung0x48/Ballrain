@@ -41,6 +41,8 @@ static double interp(double x, const std::vector<double> &xp, const std::vector<
     return r;
 }
 
+double np_interp(double x, const std::vector<double> &xp, const std::vector<double> &fp) { return interp(x, xp, fp); }
+
 ReferencePath::ReferencePath(std::vector<V3> points, std::vector<int64_t> psec, std::string src, Json m,
                              std::optional<std::vector<double>> t)
     : P(std::move(points)), point_sector(std::move(psec)), t_ms(std::move(t)), source(std::move(src)), meta(std::move(m)) {

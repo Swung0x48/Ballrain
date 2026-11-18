@@ -85,6 +85,7 @@ int main(int argc, char **argv) {
         Policy pol = Policy::load(npz, manifest);
         FeatureConfig fc = FeatureConfig::from_json(manifest.at("features"));
         fc.path_dir = pdir;
+        fc.branch_dir = arg(argc, argv, "--branch-dir", "");  // the ball-type diversion (golden.py --branch-dir)
         auto recs = read_stream(spath);
         Cursor cur{recs};
         std::unique_ptr<FeatureExtractor> fx;

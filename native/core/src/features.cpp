@@ -55,6 +55,7 @@ FeatureConfig FeatureConfig::from_json(const Json &j) {
         else if (k == "path_source") c.path_source = v.as_string();
         else if (k == "path_dir") c.path_dir = v.is_null() ? "" : v.as_string();
         else if (k == "path_sha256") c.path_sha256 = v.is_null() ? "" : v.as_string();
+        else if (k == "branch_dir") c.branch_dir = v.is_null() ? "" : v.as_string();
         else if (k == "path_lateral_scale") c.path_lateral_scale = v.as_double();
         else if (k == "path_back") c.path_back = v.as_double();
         else if (k == "path_ahead") c.path_ahead = v.as_double();
@@ -295,6 +296,10 @@ const ReferencePath *FeatureExtractor::reference_path(const GameTracker &t) {
                                                        cfg_.path_reacquire);
         else
             follower_.reset();
+        branch_.reset();
+        if (!cfg_.branch_dir.empty() && path && path->source == "tas" && asset_)
+            branch_ = load_branch(path, t.level_no, cfg_.branch_dir, asset_->sha256, cfg_.path_back, cfg_.path_ahead,
+                                  cfg_.path_margin, cfg_.path_reacquire);
     }
     path_ = path;
     have_key_ = true;
@@ -396,6 +401,7 @@ std::vector<float> FeatureExtractor::compute(const GameTracker &t, FeatureInfo *
         *at("cam_rotating") = std::abs(std::remainder(y0 - y1, 2 * PI)) > 1e-3 ? 1.0 : 0.0;
     }
     const ReferencePath *path = reference_path(t);
+    const ReferencePath *active = path;  // the line of this step's local quantities (the branch's while on it)
     if (valid) check_route(t);
     V3 pos{}, vel{};
     if (have_ball) {
@@ -419,12 +425,22 @@ std::vector<float> FeatureExtractor::compute(const GameTracker &t, FeatureInfo *
         contacts(t, F, info, pos, vel, radius, contact, support);
         info.supported = support.has_value();
         terrain(t, F, info, pos, radius, contact, support);
-        if (path) {
-            Projection pr = follower_->update(pos, t.sector());
+        if (path && (!branch_ || valid)) {
+            Projection pr;
+            double local_s;
+            if (!branch_) {
+                pr = follower_->update(pos, t.sector());
+                local_s = pr.s;
+            } else {  // features.py: `path, pr = self.branch.update(...)`: the active line from here on
+                BranchStep st = branch_->update(pos, t.sector(), bt);
+                active = st.path, pr = st.pr, local_s = st.local_s;
+                info.has_branch = true, info.branch = st.branch, info.local_s = st.local_s;
+                info.ref_elapsed_ms = st.ref_elapsed_ms, info.ref_remaining_ms = st.ref_remaining_ms;
+            }
             info.path = pr;
-            info.path_source = path->source;
-            *at("path_progress") = pr.s / std::max(path->length, 1e-9);
-            *at("path_remaining") = (path->length - pr.s) / (20 * c.pos_scale);
+            info.path_source = info.has_branch && info.branch ? "branch" : active->source;
+            *at("path_progress") = pr.s / std::max(path->length, 1e-9);  // main-line metres over the main length
+            *at("path_remaining") = (active->length - local_s) / (20 * c.pos_scale);
             *at("path_lateral") = pr.dist / c.path_lateral_scale;
             V3 tc = to_frame(pr.tangent, right, fwd);
             at("path_tangent_cam")[0] = tc[0], at("path_tangent_cam")[1] = tc[2];
@@ -434,7 +450,7 @@ std::vector<float> FeatureExtractor::compute(const GameTracker &t, FeatureInfo *
             if (c.waypoints) {
                 double *w = at("waypoints");
                 for (int j = 0; j < c.waypoints; ++j) {
-                    V3 q = path->point_at(pr.s + c.waypoint_spacing * (j + 1));
+                    V3 q = active->point_at(local_s + c.waypoint_spacing * (j + 1));
                     V3 d{q[0] - pos[0], q[1] - pos[1], q[2] - pos[2]};
                     V3 f = to_frame(d, right, fwd);
                     for (int k = 0; k < 3; ++k) w[3 * j + k] = f[k] / c.pos_scale;
@@ -443,7 +459,7 @@ std::vector<float> FeatureExtractor::compute(const GameTracker &t, FeatureInfo *
             if (!c.far_waypoints.empty()) {
                 double *w = at("far_waypoints");
                 for (size_t j = 0; j < c.far_waypoints.size(); ++j) {
-                    V3 q = path->point_at(pr.s + c.far_waypoints[j]);
+                    V3 q = active->point_at(local_s + c.far_waypoints[j]);
                     V3 d{q[0] - pos[0], q[1] - pos[1], q[2] - pos[2]};
                     V3 f = to_frame(d, right, fwd);
                     for (int k = 0; k < 3; ++k) w[3 * j + k] = f[k] / c.pos_scale;
@@ -452,7 +468,7 @@ std::vector<float> FeatureExtractor::compute(const GameTracker &t, FeatureInfo *
             if (!c.ref_speed_at.empty()) {
                 double *w = at("ref_speed");
                 for (size_t j = 0; j < c.ref_speed_at.size(); ++j) {
-                    auto v = path->speed_at(pr.s + c.ref_speed_at[j]);
+                    auto v = active->speed_at(local_s + c.ref_speed_at[j]);
                     w[j] = (v ? *v : 0.0) / c.vel_scale;
                 }
             }
@@ -464,7 +480,7 @@ std::vector<float> FeatureExtractor::compute(const GameTracker &t, FeatureInfo *
         *at("points") = t.points() / 1000.0;
         auto sr = t.sr_ms();
         *at("sr_s") = (sr ? *sr : 0.0) / 100000.0;
-        int npath = path ? path->n_sectors : 1;
+        int npath = active ? active->n_sectors : 1;  // features.py reads the (reassigned) active line
         *at("sector") = double(t.sector()) / std::max(npath, 1);
         *at("transforming") = t.transforming() ? 1.0 : 0.0;
         *at("ball_nav") = t.flags.ball_nav ? 1.0 : 0.0;
