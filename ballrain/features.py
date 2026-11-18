@@ -52,7 +52,7 @@ class FeatureConfig:
     path_source: str = "tas"  # "tas" (TAS line; the polyline only for levels without an asset) | "checkpoints"
     path_dir: str | None = None  # directory of the L<nn>.npz assets, repo-relative (default benchmarks/refpaths)
     path_sha256: str | None = None  # sha256 the level's asset must have (set by the learner; None = unchecked)
-    branch_dir: str | None = None  # optional paired Lnn.json / Lnn.npz diversion
+    branch_dir: str | None = None  # legacy checkpoint marker only; never opened
     path_lateral_scale: float = 10.0  # path_lateral = distance to the line / this
     path_back: float = 10.0  # projection window behind the previous arc length
     path_ahead: float = 30.0  # ... and ahead of it
@@ -75,10 +75,14 @@ class FeatureConfig:
     checkpoint_frames_scale: float = 10000.0
     clip: float = 10.0  # final clip of every entry
 
+    branch_sha256: str | None = None  # digest of the complete learner-distributed bundle
+
     def to_dict(self):
         d = asdict(self)
         if self.branch_dir is None:
             del d["branch_dir"]  # preserve serialized configurations when off
+        if self.branch_sha256 is None:
+            del d["branch_sha256"]
         return d
 
 
@@ -260,8 +264,11 @@ def yaw_of(matrix43) -> float:
 # --------------------------------------------------------------------------------- extractor
 
 class FeatureExtractor:
-    def __init__(self, config: FeatureConfig | None = None):
+    def __init__(self, config: FeatureConfig | None = None, *, branch_root=None):
         self.cfg = config or FeatureConfig()
+        if self.cfg.branch_dir:
+            raise ValueError("legacy branch_dir needs learner-distributed branch assets")
+        self.branch_root = branch_root
         self._layout = self._make_layout()
         self.size = sum(n for _, n in self._layout)
         self.path: ReferencePath | None = None
@@ -327,6 +334,9 @@ class FeatureExtractor:
                 # the level has an asset but its data is still incomplete: no line yet (never the polyline)
                 tas_pending = path is None and self._needs_asset(tracker)
             if path is None and not tas_pending:
+                if self.cfg.branch_sha256:
+                    from .path import RouteError
+                    raise RouteError("distributed branch requires its paired TAS main line")
                 path = ReferencePath.from_tracker(tracker)
             new_tracker = self._path_key is None or key[0] != self._path_key[0]
             same_line = (path is not None and self.path is not None and path.source == self.path.source
@@ -336,9 +346,11 @@ class FeatureExtractor:
                     path, back=self.cfg.path_back, ahead=self.cfg.path_ahead, margin=self.cfg.path_margin,
                     reacquire=self.cfg.path_reacquire)
                 self.branch = None
-                if self.cfg.branch_dir and path is not None and path.source == "tas":
+                if self.cfg.branch_sha256 and path is not None and path.source == "tas":
+                    if self.branch_root is None:
+                        raise ValueError("missing installed branch assets")
                     from .branch import load_branch
-                    self.branch = load_branch(path, tracker.level_no, self.cfg.branch_dir, self.cfg.path_dir,
+                    self.branch = load_branch(path, tracker.level_no, self.branch_root, self.cfg.path_dir,
                                               **self.follower.kw)
             self.path = path
             self._path_key = key

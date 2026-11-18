@@ -149,8 +149,20 @@ class EnvConfig:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     reward: RewardConfig | None = None
 
+    branch_assets: dict | None = None
+
+    def __reduce_ex__(self, protocol):
+        if self.branch_assets is not None:
+            # An older spawned worker must not silently drop an unfamiliar dataclass field.
+            return _restore_branch_env_v1, (vars(self),)
+        return super().__reduce_ex__(protocol)
+
     def reward_config(self) -> RewardConfig:
         return self.reward if self.reward is not None else RewardConfig(mode=self.mode)
+
+
+def _restore_branch_env_v1(fields):
+    return EnvConfig(**fields)
 
 
 def key_push_dirs(cam_matrix) -> dict:
@@ -209,7 +221,10 @@ class BallanceEnv(gym.Env):
             raise ValueError(f"launcher backend {getattr(launcher, 'backend', 'retail')!r} != EnvConfig.backend "
                              f"{self.cfg.backend!r}")
         self.launcher = launcher
-        self.fx = FeatureExtractor(self.cfg.features)
+        from .branch_assets import install
+        fc = self.cfg.features
+        self._branch_temp = install(self.cfg.branch_assets, self.cfg.level, fc.path_sha256, fc.branch_sha256)
+        self.fx = FeatureExtractor(fc, branch_root=self._branch_temp.name if self._branch_temp else None)
         self.reward = Reward(self.cfg.reward_config())
         if self.cfg.esc_frames < 3:
             raise ValueError("esc_frames must be >= 3 (Esc must be released, the toggle lands 2 frames later)")
@@ -417,19 +432,20 @@ class BallanceEnv(gym.Env):
         Never synthesize a transform, teleport, or accept a paper / unsupported handover.
         Use a private extractor: warm-preparation can run concurrently with training.
         """
-        from .path import asset_path, file_sha256, resolve_path_dir
+        from .path import asset_path, file_sha256
         cfg = self.cfg.features
-        if not cfg.branch_dir:
-            raise ValueError('branch rest start needs branch_dir')
+        if self._branch_temp is None:
+            raise ValueError('branch rest start needs distributed assets')
+        root = Path(self._branch_temp.name)
         s = p['session']
-        fx = FeatureExtractor(cfg)
+        fx = FeatureExtractor(cfg, branch_root=root)
         fx.reference_path(s.tracker)
         branch = fx.branch
         if branch is None:
             raise ValueError('no matching branch at handover')
-        with np.load(resolve_path_dir(cfg.branch_dir) / 'drive.npz', allow_pickle=False) as drive:
+        with np.load(root / 'drive.npz', allow_pickle=False) as drive:
             if (str(drive['record_sha256']) != p['start'].get('record_sha256') or
-                    str(drive['branch_sha256']) != file_sha256(asset_path(self.cfg.level, resolve_path_dir(cfg.branch_dir)))):
+                    str(drive['branch_sha256']) != file_sha256(asset_path(self.cfg.level, root))):
                 raise ValueError('drive replay does not match TAS recording or branch asset')
             samples = drive['samples']
             if k != int(drive['prefix_frame']) or not samples[:, 1].min() <= station <= samples[:, 1].max():

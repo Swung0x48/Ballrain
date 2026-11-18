@@ -140,7 +140,7 @@ def gated_curriculum(starts, cfg, finish_gate: float):
 def parse(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True)
-    p.add_argument("--level", type=int, default=1)
+    p.add_argument("--level", type=int)
     p.add_argument("--record", default="", help="TAS start record (tas-v1 dataset; default: RECORDS[level])")
     p.add_argument("--rehearse-behind-frontier", action="store_true",
                    help="rehearsal starts only from the part of each range at or after the curriculum frontier "
@@ -345,7 +345,14 @@ class Logger:
         self.log.flush()
 
 
-def make_env_config(a, out_root: Path):
+def checkpoint_config(env):
+    ec = asdict(env)
+    return {"branch_assets": ec.pop("branch_assets"), "env_config": ec}
+
+
+def make_env_config(a, out_root: Path, ck=None):
+    from ballrain.branch_assets import read_bundle, validate
+    from ballrain.path import RouteError
     from ballrain.env import EnvConfig
     from ballrain.features import FeatureConfig
     from ballrain.rewards import RewardConfig
@@ -358,16 +365,25 @@ def make_env_config(a, out_root: Path):
     asset = asset_path(a.level, resolve_path_dir(path_dir))
     if path_dir is not None and not asset.is_file():
         raise SystemExit(f"--path-dir {a.path_dir}: no reference line {asset}")
+    main_sha = file_sha256(asset) if asset.is_file() else None
+    saved = (ck or {}).get("branch_assets")
+    old = (ck or {}).get("env_config", {}).get("features", {})
+    if saved is None and (old.get("branch_sha256") or (old.get("branch_dir") and not a.branch_dir)):
+        raise RouteError("checkpoint lacks branch assets (legacy runs require explicit --branch-dir)")
+    bundle = read_bundle(a.level, a.branch_dir) if a.branch_dir else saved
+    pin = validate(bundle, a.level, main_sha) if bundle is not None else None
+    if saved is not None and (old.get("branch_sha256") != pin or bundle != saved):
+        raise RouteError("branch assets differ from checkpoint pin")
     fc = FeatureConfig(hs_block=a.hs_block, camera="world" if a.world_actions else "orient_ref",
                        far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=path_dir,
-                       branch_dir=portable_path_dir(a.branch_dir), path_sha256=file_sha256(asset) if asset.is_file() else None)
+                       branch_sha256=pin, path_sha256=main_sha)
     cu = {"start_back": a.start_back, "step": a.cu_step, "band": a.cu_band, "recent": a.cu_recent,
           "advance_at": a.advance_at, "min_episodes": a.min_episodes, "p_level_start": a.p_level_start}
     hl = None
     if a.backend == "headless":
         hl = {k: v for k, v in (("binary", a.hl_bin), ("root", a.hl_root), ("socket", a.hl_socket),
                                 ("ball_order", a.hl_ball_order)) if v}
-    return EnvConfig(level=a.level, mode="sr", action_repeat=a.action_repeat, out_root=str(out_root),
+    return EnvConfig(branch_assets=bundle, level=a.level, mode="sr", action_repeat=a.action_repeat, out_root=str(out_root),
                      start_record=start_record(a),
                      backend=a.backend, headless=hl,
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
@@ -425,6 +441,10 @@ def main(argv=None) -> int:
             setattr(a, k, saved.get(k, getattr(a, k)))
     else:
         ck = None
+    if a.level is None:
+        a.level = (ck or {}).get("env_config", {}).get("level", 1)
+    if ck and ck.get("branch_assets") and a.path_dir is None:
+        a.path_dir = ck["env_config"]["features"].get("path_dir")
     (run_dir / ("config.json" if not a.resume else f"config.resume-{time.strftime('%Y%m%d-%H%M%S')}.json")).write_text(
         json.dumps(vars(a), indent=1), encoding="utf-8")
     log = Logger(run_dir, a.resume)
@@ -435,7 +455,7 @@ def main(argv=None) -> int:
     np.random.seed(a.seed)
     gen = torch.Generator().manual_seed(a.seed)
 
-    env_cfg = make_env_config(a, run_dir / "episodes")
+    env_cfg = make_env_config(a, run_dir / "episodes", ck)
     if a.fake:  # the toy level has no TAS start states: plain starts from level load
         env_cfg.start_record = None
         cu_cfg = env_cfg.curriculum
@@ -700,7 +720,7 @@ def main(argv=None) -> int:
     def save_ckpt():
         state = {"model": model.state_dict(), "opt": opt.state_dict(), "rms": rms.state_dict(),
                  "curriculum": cu.state_dict(), "counters": dict(counters, wall_s=counters["wall_s"] + time.time() - t_start),
-                 "best": best, "args": vars(a), "n_obs": n_obs, "n_act": n_act, "env_config": asdict(env_cfg)}
+                 "best": best, "args": vars(a), "n_obs": n_obs, "n_act": n_act, **checkpoint_config(env_cfg)}
         f = run_dir / f"ckpt_{counters['update']:06d}.pt"
         torch.save(state, f)
         tmp = run_dir / "latest.pt.tmp"

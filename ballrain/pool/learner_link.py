@@ -68,6 +68,7 @@ def state_from_params(template: dict, msg: dict) -> dict:
     n_layers = sum(1 for k in model if k.startswith("pi.") and k.endswith(".weight"))
     env = template["env"]
     ec = asdict(env) if is_dataclass(env) else dict(env)
+    branch_assets = ec.pop("branch_assets", None)
     args = dict(template.get("worker") or {})
     args.setdefault("activation", "tanh")
     state = {"model": model, "rms": msg["rms"], "curriculum": msg.get("curriculum"),
@@ -78,6 +79,8 @@ def state_from_params(template: dict, msg: dict) -> dict:
     # the gateway never reads branch files of its own (the export pins features.branch from these bytes). A parameter
     # message's own copy wins over the template's (a learner that changed its branch without a restart)
     ba = msg.get("branch_assets") if msg.get("branch_assets") is not None else template.get("branch_assets")
+    if ba is None:
+        ba = branch_assets  # the EnvConfig copy (popped above so the exported env_config holds no raw bytes)
     if ba is not None:
         state["branch_assets"] = ba
     return state

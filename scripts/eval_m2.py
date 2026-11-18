@@ -45,7 +45,7 @@ def build_env_config(ck: dict, out_root: str, start_frame: int, max_frames: int,
     rc = RewardConfig(**e["reward"])
     # the checkpoint's own level and start record (checkpoints from before r8 are level 1)
     level, record = int(e.get("level") or 1), e.get("start_record") or RECORD
-    return EnvConfig(level=level, mode="sr", action_repeat=e["action_repeat"], out_root=out_root, features=fc, reward=rc,
+    return EnvConfig(branch_assets=ck.get("branch_assets"), level=level, mode="sr", action_repeat=e["action_repeat"], out_root=out_root, features=fc, reward=rc,
                      start_record=record if start_frame else None, start_frame=start_frame or None,
                      max_process_frames=max_frames, trace=True, world_actions=e.get("world_actions", False),
                      repress_stale_keys=e.get("repress_stale_keys"), backend=backend or e.get("backend", "retail"),
