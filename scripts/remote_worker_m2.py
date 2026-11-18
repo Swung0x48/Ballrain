@@ -27,6 +27,31 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts"))
 
 
+LOCAL_OVERRIDE_FIELDS = ("skip_respawn_from_sector",)
+
+
+def local_overrides(out: Path, a, log) -> dict:
+    """Bridge-local WorkerSpec fields that win over the learner's template: <out>/worker_overrides.json ({field: value},
+    only LOCAL_OVERRIDE_FIELDS; read at bridge start, so a STOP restart picks a change up without touching the
+    supervisor's arguments), then the command-line flags."""
+    ov = {}
+    f = out / "worker_overrides.json"
+    if f.is_file():
+        import json
+        d = json.loads(f.read_text(encoding="utf-8"))
+        bad = sorted(set(d) - set(LOCAL_OVERRIDE_FIELDS))
+        if bad:
+            raise SystemExit(f"{f}: unknown fields {bad} (allowed: {list(LOCAL_OVERRIDE_FIELDS)})")
+        ov.update(d)
+    if a.skip_respawn_from_sector is not None:
+        ov["skip_respawn_from_sector"] = int(a.skip_respawn_from_sector)
+    if "skip_respawn_from_sector" in ov:
+        ov["skip_respawn_from_sector"] = int(ov["skip_respawn_from_sector"])
+    if ov:
+        log(f"local worker overrides: {ov}")
+    return ov
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--learner", required=True, help="HOST:PORT of train_m2.py --remote-listen")
@@ -50,6 +75,9 @@ def main(argv=None) -> int:
     p.add_argument("--hl-ball-order", default="retail",
                    help="headless: BALLRAIN_HL_BALL_ORDER (default retail: a sampled order per process, recorded per "
                         "episode and run as ball_order)")
+    p.add_argument("--skip-respawn-from-sector", type=int, default=None,
+                   help="never play respawn lives in this sector or later (WorkerSpec.skip_respawn_from_sector), for "
+                        "engines that crash on them; default: worker_overrides.json in the output dir, else off")
     p.add_argument("--fake", action="store_true", help="FakeLauncher (tests)")
     p.add_argument("--launch", default=None,
                    help="launch recipe for this machine's copies (a key of ballrain.instances.LAUNCH_RECIPES); default: "
@@ -101,7 +129,7 @@ def main(argv=None) -> int:
         for c in copies:
             if instances.running_in_copy(instances.get_copy(c)):
                 raise SystemExit(f"Player.exe already running in {c}")
-    overrides = {}
+    overrides = local_overrides(out, a, log)
     if a.fake:
         from ballrain.fakegame import FakeLauncher
         overrides["launcher_factory"] = FakeLauncher
