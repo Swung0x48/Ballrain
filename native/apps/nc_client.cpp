@@ -4,10 +4,11 @@
 //       login_start, shows the login code and the browser link, polls until the gateway hands out the token, which
 //       is saved to <D>/token (D defaults to ./ballrain-pool-data)
 //   nc_client run --gateway URL --ballance-dir G --engine BallanceMMOSimTool[.exe] [--data-dir D] [--tasks N]
-//                 [--engine-kind x87soft|2002] [--engine-env NAME=VALUE ...] [--leaderboard on|off]
-//       hello (engine sha256, game-file hashes), then tasks one after another: the policy, starts pack and reference
-//       line from the sha-addressed cache, the task played on the local engine, every chunk posted as soon as it is
-//       complete. A refusal is printed verbatim; a token-fatal one stops the client.
+//                 [--instances K] [--engine-kind x87soft|2002] [--engine-env NAME=VALUE ...] [--leaderboard on|off]
+//                 [--auto-pause on|off]
+//       the controller (native/core/src/controller.cpp) without a UI: hello, K instances playing tasks, the upload
+//       queue, heartbeats; with --tasks N it stops after N tasks once their chunks are posted. A refusal is printed
+//       verbatim; a token-fatal one stops the client (exit code 3).
 //
 // Output: one JSON object per line on stdout (events), human-readable notes on stderr.
 #include <atomic>
@@ -20,6 +21,7 @@
 #include <thread>
 #include <vector>
 
+#include "ballrain/controller.h"
 #include "ballrain/pool_client.h"
 #include "ballrain/task_runner.h"
 #include "platform.h"
@@ -105,291 +107,56 @@ static int cmd_login(int argc, char **argv) {
     return 1;
 }
 
-struct Uploader {  // posts a task's chunks in order; network errors retried with backoff
-    GatewayClient &api;
-    std::string refusal_message;
-    bool fatal = false, failed = false;
-    int64_t accepted_steps = 0;
-    int64_t posted = 0;   // chunks the gateway has (accepted, or a duplicate of an earlier attempt)
-    bool final_posted = false;
-    void post(const Bytes &data, int64_t seq, bool final = false) {
-        if (failed) return;
-        double delay = 2.0;
-        for (int tried = 0;; ++tried) {
-            try {
-                Json r = api.chunk(data);
-                Json f = Json::object();
-                f.set("seq", r.at("seq"));
-                f.set("status", r.at("status"));
-                f.set("verify", r.at("verify"));
-                f.set("steps", r.at("steps"));
-                if (const Json *rs = r.find("reason")) f.set("reason", *rs);
-                event("chunk", f);
-                if (r.at("status").as_string() == "rejected" || r.get_bool("token_revoked", false)) {
-                    failed = true;
-                    fatal = r.get_bool("token_revoked", false);
-                    if (const Json *rs = r.find("reason")) refusal_message = rs->get_string("message", "");
-                } else {
-                    accepted_steps += r.at("steps").as_int();
-                    ++posted, final_posted = final;
-                }
-                return;
-            } catch (const GatewayUnavailable &e) {
-                if (tried >= 6) {
-                    failed = true;
-                    refusal_message = e.what();
-                    return;
-                }
-                std::fprintf(stderr, "chunk %lld: %s; retrying\n", (long long)seq, e.what());
-                sleep_s(delay);
-                delay = std::min(delay * 2, 30.0);
-            } catch (const GatewayRefusal &e) {
-                if (tried && e.code == "chunk_duplicate") {  // our own earlier attempt arrived
-                    ++posted, final_posted = final;
-                    return;
-                }
-                failed = true;
-                fatal = e.fatal;
-                refusal_message = e.message;
-                Json f = Json::object();
-                f.set("seq", Json::integer(seq));
-                f.set("reason", e.reason);
-                event("chunk_refused", f);
-                return;
-            }
-        }
-    }
-};
-
 static int cmd_run(int argc, char **argv) {
     std::string dir = arg(argc, argv, "--data-dir", "ballrain-pool-data");
     Bytes token;
     if (!read_file(dir + "/token", token) || token.empty()) throw Error("no token: run `nc_client login` first");
-    while (!token.empty() && (token.back() == '\n' || token.back() == '\r')) token.pop_back();
-    GatewayClient api(arg(argc, argv, "--gateway"), token);
-    std::string game = platform::absolute_path(arg(argc, argv, "--ballance-dir"));
-    std::string engine_bin = platform::absolute_path(arg(argc, argv, "--engine"));
-    std::string kind = arg(argc, argv, "--engine-kind", "x87soft");
-    int64_t max_tasks = std::atoll(arg(argc, argv, "--tasks", "0").c_str());
-    std::string lb = arg(argc, argv, "--leaderboard", "");
-    platform::make_dirs(dir + "/cache");
-    platform::make_dirs(dir + "/runs");
-    Json engine_json = engine_info(engine_bin, kind), files_json = hash_game_files(game, kind);
-    Json hello = api.hello(platform_name(), engine_json, files_json, 1);
-    auto rehello = [&]() {  // session_expired: the gateway forgot the session (idle / restarted): a new hello
-        hello = api.hello(platform_name(), engine_json, files_json, 1);
-        event("rehello", make_message("x"));
-    };
     bool fatal = false;
-    // a refusal outside a chunk: fatal (token) stops the client, session_expired renews the session, others are shown
-    auto refused = [&](const GatewayRefusal &e, const char *where) {
-        Json f = Json::object();
-        f.set("where", Json::string(where));
-        f.set("reason", e.reason);
-        event("refused", f);
-        std::fprintf(stderr, "%s\n", e.message.c_str());
-        if (e.fatal) fatal = true, g_stop = true;
-        else if (e.code == "session_expired") {
-            try {
-                rehello();
-            } catch (const GatewayRefusal &e2) {
-                if (e2.fatal) fatal = true, g_stop = true;
-            } catch (const GatewayUnavailable &) {
-            }
+    Controller ctl(dir, [&](const std::string &kind, const Json &f) {
+        if (kind == "log") {
+            std::fprintf(stderr, "%s\n", f.get_string("message", "").c_str());
+            return;
         }
-    };
-    {
-        Json f = Json::object();
-        f.set("user", hello.at("user"));
-        f.set("leaderboard", hello.at("leaderboard"));
-        f.set("max_instances", hello.at("max_instances"));
-        event("hello_ok", f);
+        event(kind, f);
+    });
+    ClientConfig c = ctl.config();
+    c.gateway_url = arg(argc, argv, "--gateway");
+    c.ballance_dir = platform::absolute_path(arg(argc, argv, "--ballance-dir"));
+    c.engine_binary = platform::absolute_path(arg(argc, argv, "--engine"));
+    c.engine_kind = arg(argc, argv, "--engine-kind", "x87soft");
+    c.instances = std::atoi(arg(argc, argv, "--instances", "1").c_str());
+    // the automatic pause is the TUI's (a test machine may run Player.exe for other reasons): off unless asked
+    c.auto_pause_player = c.auto_pause_battery = std::string(arg(argc, argv, "--auto-pause", "off")) == "on";
+    ctl.set_config(c);
+    ctl.max_tasks = std::atoll(arg(argc, argv, "--tasks", "0").c_str());
+    for (auto &kv : args_all(argc, argv, "--engine-env")) {
+        size_t eq = kv.find('=');
+        if (eq == std::string::npos || kv.compare(0, 9, "BALLRAIN_") != 0 || kv.find("BALL_ORDER") != std::string::npos)
+            throw Error("--engine-env NAME=VALUE (BALLRAIN_*, not the ball order)");
+        ctl.engine_env.push_back({kv.substr(0, eq), kv.substr(eq + 1)});
     }
-    if (!lb.empty() && (lb == "on") != hello.at("leaderboard").as_bool()) api.set_leaderboard(lb == "on");
-    double heartbeat_s = double(hello.at("heartbeat_s").as_int());
-    double last_hb = platform::monotonic_s();
-    int64_t total_steps = 0;
-    double t_start = platform::monotonic_s();
-    PoolCache cache(dir + "/cache", api);
-    auto heartbeat = [&](bool running, const std::string &task_id, int64_t steps) {
-        if (platform::monotonic_s() - last_hb < heartbeat_s) return;
-        last_hb = platform::monotonic_s();
-        Json inst = Json::object();
-        inst.set("slot", Json::integer(0));
-        inst.set("state", Json::string(running ? "running" : "idle"));
-        inst.set("steps", Json::integer(total_steps + steps));
-        inst.set("task_id", task_id.empty() ? Json() : Json::string(task_id));
-        Json list = Json::array();
-        list.push(inst);
-        double el = platform::monotonic_s() - t_start;
-        Json r;
-        try {
-            r = api.heartbeat(running, list, el > 0 ? double(total_steps + steps) / el : 0.0);
-        } catch (const GatewayUnavailable &e) {  // the next one will tell; the task goes on
-            std::fprintf(stderr, "heartbeat: %s\n", e.what());
-            return;
-        } catch (const GatewayRefusal &e) {
-            refused(e, "heartbeat");
-            return;
-        }
-        event("heartbeat", make_message("x"));
-        if (const Json *rv = r.find("revoked")) {
-            std::fprintf(stderr, "%s\n", rv->get_string("message", "").c_str());
-            Json f = Json::object();
-            f.set("reason", *rv);
-            event("revoked", f);
-            g_stop = true;
-        }
-    };
-    int64_t done = 0;
-    int failures = 0;  // consecutive failed tasks / fetches: backoff, give up after 8
-    auto backoff = [&](const std::string &why) {
-        ++failures;
-        Json f = Json::object();
-        f.set("error", Json::string(why));
-        f.set("failures", Json::integer(failures));
-        event("task_failed", f);
-        std::fprintf(stderr, "%s\n", why.c_str());
-        if (failures >= 8) {
-            g_stop = true;
-            return;
-        }
-        sleep_s(std::min(300.0, 2.0 * double(1 << std::min(failures, 8))));
-    };
-    while (!g_stop && (max_tasks <= 0 || done < max_tasks)) {
-        Json tm;
-        try {
-            tm = api.task();
-        } catch (const GatewayUnavailable &e) {
-            backoff(e.what());
-            continue;
-        } catch (const GatewayRefusal &e) {
-            refused(e, "task");
-            if (!fatal && e.code != "session_expired") sleep_s(30);
-            continue;
-        }
-        if (tm.at("type").as_string() == "no_task") {
-            Json f = Json::object();
-            f.set("reason", tm.at("reason"));
-            event("no_task", f);
-            heartbeat(false, "", 0);
-            sleep_s(double(tm.at("retry_s").as_int()));
-            continue;
-        }
-        std::string open_task;  // the fetched task (task_end when it ends without a final chunk)
-        Uploader up{api, std::string(), false, false, 0};
-        // close a task that ended without a final chunk once everything it has was posted (best effort: the deadline
-        // closes it otherwise), so the gateway frees its instance slot now
-        auto close_open = [&](const std::string &why) {
-            if (open_task.empty() || up.failed || up.final_posted) return;
-            try {
-                api.task_end(open_task, up.posted, why);
-                Json f = Json::object();
-                f.set("task_id", Json::string(open_task));
-                f.set("chunks", Json::integer(up.posted));
-                event("task_closed", f);
-            } catch (const std::exception &e) {
-                std::fprintf(stderr, "task_end %s: %s\n", open_task.c_str(), e.what());
-            }
-        };
-        try {
-        Task task = Task::from_json(tm.at("task"));
-        open_task = task.task_id;
-        double deadline = platform::monotonic_s() + double(task.deadline_s) - std::min(30.0, double(task.deadline_s) / 10);
-        {
-            Json f = Json::object();
-            f.set("task_id", Json::string(task.task_id));
-            f.set("start_frame", Json::integer(task.start_frame));
-            f.set("ball_order_seed", Json::integer(task.ball_order_seed));
-            event("task", f);
-        }
-        if (task.engine != kind) throw Error("task engine " + task.engine + ", local engine " + kind);
-        Policy pol = cache.policy(task.policy_sha);
-        const Json &m = pol.manifest;
-        EnvConfig ec = EnvConfig::from_manifest(m.at("env"));
-        if (ec.level != task.level || m.at("env").get_string("start_record", "") != task.record)
-            throw Error("task level / record differ from the policy's");
-        TasStarts starts = cache.starts(task.asset_starts);
-        if (starts.record != task.record || starts.record_sha256 != task.record_sha256)
-            throw Error("the starts pack is not the task's record");
-        starts.apply_camera_filter(ec.camera_quarter_tol, ec.camera_turn_grace_ms);
-        starts.exclude(ec.exclude_starts);
-        FeatureConfig fc = FeatureConfig::from_json(m.at("features"));
-        if (fc.path_sha256 != task.asset_path) throw Error("the task's reference line is not the policy's");
-        fc.path_dir = cache.path_dir(task.asset_path, task.level);
-        bool drive = task.rest && task.rest->drive;  // an at-rest start with a target may hand over in an excluded range
-        if (task.start_frame > 0 && !(drive ? starts.expected(task.start_frame).has_value()
-                                            : starts.index_of(task.start_frame).has_value()))
-            throw Error("start frame is not a valid start frame of the record");
-        EngineConfig eng;
-        eng.binary = engine_bin, eng.root = game;
-        eng.ball_order = "retail:" + std::to_string(task.ball_order_seed);
-        const Json &eo = m.at("engine_options");
-        auto opt = [&](const char *k, std::optional<int64_t> &dst) {
-            const Json *j = eo.find(k);
-            if (j && !j->is_null()) dst = j->as_int();
-        };
-        opt("boot_ticks", eng.boot_ticks), opt("hidden_ticks", eng.hidden_ticks), opt("reset_nmc", eng.reset_nmc);
-        opt("reset_seed", eng.reset_seed), opt("reset_frame", eng.reset_frame);
-        eng.legacy_edit = eo.get_bool("legacy_edit", true);
-        eng.reset_precision = eo.get_bool("reset_precision", false);
-        eng.orig_random = eo.get_bool("orig_random", false);
-        for (auto &kv : args_all(argc, argv, "--engine-env")) {
-            size_t eq = kv.find('=');
-            if (eq == std::string::npos || kv.compare(0, 9, "BALLRAIN_") != 0 || kv.find("BALL_ORDER") != std::string::npos)
-                throw Error("--engine-env NAME=VALUE (BALLRAIN_*, not the ball order)");
-            eng.extra_env.push_back({kv.substr(0, eq), kv.substr(eq + 1)});
-        }
-        std::string runs = dir + "/runs/" + task.task_id;
-        BallanceEnv env(ec, fc, eng, runs, nullptr, &starts, task.start_frame, RewardConfig::from_json(m.at("reward")),
-                        task.rest);
-        if (env.features().size() != pol.n_obs) throw Error("the env's observation size differs from the policy's");
-        for (size_t i = 0; i < env.actions().size(); ++i)
-            if (env.actions()[i] != pol.action_keys[i]) throw Error("the env's action set differs from the policy's");
-        TaskRunner runner(env, &starts, task, RolloutSpec::from_json(m.at("rollout")), m.at("env").at("delta_ms").as_double());
-        double t0 = platform::monotonic_s();
-        std::string end = sample_task(
-            runner, pol, task,
-            [&](const Bytes &data, bool final) {
-                up.post(data, -1, final);
-            },
-            [&]() -> std::string {
-                heartbeat(true, task.task_id, runner.steps);
-                if (g_stop) return "stopped";
-                if (platform::monotonic_s() >= deadline) return "deadline";
-                if (up.failed) return "stopped";
-                return "";
-            });
-        env.close();
-        std::error_code ec_rm;
-        std::filesystem::remove_all(std::filesystem::u8path(runs), ec_rm);  // a task keeps nothing locally
-        total_steps += runner.steps;
-        ++done;
-        Json f = Json::object();
-        f.set("task_id", Json::string(task.task_id));
-        f.set("end", Json::string(end));
-        f.set("steps", Json::integer(runner.steps));
-        f.set("accepted_steps", Json::integer(up.accepted_steps));
-        f.set("frames", Json::integer(runner.frames));
-        f.set("episodes", Json::integer(runner.episodes));
-        double dt = platform::monotonic_s() - t0;
-        f.set("wall_s", Json::number(dt));
-        f.set("steps_per_s", Json::number(dt > 0 ? double(runner.steps) / dt : 0.0));
-        event("task_end", f);
-        close_open("end " + end + " without a final chunk");
-        if (up.failed && !up.refusal_message.empty()) std::fprintf(stderr, "%s\n", up.refusal_message.c_str());
-        if (up.fatal) fatal = true, g_stop = true;
-        failures = 0;
-        } catch (const GatewayRefusal &e) {  // a download refused, or the policy / assets of the task
-            close_open(std::string("refused: ") + e.code);
-            refused(e, "task");
-            ++done;
-        } catch (const std::exception &e) {  // an engine failure at the start, a mismatching asset, ...: next task
-            close_open(std::string("failed: ") + e.what());
-            ++done;
-            backoff(std::string("task: ") + e.what());
-        }
+    if (!ctl.connect()) {
+        ControllerView v = ctl.view();
+        if (v.banner) std::fprintf(stderr, "%s\n", v.banner->message.c_str());
+        return v.token_dead ? 3 : 1;
     }
+    std::string lb = arg(argc, argv, "--leaderboard", "");
+    if (!lb.empty() && (lb == "on") != ctl.view().leaderboard) ctl.set_leaderboard(lb == "on");
+    ctl.start_service();
+    ctl.start();
+    while (!g_stop) {
+        if (ctl.finished()) break;
+        ControllerView v = ctl.view();
+        if (v.token_dead) {
+            fatal = true;
+            break;
+        }
+        bool gave_up = !v.inst.empty();
+        for (auto &i : v.inst) gave_up = gave_up && i.state == "error";
+        if (gave_up) break;  // every instance stopped retrying (a broken installation): the banner says why
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    ctl.shutdown();
     if (fatal) {
         event("stopped", make_message("token_fatal"));
         return 3;

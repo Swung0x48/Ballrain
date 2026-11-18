@@ -60,11 +60,12 @@ else()
     set(BALLRAIN_PLATFORM_SRC platform/platform_posix.cpp)
 endif()
 add_library(ballrain_engine STATIC core/src/session.cpp core/src/env.cpp core/src/task_runner.cpp core/src/pool_client.cpp
+    core/src/pool_task.cpp core/src/controller.cpp
     ${BALLRAIN_PLATFORM_SRC})
 target_include_directories(ballrain_engine PUBLIC platform)
 target_link_libraries(ballrain_engine PUBLIC ballrain_core)
 if(WIN32)
-    target_link_libraries(ballrain_engine PUBLIC ws2_32 winhttp)
+    target_link_libraries(ballrain_engine PUBLIC ws2_32 winhttp shell32 ole32)
     target_compile_definitions(ballrain_engine PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 elseif(NOT ANDROID)
     find_package(Threads REQUIRED)

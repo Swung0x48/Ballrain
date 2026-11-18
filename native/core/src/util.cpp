@@ -1,9 +1,14 @@
 #include "ballrain/util.h"
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 
 namespace ballrain {
+
+// paths are UTF-8 everywhere in the client; on Windows a narrow std::fstream path would be read in the ANSI code page
+// (a Chinese user name in %LOCALAPPDATA%, a Ballance folder on the 桌面)
+std::filesystem::path u8_path(const std::string &p) { return std::filesystem::u8path(p); }
 
 uint32_t fourcc(const char s[4]) {
     uint32_t v;
@@ -18,7 +23,7 @@ std::string tag_str(uint32_t tag) {
 }
 
 bool read_file(const std::string &path, Bytes &out) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(u8_path(path), std::ios::binary);
     if (!f) return false;
     f.seekg(0, std::ios::end);
     std::streamoff n = f.tellg();
@@ -30,7 +35,7 @@ bool read_file(const std::string &path, Bytes &out) {
 }
 
 bool read_file_from(const std::string &path, uint64_t offset, Bytes &out, uint64_t *file_size) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(u8_path(path), std::ios::binary);
     if (!f) return false;
     f.seekg(0, std::ios::end);
     std::streamoff n = f.tellg();
@@ -45,12 +50,12 @@ bool read_file_from(const std::string &path, uint64_t offset, Bytes &out, uint64
 }
 
 bool file_exists(const std::string &path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(u8_path(path), std::ios::binary);
     return bool(f);
 }
 
 void write_file(const std::string &path, const Bytes &data) {
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    std::ofstream f(u8_path(path), std::ios::binary | std::ios::trunc);
     if (!f) throw Error("cannot write " + path);
     f.write(data.data(), std::streamsize(data.size()));
     if (!f) throw Error("write failed: " + path);

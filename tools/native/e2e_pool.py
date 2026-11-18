@@ -55,6 +55,21 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def children_of(pid: int) -> list:
+    """PIDs of the processes whose parent is pid (Windows: CIM)."""
+    out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                          f"(Get-CimInstance Win32_Process -Filter 'ParentProcessId={int(pid)}').ProcessId"],
+                         capture_output=True, text=True).stdout
+    return [int(x) for x in out.split() if x.strip().isdigit()]
+
+
+def pid_alive(pid: int) -> bool:
+    out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                          f"[bool](Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue)"], capture_output=True,
+                         text=True).stdout
+    return out.strip() == "True"
+
+
 def get(url, cookie=None):
     """(status, headers, body) of a GET without following redirects (the player's browser)."""
     req = urllib.request.Request(url, headers={"Cookie": cookie} if cookie else {})
@@ -95,6 +110,10 @@ def main(argv=None) -> int:
                     "machine-dependent parts of the level message differ)")
     ap.add_argument("--client-engine-env", action="append", default=[], help="NAME=VALUE for the client's engine")
     ap.add_argument("--tasks", type=int, default=3)
+    ap.add_argument("--instances", type=int, default=1, help="the client's instances (engines at the same time)")
+    ap.add_argument("--kill-after", type=float, default=0.0,
+                    help="first hard-kill the client this many seconds into a run (its engines must die with it: the job "
+                         "object), then run it again: the killed run's queued chunks are posted and its tasks closed")
     ap.add_argument("--max-steps", type=int, default=3000)
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--heartbeat-s", type=int, default=5, help="the gateway's heartbeat interval (5: heartbeats during tasks)")
@@ -166,9 +185,26 @@ def main(argv=None) -> int:
     log(f"login ok: {json.loads(out.splitlines()[-1])['user']['username']}")
 
     # ---- the native client plays tasks
+    killed_tasks = []
+    if a.kill_after > 0:
+        run_cmd = [a.client, "run", "--gateway", gateway, "--data-dir", str(client_dir), "--ballance-dir", a.client_game,
+                   "--engine", a.client_engine, "--instances", str(a.instances)]
+        k = subprocess.Popen(run_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8")
+        time.sleep(a.kill_after)
+        engines = children_of(k.pid)
+        k.kill()  # TerminateProcess: no cleanup in the client at all
+        out_k = k.communicate(timeout=60)[0]
+        killed_tasks = [json.loads(x)["task_id"] for x in out_k.splitlines()
+                        if x.startswith("{") and json.loads(x)["event"] == "task"]
+        time.sleep(3)
+        alive = [pid for pid in engines if pid_alive(pid)]
+        log(f"killed the client after {a.kill_after:.0f} s: {len(engines)} engines, {len(alive)} still alive after 3 s; "
+            f"{len(killed_tasks)} tasks were running")
+        if not engines or alive:
+            return 1
     t0 = time.time()
     p = subprocess.run([a.client, "run", "--gateway", gateway, "--data-dir", str(client_dir), "--ballance-dir", a.client_game,
-                        "--engine", a.client_engine, "--tasks", str(a.tasks)]
+                        "--engine", a.client_engine, "--tasks", str(a.tasks), "--instances", str(a.instances)]
                        + [x for kv in a.client_engine_env for x in ("--engine-env", kv)], capture_output=True, text=True, encoding="utf-8",
                        timeout=3600)
     events = [json.loads(x) for x in p.stdout.splitlines() if x.strip().startswith("{")]
@@ -203,7 +239,14 @@ def main(argv=None) -> int:
     for c in rows:
         if c["verify"] != "passed":
             log(f"  chunk {c['task_id'][:8]}/{c['seq']}: {c['verify']} {c['reason']}")
-    ok = all(c["verify"] == "passed" for c in rows) and st["steps_verified"] == sum(e["steps"] for e in ends)
+    if killed_tasks:
+        states = {t: store.task(t)["state"] for t in killed_tasks}
+        log(f"tasks of the killed run: {states}")
+        if any(st == "open" for st in states.values()):
+            log("a task of the killed run is still open (it should be closed by task_end after the restart)")
+            return 1
+    want = sum(e["steps"] for e in ends)  # (+ the killed run's prefixes, verified as well)
+    ok = all(c["verify"] == "passed" for c in rows) and (st["steps_verified"] >= want if killed_tasks else st["steps_verified"] == want)
 
     # ---- a forged native chunk (reward changed by 0.25 at step 10, resealed) replayed offline: must be caught
     e = ends[0]

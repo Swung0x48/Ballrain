@@ -27,6 +27,24 @@ struct DirEntry {
 };
 bool list_files(const std::string &dir, std::vector<DirEntry> &out, size_t max_files = 20000);
 bool is_dir(const std::string &path);
+std::vector<std::string> list_dir(const std::string &dir);  // the names in dir (no "." / ".."), unsorted
+bool rename_file(const std::string &from, const std::string &to);  // replaces an existing target
+int64_t file_size(const std::string &path);                       // -1 when missing
+int64_t unix_time();                                              // wall-clock seconds
+
+// The client's data directory: %LOCALAPPDATA%\BallrainPool, ~/Library/Application Support/BallrainPool,
+// $XDG_DATA_HOME/ballrain-pool (else ~/.local/share/ballrain-pool)
+std::string data_dir();
+std::string home_dir();
+std::string executable_path();  // this program (absolute)
+std::string user_name();        // the login name (diagnostics scrub it from paths)
+bool open_url(const std::string &url);  // the system browser (ShellExecute / open / xdg-open)
+
+// Automatic-pause probes (best effort: false when unknown). process_running compares image names case-insensitively
+// (Windows: the process list; Linux: /proc/<pid>/cmdline contains the name, e.g. Player.exe under Wine)
+bool process_running(const std::string &image_name);
+bool on_battery();
+int cpu_count();
 
 // One HTTP(S) request. Windows: WinHTTP (http and https, the system's TLS and proxy settings). POSIX: http only for
 // now (a loopback test gateway); https on macOS / Linux / Android is not implemented yet. Throws ballrain::Error on a
@@ -66,6 +84,10 @@ public:
         std::vector<std::pair<std::string, std::string>> env;  // the complete environment of the child
         std::string cwd;          // "" = inherit
         std::string stderr_path;  // "" = discard
+        // the volunteer client's engines: below-normal priority, and (Windows) inside a Job Object of this process
+        // with KILL_ON_JOB_CLOSE, so no engine outlives the client however it ends (POSIX: the engine exits when its
+        // socket closes; nice 10)
+        bool background = false;
     };
     virtual ~Process() = default;
     virtual int pid() const = 0;
