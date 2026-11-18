@@ -95,6 +95,7 @@ def make_env(ck: dict, launcher, out_root: Path, k: int, kind: str):
     from ballrain.features import FeatureConfig
     from ballrain.rewards import RewardConfig
     ec = dict(ck["env_config"])
+    ec["branch_assets"] = ck.get("branch_assets")  # the run's route bundle lives beside env_config in the checkpoint
     fc = dict(ec.pop("features"))
     rc = dict(ec.pop("reward"))
     fc["path_dir"] = _local_path(fc.get("path_dir"))
