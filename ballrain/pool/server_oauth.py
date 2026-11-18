@@ -20,6 +20,9 @@ from datetime import datetime, timezone
 from .reasons import Reason, payload
 
 MAX_FORUM_RESPONSE = 64 * 1024
+# the forum sits behind Cloudflare, which bans urllib's default "Python-urllib/3.x" (error 1010, HTTP 403 on both
+# /oauth/token and /api/user): every server-side forum request names the gateway with a generic agent instead
+USER_AGENT = "ballrain-pool-gateway/1.0"
 USER_FIELDS = ("id", "username", "nickname", "avatar_url", "is_email_confirmed", "joined_at", "comment_count")
 
 
@@ -80,7 +83,7 @@ class ForumClient:
                                        "client_secret": self.cfg.client_secret}).encode("ascii")
         req = urllib.request.Request(f"{self.cfg.base_url}/oauth/token", data=body, method="POST",
                                      headers={"Content-Type": "application/x-www-form-urlencoded",
-                                              "Accept": "application/json"})
+                                              "Accept": "application/json", "User-Agent": USER_AGENT})
         o = self._json(req)
         tok = o.get("access_token")
         if not isinstance(tok, str) or not tok or len(tok) > 4096:
@@ -90,7 +93,8 @@ class ForumClient:
     def user(self, access_token: str) -> dict:
         """The forum user's fields the pool reads (USER_FIELDS); email is dropped here."""
         req = urllib.request.Request(f"{self.cfg.base_url}/api/user", method="GET",
-                                     headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"})
+                                     headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json",
+                                              "User-Agent": USER_AGENT})
         o = self._json(req)
         if isinstance(o.get("data"), dict):  # JSON:API wrapping ({"data": {"id", "attributes": {...}}})
             d = o["data"]
