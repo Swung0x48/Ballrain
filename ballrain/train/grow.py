@@ -11,6 +11,8 @@ shrink, or an old layout that is not a prefix of the new one, is refused.
 """
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import torch
 
@@ -92,24 +94,54 @@ def grow_optimizer_state(opt_sd: dict, model, n_old: int, n_new: int) -> dict:
     return {"state": state, "param_groups": groups}
 
 
+def _split_output(model, sd, opt_sd):
+    """Preserve the legacy parameter order and append independent copies of the output slots."""
+    sd = dict(sd)
+    names = list(dict(model.named_parameters()))
+    extra = [n for n in names if n.startswith("extra_heads.")]
+    if opt_sd is not None:
+        opt_sd = copy.deepcopy(opt_sd)
+        groups = opt_sd["param_groups"]
+        if len(groups) != 1 or len(groups[0]["params"]) != len(names) - len(extra) or names[-len(extra):] != extra:
+            raise GrowError("actor split expects the trainer's single ordered Adam parameter group")
+        ids = groups[0]["params"]
+    for name in extra:
+        source = f"pi.{len(model.pi) - 1}.{name.rsplit('.', 1)[1]}"
+        sd[name] = sd[source].clone()
+        if opt_sd is not None:
+            old_id, new_id = ids[names.index(source)], max(ids) + 1
+            ids.append(new_id)
+            if old_id in opt_sd["state"]:
+                opt_sd["state"][new_id] = copy.deepcopy(opt_sd["state"][old_id])
+    return sd, opt_sd
+
+
 def load_grown(model, opt, rms, src: dict, n_obs: int, new_features: dict | None = None, load_opt: bool = True,
                log=None) -> bool:
     """Model, observation statistics and (load_opt) optimiser state of a checkpoint dict into model / opt / rms,
-    grown to n_obs entries when the checkpoint has fewer. Returns True when it was grown."""
+    grown to n_obs entries and/or split into actor heads if requested. Returns True for either migration."""
     sd, n_old = src["model"], int(src["n_obs"])
     st = src["rms"]
     old_features = (src.get("env_config") or {}).get("features")
+    opt_sd = src["opt"] if load_opt else None
+    split = model.actor_heads == "ball_type" and "extra_heads.0.weight" not in sd
+    if split:
+        sd, opt_sd = _split_output(model, sd, opt_sd)
+        if log:
+            log("split actor output into wood / paper / stone heads")
+    elif model.actor_heads == "single" and "extra_heads.0.weight" in sd:
+        raise GrowError("cannot merge trained heads; use --actor-heads ball_type or a pre-split checkpoint")
     if n_old == n_obs:
         model.load_state_dict(sd)
         rms.load_state_dict(st)
         if load_opt:
-            opt.load_state_dict(src["opt"])
-        return False
+            opt.load_state_dict(opt_sd)
+        return split
     check_prefix(old_features, new_features, n_old, n_obs)
     model.load_state_dict(grow_model_state(sd, n_old, n_obs))
     rms.load_state_dict(grow_rms_state(st, n_old, n_obs))
     if load_opt:
-        opt.load_state_dict(grow_optimizer_state(src["opt"], model, n_old, n_obs))
+        opt.load_state_dict(grow_optimizer_state(opt_sd, model, n_old, n_obs))
     if log is not None:
         log(f"policy grown from {n_old} to {n_obs} observation entries (zero input weights; Adam for the new columns: "
             f"zero first moments, second moments seeded with the row mean of the old columns; observation statistics "

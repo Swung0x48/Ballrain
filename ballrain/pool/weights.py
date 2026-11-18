@@ -31,7 +31,7 @@ from .protocol import dumps
 FORMAT = "ballrain-pool-weights/1"
 NORM_EPS = 1e-8  # ballrain.train.ppo.normalize
 NORM_CLIP = 10.0
-ARRAY_ORDER_PREFIX = ("pi.", "v.")
+ARRAY_ORDER_PREFIX = ("pi.", "v.", "extra_heads.")
 
 # EnvConfig fields a client takes from the manifest (everything else is either the task's -- start frame, ball order
 # -- or the client's own -- copy, out_root, headless paths -- or must stay off: curriculum / rest / rehearsal draws)
@@ -172,7 +172,8 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     for k, a in arrays.items():
         if not np.isfinite(a).all():
             raise ValueError(f"{k}: non-finite values")
-    _check_arch(arrays, n_obs, n_act, hidden)
+    mode = args.get("actor_heads", "single")
+    _check_arch(arrays, n_obs, n_act, hidden, mode)
 
     ec = dict(state.get("env_config") or {})
     from ballrain.headless import HeadlessConfig
@@ -184,7 +185,7 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     fc = dict(ec.get("features") or {})
     feats = _plain({f.name: fc.get(f.name, getattr(FeatureConfig(), f.name)) for f in fields(FeatureConfig)})
     legacy_dir = feats.pop("branch_dir", None)  # (old checkpoints: a directory marker, never opened)
-    requires = []
+    requires = ["actor_ball_type_v1"] if mode == "ball_type" else []
     if feats.get("branch_sha256") or legacy_dir:
         # a route branch: its files come from the learner with the policy (state["branch_assets"], ballrain.branch_assets),
         # never from a local directory; the manifest keeps the learner's pin (features.branch_sha256: the digest of the
@@ -248,7 +249,8 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     m = {
         "format": FORMAT,
         "source": {"run": str(run), "update": int(c.get("update", 0)), "steps": int(c.get("steps", 0))},
-        "arch": {"kind": "mlp_actor_critic", "n_obs": n_obs, "n_act": n_act, "hidden": hidden, "activation": act},
+        "arch": {"kind": "mlp_actor_critic_ball_type" if mode == "ball_type" else "mlp_actor_critic",
+                 "n_obs": n_obs, "n_act": n_act, "hidden": hidden, "activation": act},
         "obs_norm": {"eps": NORM_EPS, "clip": NORM_CLIP, "count": float(rms.get("count", 0.0))},
         "actions": {"keys": [int(k) for k in keys], "names": names, "world_actions": bool(env.get("world_actions"))},
         "env": env, "engine_options": engine_options, "features": feats, "reward": reward, "rollout": rollout,
@@ -288,7 +290,7 @@ def export_checkpoint(ckpt_path, out_dir, run: str | None = None) -> dict:
     return export_state(load_trusted_checkpoint(p), out_dir, run or p.parent.name)
 
 
-def _check_arch(arrays: dict, n_obs: int, n_act: int, hidden: list) -> None:
+def _check_arch(arrays: dict, n_obs: int, n_act: int, hidden: list, mode="single") -> None:
     dims = [n_obs] + list(hidden)
     for head, n_out in (("pi", n_act), ("v", 1)):
         for i, (a, b) in enumerate(zip(dims, dims[1:] + [n_out])):
@@ -296,6 +298,15 @@ def _check_arch(arrays: dict, n_obs: int, n_act: int, hidden: list) -> None:
             if w is None or bias is None or w.shape != (b, a) or bias.shape != (b,):
                 raise ValueError(f"{head} layer {i}: expected weight ({b}, {a}) and bias ({b},)")
     want = {f"{h}.{2 * i}.{p}" for h in ("pi", "v") for i in range(len(hidden) + 1) for p in ("weight", "bias")}
+    if mode == "ball_type" and n_obs >= 4:
+        for i in range(2):
+            for suffix, shape in (("weight", (n_act, dims[-1])), ("bias", (n_act,))):
+                key = f"extra_heads.{i}.{suffix}"
+                if key not in arrays or arrays[key].shape != shape:
+                    raise ValueError(f"{key}: expected shape {shape}")
+                want.add(key)
+    elif mode != "single":
+        raise ValueError(f"unsupported actor layout {mode!r} for {n_obs} observations")
     want |= {"rms_mean", "rms_var"}
     if set(arrays) != want:
         raise ValueError(f"array names {sorted(set(arrays) ^ want)} unexpected / missing")
@@ -332,7 +343,7 @@ def load_policy(npz_path, manifest, expect_sha: str | None = None) -> "NumpyPoli
     if _file_sha(p) != m["npz_sha256"]:
         raise ValueError("weights file sha256 differs from the manifest")
     arch = m["arch"]
-    if arch.get("kind") != "mlp_actor_critic" or arch.get("activation") not in ("tanh", "relu"):
+    if arch.get("kind") not in ("mlp_actor_critic", "mlp_actor_critic_ball_type") or arch.get("activation") not in ("tanh", "relu"):
         raise ValueError(f"unsupported architecture {arch!r}")
     arrays = {}
     with np.load(p, allow_pickle=False) as z:
@@ -348,7 +359,8 @@ def load_policy(npz_path, manifest, expect_sha: str | None = None) -> "NumpyPoli
             if not np.isfinite(a).all():
                 raise ValueError(f"{k}: non-finite values")
             arrays[k] = _c(a)
-    _check_arch(arrays, int(arch["n_obs"]), int(arch["n_act"]), [int(h) for h in arch["hidden"]])
+    _check_arch(arrays, int(arch["n_obs"]), int(arch["n_act"]), [int(h) for h in arch["hidden"]],
+                "ball_type" if arch["kind"] == "mlp_actor_critic_ball_type" else "single")
     sha = policy_sha(m, arrays)
     if sha != m.get("policy_sha") or (expect_sha is not None and sha != expect_sha):
         raise ValueError("policy_sha does not match the weights")
@@ -366,6 +378,8 @@ class NumpyPolicy:
         nl = len(arch["hidden"]) + 1
         self.pi = [(arrays[f"pi.{2 * i}.weight"].T.copy(), arrays[f"pi.{2 * i}.bias"]) for i in range(nl)]
         self.v = [(arrays[f"v.{2 * i}.weight"].T.copy(), arrays[f"v.{2 * i}.bias"]) for i in range(nl)]
+        self.heads = ([self.pi[-1]] + [(arrays[f"extra_heads.{i}.weight"].T.copy(), arrays[f"extra_heads.{i}.bias"])
+                                      for i in range(2)] if arch.get("kind") == "mlp_actor_critic_ball_type" else None)
         self.act_fn = np.tanh if arch["activation"] == "tanh" else (lambda x: np.maximum(x, np.float32(0)))
         self.mean = arrays["rms_mean"].astype(np.float64)
         self.std = np.sqrt(arrays["rms_var"].astype(np.float64) + manifest["obs_norm"]["eps"])
@@ -385,7 +399,19 @@ class NumpyPolicy:
 
     def logits(self, x) -> np.ndarray:
         """Policy logits of normalised observations x ((n_obs,) or (B, n_obs))."""
-        return self._mlp(self.pi, x)
+        if self.heads is None:
+            return self._mlp(self.pi, x)
+        h = np.asarray(x, np.float32)
+        bits = h[..., 1:4]
+        ctx = np.where(bits.max(axis=-1) > 0, bits.argmax(axis=-1), 0)
+        for w, b in self.pi[:-1]:
+            h = self.act_fn(h @ w + b)
+        out = np.empty((*h.shape[:-1], self.n_act), np.float32)
+        for i in np.unique(ctx):
+            w, b = self.heads[i]
+            mask = ctx == i
+            out[mask] = h[mask] @ w + b
+        return out
 
     def value(self, x) -> np.ndarray:
         """Value of normalised observations: scalar array for (n_obs,), (B,) for a batch."""

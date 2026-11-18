@@ -61,14 +61,42 @@ def _mlp(n_in, hidden, n_out, act, out_gain):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, n_obs: int, n_act: int, hidden=(256, 256), act: str = "tanh"):
+    def __init__(self, n_obs: int, n_act: int, hidden=(256, 256), act: str = "tanh", actor_heads: str = "single"):
         super().__init__()
         a = {"tanh": nn.Tanh, "relu": nn.ReLU}[act]
         self.pi = _mlp(n_obs, hidden, n_act, a, 0.01)
         self.v = _mlp(n_obs, hidden, 1, a, 1.0)
 
+        if actor_heads not in ("single", "ball_type"):
+            raise ValueError(f"unsupported actor_heads {actor_heads!r}")
+        self.actor_heads = actor_heads
+        if actor_heads == "ball_type":
+            if n_obs < 4:
+                raise ValueError("ball_type needs observation columns 1:4")
+            # Head zero stays at its legacy name; append parameters AFTER the critic for Adam migration.
+            self.extra_heads = nn.ModuleList(copy.deepcopy(self.pi[-1]) for _ in range(2))
+
+    @staticmethod
+    def context(x):
+        # make_layout always begins with valid, ball_type[3]. RMS of a binary column
+        # preserves the sign: a present bit is positive, absent bits nonpositive.
+        strength, index = x[..., 1:4].max(dim=-1)
+        return torch.where(strength > 0, index, 0)
+
     def forward(self, x):
-        return self.pi(x), self.v(x).squeeze(-1)
+        if self.actor_heads == "single":
+            logits = self.pi(x)
+        else:
+            ctx = self.context(x)
+            h = self.pi[:-1](x)
+            heads = (self.pi[-1], *self.extra_heads)
+            # Keep the dense GEMM shape identical to legacy. Do not even call unused
+            # heads: grad=None means Adam skips their moments as well as their weights.
+            active = ctx.unique().tolist()
+            logits = heads[active[0] if active else 0](h)
+            for i in active[1:]:
+                logits = torch.where((ctx == i).unsqueeze(-1), heads[i](h), logits)
+        return logits, self.v(x).squeeze(-1)
 
     @torch.no_grad()
     def act(self, x: np.ndarray, temperature: float = 1.0, greedy: bool = False, gen=None):

@@ -216,6 +216,8 @@ def parse(argv=None):
     p.add_argument("--target-kl", type=float, default=None)
     p.add_argument("--reward-scale", type=float, default=0.1)
     p.add_argument("--hidden", default="256,256")
+    p.add_argument("--actor-heads", choices=("single", "ball_type"), default=None,
+                   help="actor routing (default: checkpoint layout on resume, otherwise single)")
     p.add_argument("--activation", default="tanh")
     p.add_argument("--torch-threads", type=int, default=4)
     p.add_argument("--device", default="cpu")
@@ -461,6 +463,8 @@ def main(argv=None) -> int:
         a.reach = bool(a.reach or saved.get("reach"))  # on stays on (the observation never shrinks); off -> on grows it
     else:
         ck = None
+    if a.actor_heads is None:
+        a.actor_heads = (ck or {}).get("args", {}).get("actor_heads", "single")
     if a.level is None:
         a.level = (ck or {}).get("env_config", {}).get("level", 1)
     if ck and ck.get("branch_assets") and a.path_dir is None:
@@ -504,7 +508,7 @@ def main(argv=None) -> int:
         raise SystemExit(f"layout says {n_obs} observation entries, the fake env has "
                          f"{probe.observation_space.shape[0]}")
     n_act = 9
-    model = ActorCritic(n_obs, n_act, hidden, a.activation).to(a.device)
+    model = ActorCritic(n_obs, n_act, hidden, a.activation, a.actor_heads).to(a.device)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
     rms = RunningMeanStd(n_obs)
     counters = {"update": 0, "steps": 0, "frames": 0, "episodes": 0, "runs": 0, "wall_s": 0.0, "finish_runs": 0,
@@ -599,7 +603,7 @@ def main(argv=None) -> int:
         if a.fake:
             cfg.out_root = str(run_dir / "episodes" / names[i])
         return WorkerSpec(wid=i, copy=names[i], env=cfg, seed=seed, chunk=a.chunk, hidden=hidden,
-                          activation=a.activation, cap_mult=a.cap_mult, stall_s=a.stall_s,
+                          activation=a.activation, actor_heads=a.actor_heads, cap_mult=a.cap_mult, stall_s=a.stall_s,
                           respawn_stall_s=a.respawn_stall_s, stall_terminal=a.stall_terminal, prune=a.prune,
                           stall_extra=a.stall_extra, stall_compensate=a.stall_compensate, gamma=a.gamma,
                           stall_speed=a.stall_speed, stall_max_s=a.stall_max_s,
@@ -666,6 +670,8 @@ def main(argv=None) -> int:
                                "rail_gate": json.loads(a.rail_gate) if a.rail_gate else {},
                                "respawn_level_starts": a.respawn_level_starts,
                                "counter_rand": json.loads(a.counter_rand) if a.counter_rand else {}}}
+        if a.actor_heads != "single":
+            template["worker"]["actor_heads"] = a.actor_heads
         if getattr(env_cfg, "branch_assets", None):
             # the same raw bytes the checkpoint holds ({level, line_npz, desc_json, drive_npz, sha256}); the pool's
             # learner link carries them into the exported policy state
@@ -863,7 +869,8 @@ def main(argv=None) -> int:
             except GrowError as e:
                 raise SystemExit(f"--teacher {a.teacher}: {e}")
         ta = tck["args"]
-        tmodel = ActorCritic(t_obs, n_act, tuple(int(x) for x in ta["hidden"].split(",")), ta["activation"]).to(a.device)
+        tmodel = ActorCritic(t_obs, n_act, tuple(int(x) for x in ta["hidden"].split(",")), ta["activation"],
+                             ta.get("actor_heads", "single")).to(a.device)
         tmodel.load_state_dict(tck["model"])
         tmodel.eval()
         sl = obs_layout(env_cfg.features)[1]["path_progress"]

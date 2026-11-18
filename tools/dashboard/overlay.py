@@ -173,7 +173,8 @@ def env_replay(run, row: dict, meta: dict, frames: np.ndarray, k: int, out: Path
         raise RuntimeError(f"checkpoint env is level {got_level} / {got_rec}, the run is level {want['level']} / "
                            f"{want['record']}")
     hidden = tuple(int(x) for x in str(a.get("hidden", "256,256")).split(",") if x.strip())
-    model = ActorCritic(int(ck["n_obs"]), int(ck["n_act"]), hidden, a.get("activation", "tanh"))
+    model = ActorCritic(int(ck["n_obs"]), int(ck["n_act"]), hidden, a.get("activation", "tanh"),
+                        a.get("actor_heads", "single"))
     model.load_state_dict(ck["model"])
     model.eval()
     rms = ck["rms"]
