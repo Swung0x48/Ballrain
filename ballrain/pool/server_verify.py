@@ -1,26 +1,46 @@
 """The verifier: replays closed tasks with the same engine kind the client ran and compares bit for bit
 (docs/volunteer-compute.md 4, docs/pool-prototype.md 3.4).
 
-Which chunks are replayed is decided by the gateway when a chunk arrives (chunks.selected: every chunk of an
-account's first probation_chunks, then a sample_rate draw), never told to the client. A task is replayed once it is
-closed (final chunk received, or the deadline passed): from the task's start (record frame k, ball-order seed) with
-the submitted actions, up to its highest selected chunk (a chunk can only be replayed together with all chunks before
-it). Chunks up to there pass or the first mismatching one is rejected; later chunks of the task are released
-unreplayed (verify "skipped").
+Which tasks are replayed is decided by the gateway, never told to the client (2026-11-18: per task, not per chunk):
+- when a task is issued (tasks.replay, select_task): every task during the account's probation (probation_chunks x
+  chunk_steps steps replayed or waiting), every task while the account is escalated, else a task_sample draw
+  (secrets); a replayed task is replayed in full, so its chunks are all selected;
+- when a chunk arrives it gets the cheap checks: the structural ones (protocol.decode_chunk, chain link, sizes) and
+  the policy-consistency check (policy_consistency: the task's policy recomputed on the chunk's float16 observations
+  must give the submitted log-probs and values and draw the submitted actions from the task's sample_seed, within
+  tolerances 5-25x the measured float16 noise). A chunk that fails it is flagged (chunks.flag): its task becomes a
+  full replay and the account's next escalate_tasks tasks too. The flag itself revokes nothing (float16 copies are
+  approximate); the replay decides.
+A task is replayed once it is closed (final chunk received, or the deadline passed): from the task's start (record
+frame k, ball-order seed) with the submitted actions, up to its highest selected chunk. Chunks up to there pass or the
+first mismatching one is rejected; unselected tasks are released unreplayed (verify "skipped").
 
 Any mismatch (rollout.replay_task: observation chain / float16 copy, reward, flags, end, value, log-prob; earliest
 step first) rejects that chunk with its reason (replay_mismatch / replay_reward_mismatch / replay_value_mismatch /
-replay_logp_mismatch, with task, chunk and step), quarantines every unverified chunk of the account and revokes the
-account (token_revoked_replay with the same task / chunk / step). A failure of the verifier's own engine (launch,
+replay_logp_mismatch, with task, chunk and step: the player sees it in me.stats.last_rejection). What happens then
+(2026-11-18, the user's rule: the system rejects bad data by itself, revocations and rollbacks are the user's call):
+- the task's data never reaches the learner: the failing chunk is rejected, the task's other chunks are quarantined
+  (Store.reject_task);
+- the account is flagged suspect, NOT revoked (Store.flag_suspect): while flagged every task of it is replayed in full
+  (select_task, and here every chunk of its tasks) and only replay-passed chunks of it are fed to the learner
+  (Store.to_ingest);
+- an alert for the coordinator: <pool>/alerts/<time>-suspect-<task>.json with the account (forum id and a pseudonym),
+  task, chunk, step, reason, the mismatching values against their tolerance (rollout.Mismatch.values) and the learner
+  updates the account's earlier sampled-but-not-replayed data already reached (chunks.ingested of verify 'skipped'),
+  plus one line in the gateway log;
+- revoke / unflag are manual (tools/pool/gateway.py admin revoke / unflag); learner updates are never undone here. A failure of the verifier's own engine (launch,
 hand-over, crash) is replay_failed: the task is retried later, never held against the player.
 
-One engine process at a time; the replay's run directories are deleted afterwards.
+workers replay in parallel (Verifier.start_threads(n), [verify] workers), one engine process each; a task is claimed
+by one worker at a time. The replay's run directories are deleted afterwards.
 """
 from __future__ import annotations
 
 import json
 import secrets
 import shutil
+
+import numpy as np
 import threading
 import traceback
 from pathlib import Path
@@ -42,22 +62,29 @@ class Verifier:
         self.log = log or (lambda msg: None)
         self.retry_s = retry_s
         self._policies: dict = {}
+        self._plock = threading.Lock()
+        self._claim_lock = threading.Lock()
+        self._claimed: set = set()  # task ids a worker is replaying
         self.stop_event = threading.Event()
         self.replays = 0
 
     # ------------------------------------------------------------------------------------------ inputs
     def _policy(self, sha: str):
-        if sha not in self._policies:
-            wd = self.pool_dir / "weights"
-            m = W.read_manifest(wd / f"{sha}.json")
-            self._policies = {sha: (m, W.load_policy(wd / f"{sha}.npz", m, expect_sha=sha))}  # keep one
-        return self._policies[sha]
+        with self._plock:
+            if sha not in self._policies:
+                wd = self.pool_dir / "weights"
+                m = W.read_manifest(wd / f"{sha}.json")
+                if len(self._policies) >= 8:  # keep a few (parallel workers on tasks of recent versions)
+                    self._policies.pop(next(iter(self._policies)))
+                self._policies[sha] = (m, W.load_policy(wd / f"{sha}.npz", m, expect_sha=sha))
+            return self._policies[sha]
 
     def _assets(self, task: T.Task):
         cache = self.pool_dir / "cache"
         ad = self.pool_dir / "assets"
-        sdir = T.install_starts_pack(ad / f"{task.assets['starts']}.npz", cache, task.assets["starts"])
-        pdir = T.install_path_asset(ad / f"{task.assets['path']}.npz", cache, task.level, task.assets["path"])
+        with self._plock:  # parallel workers: one installs a pack at a time (Windows refuses a replace of an open file)
+            sdir = T.install_starts_pack(ad / f"{task.assets['starts']}.npz", cache, task.assets["starts"])
+            pdir = T.install_path_asset(ad / f"{task.assets['path']}.npz", cache, task.level, task.assets["path"])
         return sdir, pdir
 
     def _decoded(self, task_id: str, rows: list, upto: int, n_obs: int, n_act: int) -> list:
@@ -86,6 +113,8 @@ class Verifier:
             s.skip_task(task_id, top)
             return "empty"
         selected = [c["seq"] for c in chunks if c["selected"]]
+        if acct is not None and acct["suspect"]:  # a suspect account: every task in full, whatever was drawn
+            selected = [c["seq"] for c in chunks]
         if not selected:
             s.skip_task(task_id, top)
             return "skipped"
@@ -121,21 +150,42 @@ class Verifier:
             self.log(f"verify {task_id[:8]}: passed up to chunk {upto}")
             return "passed"
         params = mm.params(task_id)
-        s.finish_verify(task_id, upto, False, payload(mm.reason, **params), mm.seq)
-        s.revoke(row["forum_id"], payload(Reason.TOKEN_REVOKED_REPLAY, **params))
-        self.log(f"verify {task_id[:8]}: {mm.reason.value} at chunk {mm.seq} step {mm.step} ({mm.detail}); "
-                 f"account revoked")
+        s.reject_task(task_id, mm.seq, payload(mm.reason, **params))
+        fid = int(row["forum_id"])
+        span = s.record_ingest_span(fid, unreplayed_only=True)
+        record = {"t": s.now(), "kind": "replay_mismatch", "account": fid, "pseudonym": pseudonym(fid),
+                  "task_id": task_id, "reason": mm.reason.value, "chunk": int(mm.seq), "step": int(mm.step),
+                  "detail": mm.detail, "values": mm.values or {}, "learner_updates_unreplayed": span,
+                  "learner_updates_all": dict(zip(("first", "last", "steps"), s.ingested_updates(fid))),
+                  "action": "task rejected / quarantined; account flagged suspect (every task replayed, only verified "
+                            "data fed); revoke or unflag by hand: tools/pool/gateway.py admin revoke|unflag --forum-id"}
+        s.flag_suspect(fid, record)
+        path = write_alert(self.pool_dir, f"suspect-{task_id[:12]}", record)
+        self.log(f"verify {task_id[:8]}: {mm.reason.value} at chunk {mm.seq} step {mm.step} ({mm.detail}); task "
+                 f"rejected, account {pseudonym(fid)} flagged suspect (not revoked); its unreplayed data reached "
+                 f"learner updates {span['first']}..{span['last']} ({span['steps']} steps); alert {path.name if path else '-'}")
         return "failed"
 
     # ------------------------------------------------------------------------------------------ loop
     def run_once(self, limit: int = 10) -> int:
         self.store.close_expired()
         n = 0
-        for row in self.store.tasks_to_verify(limit):
-            if self.stop_event.is_set():
+        for row in self.store.tasks_to_verify(limit + len(self._claimed)):
+            if self.stop_event.is_set() or n >= limit:
                 break
-            self.verify_task(row)
-            n += 1
+            with self._claim_lock:
+                if row["task_id"] in self._claimed:
+                    continue
+                self._claimed.add(row["task_id"])
+            try:
+                cur = self.store.one("SELECT state, verify_after FROM tasks WHERE task_id=?", (row["task_id"],))
+                if cur is None or cur["state"] != "closed":  # another worker finished it since the listing
+                    continue
+                self.verify_task(row)
+                n += 1
+            finally:
+                with self._claim_lock:
+                    self._claimed.discard(row["task_id"])
         return n
 
     def run_forever(self, idle_s: float = 5.0):
@@ -149,16 +199,86 @@ class Verifier:
                 self.stop_event.wait(idle_s)
 
     def start_thread(self) -> threading.Thread:
-        th = threading.Thread(target=self.run_forever, name="pool-verifier", daemon=True)
-        th.start()
-        return th
+        return self.start_threads(1)[0]
+
+    def start_threads(self, n: int = 1) -> list:
+        out = []
+        for i in range(max(1, int(n))):
+            th = threading.Thread(target=self.run_forever, name=f"pool-verifier-{i}", daemon=True)
+            th.start()
+            out.append(th)
+        return out
 
 
-def select_chunk(store: Store, forum_id: int, probation_steps: int, rate: float) -> bool:
-    """Whether a newly accepted chunk is replayed: every chunk until the account has probation_steps steps waiting for
-    or passed by the replay (probation_chunks x the task's chunk_steps: counted in steps, so a flood of 1-step tasks
-    does not end it), then a draw (secrets-based: unpredictable to the client, decided before it could know the
-    outcome)."""
+def pseudonym(forum_id: int) -> str:
+    """A stable short name of an account for alerts and logs (no forum name / nickname)."""
+    import hashlib
+    return "acct-" + hashlib.sha256(f"ballrain-pool/account/{int(forum_id)}".encode()).hexdigest()[:10]
+
+
+def write_alert(pool_dir, name: str, record: dict):
+    """<pool>/alerts/<utc time>-<name>.json (one file per alert, written atomically; the coordinator polls the dir)."""
+    import time as _time
+    d = Path(pool_dir) / "alerts"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{_time.strftime('%Y%m%dT%H%M%SZ', _time.gmtime())}-{name}.json"
+        tmp = p.with_name(f".{p.name}.tmp")
+        tmp.write_text(json.dumps(record, indent=1, ensure_ascii=False, default=str), encoding="utf-8")
+        tmp.replace(p)
+        return p
+    except OSError:
+        return None
+
+
+def select_task(store: Store, forum_id: int, probation_steps: int, p: float) -> bool:
+    """Whether a task about to be issued is replayed in full: every task until the account has probation_steps steps
+    waiting for or passed by the replay (probation_chunks x chunk_steps: counted in steps, so a flood of 1-step tasks
+    does not end it), every task while it is escalated, then a draw with probability p (secrets: unpredictable to the
+    client, fixed before it plays)."""
     if store.probation_steps(forum_id) < probation_steps:
         return True
-    return secrets.randbelow(1_000_000) < int(rate * 1_000_000)
+    if store.is_suspect(forum_id):  # flagged by a replay mismatch: every task in full until unflagged by hand
+        return True
+    if store.take_escalation(forum_id):
+        return True
+    return secrets.randbelow(1_000_000) < int(round(p * 1_000_000))
+
+
+# the cheap check's tolerances: 5-25x the float16-copy noise measured on honest native-client chunks (L1 6563 and
+# L2 5423 steps, 2026-11-18: |logp| <= 0.011, value <= 0.3 % relative, action outside its cdf interval by <= 4e-4)
+CONSIST_LOGP_TOL = 0.05
+CONSIST_VALUE_TOL = 0.02
+CONSIST_CDF_TOL = 0.01
+
+
+def policy_consistency(chunk, policy, task: dict, step0: int):
+    """The cheap per-chunk check: the task's policy on the chunk's float16 observations must reproduce the submitted
+    behaviour log-probs and values, and the submitted actions must be the task's sample_seed draws (argmax for greedy
+    tasks), within loose tolerances. Returns None or a short reason (the chunk is then flagged for a full replay).
+    It cannot see a fabricated trajectory whose observations are self-consistent with the policy: only the replay can."""
+    from .sampling import cdf, sample_u
+    A = chunk.arrays
+    T = int(chunk.header["steps"])
+    x = policy.normalize(np.asarray(A["obs"], np.float32))
+    lp = policy.log_probs(x)
+    v = policy.value(x)
+    if np.any(np.abs(v - A["values"]) > CONSIST_VALUE_TOL * np.maximum(1.0, np.abs(v))):
+        return "value"
+    a = A["actions"].astype(np.int64)
+    got = np.clip(lp[np.arange(T), a], P.MIN_LOGP, 0.0)
+    if np.any(np.abs(got - A["logp"]) > CONSIST_LOGP_TOL):
+        return "logp"
+    greedy = bool(task.get("greedy"))
+    for j in range(T):
+        if greedy:
+            if lp[j, a[j]] < lp[j].max() - CONSIST_LOGP_TOL:
+                return "action"
+            continue
+        c = cdf(lp[j])
+        lo = float(c[a[j] - 1]) if a[j] > 0 else 0.0
+        hi = float(c[a[j]]) if a[j] < len(c) - 1 else 1.0
+        u = sample_u(int(task["sample_seed"]), int(step0) + j)
+        if not lo - CONSIST_CDF_TOL <= u < hi + CONSIST_CDF_TOL:
+            return "action"
+    return None

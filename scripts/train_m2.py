@@ -180,6 +180,17 @@ def parse(argv=None):
     p.add_argument("--remote-key", default=None, help="shared secret (default $BALLRAIN_REMOTE_KEY)")
     p.add_argument("--remote-backend", default="retail", help="backend of the remote workers' env")
     p.add_argument("--max-stale-remote", type=int, default=2, help="max_stale for remote chunks")
+    p.add_argument("--pool-ingest", action="store_true",
+                   help="train on volunteer-pool chunks (host 'pool' on the remote hub: ballrain.pool.learner_link); "
+                        "off by default: pool chunks are dropped and counted (pool_refused)")
+    p.add_argument("--pool-max-lag", type=int, default=300,
+                   help="drop pool chunks whose policy is more than this many updates old (pool_dropped)")
+    p.add_argument("--pool-correction", choices=("vtrace", "none"), default="vtrace",
+                   help="vtrace: V-trace targets / advantages with the current critic and PPO clipping around the "
+                        "current policy (ppo.vtrace); none: like a remote chunk (GAE on the behaviour values, ratio to "
+                        "the behaviour policy; for comparison runs)")
+    p.add_argument("--pool-rho-bar", type=float, default=1.0, help="V-trace importance-weight truncation (rho bar)")
+    p.add_argument("--pool-c-bar", type=float, default=1.0, help="V-trace trace truncation (c bar)")
     p.add_argument("--workers", type=int, default=12)
     p.add_argument("--copy-offset", type=int, default=0)
     p.add_argument("--seed", type=int, default=1)
@@ -389,7 +400,7 @@ def main(argv=None) -> int:
     import torch
     from ballrain import instances
     from ballrain.curriculum import CurriculumConfig, ReverseCurriculum, TasStarts
-    from ballrain.train.ppo import ActorCritic, RunningMeanStd, explained_variance, gae, normalize, ppo_update
+    from ballrain.train.ppo import ActorCritic, RunningMeanStd, explained_variance, gae, normalize, ppo_update, vtrace
     from ballrain.train.worker import WorkerSpec, worker_main
 
     run_dir = instances.runtime_dir() / "m2-train" / a.run
@@ -702,6 +713,56 @@ def main(argv=None) -> int:
         log.msg(f"auto-rollback guard: TAS starts {guard.lo}-{guard.hi}, bins of {guard.bin} versions (>= {guard.min_n} "
                 f"episodes), roll back after {guard.consecutive} bins < {guard.low} to the newest bin >= {guard.good}")
 
+    pool_lags: list = []
+    pool_warned = [False]
+    pool_rho: list = []
+
+    def pool_correction(chunks, obs_n) -> dict:
+        """--pool-correction vtrace: chunk index -> (adv, ret, logp_prox, v_prox) for the pool chunks of the batch: the
+        current policy / critic (before this update) on their normalised observations, V-trace targets and advantages
+        (ppo.vtrace), and the current log-probs as the batch's "old" log-probs (PPO clips around the current policy;
+        the behaviour policy enters through vtrace's truncated weights)."""
+        out, off = {}, 0
+        idx = []
+        for i, c in enumerate(chunks):
+            T = len(c["rewards"])
+            if c.get("pool"):
+                idx.append((i, off, T))
+            off += T
+        if not idx:
+            return out
+        rs = rms.state_dict()
+        with torch.no_grad():
+            for i, o0, T in idx:
+                c = chunks[i]
+                x = torch.as_tensor(obs_n[o0:o0 + T], device=a.device)
+                xl = torch.as_tensor(normalize(c["raw_last"][None].astype(np.float32), rs), device=a.device)
+                logits, v = model(x)
+                _, vl = model(xl)
+                lp = torch.log_softmax(logits, -1).gather(-1, torch.as_tensor(c["actions"], device=a.device)[:, None])
+                lp = lp.squeeze(-1).cpu().numpy().astype(np.float32)
+                v = v.cpu().numpy().astype(np.float32)
+                adv, ret, rho = vtrace(c, lp, v, float(vl.cpu().numpy()[0]), a.gamma, a.lam, a.reward_scale,
+                                       a.pool_rho_bar, a.pool_c_bar)
+                pool_rho.append(rho)
+                out[i] = (adv, ret, lp, v)
+        return out
+
+    def pool_stats(chunks) -> dict:
+        n = sum(len(c["rewards"]) for c in chunks if c.get("pool"))
+        if not n:
+            return {}
+        st = {"pool_steps": float(n), "pool_frac": n / max(sum(len(c["rewards"]) for c in chunks), 1)}
+        if pool_lags:
+            st["pool_lag"] = float(np.mean(pool_lags))
+            pool_lags.clear()
+        if pool_rho:
+            r = np.concatenate(pool_rho)
+            st["pool_rho"] = float(r.mean())
+            st["pool_rho_clip"] = float(np.mean(r >= a.pool_rho_bar - 1e-6))
+            pool_rho.clear()
+        return st
+
     watch = None
     if a.watch_s:
         from ballrain.features import FeatureExtractor
@@ -832,6 +893,25 @@ def main(argv=None) -> int:
                 if "obs" not in m:
                     continue
                 be = m.get("backend", a.backend)
+                if m.get("pool"):  # volunteer-pool data (ballrain.pool.learner_link): its own flag and lag bound; nothing
+                    # of a refused / dropped pool chunk reaches the statistics (frames, reset_frac, the remote watchdog)
+                    lag = counters["update"] - int(m["version"])
+                    if not a.pool_ingest:
+                        counters["pool_refused"] = counters.get("pool_refused", 0) + 1
+                        if not pool_warned[0]:
+                            log.msg("pool chunks arrive but --pool-ingest is off: dropped (counted in pool_refused)")
+                            pool_warned[0] = True
+                        continue
+                    if m["raw"].shape[1] != n_obs or lag > a.pool_max_lag or lag < 0:
+                        counters["pool_dropped"] = counters.get("pool_dropped", 0) + 1
+                        counters["pool_dropped_steps"] = counters.get("pool_dropped_steps", 0) + len(m["rewards"])
+                        continue
+                    counters["steps_pool"] = counters.get("steps_pool", 0) + len(m["rewards"])
+                    counters["frames"] += m["frames"]
+                    pool_lags.append(lag)
+                    chunks.append(m)
+                    n += len(m["rewards"])
+                    continue
                 for e in m["episodes"]:
                     e["wid"] = m["wid"]
                     e["backend"] = be
@@ -863,9 +943,18 @@ def main(argv=None) -> int:
                 first = False
                 ustats = {}
             else:
-                advs, rets = zip(*(gae(c, a.gamma, a.lam, a.reward_scale) for c in chunks))
-                batch = {"obs": normalize(raw, rms.state_dict()), "actions": np.concatenate([c["actions"] for c in chunks]),
-                         "logp": np.concatenate([c["logp"] for c in chunks]), "adv": np.concatenate(advs),
+                obs_n = normalize(raw, rms.state_dict())
+                pool_terms = pool_correction(chunks, obs_n) if a.pool_correction == "vtrace" else {}
+                advs, rets, logps, vals = [], [], [], []
+                for i, c in enumerate(chunks):
+                    if i in pool_terms:
+                        adv_i, ret_i, lp_i, v_i = pool_terms[i]
+                    else:
+                        adv_i, ret_i = gae(c, a.gamma, a.lam, a.reward_scale)
+                        lp_i, v_i = c["logp"], c["values"]
+                    advs.append(adv_i), rets.append(ret_i), logps.append(lp_i), vals.append(v_i)
+                batch = {"obs": obs_n, "actions": np.concatenate([c["actions"] for c in chunks]),
+                         "logp": np.concatenate(logps).astype(np.float32), "adv": np.concatenate(advs),
                          "ret": np.concatenate(rets)}
                 wstats = watch_entropy(batch["obs"], raw) if watch is not None else {}
                 model.train()
@@ -873,7 +962,9 @@ def main(argv=None) -> int:
                 ustats = ppo_update(model, opt, batch, a.epochs, a.minibatch, a.clip, a.vf_coef, a.ent_coef,
                                     a.max_grad_norm, a.device, gen, a.target_kl, tl, tm, tc)
                 model.eval()
-                ustats["explained_var"] = explained_variance(np.concatenate([c["values"] for c in chunks]), batch["ret"])
+                ustats["explained_var"] = explained_variance(np.concatenate(vals), batch["ret"])
+                for k, v in pool_stats(chunks).items():  # TensorBoard only: updates.csv keeps its columns
+                    log.tb.add_scalar(f"pool/{k}", v, counters["steps"])
                 ustats["adv_std"] = float(batch["adv"].std())
                 ustats["ret_mean"] = float(batch["ret"].mean())
                 ustats.update(wstats)
@@ -988,6 +1079,9 @@ def main(argv=None) -> int:
                                           counters["steps"])
                         row[f"route_{name}_visits"] = len(vis)
                         row[f"route_{name}_deaths"] = sum(e.get("death_probe") == name for e in eps)
+                if a.pool_ingest or counters.get("pool_refused"):
+                    for k in ("pool_refused", "pool_dropped", "pool_dropped_steps"):
+                        log.tb.add_scalar(f"pool/{k}", counters.get(k, 0), counters["steps"])
                 if hub is not None:
                     idle = time.time() - remote_last[0]
                     log.tb.add_scalar("remote/alive", float(idle < 600), counters["steps"])

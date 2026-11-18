@@ -431,6 +431,7 @@ class Mismatch:
     seq: int  # chunk
     step: int  # task step (row index for an observation)
     detail: str = ""
+    values: dict | None = None  # what differed: {"submitted", "replayed", "tolerance", ...} (the coordinator's alert)
 
     def params(self, task_id: str) -> dict:
         return {"task_id": task_id, "chunk": int(self.seq), "step": int(self.step)}
@@ -467,22 +468,33 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
             if hv != bytes(A["obs_hash"][j]):
                 return Mismatch(Reason.REPLAY_MISMATCH, s, i, "engine state")
             if not P.obs_close(A["obs"][j], r32):
-                return Mismatch(Reason.REPLAY_MISMATCH, s, i, "observation")
+                d = np.abs(np.asarray(A["obs"][j], np.float64) - r32.astype(np.float16).astype(np.float64))
+                k = int(np.argmax(d))
+                return Mismatch(Reason.REPLAY_MISMATCH, s, i, "observation",
+                                {"index": k, "submitted": float(A["obs"][j][k]), "replayed": float(r32[k]),
+                                 "tolerance": f"one float16 ulp + {P.OBS_TOL} x max(1, |v|)"})
             x = policy.normalize(r32)
             v = float(policy.value(x))
             if abs(v - float(A["values"][j])) > VALUE_TOL * max(1.0, abs(v)):
-                return Mismatch(Reason.REPLAY_VALUE_MISMATCH, s, i, "value")
+                return Mismatch(Reason.REPLAY_VALUE_MISMATCH, s, i, "value",
+                                {"submitted": float(A["values"][j]), "replayed": v,
+                                 "tolerance": VALUE_TOL * max(1.0, abs(v))})
             if j == T:  # the row after the chunk's last step (= the next chunk's first row)
                 break
             prev = hv
             a = int(A["actions"][j])
             lp = policy.log_probs(x)
             if abs(float(np.clip(lp[a], P.MIN_LOGP, 0.0)) - float(A["logp"][j])) > LOGP_TOL:
-                return Mismatch(Reason.REPLAY_LOGP_MISMATCH, s, i, "logp")
+                return Mismatch(Reason.REPLAY_LOGP_MISMATCH, s, i, "logp",
+                                {"submitted": float(A["logp"][j]), "replayed": float(np.clip(lp[a], P.MIN_LOGP, 0.0)),
+                                 "tolerance": LOGP_TOL})
             if greedy and float(lp[a]) < float(lp.max()) - LOGP_TOL:
                 return Mismatch(Reason.REPLAY_LOGP_MISMATCH, s, i, "greedy task, not the argmax action")
             if not greedy and not action_consistent(lp, sample_u(task.sample_seed, i), a):
-                return Mismatch(Reason.REPLAY_ACTION_MISMATCH, s, i, "not the action of the task's sample_seed")
+                from .sampling import ACTION_EPS, sample_action
+                return Mismatch(Reason.REPLAY_ACTION_MISMATCH, s, i, "not the action of the task's sample_seed",
+                                {"submitted": a, "replayed": sample_action(lp, sample_u(task.sample_seed, i)),
+                                 "tolerance": f"cdf boundary +- {ACTION_EPS}"})
             if runner.end is not None:  # the submitted task goes on after the replay ended
                 return Mismatch(Reason.REPLAY_MISMATCH, s, i, f"the replay ended ({runner.end})")
             is_last = last_chunk and j == T - 1
@@ -490,14 +502,17 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
             st = runner.step(a, stop=h["end"] if is_last and h["end"] in ("stopped", "deadline") else None)
             # ---- the step's results
             if not P.value_close(A["rewards"][j], np.float32(st.reward), P.REWARD_TOL):
-                return Mismatch(Reason.REPLAY_REWARD_MISMATCH, s, i, "reward")
+                return Mismatch(Reason.REPLAY_REWARD_MISMATCH, s, i, "reward",
+                                {"submitted": float(A["rewards"][j]), "replayed": float(st.reward),
+                                 "tolerance": P.REWARD_TOL * max(1.0, abs(float(st.reward)))})
             sub_flag = int(A["flags"][j])
             if is_last and h["end"] == "error":  # the client's engine failed on the NEXT step: this one went on
                 if st.end is not None or not (st.flags == sub_flag or (st.flags == 0 and sub_flag == P.FLAG_TRUNCATED)):
                     return Mismatch(Reason.REPLAY_MISMATCH, s, i, "flags")
             else:
                 if st.flags != sub_flag:
-                    return Mismatch(Reason.REPLAY_MISMATCH, s, i, "flags")
+                    return Mismatch(Reason.REPLAY_MISMATCH, s, i, "flags",
+                                    {"submitted": sub_flag, "replayed": int(st.flags), "tolerance": "exact"})
                 if is_last and st.end != h["end"]:
                     return Mismatch(Reason.REPLAY_MISMATCH, s, i, f"end {h['end']} != replay {st.end}")
             if not is_last and st.end is not None:
@@ -506,10 +521,15 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
                               ("frames", np.dtype("<u2").type(min(max(st.frames, 0), 65535))),
                               ("sr_ms", np.float64(st.sr_ms))):
                 if name in A and not _bits_equal(np.asarray(got, A[name].dtype), A[name][j]):
-                    return Mismatch(Reason.REPLAY_MISMATCH, s, i, name)
+                    return Mismatch(Reason.REPLAY_MISMATCH, s, i, name,
+                                    {"submitted": float(A[name][j]), "replayed": float(got), "tolerance": "exact"})
             if "env_rewards" in A and not P.value_close(A["env_rewards"][j], np.float32(st.env_reward), P.REWARD_TOL):
-                return Mismatch(Reason.REPLAY_MISMATCH, s, i, "env_rewards")
+                return Mismatch(Reason.REPLAY_MISMATCH, s, i, "env_rewards",
+                                {"submitted": float(A["env_rewards"][j]), "replayed": float(st.env_reward),
+                                 "tolerance": P.REWARD_TOL * max(1.0, abs(float(st.env_reward)))})
             if "arc" in A and not P.value_close(A["arc"][j], np.float32(st.arc), P.ARC_TOL):
-                return Mismatch(Reason.REPLAY_MISMATCH, s, i, "arc")
+                return Mismatch(Reason.REPLAY_MISMATCH, s, i, "arc",
+                                {"submitted": float(A["arc"][j]), "replayed": float(st.arc),
+                                 "tolerance": P.ARC_TOL * max(1.0, abs(float(st.arc)))})
             row = st.next_obs
     return None
