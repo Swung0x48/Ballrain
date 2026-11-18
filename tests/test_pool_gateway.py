@@ -819,3 +819,21 @@ def test_forum_requests_name_the_gateway_agent():
     assert fc.exchange("code") == "t"
     fc.user("t")
     assert [ua for _, ua in seen] == [SO.USER_AGENT, SO.USER_AGENT] and "python" not in SO.USER_AGENT.lower()
+
+
+def test_forum_user_fields_in_other_serialisations():
+    """joined_at as ISO with fraction / without zone / a space, or Unix seconds / ms; 0 / 1 flags; digit-string counts.
+    A failure names the type, never the value."""
+    good = {"id": 7, "username": "u", "nickname": "n", "avatar_url": None, "is_email_confirmed": True,
+            "joined_at": "2024-01-01T00:00:00Z", "comment_count": 9}
+    want = parse_user(good)["joined"]
+    for j in ("2024-01-01T00:00:00.000000Z", "2024-01-01T00:00:00+00:00", "2024-01-01 00:00:00", 1704067200,
+              1704067200000, "1704067200"):
+        assert parse_user(dict(good, joined_at=j))["joined"] == want
+    assert parse_user(dict(good, is_email_confirmed=1))["email_confirmed"] is True
+    assert parse_user(dict(good, is_email_confirmed="0"))["email_confirmed"] is False
+    assert parse_user(dict(good, comment_count="12"))["comments"] == 12
+    with pytest.raises(ForumError, match=r"joined_at \(NoneType\)"):
+        parse_user(dict(good, joined_at=None))
+    with pytest.raises(ForumError, match=r"joined_at \(str, length 9\)"):
+        parse_user(dict(good, joined_at="yesterday"))
