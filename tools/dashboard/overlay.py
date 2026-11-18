@@ -191,7 +191,7 @@ def env_replay(run, row: dict, meta: dict, frames: np.ndarray, k: int, out: Path
         launcher = launcher_cls("video-00", srv.path, fps, extra={"BALLRAIN_CAPTURE_TAIL": str(post),
                                                                   "BALLRAIN_PREFIX_EVENTS": "1"})
         env = make_env(ck, launcher, out / "env", k, kind)
-        fx_tas = FeatureExtractor(env.cfg.features)  # TAS frames: features for the panel only (env's own untouched)
+        fx_tas = FeatureExtractor(env.cfg.features, branch_root=env._branch_temp.name if env._branch_temp else None)  # TAS frames: features for the panel only (env's own untouched)
     except BaseException:
         srv.close()
         sink.close()
