@@ -13,7 +13,7 @@ from ballrain.features import FeatureConfig
 from ballrain.path import ReferencePath, file_sha256
 
 
-def probe(live, build, station, mode, v1=False):
+def probe(live, build, station, mode, v1=False, observer=None, corner_cap=None):
     repo = Path(__file__).resolve().parents[1]
     assets = repo / "benchmarks/refpaths-alt/L02-multi"
     path = ReferencePath.load(assets / "south-loop/L02.npz")
@@ -94,6 +94,16 @@ def probe(live, build, station, mode, v1=False):
                 tgt = path.point_at(s + 4)[[0, 2]]
                 d = tgt - p[[0, 2]]
                 aim = d * min(3, 8 / max(0.01, np.linalg.norm(d))) - v[[0, 2]]
+                if corner_cap is not None and s < 1780:
+                    target = path.point_at(s + 4)[[0, 2]] - p[[0, 2]]
+                    aim = (
+                        target * (corner_cap / max(0.01, np.linalg.norm(target)))
+                        - v[[0, 2]]
+                    )
+                if mode.startswith("late") and s < float(mode[4:]):
+                    aim = np.array([0.0, -40.0])
+                if observer is not None:
+                    observer(tr, s, p, v, frame)
                 entered |= p[2] < -201 and p[0] > 1031 and p[1] > 11
                 if recovering and (p[0] < 1053 or abs(v[0]) > 1.5 or p[1] > 7):
                     aim = np.array(
@@ -101,9 +111,22 @@ def probe(live, build, station, mode, v1=False):
                     )
                 elif recovering:
                     recovering = False
-                elif mode in ("runup", "detour") and entered and p[2] < -22:
+                elif (
+                    (
+                        mode in ("runup", "detour")
+                        or corner_cap is not None
+                        or mode in ("idle4", "north22", "align")
+                    )
+                    and entered
+                    and p[2] < -22
+                ):
                     d = np.array([1040.55 - p[0], 24.0])
-                    aim = d * (26 / np.linalg.norm(d)) - v[[0, 2]]
+                    aim = (
+                        d * ((22 if mode == "north22" else 26) / np.linalg.norm(d))
+                        - v[[0, 2]]
+                    )
+                    if mode == "align":
+                        aim[0] = np.clip(3 * (1040.55 - p[0]), -12, 12) - v[0]
                 elif (s > 1944 or (station >= 1960 and mode != "detour")) and p[
                     2
                 ] < -22:
@@ -130,6 +153,8 @@ def probe(live, build, station, mode, v1=False):
                 )
                 if abs(aim[1]) > 0.4 * n:
                     mask |= tas.KEY_UP if aim[1] > 0 else tas.KEY_DOWN
+                if mode == "idle4" and frame < 528:
+                    mask = 0
                 w.writerow([frame, s, pr["dist"], *p, *v, b["type"], tr.sector, mask])
                 if tr.sector >= 5 or p[1] < -3 or o.has_event(Ev.BallOff):
                     break
