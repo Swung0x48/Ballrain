@@ -115,6 +115,10 @@ class EnvConfig:
     # (a range the frontier has not reached yet is skipped: the draw falls through to the curriculum), so every section
     # is rehearsed once the reverse curriculum has passed it (r8 / level 2)
     rehearse_behind_frontier: bool = False
+    # rehearse_always: more [lo, hi] ranges drawn like rehearse_starts entries (same per-entry share of p_rehearse) but
+    # never clipped by rehearse_behind_frontier: a hard section behind (upstream of) the frontier keeps being trained
+    # (r8 L2 小节 3 cluster). A separate field so older workers (pickled EnvConfig) just ignore it
+    rehearse_always: list | None = None
     # record frames [lo, hi) that are never used as start states (e.g. the TAS on a route the training does not
     # follow: L1 shortcut 2 while the reference line takes shortcut 1); applied to TasStarts, so curriculum draws,
     # rehearsal and at-rest starts all skip them
@@ -272,9 +276,12 @@ class BallanceEnv(gym.Env):
         if self.starts is None:
             return None
         c = self.cfg
-        if c.rehearse_starts and c.p_rehearse and self._start_rng.random() < c.p_rehearse:
-            lo, hi = c.rehearse_starts[int(self._start_rng.integers(len(c.rehearse_starts)))]
-            if c.rehearse_behind_frontier and self.curriculum is not None and int(lo) > 0:
+        entries = list(c.rehearse_starts or []) + list(getattr(c, "rehearse_always", None) or [])
+        if entries and c.p_rehearse and self._start_rng.random() < c.p_rehearse:
+            j = int(self._start_rng.integers(len(entries)))
+            lo, hi = entries[j][0], entries[j][1]
+            always = j >= len(c.rehearse_starts or [])
+            if c.rehearse_behind_frontier and not always and self.curriculum is not None and int(lo) > 0:
                 lo = max(int(lo), int(self.curriculum.frontier))
             if int(lo) <= int(hi):
                 return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))

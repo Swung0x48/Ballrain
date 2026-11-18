@@ -241,6 +241,9 @@ def parse(argv=None):
     p.add_argument("--p-rest", type=float, default=0.0, help="probability of an at-rest start for a new process")
     p.add_argument("--rehearse-starts", default="", help="rehearsal start ranges lo-hi (record frames), e.g. 4900-5075")
     p.add_argument("--p-rehearse", type=float, default=0.0, help="probability of a rehearsal start for a new process")
+    p.add_argument("--rehearse-always", default="",
+                   help="rehearsal ranges lo-hi that --rehearse-behind-frontier never clips (EnvConfig.rehearse_always): "
+                        "drawn like --rehearse-starts entries, also behind the frontier")
     p.add_argument("--stall-extra", type=float, default=0.0, help="with --stall-terminal: extra penalty on top of a death's")
     p.add_argument("--stall-compensate", action="store_true",
                    help="with --stall-terminal: divide the stall penalty by gamma ** window steps (never cheaper than dying now)")
@@ -370,6 +373,7 @@ def make_env_config(a, out_root: Path):
                      p_rest=a.p_rest,
                      rehearse_starts=[[int(v) for v in r.split("-")] for r in a.rehearse_starts.split(",") if r.strip()] or None,
                      p_rehearse=a.p_rehearse,
+                     rehearse_always=[[int(v) for v in r.split("-")] for r in a.rehearse_always.split(",") if r.strip()] or None,
                      rehearse_behind_frontier=a.rehearse_behind_frontier,
                      exclude_starts=[[int(v) for v in r.split("-")] for r in a.exclude_starts.split(",") if r.strip()] or None)
 
