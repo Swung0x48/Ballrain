@@ -9,9 +9,11 @@
 //   BALLRAIN_UPDATE_URL       the signed release manifest (update.h), e.g. .../releases/latest/download/release.json
 //   BALLRAIN_RELEASE_PUBKEY   the release key's public half (hex; tools: nc_release keygen)
 //
-//   ballrain_pool [--data-dir D]
+//   ballrain_pool [options]   (ballrain_pool --help lists them: the start page, start sampling or the browser login
+//                             at once, configuration values saved to config.json)
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -30,6 +32,9 @@
 #include "platform.h"
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -47,6 +52,28 @@ using namespace ballrain;
 using namespace ftxui;
 
 namespace {
+
+// Ctrl-C / Ctrl-Break / closing the window / logoff: the same orderly exit as the 退出 button (tasks end "stopped",
+// engines stop, the uploads get their few seconds); the default handler would end the process at once (the engines
+// then die with the job object, their last chunks wait in the queue for the next start)
+std::atomic<bool> g_quitting{false};
+std::atomic<bool> g_shutdown_done{false};
+#ifdef _WIN32
+BOOL WINAPI on_console_event(DWORD type) {
+    g_quitting = true;
+    if (type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT || type == CTRL_SHUTDOWN_EVENT) {
+        // Windows ends the process when this returns (and after ~5 s anyway): wait for the shutdown meanwhile
+        for (int i = 0; i < 45 && !g_shutdown_done; ++i) Sleep(100);
+    }
+    return TRUE;
+}
+#endif
+// SIGINT / SIGTERM. FTXUI records a Ctrl-C, leaves its loop and then restores the handler it found and raises the
+// signal again: installed before FTXUI, this is the handler it finds, so the raise only sets the flag
+void on_signal(int sig) {
+    g_quitting = true;
+    std::signal(sig, on_signal);
+}
 
 enum Page { SETUP = 0, LOGIN = 1, MAIN = 2, DIAG = 3 };
 
@@ -112,6 +139,7 @@ int main(int argc, char **argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     SetConsoleTitleW(L"Ballrain 算力池");
+    SetConsoleCtrlHandler(on_console_event, TRUE);
     // the console as it was: restored on exit (restore_console)
     HANDLE con_in = GetStdHandle(STD_INPUT_HANDLE), con_out = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD in_mode0 = 0, out_mode0 = 0;
@@ -133,9 +161,61 @@ int main(int argc, char **argv) {
         if (have_out) SetConsoleMode(con_out, out_mode0);
 #endif
     };
-    std::string data_dir = platform::data_dir();
-    for (int i = 1; i + 1 < argc; ++i)
-        if (std::strcmp(argv[i], "--data-dir") == 0) data_dir = platform::absolute_path(argv[i + 1]);
+    // ---- command line: where to start, what to do at once, configuration values (saved to config.json)
+    static const char *USAGE =
+        "用法：BallrainPool [选项]\n"
+        "  --page setup|login|main|diag  直接打开这一页\n"
+        "  --start                       启动后立即连接网关并开始采样（需要已登录）\n"
+        "  --login                       启动后立即在浏览器中开始登录\n"
+        "  --gateway URL                 网关地址\n"
+        "  --ballance-dir 目录           Ballance 安装目录\n"
+        "  --engine 文件                 无头引擎（默认用随客户端附带的）\n"
+        "  --instances N                 实例数（1–8）\n"
+        "  --quiet-file 路径             暂停开关文件（\"\" 表示不用）\n"
+        "  --auto-pause on|off           玩 Ballance / 用电池时自动暂停\n"
+        "  --data-dir 目录               数据目录（默认 %USERPROFILE%\\.ballrain）\n"
+        "  --version                     打印版本号\n"
+        "以 --gateway 等给出的设置会保存下来，下次不用再给。\n";
+    std::string data_dir = platform::data_dir(), opt_page, snapshot_arg;
+    bool opt_start = false, opt_login = false;
+    std::vector<std::pair<std::string, std::string>> sets;  // configuration values given on the command line
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto value = [&]() -> std::string {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "%s 缺少参数值\n%s", a.c_str(), USAGE);
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+        if (a == "--help" || a == "-h" || a == "/?") {
+            std::printf("%s", USAGE);
+            return 0;
+        } else if (a == "--version") {
+            std::printf("%s\n", CLIENT_VERSION);
+            return 0;
+        } else if (a == "--data-dir") {
+            data_dir = platform::absolute_path(value());
+        } else if (a == "--page") {
+            opt_page = value();
+            if (opt_page != "setup" && opt_page != "login" && opt_page != "main" && opt_page != "diag") {
+                std::fprintf(stderr, "--page 只能是 setup、login、main 或 diag\n");
+                return 2;
+            }
+        } else if (a == "--start") {
+            opt_start = true;
+        } else if (a == "--login") {
+            opt_login = true;
+        } else if (a == "--snapshot") {
+            snapshot_arg = value();
+        } else if (a == "--gateway" || a == "--ballance-dir" || a == "--engine" || a == "--instances" ||
+                   a == "--quiet-file" || a == "--auto-pause") {
+            sets.push_back({a, value()});
+        } else {
+            std::fprintf(stderr, "不认识的选项 %s\n%s", a.c_str(), USAGE);
+            return 2;
+        }
+    }
     platform::make_dirs(data_dir);
     if (!platform::single_instance(data_dir)) {
         std::fprintf(stderr, "Ballrain 算力池客户端已经在运行了（同一个数据目录只能开一个）。\n");
@@ -143,10 +223,32 @@ int main(int argc, char **argv) {
     }
     Controller ctl(data_dir);
     ClientConfig cfg = ctl.config();
+    if (!sets.empty()) {
+        for (auto &kv : sets) {
+            const std::string &k = kv.first, &v = kv.second;
+            if (k == "--gateway") cfg.gateway_url = v;
+            else if (k == "--ballance-dir") cfg.ballance_dir = v.empty() ? v : platform::absolute_path(v);
+            else if (k == "--engine") cfg.engine_binary = v.empty() ? v : platform::absolute_path(v);
+            else if (k == "--instances") cfg.instances = std::max(1, std::min(MAX_INSTANCES, std::atoi(v.c_str())));
+            else if (k == "--quiet-file") cfg.quiet_file = v;
+            else if (k == "--auto-pause") cfg.auto_pause_player = cfg.auto_pause_battery = v == "on";
+        }
+        ctl.set_config(cfg);
+        if (ctl.problems().empty() && !cfg.gateway_url.empty()) {  // given on the command line and fine: set up
+            cfg.setup_done = true;
+            ctl.set_config(cfg);
+        }
+    }
     if (cfg.gateway_url.empty()) cfg.gateway_url = BALLRAIN_DEFAULT_GATEWAY;
     Jobs jobs;
-    std::atomic<bool> quitting{false};
+    std::atomic<bool> &quitting = g_quitting;
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
     int page = cfg.setup_done && ctl.problems().empty() ? (ctl.has_token() ? MAIN : LOGIN) : SETUP;
+    if (opt_login) page = LOGIN;
+    if (opt_start) page = ctl.has_token() ? MAIN : LOGIN;  // not logged in yet: the login comes first
+    if (!opt_page.empty())
+        page = opt_page == "setup" ? SETUP : opt_page == "login" ? LOGIN : opt_page == "diag" ? DIAG : MAIN;
 
     // ---------------------------------------------------------------------------------------- setup page
     std::string in_gateway = cfg.gateway_url, in_dir = cfg.ballance_dir, in_engine = cfg.engine_binary;
@@ -426,9 +528,7 @@ int main(int argc, char **argv) {
         if (quitting) return false;
         return false;
     });
-    std::string snapshot;  // tests: one frame of a page as text (no terminal needed), e.g. --snapshot setup
-    for (int i = 1; i + 1 < argc; ++i)
-        if (std::strcmp(argv[i], "--snapshot") == 0) snapshot = argv[i + 1];
+    std::string snapshot = snapshot_arg;  // tests: one frame of a page as text (no terminal needed), e.g. --snapshot setup
     if (!snapshot.empty()) {
         if (snapshot == "setup") do_check(), page = SETUP;
         else if (snapshot == "login") page = LOGIN;
@@ -451,7 +551,16 @@ int main(int argc, char **argv) {
     }
     auto app = App::Fullscreen();
     ctl.start_service();
-    if (page == MAIN) jobs.run("连接网关", [&] { return ctl.connect() ? "已连接网关" : std::string("连接失败"); });
+    if (page == DIAG) diag = ctl.diagnostics();
+    if (opt_start && page == MAIN) {
+        jobs.run("连接网关并开始采样", [&] {
+            ctl.start();  // connects first when needed
+            return std::string("");
+        });
+    } else if (page == MAIN) {
+        jobs.run("连接网关", [&] { return ctl.connect() ? "已连接网关" : std::string("连接失败"); });
+    }
+    if (page == LOGIN && (opt_login || opt_start)) start_login();
     std::thread update_thread([&] {
         if (std::strlen(BALLRAIN_UPDATE_URL) && std::strlen(BALLRAIN_RELEASE_PUBKEY))
             ctl.check_update(BALLRAIN_UPDATE_URL, BALLRAIN_RELEASE_PUBKEY);
@@ -471,6 +580,7 @@ int main(int argc, char **argv) {
     std::fflush(stdout);
     if (login_thread.joinable()) login_thread.join();
     ctl.shutdown();
+    g_shutdown_done = true;
     update_thread.join();
     jobs.join();
     return 0;
