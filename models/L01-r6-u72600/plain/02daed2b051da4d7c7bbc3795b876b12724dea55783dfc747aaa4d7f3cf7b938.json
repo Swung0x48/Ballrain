@@ -1,0 +1,325 @@
+{
+ "format": "ballrain-pool-weights/1",
+ "source": {
+  "run": "r6",
+  "update": 72600,
+  "steps": 502255616
+ },
+ "arch": {
+  "kind": "mlp_actor_critic",
+  "n_obs": 208,
+  "n_act": 9,
+  "hidden": [
+   256,
+   256
+  ],
+  "activation": "tanh"
+ },
+ "obs_norm": {
+  "eps": 1e-08,
+  "clip": 10.0,
+  "count": 419303424.0001
+ },
+ "actions": {
+  "keys": [
+   0,
+   1,
+   2,
+   4,
+   8,
+   5,
+   9,
+   6,
+   10
+  ],
+  "names": [
+   "none",
+   "up",
+   "down",
+   "left",
+   "right",
+   "up+left",
+   "up+right",
+   "down+left",
+   "down+right"
+  ],
+  "world_actions": true
+ },
+ "env": {
+  "level": 1,
+  "mode": "sr",
+  "delta_ms": 7.5757575035095215,
+  "action_repeat": 2,
+  "camera_actions": false,
+  "world_actions": true,
+  "repress_stale_keys": null,
+  "camera_quarter_tol": 0.0001,
+  "camera_turn_grace_ms": 400.0,
+  "esc_action": null,
+  "collect_action": false,
+  "esc_frames": 4,
+  "collect_max_frames": 1200,
+  "collect_chunk": 8,
+  "mask_keys_while_paused": true,
+  "pause_keys": 0,
+  "esc_requires_control": true,
+  "max_pause_frames": 3000,
+  "max_episode_pause_frames": 20000,
+  "per_life": true,
+  "max_episode_frames": null,
+  "max_process_frames": 200000,
+  "idle_keys": 0,
+  "skip_tutorial": true,
+  "start_record": "SR01_1_14_457_264",
+  "exclude_starts": [
+   [
+    3800,
+    4000
+   ],
+   [
+    4450,
+    6018
+   ]
+  ],
+  "rest_speed": 0.5,
+  "rest_max_frames": 600,
+  "start_check": true,
+  "start_retries": 3,
+  "timeout_ms": 1800000,
+  "obs_timeout_s": 300.0,
+  "hello_timeout_s": 120.0,
+  "sr_tail": 32,
+  "respawn_limit_frames": 20000,
+  "body_radius": 60.0,
+  "skip_render": true
+ },
+ "engine_options": {
+  "boot_ticks": null,
+  "hidden_ticks": null,
+  "legacy_edit": true,
+  "reset_nmc": null,
+  "reset_seed": null,
+  "reset_frame": null,
+  "reset_precision": false,
+  "orig_random": false
+ },
+ "features": {
+  "version": "f6",
+  "camera": "world",
+  "pos_scale": 50.0,
+  "vel_scale": 20.0,
+  "angvel_scale": 20.0,
+  "absolute_position": false,
+  "height_grid": 7,
+  "height_spacing": 1.0,
+  "height_clip": 5.0,
+  "height_up": 3.0,
+  "fan_dirs": 8,
+  "fan_step": 0.25,
+  "fan_max": 8.0,
+  "fan_rule": "step",
+  "fan_step_drop": 0.75,
+  "fan_drop": 1.0,
+  "fan_up": 1.0,
+  "mesh_edge": true,
+  "rail_radius": 6.0,
+  "path_source": "tas",
+  "path_dir": null,
+  "path_sha256": "9915be29acf27c3c0d9f19373e017eb3eeec0f490264045ba11cc75bf25a02f6",
+  "path_lateral_scale": 10.0,
+  "path_back": 10.0,
+  "path_ahead": 30.0,
+  "path_margin": 20.0,
+  "path_reacquire": 5.0,
+  "waypoints": 3,
+  "waypoint_spacing": 5.0,
+  "far_waypoints": [
+   20.0,
+   30.0,
+   45.0
+  ],
+  "ref_speed_at": [
+   0.0,
+   15.0,
+   30.0
+  ],
+  "bodies": 4,
+  "body_radius": 60.0,
+  "dynamic_geometry": true,
+  "counters": true,
+  "hs_block": false,
+  "follower_sources": 4,
+  "checkpoint_frames_scale": 10000.0,
+  "clip": 10.0
+ },
+ "reward": {
+  "mode": "sr",
+  "gamma": 0.99,
+  "progress_weight": 0.1,
+  "time_weight": 1.0,
+  "finish_bonus": 10.0,
+  "death_penalty": 5.0,
+  "shaping_weight": 0.0,
+  "backward_scale": 1.0,
+  "hold_unsupported": true,
+  "death_refund": 0.4,
+  "checkpoint_bonus": 0.0,
+  "pay_jumps": true,
+  "score_scale": 0.01,
+  "hs_death_lifebonus": true,
+  "hs_progress_weight": 0.0,
+  "hs_follower_shaping": 0.0
+ },
+ "rollout": {
+  "chunk": 256,
+  "cap_mult": 2.5,
+  "cap_extra_s": 10.0,
+  "stall_s": 4.0,
+  "stall_terminal": true,
+  "stall_extra": 0.0,
+  "stall_compensate": true,
+  "stall_speed": 3.0,
+  "stall_max_s": 15.0,
+  "gamma": 0.9985,
+  "respawn_stall_s": 4.0,
+  "stall_progress": 5.0,
+  "route_probes": {
+   "last_tas": [
+    525,
+    565,
+    -935,
+    -905
+   ],
+   "last_detour": [
+    525,
+    565,
+    -885,
+    -860
+   ],
+   "exit_guard": [
+    -168.8,
+    -165.5,
+    -195,
+    -172
+   ],
+   "exit_trough": [
+    -172.6,
+    -169.4,
+    -195,
+    -172
+   ],
+   "mid_floor_fall": [
+    -163,
+    -156,
+    -172,
+    -166
+   ]
+  },
+  "gates": {},
+  "split_k": 5.0,
+  "split_min_ref_s": 5.0,
+  "split_rest_allow_s": 1.0,
+  "split_extra": [
+   [
+    4764,
+    6018,
+    2.86
+   ]
+  ]
+ },
+ "arrays": {
+  "pi.0.bias": {
+   "dtype": "<f4",
+   "shape": [
+    256
+   ]
+  },
+  "pi.0.weight": {
+   "dtype": "<f4",
+   "shape": [
+    256,
+    208
+   ]
+  },
+  "pi.2.bias": {
+   "dtype": "<f4",
+   "shape": [
+    256
+   ]
+  },
+  "pi.2.weight": {
+   "dtype": "<f4",
+   "shape": [
+    256,
+    256
+   ]
+  },
+  "pi.4.bias": {
+   "dtype": "<f4",
+   "shape": [
+    9
+   ]
+  },
+  "pi.4.weight": {
+   "dtype": "<f4",
+   "shape": [
+    9,
+    256
+   ]
+  },
+  "rms_mean": {
+   "dtype": "<f8",
+   "shape": [
+    208
+   ]
+  },
+  "rms_var": {
+   "dtype": "<f8",
+   "shape": [
+    208
+   ]
+  },
+  "v.0.bias": {
+   "dtype": "<f4",
+   "shape": [
+    256
+   ]
+  },
+  "v.0.weight": {
+   "dtype": "<f4",
+   "shape": [
+    256,
+    208
+   ]
+  },
+  "v.2.bias": {
+   "dtype": "<f4",
+   "shape": [
+    256
+   ]
+  },
+  "v.2.weight": {
+   "dtype": "<f4",
+   "shape": [
+    256,
+    256
+   ]
+  },
+  "v.4.bias": {
+   "dtype": "<f4",
+   "shape": [
+    1
+   ]
+  },
+  "v.4.weight": {
+   "dtype": "<f4",
+   "shape": [
+    1,
+    256
+   ]
+  }
+ },
+ "policy_sha": "02daed2b051da4d7c7bbc3795b876b12724dea55783dfc747aaa4d7f3cf7b938",
+ "npz_sha256": "035b44b9fc14c7915e66d6f22b87623aa3a14bb1767b47fdcf31f7aab3ac09ce",
+ "npz_bytes": 971504
+}
