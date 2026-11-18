@@ -213,6 +213,27 @@ def test_learner_link_publishes_live_policies_and_feeds_only_released_chunks(poo
         link.template = dict(link.template, pool_max_lag=400)
         assert link.max_lag() == 400 and link.feed_once() == len(pool.store.chunks(t3.task_id))
         assert all(r["ingested"] == 321 for r in pool.store.chunks(t3.task_id))
+        # the learner re-pinned (a --branch-update / another reference line): released chunks of the old features are
+        # never fed, whatever their lag; the same features feed as before
+        assert link._learner_identity() == LL.feature_identity(pub.manifest["features"])  # no false positive
+        t4 = pl.task()
+        for c in pl.play(t4)[0]:
+            assert pl.send(c).status == 200
+        assert pool.verifier.run_once() == 1
+        import dataclasses
+        env_new = dataclasses.replace(link.template["env"], features=dataclasses.replace(
+            link.template["env"].features, path_sha256="e" * 64))
+        link.template = dict(link.template, env=env_new)
+        link._stale_pass_done = False
+        logs.clear()
+        time.sleep(0.5)  # the hub thread delivers t3's chunks into data_q: drain them first
+        while not data_q.empty():
+            data_q.get()
+        assert link.feed_once() == 0
+        time.sleep(0.5)
+        assert data_q.empty()
+        assert all(r["ingested"] == INGEST_STALE for r in pool.store.chunks(t4.task_id))
+        assert any("other features" in m for m in logs)
     finally:
         link.close()
         hub.close()
