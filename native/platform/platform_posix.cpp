@@ -16,6 +16,7 @@
 
 #include <chrono>
 #include <climits>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -257,6 +258,134 @@ private:
 };
 
 std::unique_ptr<Process> Process::spawn(const Spec &spec) { return std::make_unique<PosixProcess>(spec); }
+
+}  // namespace platform
+}  // namespace ballrain
+#endif
+
+// ---------------------------------------------------------------------------------------------- files, HTTP (POSIX)
+#ifndef _WIN32
+#include <dirent.h>
+#include <netdb.h>
+
+namespace ballrain {
+namespace platform {
+
+bool is_dir(const std::string &path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool walk(const std::string &root, const std::string &rel, std::vector<DirEntry> &out, size_t max_files) {
+    std::string d = root + (rel.empty() ? "" : "/" + rel);
+    DIR *dir = opendir(d.c_str());
+    if (!dir) return false;
+    bool ok = true;
+    while (struct dirent *e = readdir(dir)) {
+        std::string n = e->d_name;
+        if (n == "." || n == "..") continue;
+        std::string r = rel.empty() ? n : rel + "/" + n;
+        struct stat st;
+        if (lstat((root + "/" + r).c_str(), &st) != 0) continue;
+        if (S_ISLNK(st.st_mode)) {
+            struct stat t;
+            if (stat((root + "/" + r).c_str(), &t) == 0 && S_ISDIR(t.st_mode)) continue;  // os.walk skips linked dirs
+            out.push_back({r, true});
+        } else if (S_ISDIR(st.st_mode)) {
+            ok = walk(root, r, out, max_files) && ok;
+        } else {
+            out.push_back({r, !S_ISREG(st.st_mode)});
+        }
+        if (out.size() > max_files) {
+            ok = false;
+            break;
+        }
+    }
+    closedir(dir);
+    return ok;
+}
+
+bool list_files(const std::string &dir, std::vector<DirEntry> &out, size_t max_files) {
+    out.clear();
+    if (!is_dir(dir)) return false;
+    return walk(dir, "", out, max_files);
+}
+
+HttpResponse http_request(const std::string &method, const std::string &url,
+                          const std::vector<std::pair<std::string, std::string>> &headers, const std::string &body,
+                          double timeout_s, size_t max_body) {
+    if (url.compare(0, 7, "http://") != 0) throw Error("http: only http:// is implemented on this platform yet");
+    std::string rest = url.substr(7);
+    size_t slash = rest.find('/');
+    std::string hostport = rest.substr(0, slash), path = slash == std::string::npos ? "/" : rest.substr(slash);
+    std::string host = hostport, port = "80";
+    size_t colon = hostport.rfind(':');
+    if (colon != std::string::npos) host = hostport.substr(0, colon), port = hostport.substr(colon + 1);
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) throw Error("http: cannot resolve " + host);
+    int s = -1;
+    for (addrinfo *a = res; a; a = a->ai_next) {
+        s = cloexec(socket(a->ai_family, a->ai_socktype, a->ai_protocol));
+        if (s >= 0 && connect(s, a->ai_addr, a->ai_addrlen) == 0) break;
+        if (s >= 0) ::close(s), s = -1;
+    }
+    freeaddrinfo(res);
+    if (s < 0) throw Error("http: connect failed");
+    PosixStream st(s);
+    std::string req = method + " " + path + " HTTP/1.1\r\nHost: " + hostport +
+                      "\r\nConnection: close\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
+    for (auto &kv : headers) req += kv.first + ": " + kv.second + "\r\n";
+    req += "\r\n";
+    req += body;
+    if (!st.send_all(req.data(), req.size())) throw Error("http: send failed");
+    double deadline = monotonic_s() + timeout_s;
+    std::string resp;
+    char buf[65536];
+    for (;;) {  // read to EOF (Connection: close)
+        double left = deadline - monotonic_s();
+        if (left <= 0) throw Error("http: timeout");
+        fd_set r;
+        FD_ZERO(&r);
+        FD_SET(s, &r);
+        timeval tv;
+        tv.tv_sec = long(left);
+        tv.tv_usec = long((left - double(tv.tv_sec)) * 1e6);
+        int k = select(s + 1, &r, nullptr, nullptr, &tv);
+        if (k < 0 && errno == EINTR) continue;
+        if (k == 0) throw Error("http: timeout");
+        if (k < 0) throw Error("http: read failed");
+        ssize_t n = ::recv(s, buf, sizeof buf, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        resp.append(buf, size_t(n));
+        if (resp.size() > max_body + 65536) throw Error("http: response too large");
+    }
+    size_t he = resp.find("\r\n\r\n");
+    if (he == std::string::npos || resp.compare(0, 5, "HTTP/") != 0) throw Error("http: bad response");
+    HttpResponse out;
+    out.status = std::atoi(resp.c_str() + resp.find(' ') + 1);
+    std::string head = resp.substr(0, he), b = resp.substr(he + 4);
+    for (auto &c : head) c = char(std::tolower(static_cast<unsigned char>(c)));
+    if (head.find("transfer-encoding: chunked") != std::string::npos) {
+        std::string dec;
+        size_t p = 0;
+        for (;;) {
+            size_t e = b.find("\r\n", p);
+            if (e == std::string::npos) throw Error("http: bad chunked body");
+            size_t n = std::strtoul(b.substr(p, e - p).c_str(), nullptr, 16);
+            p = e + 2;
+            if (!n) break;
+            if (p + n > b.size()) throw Error("http: bad chunked body");
+            dec += b.substr(p, n);
+            p += n + 2;
+        }
+        b = dec;
+    }
+    if (b.size() > max_body) throw Error("http: response too large");
+    out.body = b;
+    return out;
+}
 
 }  // namespace platform
 }  // namespace ballrain

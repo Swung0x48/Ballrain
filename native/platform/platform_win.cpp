@@ -317,3 +317,112 @@ std::unique_ptr<Process> Process::spawn(const Spec &spec) { return std::make_uni
 }  // namespace platform
 }  // namespace ballrain
 #endif
+
+// ---------------------------------------------------------------------------------------------- files, HTTP (Windows)
+#ifdef _WIN32
+#include <winhttp.h>
+
+namespace ballrain {
+namespace platform {
+
+bool is_dir(const std::string &path) {
+    DWORD a = GetFileAttributesW(widen(path).c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool walk(const std::wstring &root, const std::wstring &rel, std::vector<DirEntry> &out, size_t max_files) {
+    std::wstring pat = root + (rel.empty() ? L"" : L"\\" + rel) + L"\\*";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
+    bool ok = true;
+    do {
+        std::wstring n = fd.cFileName;
+        if (n == L"." || n == L"..") continue;
+        std::wstring r = rel.empty() ? n : rel + L"\\" + n;
+        bool link = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !link) {
+            ok = walk(root, r, out, max_files) && ok;
+        } else if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            std::string s = narrow(r);
+            for (auto &c : s)
+                if (c == '\\') c = '/';
+            out.push_back({s, link});
+            if (out.size() > max_files) {
+                ok = false;
+                break;
+            }
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
+}
+
+bool list_files(const std::string &dir, std::vector<DirEntry> &out, size_t max_files) {
+    out.clear();
+    if (!is_dir(dir)) return false;
+    return walk(widen(dir), L"", out, max_files);
+}
+
+HttpResponse http_request(const std::string &method, const std::string &url,
+                          const std::vector<std::pair<std::string, std::string>> &headers, const std::string &body,
+                          double timeout_s, size_t max_body) {
+    std::wstring wurl = widen(url);
+    URL_COMPONENTS uc{};
+    uc.dwStructSize = sizeof uc;
+    uc.dwHostNameLength = DWORD(-1);
+    uc.dwUrlPathLength = DWORD(-1);
+    uc.dwExtraInfoLength = DWORD(-1);
+    if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) throw Error("http: bad url");
+    std::wstring whost(uc.lpszHostName, uc.dwHostNameLength);
+    std::wstring wpath(uc.lpszUrlPath, uc.dwUrlPathLength);
+    if (uc.lpszExtraInfo && uc.dwExtraInfoLength) wpath += std::wstring(uc.lpszExtraInfo, uc.dwExtraInfoLength);
+    if (wpath.empty()) wpath = L"/";
+    bool tls = uc.nScheme == INTERNET_SCHEME_HTTPS;
+    struct H {
+        HINTERNET h = nullptr;
+        ~H() {
+            if (h) WinHttpCloseHandle(h);
+        }
+    } ses, con, req;
+    ses.h = WinHttpOpen(L"ballrain-native-client", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!ses.h) throw Error("http: WinHttpOpen failed");
+    int ms = int(timeout_s * 1000);
+    WinHttpSetTimeouts(ses.h, ms, ms, ms, ms);
+    con.h = WinHttpConnect(ses.h, whost.c_str(), uc.nPort, 0);
+    if (!con.h) throw Error("http: connect failed");
+    req.h = WinHttpOpenRequest(con.h, widen(method).c_str(), wpath.c_str(), nullptr, WINHTTP_NO_REFERER,
+                               WINHTTP_DEFAULT_ACCEPT_TYPES, tls ? WINHTTP_FLAG_SECURE : 0);
+    if (!req.h) throw Error("http: open request failed");
+    DWORD no_redirect = WINHTTP_DISABLE_REDIRECTS;
+    WinHttpSetOption(req.h, WINHTTP_OPTION_DISABLE_FEATURE, &no_redirect, sizeof no_redirect);
+    std::wstring hs;
+    for (auto &kv : headers) hs += widen(kv.first + ": " + kv.second) + L"\r\n";
+    if (!WinHttpSendRequest(req.h, hs.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : hs.c_str(), DWORD(hs.size()),
+                            body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char *>(body.data()), DWORD(body.size()),
+                            DWORD(body.size()), 0))
+        throw Error("http: send failed (" + std::to_string(GetLastError()) + ")");
+    if (!WinHttpReceiveResponse(req.h, nullptr)) throw Error("http: no response (" + std::to_string(GetLastError()) + ")");
+    DWORD status = 0, sz = sizeof status;
+    WinHttpQueryHeaders(req.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status,
+                        &sz, WINHTTP_NO_HEADER_INDEX);
+    HttpResponse r;
+    r.status = int(status);
+    for (;;) {
+        DWORD avail = 0;
+        if (!WinHttpQueryDataAvailable(req.h, &avail)) throw Error("http: read failed");
+        if (!avail) break;
+        if (r.body.size() + avail > max_body) throw Error("http: response too large");
+        size_t at = r.body.size();
+        r.body.resize(at + avail);
+        DWORD got = 0;
+        if (!WinHttpReadData(req.h, &r.body[at], avail, &got)) throw Error("http: read failed");
+        r.body.resize(at + got);
+    }
+    return r;
+}
+
+}  // namespace platform
+}  // namespace ballrain
+#endif

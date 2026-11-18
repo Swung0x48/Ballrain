@@ -40,22 +40,31 @@ if(NOT MSVC)
     target_compile_options(ballrain_miniz PRIVATE -w)
 endif()
 
+add_library(ballrain_zstd STATIC third_party/zstd/zstd.c)
+target_include_directories(ballrain_zstd PUBLIC third_party/zstd)
+target_compile_definitions(ballrain_zstd PRIVATE ZSTD_DISABLE_ASM=1)
+if(NOT MSVC)
+    target_compile_options(ballrain_zstd PRIVATE -w)
+endif()
+
 add_library(ballrain_core STATIC
     core/src/util.cpp core/src/json.cpp core/src/sha256.cpp core/src/npz.cpp core/src/wire.cpp core/src/state.cpp
-    core/src/geometry.cpp core/src/path.cpp core/src/features.cpp core/src/policy.cpp core/src/stream.cpp)
+    core/src/geometry.cpp core/src/path.cpp core/src/features.cpp core/src/policy.cpp core/src/stream.cpp
+    core/src/engine_chain.cpp core/src/chunk.cpp core/src/starts.cpp core/src/reward.cpp)
 target_include_directories(ballrain_core PUBLIC core/include)
-target_link_libraries(ballrain_core PRIVATE ballrain_miniz)
+target_link_libraries(ballrain_core PRIVATE ballrain_miniz ballrain_zstd)
 
 if(WIN32)
     set(BALLRAIN_PLATFORM_SRC platform/platform_win.cpp)
 else()
     set(BALLRAIN_PLATFORM_SRC platform/platform_posix.cpp)
 endif()
-add_library(ballrain_engine STATIC core/src/session.cpp core/src/env.cpp ${BALLRAIN_PLATFORM_SRC})
+add_library(ballrain_engine STATIC core/src/session.cpp core/src/env.cpp core/src/task_runner.cpp core/src/pool_client.cpp
+    ${BALLRAIN_PLATFORM_SRC})
 target_include_directories(ballrain_engine PUBLIC platform)
 target_link_libraries(ballrain_engine PUBLIC ballrain_core)
 if(WIN32)
-    target_link_libraries(ballrain_engine PUBLIC ws2_32)
+    target_link_libraries(ballrain_engine PUBLIC ws2_32 winhttp)
     target_compile_definitions(ballrain_engine PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 elseif(NOT ANDROID)
     find_package(Threads REQUIRED)
@@ -67,6 +76,8 @@ if(BALLRAIN_APPS)
     target_link_libraries(nc_golden PRIVATE ballrain_engine)
     add_executable(nc_runner apps/nc_runner.cpp)
     target_link_libraries(nc_runner PRIVATE ballrain_engine)
+    add_executable(nc_client apps/nc_client.cpp)
+    target_link_libraries(nc_client PRIVATE ballrain_engine)
 endif()
 
 # tests: the engine-free self test always; the golden replays when BALLRAIN_GOLDEN_DIR names a directory of

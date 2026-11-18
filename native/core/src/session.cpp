@@ -36,6 +36,7 @@ void Ingest::load_level(bool full) {
     if (!b) return;
     size_t len = 0;
     LevelMessage lm = parse_level_message(b->data(), b->size(), &len);
+    if (digest) digest->level('F', b->data(), b->size());
     tracker.merge_level(lm);
     level_loaded = true;
 }
@@ -46,6 +47,7 @@ void Ingest::load_increments() {
     if (!tail) return;
     size_t used = 0;
     auto msgs = parse_level_stream(tail->data(), tail->size(), &used);
+    if (digest) digest->level('I', tail->data(), used);
     for (auto &lm : msgs) tracker.merge_level(lm);
     inc_pos += used;
 }
@@ -293,6 +295,7 @@ const Observation *Session::next_obs() {
             return nullptr;
         }
         if (rec_) rec_->put(K_OBS, *data);
+        if (ing_->digest) ing_->digest->obs(data->data() + 24, data->size() - 24);
         Observation o = parse_observation(data->data() + 24, data->size() - 24);
         bool prefix = (o.flags & OBS_PREFIX) && !o.final();
         ing_->ingest(std::move(o), chan_->header());

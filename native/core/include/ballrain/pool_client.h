@@ -1,0 +1,75 @@
+// The volunteer side of the pool protocol (a port of ballrain/pool/client_api.py and the parts of task.py /
+// client_game.py a client needs): JSON messages over HTTP(S), the sha-addressed download cache, the game-file hashes.
+#pragma once
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "ballrain/json.h"
+#include "ballrain/policy.h"
+#include "ballrain/starts.h"
+
+namespace ballrain {
+
+extern const char *const CLIENT_VERSION;
+
+struct GatewayUnavailable : Error {  // no usable answer: network, timeout, not the protocol
+    explicit GatewayUnavailable(const std::string &m) : Error(m) {}
+};
+struct GatewayRefusal : Error {  // the gateway's reason; .message is shown to the player verbatim
+    GatewayRefusal(Json reason, int http_status);
+    Json reason;
+    std::string code, message;
+    int http_status;
+    bool fatal;  // reasons.TOKEN_FATAL: stop everything, log in again
+};
+
+// "https://host[/path]", or http only for this machine (a local test gateway); no query / credentials
+std::string check_gateway_url(const std::string &url);
+Json make_message(const std::string &type, Json fields = Json::object());
+
+class GatewayClient {
+public:
+    explicit GatewayClient(const std::string &base_url, std::string token = "", double timeout_s = 20.0);
+    std::string token, session_id;
+
+    Json login_start();
+    Json login_poll(const std::string &login_id, const std::string &poll_secret);
+    Json hello(const std::string &platform, const Json &engine, const Json &game_files, int instances);
+    Json task();  // a "task" or "no_task" message
+    Json chunk(const Bytes &data);  // chunk_result (a "rejected" result is returned, an error message raised)
+    Json heartbeat(bool running, const Json &instances, double steps_per_s);
+    Json me();
+    Json set_leaderboard(bool on);
+    Bytes download(const std::string &path, size_t max_bytes, const std::string &expect_sha = "");
+
+private:
+    Json call(const std::string &method, const std::string &path, const std::vector<std::string> &expect,
+              const Bytes &body, const std::string &ctype, bool auth, bool session);
+    std::string base_;
+    double timeout_s_;
+};
+
+// <data dir>/cache: weights/<sha>.{json,npz}, assets/<sha>.npz, refpaths/<sha>/L<nn>.npz
+class PoolCache {
+public:
+    PoolCache(std::string root, GatewayClient &api) : root_(std::move(root)), api_(api) {}
+    Policy policy(const std::string &policy_sha);  // downloads, checks (Policy::load), drops a bad cached copy
+    std::string asset(const std::string &sha);     // the asset file, downloaded and sha-checked
+    TasStarts starts(const std::string &sha);      // the starts pack, checked (install_starts_pack's checks)
+    std::string path_dir(const std::string &sha, int level);  // the reference line installed as L<nn>.npz
+
+private:
+    std::string root_;
+    GatewayClient &api_;
+};
+
+// hello.game_files (task.hash_game_files): GAME_FILE_LIST (+ BuildingBlocks/physics_RT.dll for the 2002 engine);
+// a directory entry is the tree digest of its files; a missing entry is 64 zeros
+Json hash_game_files(const std::string &root, const std::string &engine_kind);
+// hello.engine: kind, the binary's sha256, version (ENGINE_VERSION next to the binary, else dev-<sha12>)
+Json engine_info(const std::string &binary, const std::string &kind);
+std::string platform_name();
+
+}  // namespace ballrain

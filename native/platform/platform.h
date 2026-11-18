@@ -19,6 +19,26 @@ bool remove_file(const std::string &path);
 std::string absolute_path(const std::string &path);
 std::string temp_dir();
 
+// Directory listing for game-file hashing: regular files under dir (recursively), paths relative to dir with '/'.
+// link = a symbolic link / reparse point (not followed; the hash counts it as a mismatch). false: dir unreadable.
+struct DirEntry {
+    std::string rel;
+    bool link = false;
+};
+bool list_files(const std::string &dir, std::vector<DirEntry> &out, size_t max_files = 20000);
+bool is_dir(const std::string &path);
+
+// One HTTP(S) request. Windows: WinHTTP (http and https, the system's TLS and proxy settings). POSIX: http only for
+// now (a loopback test gateway); https on macOS / Linux / Android is not implemented yet. Throws ballrain::Error on a
+// connection failure, a timeout or a body larger than max_body.
+struct HttpResponse {
+    int status = 0;
+    std::string body;
+};
+HttpResponse http_request(const std::string &method, const std::string &url,
+                          const std::vector<std::pair<std::string, std::string>> &headers, const std::string &body,
+                          double timeout_s, size_t max_body);
+
 // A connected byte stream (TCP). recv_exact returns false on EOF / error; throws ballrain::Error("timeout") when
 // the deadline (monotonic_s()) passes first.
 class Stream {

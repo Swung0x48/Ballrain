@@ -3,6 +3,7 @@
 #include <cmath>
 #include <limits>
 
+#include "ballrain/policy.h"
 #include "platform.h"
 
 namespace ballrain {
@@ -55,6 +56,10 @@ EnvConfig EnvConfig::from_manifest(const Json &e) {
     c.respawn_limit_frames = uint32_t(e.get_int("respawn_limit_frames", 20000));
     c.body_radius = e.get_double("body_radius", 60.0);
     c.skip_render = e.get_bool("skip_render", true);
+    c.start_check = e.get_bool("start_check", true);
+    c.start_retries = int(e.get_int("start_retries", 3));
+    if (const Json *x = e.find("exclude_starts"); x && x->is_array())
+        for (auto &r : x->items()) c.exclude_starts.push_back({r.at(size_t(0)).as_int(), r.at(size_t(1)).as_int()});
     return c;
 }
 
@@ -94,8 +99,11 @@ uint32_t world_to_camera_keys(uint32_t keys, const float m[12]) {
 // ---------------------------------------------------------------------------------------------- env
 
 BallanceEnv::BallanceEnv(EnvConfig cfg, FeatureConfig features, EngineConfig engine, std::string run_root,
-                         StreamWriter *rec)
-    : cfg_(std::move(cfg)), eng_(std::move(engine)), run_root_(std::move(run_root)), rec_(rec), fx_(std::move(features)) {
+                         StreamWriter *rec, const TasStarts *starts, int64_t start_frame, RewardConfig reward)
+    : cfg_(std::move(cfg)), eng_(std::move(engine)), run_root_(std::move(run_root)), rec_(rec), fx_(std::move(features)),
+      starts_(starts), start_frame_(start_frame), reward_(reward) {
+    if (start_frame_ > 0 && (!starts_ || !starts_->index_of(start_frame_)))
+        throw Error("start frame " + std::to_string(start_frame_) + " is not a valid start frame of the record");
     for (auto k : ARROWS9) actions_.push_back(k);
     if (cfg_.esc_frames < 3) throw Error("esc_frames must be >= 3");
     repress_ = cfg_.repress_stale_keys ? *cfg_.repress_stale_keys : cfg_.world_actions;
@@ -123,7 +131,7 @@ void BallanceEnv::finish_process() {
     after_death_ = false;
 }
 
-void BallanceEnv::start_process() {
+bool BallanceEnv::launch(int64_t k) {
     SessionConfig sc;
     sc.level = cfg_.level;
     sc.out_dir = run_root_ + "/run-" + std::to_string(platform::self_pid()) + "-" + std::to_string(processes++);
@@ -134,7 +142,16 @@ void BallanceEnv::start_process() {
     sc.skip_render = cfg_.skip_render;
     sc.obs_timeout_s = cfg_.obs_timeout_s;
     sc.hello_timeout_s = cfg_.hello_timeout_s;
+    if (k > 0) {  // the record's first k frames, replayed by the engine before the hand-over (BALLRAIN_PREFIX)
+        if (!platform::make_dirs(sc.out_dir)) throw Error("cannot create " + sc.out_dir);
+        sc.prefix = sc.out_dir + "/prefix.bin";
+        Bytes raw;
+        for (auto &f : starts_->prefix(k)) put<float>(raw, f.delta), put<uint32_t>(raw, f.keys);
+        write_file(sc.prefix, raw);
+    }
+    if (digest_) digest_->reset();  // a process discarded by the hand-over check leaves nothing in the digest
     sess_ = std::make_unique<Session>(sc, eng_, rec_);
+    sess_->set_digest(digest_);
     sess_->start();
     try {
         intro();
@@ -143,10 +160,73 @@ void BallanceEnv::start_process() {
         sess_.reset();
         throw;
     }
-    // _init_held for a start from level load
+    return !(k > 0 && cfg_.start_check) || handover_ok(k);
+}
+
+// env._handover_check: the hand-over state against the record's (frame, sector, checkpoints, points, lives, SR, ball
+// position: exact)
+bool BallanceEnv::handover_ok(int64_t k) const {
+    auto exp = starts_->expected(k);
+    const Observation *o = sess_->obs();
+    if (!exp || !o || !o->ball || sess_->ended()) return false;
+    const GameTracker &t = sess_->tracker();
+    auto sr = t.sr_ms();
+    return int64_t(sess_->frames_done()) == exp->frame && t.sector() == exp->sector && t.checkpoints == exp->checkpoints &&
+           t.points() == exp->points && t.lives() == exp->lives && (sr ? *sr : 0.0) == exp->sr_double &&
+           o->ball->pos[0] == exp->pos[0] && o->ball->pos[1] == exp->pos[1] && o->ball->pos[2] == exp->pos[2];
+}
+
+void BallanceEnv::start_process() {
+    int64_t k = start_frame_;
+    int mismatches = 0;
+    for (int attempt = 0;; ++attempt) {
+        if (launch(k)) break;
+        ++mismatches;
+        finish_process();
+        if (attempt >= std::max(0, cfg_.start_retries))
+            throw Error("hand-over at frame " + std::to_string(k) + " differs from the record " +
+                        std::to_string(mismatches) + " times");
+    }
+    start_ = StartInfo();
+    start_.kind = "tas";
+    start_.frame = k;
+    start_.new_process = true;
+    start_.handover_mismatches = mismatches;
+    init_held(k);
+}
+
+// env._init_held: none from level load; after a TAS prefix the keys of its last frame, each with the record's camera
+// quarter when it went down; the camera-turn clock from the record's last turn press
+void BallanceEnv::init_held(int64_t k) {
     held_ = 0;
     for (int b = 0; b < 4; ++b) press_known_[b] = false, press_q_[b].reset();
     ms_since_turn_ = std::numeric_limits<double>::infinity();
+    if (k <= 0 || !starts_) return;
+    const std::vector<Frame> &fr = starts_->frames;
+    size_t n = size_t(std::min<int64_t>(k, int64_t(fr.size())));
+    auto turn = [&](size_t i) { return (fr[i].keys & KEY_SHIFT) && (fr[i].keys & (KEY_LEFT | KEY_RIGHT)); };
+    std::optional<size_t> e;
+    for (size_t i = 0; i < n; ++i)
+        if (turn(i) && (i == 0 || !turn(i - 1))) e = i;
+    if (e) {
+        std::vector<double> d;
+        for (size_t i = *e; i < n; ++i) d.push_back(double(fr[i].delta));
+        ms_since_turn_ = numpy_sum(d.data(), d.size());
+    }
+    if (!n) return;
+    uint32_t last = fr[n - 1].keys & ARROW_MASK;
+    if (!last) return;
+    const std::vector<int8_t> &cq = starts_->camera_quarter;
+    for (int b = 0; b < 4; ++b) {
+        uint32_t bit = ARROW_BITS[b];
+        if (!(last & bit)) continue;
+        size_t j = n - 1;
+        while (j > 0 && (fr[j - 1].keys & bit)) --j;
+        press_known_[b] = true;
+        if (j < cq.size() && cq[j] >= 0) press_q_[b] = int(cq[j]);
+        else press_q_[b].reset();
+    }
+    held_ = last;
 }
 
 void BallanceEnv::intro() {
@@ -194,11 +274,19 @@ std::optional<std::vector<float>> BallanceEnv::reset(bool relaunch, StepInfo *in
     if (!sess_) {
         start_process();
         if (sess_->ended() || !sess_->tracker().flags.ball_nav) throw Error("run ended before the player got control");
+    } else {  // a respawn in the same process
+        start_ = StartInfo();
+        start_.kind = "respawn";
+        start_.frame = sess_->frames_done();
+        start_.new_process = false;
     }
     ep_steps_ = ep_frames_ = ep_pause_frames_ = 0;
     fx_.reset_episode();
     if (rec_) rec_->put(K_RESET, Bytes());
-    std::vector<float> o = features(info);
+    StepInfo tmp;
+    StepInfo *pi = info ? info : &tmp;
+    std::vector<float> o = features(pi);
+    reward_.begin(sess_->tracker(), pi->feat.path ? std::optional<double>(pi->feat.path->s) : std::nullopt);
     if (info) {
         info->frames_done = sess_->frames_done();
         info->sr_ms = sess_->tracker().sr_ms();
@@ -270,7 +358,7 @@ std::string BallanceEnv::esc() {
     return now == was ? "no_toggle" : (now ? "paused" : "unpaused");
 }
 
-std::vector<float> BallanceEnv::step(int action, bool &terminated, bool &truncated, StepInfo &info) {
+std::vector<float> BallanceEnv::step(int action, bool &terminated, bool &truncated, StepInfo &info, double *reward_out) {
     Session *s = sess_.get();
     if (!s || s->ended()) throw Error("step() after the run ended; call reset()");
     if (action < 0 || action >= int(actions_.size())) throw Error("action out of range");
@@ -334,6 +422,15 @@ std::vector<float> BallanceEnv::step(int action, bool &terminated, bool &truncat
     bool cam_bad = !terminated && !ended && camera_off_quarter();
     if (cam_bad) terminated = true, truncated = false;
     std::vector<float> obs = features(&info);
+    const auto &pr = info.feat.path;
+    double r = reward_.step(t, pr ? std::optional<double>(pr->s) : std::nullopt, died, finished, terminated,
+                            pr && pr->jump, std::optional<bool>(info.feat.supported));
+    if (cam_bad) {  // no credit for the episode: its return becomes -death_penalty
+        double pen = -reward_.total - reward_.cfg.death_penalty;
+        r += pen;
+        reward_.total += pen;
+    }
+    if (reward_out) *reward_out = r;
     info.frames_done = s->frames_done();
     info.sr_ms = t.sr_ms();
     info.sector = t.sector();

@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "ballrain/engine_chain.h"
 #include "ballrain/state.h"
 #include "ballrain/stream.h"
 #include "ballrain/wire.h"
@@ -72,6 +73,7 @@ public:
     std::optional<uint32_t> end_reason;
     std::optional<uint64_t> trace_hash;
     std::optional<double> sr_at_levelfinish;
+    EngineDigest *digest = nullptr;  // pool tasks: fed with every level-message read (Session feeds the OBS1 messages)
 
 private:
     void load_level(bool full);
@@ -154,6 +156,7 @@ public:
     std::optional<uint32_t> end_reason() const { return ing_->end_reason; }
     const ChanHeader &hello() const { return hello_; }
     int pid() const;
+    void set_digest(EngineDigest *d) { ing_->digest = d; }
 
     struct Timing { double launch = 0, hello = 0, first_obs = 0; } timing;
 

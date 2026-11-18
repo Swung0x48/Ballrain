@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "ballrain/engine_chain.h"
 #include "ballrain/features.h"
 #include "ballrain/json.h"
 #include "ballrain/policy.h"
@@ -70,6 +71,9 @@ int main(int argc, char **argv) {
         double tol = std::atof(arg(argc, argv, "--tol", "1e-4").c_str());
         std::string out_json = arg(argc, argv, "--json", "");
         std::string drawn_s = arg(argc, argv, "--drawn-actions", "auto");
+        std::string digests_out = arg(argc, argv, "--digests", "");  // engine-state digest per FEAT record
+        std::FILE *dgf = digests_out.empty() ? nullptr : std::fopen(digests_out.c_str(), "w");
+        EngineDigest dg;
         bool drawn = drawn_s == "1";
         if (drawn_s == "auto") {
             std::string mp = spath.substr(0, spath.find_last_of("/\\") + 1) + "meta.json";
@@ -110,6 +114,8 @@ int main(int argc, char **argv) {
                     }
                     src = std::make_unique<ReplayLevelSource>(cur);
                     ing = std::make_unique<Ingest>(1, src.get(), nullptr);
+                    ing->digest = &dg;
+                    dg.reset();
                     break;
                 case K_OBS: {
                     if (!ing) throw Error("OBS before HELLO");
@@ -117,11 +123,13 @@ int main(int argc, char **argv) {
                     ChanHeader ch;
                     ch.mod_state = h.u32(), ch.end_reason = h.u32(), ch.frames_done = h.u32(), ch.last_error = h.u32();
                     ch.mod_seq = h.u64();
+                    dg.obs(r.data.data() + 24, r.data.size() - 24);
                     ing->ingest(parse_observation(r.data.data() + 24, r.data.size() - 24), ch);
                     break;
                 }
                 case K_RESET: fx->reset_episode(); break;
                 case K_FEAT: {
+                    if (dgf) std::fprintf(dgf, "%s\n", hex(dg.take()).c_str());
                     std::vector<float> py(r.data.size() / 4);
                     std::memcpy(py.data(), r.data.data(), r.data.size());
                     std::vector<float> cc = fx->compute(ing->tracker);
@@ -167,6 +175,7 @@ int main(int argc, char **argv) {
                 default: break;  // ACT, NOTE (LVL records are consumed by the ingest)
             }
         }
+        if (dgf) std::fclose(dgf);
         std::printf("feature rows %lld, rows with a value over tol %g: %lld (first %lld)\n", (long long)rows, tol,
                     (long long)bad_rows, (long long)first_bad_row);
         double worst = 0;

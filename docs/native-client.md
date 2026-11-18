@@ -3,7 +3,7 @@
 志愿者算力池的玩家端程序：不需要 Python，直接驱动无头引擎（x87-soft 物理），自己算观测特征、跑策略、按服务器种子抽动作。
 Python 侧（`ballrain/pool`、`tools/pool`）是训练 / 网关 / 校验方。设计背景见 `volunteer-compute.md`、`pool-prototype.md`。
 
-里程碑：**M1**（本文件现在的内容）核心库 + 回合运行器；M2 池协议客户端 + 校验改为跨 CPU 容差；M3 控制器界面、子进程生命周期、OAuth、单文件发布。
+里程碑：**M1** 核心库 + 回合运行器（§1–4）；**M2** 池协议客户端 + 校验改为跨 CPU 容差（§5）；M3 控制器界面、子进程生命周期、OAuth、单文件发布。
 
 ## 1. 结构
 
@@ -99,7 +99,60 @@ Python 同种子跑两次（`policy_s1` / `policy_s1b`），C++ 与 Python 之�
 但两个都是 Windows x86 MSVC 构建；**Mac arm64 / Linux 的引擎构建之间这些段是否逐字节相同还没验证**——CK 侧（相机、WTCH 装饰物体）是原生浮点代码，
 `headless.md` §7 里零售与无头的差异正出在这些段上。M2 的链设计要先把这一点查清（或者只哈希物理侧的段）。
 
-## 5. 还没有做（M2 / M3）
+## 5. M2：池协议客户端，校验不再依赖跨 CPU 逐位一致
 
-- TAS 起点任务（k > 0：前缀回放、交接检查、`_init_held` 用录制的相机象限），训练奖励（`rewards.py` + worker 的分段奖励 / 卡住截断），池任务的结束判定（max_steps / max_frames / cap / stall）：M2 与池协议一起做。
+### 5.1 校验方式改了（Python 侧，链 v2）
+
+以前数据段的哈希链覆盖每行的 float32 特征，验证器重放时要逐位复现——这等于要求志愿者的 CPU / 编译器算出的特征和服务端逐位相同。现在（`pool-prototype.md` §3.2、§10.6）：
+
+- **链覆盖引擎原始字节**：每行的引擎摘要 = 上一行之后收到的全部 OBS1 消息和关卡消息读取（规范化：去掉带地址的 SCOR、SREN、IVPO），
+  `h(i) = sha256(h(i-1) || d_i)`（`ballrain/pool/engine_chain.py`，`native/core/src/engine_chain.cpp`）。引擎是确定的，验证器的重放必须逐位复现这条链。
+- **验证器自己算特征**，float16 观测在一个 float16 ulp + 1e-4 内即可；log-prob / 价值用验证器自己的特征和原有的 `LOGP_TOL` / `VALUE_TOL` 比；
+  动作必须是服务端种子的抽取，或者 `u` 落在累积分布边界的 `ACTION_EPS` 内；奖励、env_rewards 在 1e-4 × max(1, |r|) 内，弧长在 1e-3 × max(1, |arc|) 内；flags、end、sector、帧数、IGT 逐位。
+- 数据段格式号 `CHUNK_FORMAT` 改成 2（旧的段在新链上本来就对不上）。
+- Python 主控程序（`client_sampler`）和验证器（`rollout`）同步改了；测试：`tests/test_pool_engine_chain.py`（规范记录、字节布局）、
+  `test_pool_verifier.py` 新增“另一种 CPU 的浮点噪声照常通过”和“伪造引擎状态并重算链”两项。池子相关测试 102 项通过、4 项跳过
+  （`test_http_layer_refuses_before_reading_and_bounds_connections` 在一次全量运行里因负载超时失败过一次，单独和再跑两遍都通过；没动过那部分代码）。
+
+### 5.2 客户端（`native/`）
+
+| 部分 | 位置 | 对应的 Python |
+|---|---|---|
+| 引擎摘要 / 链 | `core/src/engine_chain.cpp` | `pool/engine_chain.py` |
+| 数据段编码（JSON 头规范输出、raw / zstd 段、float16 就近取偶、sha256） | `core/src/chunk.cpp`，zstd 1.5.7 单文件（`third_party/zstd`，BSD） | `pool/protocol.py encode_chunk` |
+| 开局包（校验同 `install_starts_pack`；相机过滤、exclude、`expected`、前缀） | `core/src/starts.cpp` | `pool/task.py`、`curriculum.TasStarts` |
+| SR 奖励 | `core/src/reward.cpp` | `rewards.py` |
+| env 补齐：TAS 起点（前缀回放、交接检查与重试、按录制恢复按住的键和相机计时）、奖励、相机守卫罚分、引擎摘要 | `core/src/env.cpp`、`session.cpp` | `env.py` |
+| 任务运行：worker 的训练奖励（分段奖励、门、帧上限、stall / stall_terminal / stall_compensate）、任务结束判定、数据段组装、按种子抽样 | `core/src/task_runner.cpp` | `pool/rollout.py`（验证器重放用的那份） |
+| 网关客户端：HTTP（Windows 用 WinHTTP，http / https；POSIX 目前只有 http，见 §6）、消息、sha 寻址缓存、game_files 哈希、引擎信息 | `core/src/pool_client.cpp`、`platform/` | `pool/client_api.py`、`task.py`、`client_game.py` |
+| 命令行客户端：`nc_client login`（login_start / login_poll，存令牌）、`nc_client run`（hello → 领任务 → 下载并校验 → 跑任务 → 每段立即上传，网络错误退避重试；拒收原样打印，`TOKEN_FATAL` 停止） | `apps/nc_client.cpp` | `client_worker.py`、`client_core.py` 的一部分 |
+
+### 5.3 端到端（`tools/native/e2e_pool.py`）
+
+本机回环：模拟论坛 + 网关（真实 r7 策略导出、SR01 开局包、`runtime/refpaths-alt` 参考线）+ Python 验证器（x87-soft 引擎 `bin-x86soft`），
+原生客户端走完整的登录流程（浏览器那一步由脚本带着 cookie 模拟，模拟论坛用户 `eligible`）、跑任务、上传；验证器在试用期内重放每一段。
+
+| 组合 | 任务 | 数据段 | 验证 |
+|---|---|---|---|
+| 客户端 `bin-x86soft`，验证器 `bin-x86soft` | 2 个（LevelFinish 2738 步；max_steps 3000 步），开局 k 来自 r7 的课程（前沿 4100 附近） | 23 段全部接收 | **23/23 通过**，5738 步通过验证 |
+| 客户端 `bin-x86p2002d` + `BALLRAIN_HL_PHYS2002=0`，验证器 `bin-x86soft`（两个不同的 x87-soft 构建） | 4 个，都 LevelFinish（1645 / 3877 / 2729 / 1495 步） | 40 段全部接收 | **40/40 通过**，9746 步通过验证 |
+| 伪造：把一段原生数据段第 10 步的奖励加 0.25 并重新封装，交给验证器的 `replay_task` | — | — | 报 `replay_reward_mismatch`，第 10 步 |
+
+客户端在任务里约 300–640 步/秒（含每段上传）；验证器重放约 200 步/秒。
+
+```sh
+$PY tools/native/e2e_pool.py --dir runtime/nc/e2e --ckpt runtime/nc/ckpt/r7_latest.pt     --record <main checkout>/runtime/datasets/tas-v1/SR01_1_14_457_264     --engine runtime/nc/engine-x86soft/BallanceMMOSimTool.exe --game runtime/nc/game     --client build/native-Release/nc_client.exe --tasks 2 --max-steps 3000
+```
+
+另外两项交叉检查：`tools/native/stream_digests.py`（Python）与 `nc_golden --digests`（C++）对同一录制算出的引擎摘要逐行相同（17299 行）；
+Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相同。
+
+## 6. 还没有做 / 限制
+
+- **POSIX 上没有 https**：macOS / Linux / Android 的 `http_request` 只支持 http（本机测试网关）。真网关在 https 隧道后面，这几个平台要接系统 TLS（macOS Security / Network 框架、Android 的 Java HTTP，Linux 用 libcurl 或 OpenSSL）。
+- **跨引擎构建的字节一致**只在两个 Windows x86 构建之间验证过；Mac arm64 / Linux 引擎构建之间要先核对（§4.1）。另外容差只能吸收舍入，特征里的离散判定在另一种 CPU 上翻转会被当成不一致（`pool-prototype.md` §8）。
+- **只有一个实例、没有界面、登录要自己打开浏览器**：M3（TUI、多实例、Job Object / 进程组、系统浏览器 + 本机回调、单文件发布）。
+- 网关响应只做了轻量的结构检查（类型和必需字段），没有照搬 `protocol.MESSAGES` 的完整 schema。
+- 上传是同步的（每段在本步结束时直接 POST）；Python 主控程序是后台线程。本机回环上没有影响，慢网络下会拖慢采样。
+- 只支持 SR 策略（与网关导出的限制相同）；`route_probes` 只是记账，没有移植。
 - `fastreach`、2002 零售版 Player.exe 版本：以后。
