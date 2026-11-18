@@ -2,10 +2,12 @@
 // tracker / features / policy and compare with the recorded feature vectors and policy outputs.
 //
 //   nc_golden --manifest <policy>.json --stream <dir>/stream.bin --path-dir <dir of L01.npz> [--tol 1e-4] [--json out]
+//             [--drawn-actions auto|1|0]
 //
 // A feature value matches when |cpp - py| <= tol or |cpp - py| <= tol * |py|. Log-probs and values are compared with
 // the pool's LOGP_TOL / VALUE_TOL; the sampled action (policy streams) must be the recorded one unless u lies within
-// ACTION_EPS of a cdf boundary.
+// ACTION_EPS of a cdf boundary. --drawn-actions: whether the recorded actions are the policy's draws (auto: from the
+// stream's meta.json "mode", "policy" = drawn; golden.py's random mode records random sticky actions).
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -67,6 +69,13 @@ int main(int argc, char **argv) {
         std::string pdir = arg(argc, argv, "--path-dir");
         double tol = std::atof(arg(argc, argv, "--tol", "1e-4").c_str());
         std::string out_json = arg(argc, argv, "--json", "");
+        std::string drawn_s = arg(argc, argv, "--drawn-actions", "auto");
+        bool drawn = drawn_s == "1";
+        if (drawn_s == "auto") {
+            std::string mp = spath.substr(0, spath.find_last_of("/\\") + 1) + "meta.json";
+            Bytes mb;
+            drawn = !read_file(mp, mb) || Json::parse(mb).get_string("mode", "policy") == "policy";
+        }
         Json manifest = Policy::read_manifest(mpath);
         std::string npz = mpath.substr(0, mpath.size() - 5) + ".npz";
         Policy pol = Policy::load(npz, manifest);
@@ -198,7 +207,8 @@ int main(int argc, char **argv) {
             j.set("actions_different", Json::integer(act_diff));
             write_file(out_json, j.dump(true) + "\n");
         }
-        bool ok = bad_rows == 0 && max_lp <= LOGP_TOL && max_v <= VALUE_TOL;
+        bool ok = bad_rows == 0 && max_lp <= LOGP_TOL && max_v <= VALUE_TOL && (!drawn || act_diff == 0);
+        if (!drawn) std::puts("(recorded actions are not policy draws: action agreement not checked)");
         std::printf("%s\n", ok ? "OK" : "MISMATCH");
         return ok ? 0 : 1;
     } catch (const std::exception &e) {

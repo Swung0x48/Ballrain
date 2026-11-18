@@ -18,6 +18,14 @@ Python 侧（`ballrain/pool`、`tools/pool`）是训练 / 网关 / 校验方。�
 
 传输一律用回环 TCP（引擎在所有平台都支持 `tcp:`），客户端是服务端、引擎连上来，消息格式同 `headless.md` §2。
 关卡消息（`level.msg` / `.inc`）照旧是引擎写的本地文件，客户端在 AgentSession 读它的同一时刻读（StartLevel 或尚未加载时读全量，有 PHYS 或 StartLevel 时读增量）。
+子进程只继承它的三个标准句柄（Windows：`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`，套接字建成不可继承；POSIX：套接字 `FD_CLOEXEC`），
+所以同时开多个引擎时，一个引擎不会握着另一个引擎的连接（否则关掉那条连接对方收不到 EOF）。
+
+`headless/src/ballrain_wire.h` 没有复用：它是引擎一侧写 OBS1 / LVL1 段的写入器，客户端要的是读取（照 `protocol.py` 的布局移植），
+要写的只有 ACT1（36 字节头 + 帧，没有段结构），用不上它的段封装。
+
+**参考线必须显式给出**：`path_source = "tas"` 而 `path_dir` 没设时直接报 `RouteError`。Python 在这种情况下会用仓库里的
+`benchmarks/refpaths`；客户端没有这个默认目录，若悄悄退回检查点折线就是 r6 出过的那种"跑在别的路线上"的错误（`path.py` 文档）。
 
 ## 2. 编译
 
@@ -33,8 +41,32 @@ Python 侧（`ballrain/pool`、`tools/pool`）是训练 / 网关 / 校验方。�
    AgentSession 每次读关卡消息时读到的字节（全量文件 / `.inc` 未读的尾部，没读时记 status 0）、每次 `reset_episode()`、每个特征向量、策略模式下每步的 log-prob / value / u / 动作。
    录制放在 `runtime/` 下（含关卡几何，不进 git；meta.json 里的路径已去掉）。
 2. `nc_golden` 把录下的引擎字节原样喂给 C++ 的 tracker / 特征 / 策略，逐行比较特征（|差| ≤ 1e-4 或相对 1e-4）、log-prob（`LOGP_TOL` 1e-3）、value（`VALUE_TOL`），并检查按 u 抽到的动作。
-3. `nc_runner` 在线跑同一个种子（同样的 `retail:<seed>` 球序、`BALLRAIN_HL_PHYS2002=0`），写同格式的流；`stream_diff.py` 逐条比较两条流。
+3. `nc_runner` 在线跑同一个种子（同样的 `retail:<seed>` 球序、`BALLRAIN_HL_PHYS2002=0`），写同格式的流；`stream_diff.py` 逐条比较两条流（含最终 TraceHash）。
    `--actions-from <stream>` 让它按另一条流里的动作走（用来在线复现 Python 的随机动作 run：死亡、重生、GameOver）。
+   `nc_golden` 对策略流（meta.json `mode` 为 policy）要求按 u 抽到的动作与录制的相同，否则失败；随机 / TAS 流的动作不是抽出来的，不检查。
+
+### 3.1 复现（Windows PC，仓库根目录；`PY` = 仓库的 Python 环境）
+
+```sh
+# 自用拷贝（不动训练用的那份）：训练用的引擎、游戏目录、参考线、检查点
+mkdir -p runtime/nc/engine runtime/nc/ckpt runtime/refpaths-alt
+cp <main checkout>/runtime/hl-win/bin-x86p2002d/BallanceMMOSimTool.exe runtime/nc/engine/
+cp -r <main checkout>/runtime/hl-win/game runtime/nc/game
+cp <main checkout>/runtime/refpaths-alt/L01.npz runtime/refpaths-alt/
+cp <main checkout>/runtime/m2-train-mac/r7/latest.pt runtime/nc/ckpt/r7_latest.pt
+# 策略导出（可信的检查点，torch）：runtime/nc/policy/<sha>.json + .npz
+$PY -c "from ballrain.pool import weights as W; print(W.export_checkpoint('runtime/nc/ckpt/r7_latest.pt', 'runtime/nc/policy', 'r7')['policy_sha'])"
+M=runtime/nc/policy/<sha>.json
+$PY tools/native/golden.py policy --manifest $M --out runtime/nc/golden/policy_s1 --seed 1 --ball-seed 12
+$PY tools/native/golden.py random --manifest $M --out runtime/nc/golden/random_s2 --seed 2 --max-steps 6000
+$PY tools/native/golden.py tas --manifest $M --out runtime/nc/golden/tas_sr01 --record <main checkout>/runtime/datasets/tas-v1/SR01_1_14_457_264
+native/build_win.cmd Release
+build/native-Release/nc_selftest.exe
+build/native-Release/nc_golden.exe --manifest $M --stream runtime/nc/golden/policy_s1/stream.bin --path-dir runtime/refpaths-alt
+build/native-Release/nc_runner.exe --manifest $M --engine runtime/nc/engine/BallanceMMOSimTool.exe --root runtime/nc/game \
+    --path-dir runtime/refpaths-alt --out runtime/nc/cpp/policy_s1 --seed 1 --ball-seed 12
+$PY tools/native/stream_diff.py runtime/nc/golden/policy_s1/stream.bin runtime/nc/cpp/policy_s1/stream.bin
+```
 
 ## 4. M1 结果（2026-11-17，Windows PC，r7 u82000 的策略导出 `9fec4769…`）
 
@@ -50,6 +82,10 @@ Python 侧（`ballrain/pool`、`tools/pool`）是训练 / 网关 / 校验方。�
 | 速度（单实例，同一引擎，同时有训练在跑） | C++ **680–930 步/秒**（策略推理 0.18 ms/步，其余主要是引擎的 2 帧）；Python（`BallanceEnv` + numpy 策略，同一循环）217–262 步/秒：约 3–4 倍 |
 | Android NDK r28 arm64 | core + engine + 程序都能编译（没在设备上跑） |
 
+适用范围：以上全部在同一台 x86-64 机器上（MSVC / gcc / clang 三种构建都是 x86-64），没有在 arm64 上跑过；“逐位相同”只覆盖 r7 的特征配置、第 1 关、木球。
+移植了但没有任何黄金数据跑到的分支：纸球（非球面突触）的 MIND 法线定向（`_closest_on`）、非 world 相机系、`hs_block`、检查点折线参考线、
+暂停 / Esc（含强制解除暂停）、前缀观测确认、TAS 起点（k > 0，还没移植）。
+
 ### 4.1 同一输入两次运行，引擎字节并非完全确定（影响 M2 的哈希链）
 
 Python 同种子跑两次（`policy_s1` / `policy_s1b`），C++ 与 Python 之间也一样：ACT、特征、TraceHash 全同，但
@@ -58,6 +94,10 @@ Python 同种子跑两次（`policy_s1` / `policy_s1b`），C++ 与 Python 之�
 
 其余段（TIME、BALL、FRIC、MIND、BODY、CAMS、ARRS、EVTS、WTCH、PHYS、HASH，以及全量 level.msg 和其它增量段）逐字节相同。
 所以 M2 的哈希链不能直接哈希引擎原始字节：要么把 SCOR / SREN 的 Energy 第 4 列置零、跳过 IVPO（特征不读它们），要么只哈希特征读到的那些段。
+
+跨引擎构建：同一组动作在另一个构建 `bin-x86soft`（x87-soft 构建，`runtime/hl-win`）上回放，结果与上面完全一样（只有同样的指针字段不同，TraceHash 相同）。
+但两个都是 Windows x86 MSVC 构建；**Mac arm64 / Linux 的引擎构建之间这些段是否逐字节相同还没验证**——CK 侧（相机、WTCH 装饰物体）是原生浮点代码，
+`headless.md` §7 里零售与无头的差异正出在这些段上。M2 的链设计要先把这一点查清（或者只哈希物理侧的段）。
 
 ## 5. 还没有做（M2 / M3）
 

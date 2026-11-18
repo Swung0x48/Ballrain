@@ -260,7 +260,12 @@ const ReferencePath *FeatureExtractor::reference_path(const GameTracker &t) {
     std::shared_ptr<const ReferencePath> path;
     bool tas_pending = false;
     if (cfg_.path_source == "tas" && !is_synthetic(t)) {
-        // ballrain.path.load_tas_path(level, tracker, path_dir, strict=True, sha256=path_sha256)
+        // ballrain.path.load_tas_path(level, tracker, path_dir, strict=True, sha256=path_sha256). Python resolves an
+        // unset path_dir to its committed benchmarks/refpaths; the client has no such default, and quietly running on
+        // the checkpoint polyline instead is the r6 failure path.py guards against: refuse.
+        if (cfg_.path_dir.empty())
+            throw RouteError("level " + std::to_string(t.level_no) +
+                             ": path_source \"tas\" without a path_dir (install the reference line and set it)");
         std::string file = asset_file(cfg_.path_dir, t.level_no);
         if (!asset_loaded_) {
             asset_ = file.empty() ? nullptr : load_path_asset(file);

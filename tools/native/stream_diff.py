@@ -77,6 +77,16 @@ def main(argv=None) -> int:
     for k, p in B:
         by[k][1].append(p)
     rc = 0
+    th = []
+    for recs in (A, B):  # the run fingerprint of the final observation (headless HASH section)
+        h = None
+        for k, p in recs:
+            if k == 2:
+                o = P.parse_observation(p[24:])
+                if o.hash is not None:
+                    h = f"{int(o.hash['trace_hash']):016x} ({int(o.hash['frames'])} frames)"
+        th.append(h)
+    print(f"TraceHash {th[0]} / {th[1]}: {'same' if th[0] == th[1] else 'DIFFERENT'}")
     for k in sorted(by):
         xa, xb = by[k]
         name = NAMES.get(k, str(k))

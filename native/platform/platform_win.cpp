@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cwchar>
 #include <map>
+#include <vector>
 
 #include "ballrain/util.h"
 #include "platform.h"
@@ -155,7 +156,8 @@ class WinListener : public Listener {
 public:
     explicit WinListener(int port) {
         wsa_init();
-        s_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        // not inheritable: an engine started later must not hold this listener (or another engine's connection)
+        s_ = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
         if (s_ == INVALID_SOCKET) throw Error("socket() failed");
         sockaddr_in a{};
         a.sin_family = AF_INET;
@@ -182,6 +184,7 @@ public:
         if (k <= 0) return nullptr;
         SOCKET c = ::accept(s_, nullptr, nullptr);
         if (c == INVALID_SOCKET) return nullptr;
+        SetHandleInformation(reinterpret_cast<HANDLE>(c), HANDLE_FLAG_INHERIT, 0);
         return std::make_unique<WinStream>(c);
     }
 
@@ -196,7 +199,7 @@ std::unique_ptr<Stream> Listener::connect_loopback(int port, double timeout_s) {
     wsa_init();
     double end = monotonic_s() + timeout_s;
     for (;;) {
-        SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        SOCKET s = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
         sockaddr_in a{};
         a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -250,15 +253,28 @@ public:
         if (!spec.stderr_path.empty())
             err = CreateFileW(widen(spec.stderr_path).c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
-        STARTUPINFOW si{};
-        si.cb = sizeof si;
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = nul_in, si.hStdOutput = nul_out, si.hStdError = err;
+        // the child inherits exactly its three standard handles (PROC_THREAD_ATTRIBUTE_HANDLE_LIST), nothing else this
+        // process has open: sockets of other engines, recording files (Python's Popen does the same)
+        STARTUPINFOEXW si{};
+        si.StartupInfo.cb = sizeof si;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = nul_in, si.StartupInfo.hStdOutput = nul_out, si.StartupInfo.hStdError = err;
+        HANDLE inherit[3] = {nul_in, nul_out, err};
+        DWORD n_inherit = err == nul_out ? 2 : 3;
+        SIZE_T attr_size = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+        std::vector<char> attr_buf(attr_size);
+        si.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+        bool attr_ok = InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_size) &&
+                       UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
+                                                 n_inherit * sizeof(HANDLE), nullptr, nullptr);
         PROCESS_INFORMATION pi{};
         std::wstring cwd = widen(spec.cwd);
-        BOOL ok = CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-                                 &blk[0], cwd.empty() ? nullptr : cwd.c_str(), &si, &pi);
+        BOOL ok = attr_ok && CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE,
+                                            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                                            &blk[0], cwd.empty() ? nullptr : cwd.c_str(), &si.StartupInfo, &pi);
         DWORD e = GetLastError();
+        if (attr_ok) DeleteProcThreadAttributeList(si.lpAttributeList);
         if (nul_in != INVALID_HANDLE_VALUE) CloseHandle(nul_in);
         if (err != nul_out && err != INVALID_HANDLE_VALUE) CloseHandle(err);
         if (nul_out != INVALID_HANDLE_VALUE) CloseHandle(nul_out);

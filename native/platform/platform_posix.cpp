@@ -77,6 +77,13 @@ std::string temp_dir() {
 
 // ---------------------------------------------------------------------------------------------- sockets
 
+// close-on-exec: posix_spawn passes every other open descriptor to the child (an engine started later must not hold
+// this listener or another engine's connection)
+static int cloexec(int fd) {
+    if (fd >= 0) fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+    return fd;
+}
+
 class PosixStream : public Stream {
 public:
     explicit PosixStream(int s) : s_(s) {
@@ -137,7 +144,7 @@ class PosixListener : public Listener {
 public:
     explicit PosixListener(int port) {
         signal(SIGPIPE, SIG_IGN);
-        s_ = socket(AF_INET, SOCK_STREAM, 0);
+        s_ = cloexec(socket(AF_INET, SOCK_STREAM, 0));
         if (s_ < 0) throw Error("socket() failed");
         sockaddr_in a{};
         a.sin_family = AF_INET;
@@ -162,7 +169,7 @@ public:
         tv.tv_usec = long((timeout_s - double(tv.tv_sec)) * 1e6);
         int k = select(s_ + 1, &r, nullptr, nullptr, &tv);
         if (k <= 0) return nullptr;
-        int c = ::accept(s_, nullptr, nullptr);
+        int c = cloexec(::accept(s_, nullptr, nullptr));
         if (c < 0) return nullptr;
         return std::make_unique<PosixStream>(c);
     }
@@ -177,7 +184,7 @@ std::unique_ptr<Listener> Listener::listen_loopback(int port) { return std::make
 std::unique_ptr<Stream> Listener::connect_loopback(int port, double timeout_s) {
     double end = monotonic_s() + timeout_s;
     for (;;) {
-        int s = socket(AF_INET, SOCK_STREAM, 0);
+        int s = cloexec(socket(AF_INET, SOCK_STREAM, 0));
         sockaddr_in a{};
         a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
