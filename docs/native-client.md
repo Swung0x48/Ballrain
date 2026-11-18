@@ -319,6 +319,8 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
   打成分线包（`task.export_branch_pack`，三个 uint8 数组，内容相同 sha 就相同），任务带 `assets.branch`；客户端和校验端
   `install_branch_pack` 装到缓存 `branch/<sha>/`，`build_env` / `play_task` 再核对一次三份文件。网关按 `rest_starts` 的
   `lo-hi@branch:s` 条目抽石球静止开局（和环境同样的随机数调用顺序），发 `rest = {"target": null, "branch_s": s}`。
+  端到端（`e2e_pool.py --branch-dir`，r8 检查点，`rest_starts` 两个 `@branch:` 条目、`p_rest` 0.8）：网关导出带 `features.branch` 的清单和分线包，
+  发出 4 个任务（3 个石球静止开局），原生客户端下载安装分线包跑完，校验端 23 个块全部通过，伪造的块被抓到。
 - **旧客户端**：0.3.0 碰到清单里的 `features.branch` 会报“unknown feature config field”而放弃这个任务，不会不带分线悄悄跑出校验不过的数据；
   网关那边怎么避免把这类任务发给旧客户端（版本下限还是能力声明）还在和池会话商定。
 
