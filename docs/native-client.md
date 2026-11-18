@@ -379,7 +379,7 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
   - 端到端（`e2e_pool.py --branch-dir L02-multi`，f7）：网关发出东平台和南环的静止开局，客户端装好 v2 分线包，校验端 14 个块全部通过，伪造的块被抓到。
   - v1 回归：石线 f6 8/8、f7 通过，L2 10/10，步数和以前一样。
 
-
+## 11. 还没有做 / 限制
 
 - **https 没有对真网关实测过**：Windows 的 WinHTTP https 分支、POSIX 的 libcurl 分支都只编译过（端到端都是本机 http）。Android 仍然只有 http。
 - **跨引擎构建的字节一致**只在两个 Windows x86 构建之间验证过；Mac arm64 / Linux 引擎构建之间要先核对（§4.1）。另外容差只能吸收舍入，特征里的离散判定在另一种 CPU 上翻转会被当成不一致（`pool-prototype.md` §8）。
