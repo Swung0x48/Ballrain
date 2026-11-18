@@ -493,6 +493,8 @@ def test_capability_refusal_explains_what_changed_with_an_existing_code():
     assert "新功能 future_x" in refusal("0.4.0", ["future_x"])["message"]
     f7 = refusal("0.3.0", ["reach_f7"])
     assert "可达性" in f7["message"] and f7["params"]["min_version"] == "0.4.0"
+    br = refusal("0.3.0", ["branch_v1", "branch_rules_v1"])
+    assert "规则" in br["message"] and br["params"]["missing"] == "branch_v1,branch_rules_v1"
 
 
 @win_only
@@ -544,12 +546,11 @@ def test_gateway_start_draw_equals_the_env_draw_with_rehearse_always(tmp_path):
     assert seen == {"always", "drive", "brake"}
 
 
-def test_link_hello_carries_branch_assets_version_and_non_default_rules_stay_refused(tmp_path):
-    """A learner distributing a route-branch bundle accepts the link (its hello says branch_assets_version 1); one with
-    non-default branch rules still refuses it (the pool does not claim branch_rules_version: its task loops do not
-    implement them)."""
+def test_link_hello_carries_the_branch_versions(tmp_path):
+    """A learner distributing a route-branch bundle accepts the link, with default and with non-default branch rules (its
+    hello says branch_assets_version 1 and branch_rules_version 1: the pool's client and replay apply the rules)."""
     import json as _json
-    for rules, ok in (({}, True), ({"drive_gain": 0.5}, False)):
+    for rules, ok in (({}, True), ({"drive_gain": 0.5}, True)):
         env = SimpleNamespace(branch_assets={"level": 2, "line_npz": b"L", "drive_npz": b"D",
                                              "desc_json": _json.dumps({"rules": rules}).encode()})
         hub, addr = _hub({"env": env, "run": "r", "worker": {}, "pool_ingest": True})
