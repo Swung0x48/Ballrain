@@ -348,6 +348,8 @@ class BallanceEnv(gym.Env):
         if c.start_rest is not None and (c.start_frame or 0) > 0:  # a given at-rest start (pool task): not snapped
             if c.start_rest.get("branch_s") is not None:  # the stone branch's measured drive (rest_starts lo-hi@branch:s)
                 self._rest_next = {"branch_s": float(c.start_rest["branch_s"])}
+                if c.start_rest.get("branch_id"):  # a multi-branch member (rest_starts lo-hi@branch:<id>:<s>)
+                    self._rest_next["id"] = str(c.start_rest["branch_id"])
                 return int(c.start_frame)
             t = c.start_rest.get("target")
             mf = c.start_rest.get("max_frames")

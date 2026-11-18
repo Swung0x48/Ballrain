@@ -8,7 +8,7 @@ A branch describes how to navigate, not a new observation layout or a new reward
 
 | Member field | Meaning |
 |---|---|
-| `id` | Unique lower-case ASCII identifier matching `[a-z][a-z0-9-]*`; no Windows device names. No paths from the sender. |
+| `id` | Unique lower-case ASCII identifier matching `[a-z][a-z0-9-]*`, at most 32 characters; no Windows device names. No paths from the sender. |
 | `phases` | Nonempty ordered sequence of `{when, local_s:[lo,hi]}`. Spans are contiguous and positive, start/end at vertices of the branch, and partition `branch_s`. The array index is the phase. Optional `from:[?]` names earlier eligible predecessor indices and must include the immediately previous one. |
 | `when` | `ball` (wood=0, paper=1, stone=2), plus **at least one** of `sector`, `s:[lo,hi]` or `box:[[xmin,ymin,zmin],[xmax,ymax,zmax]]`. All supplied predicates are ANDed, bounds inclusive. `s` always refers to the currently active physical line **before** transition. No expressions, callbacks, host filenames or code. |
 | `merge` | Same predicates (ball optional), tested in the final phase. On match resume the main reference. Leaving an explicitly gated sector without entering the next phase also releases the branch. |
