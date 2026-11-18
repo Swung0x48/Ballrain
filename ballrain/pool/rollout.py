@@ -227,17 +227,19 @@ class TaskRunner:
         if not (term or trunc):
             ef = env._ep_frames
             s = env.reward.s
-            if s is not None and s > ep.mark_s + sp.stall_progress:
-                ep.mark_s, ep.mark_frame = s, ef
-            win = self.stall_rsp if ep.d["kind"] == "respawn" else self.stall_all
-            since = ef - ep.mark_frame
+            branch = bool(info2.get("branch"))  # as Worker.run: stall_age on the active line's metres
+            odometer = info2.get("local_s") if branch else s
+            speed = None
             if sp.stall_speed is not None:
                 o = env.session.tracker.obs if env.session is not None else None
-                if o is not None and o.ball is not None and float(np.linalg.norm(o.ball["speed"])) > sp.stall_speed:
-                    ep.move_frame = ef
-                since = min(since, ef - ep.move_frame)
-                if ef - ep.mark_frame >= self.stall_max:
-                    since = win
+                if o is not None and o.ball is not None:
+                    velocity = o.ball["speed"]
+                    if branch:
+                        velocity = np.asarray(velocity) + o.ball["speed_change"]
+                    speed = float(np.linalg.norm(velocity))
+            win = self.stall_rsp if ep.d["kind"] == "respawn" else self.stall_all
+            since = self.W.stall_age(ep, ef, odometer, branch, speed, sp.stall_progress, sp.stall_speed,
+                                     self.stall_max, win)
             if ep.d["cap_frames"] is not None and ef >= ep.d["cap_frames"]:
                 trunc, end = True, "cap"
             elif s is not None and since >= win:

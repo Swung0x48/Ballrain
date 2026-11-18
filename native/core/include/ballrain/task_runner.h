@@ -116,6 +116,7 @@ private:
         std::optional<int64_t> seg_k0;
         std::set<std::string> gates_hit;
         std::optional<bool> cap_branch;  // the branch flag the cap was last computed for (worker ep.d["cap_branch"])
+        bool stall_branch = false;       // the route the stall odometer (mark_s) is measured on (worker ep.stall_branch)
     };
     void new_episode(const StepInfo &info);
     std::optional<int64_t> cap_frames(const StepInfo &info) const;

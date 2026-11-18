@@ -204,8 +204,7 @@ bool BallanceEnv::handover_ok(int64_t k) const {
            o->ball->pos[0] == exp->pos[0] && o->ball->pos[1] == exp->pos[1] && o->ball->pos[2] == exp->pos[2];
 }
 
-void BallanceEnv::start_process() {
-    int64_t k = start_frame_;
+int BallanceEnv::launch_checked(int64_t k) {
     int mismatches = 0;
     for (int attempt = 0;; ++attempt) {
         if (launch(k)) break;
@@ -215,22 +214,45 @@ void BallanceEnv::start_process() {
             throw Error("hand-over at frame " + std::to_string(k) + " differs from the record " +
                         std::to_string(mismatches) + " times");
     }
+    return mismatches;
+}
+
+void BallanceEnv::start_process() {
+    int64_t k = start_frame_;
+    int mismatches = launch_checked(k);
     start_ = StartInfo();
     start_.kind = "tas";
     start_.frame = k;
     start_.new_process = true;
     start_.handover_mismatches = mismatches;
     if (rest_ && k > 0 && rest_->branch_s) {  // env._prepare: the stone branch's measured drive, then a closed loop
+        std::string err;
         try {
             branch_rest(*rest_->branch_s);
+        } catch (const std::exception &e) {
+            err = e.what();
+            if (err.empty()) err = "branch rest failed";
         } catch (...) {
             if (sess_) sess_->close(true), sess_.reset();
             after_death_ = false;
             throw;
         }
-        start_.kind = "tas_rest";
-        start_.branch_s = rest_->branch_s;
-        init_held(0);
+        if (err.empty()) {
+            start_.kind = "tas_rest";
+            start_.branch_s = rest_->branch_s;
+            init_held(0);
+            return;
+        }
+        // the failed simulation is not a valid hand-over: launch once without the drive, at the same TAS frame
+        if (sess_) sess_->close(true), sess_.reset();
+        after_death_ = false;
+        ++branch_rest_failures_;
+        mismatches = launch_checked(k);
+        start_.handover_mismatches = mismatches;
+        start_.branch_rest_failures = branch_rest_failures_;
+        start_.branch_rest_target = rest_->branch_s;
+        start_.branch_rest_error = err;
+        init_held(k);
         return;
     }
     if (rest_ && k > 0) {  // env._prepare: drive (with a target), then brake; _init_held then holds nothing
@@ -446,7 +468,7 @@ std::vector<float> BallanceEnv::features(StepInfo *info) {
         // env._info: the route's branch fields, else (no IVP ball: transforms, finish) the branch's last timing, so
         // the route clock is never compared with the absolute TAS IGT
         if (fi.has_branch) {
-            info->has_branch = true, info->branch = fi.branch, info->local_s = fi.local_s;
+            info->has_branch = true, info->branch = fi.branch, info->local_s = fi.local_s, info->has_local_s = true;
             info->ref_elapsed_ms = fi.ref_elapsed_ms, info->ref_remaining_ms = fi.ref_remaining_ms;
         } else if (const BranchFollower *b = fx_.branch(); b && b->timing.set) {
             info->has_branch = true, info->branch = b->timing.branch;

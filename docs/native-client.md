@@ -305,9 +305,13 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - **特征**：`FeatureConfig.branch_dir`；路径块（路标、切线、剩余距离、参考速度、小节除数）用活动线，`path_progress` 用主线总长归一化；没开时布局和数值都不变。
 - **环境**：每步信息带 `branch` / `local_s` / `ref_elapsed_ms` / `ref_remaining_ms`（看不到球时用跟随器上一次的时钟）；石球静止开局（`RestStart.branch_s`）
   回放 `drive.npz` 已验证的按键流到对应站点，核对石球和小节，再闭环开到目标、制动，检查支撑、位置和速度。
+  任何一步失败都不算有效交接：关掉这个进程，在同一帧重新做一次普通 TAS 开局（`kind` 为 `tas`，带 `branch_rest_failures` / `branch_rest_target` / `branch_rest_error`，同 `env._prepare`）。
 - **奖励整形**：分段奖励用活动线参考时钟，帧数上限用 `(ref_elapsed + ref_remaining) × cap_mult`，换线时重算（Python 的 `rollout.TaskRunner`、`client_sampler` 也补上了这一步）。
-- **对照**：`golden.py branch`（SR02 录像到 `drive.npz` 的前缀帧，再接上它的按键流，球经变球器变石球、走南环）：22402 帧、11202 行特征 C++ 与 Python
-  **逐位相同**；同一条流不带分线回放时最大差 10，3204 行读到了石线的 `t_ms`，说明确实走在石线上。`task_diff.py --branch-dir`（r8 检查点，分线目录暂时在清单之外给两边）4 个场景全部通过：石球静止开局 + 策略（723 行全是石球，417 行在石线上）、石球静止开局 + 随机粘滞动作（994 行全在石线上）、变球器上游的 TAS 开局 + 策略（277 行在石线上）、小节 3–4 的 TAS 开局 + 随机粘滞动作（1127 行石球但不在石线区间内，走主线）。
+  停滞判定同 `worker.stall_age`：在石线上里程用活动线米数 `local_s`（换线就重新起算），速度用 `speed + speed_change`，静止阈值取 `min(1, stall_speed)`；
+  主线上不变。`rollout.TaskRunner` 和 `client_sampler` 改成直接调用 `worker.stall_age`。
+- **对照**（主线 `benchmarks/refpaths-v2/L02.npz`，分线 `benchmarks/refpaths-alt/L02-stone`，r8 v2 清单）：`golden.py branch`（SR02 录像到 `drive.npz` 的前缀帧，再接上它的按键流，球经变球器变石球、走南环）：22402 帧、11202 行特征 C++ 与 Python
+  **逐位相同**；同一条流不带分线回放时最大差 10，3204 行读到了石线的 `t_ms`，说明确实走在石线上。`task_diff.py --branch-dir`（r8 检查点，分线目录暂时在清单之外给两边）5 个场景全部通过：石球静止开局 + 策略、石球静止开局 + 随机粘滞动作、变球器上游的 TAS 开局 + 策略、小节 3–4 的 TAS 开局 + 随机粘滞动作，以及目标超出按键流范围、回退到普通 TAS 开局的 `branch_rest_fallback`。
+  `tools/native/branch_diff.py`（`nc_branch_diff`）把跟随器单独拿出来对照：`tests/test_stone_branch.py` 的几个场景加 40 组随机游走（横向噪声、换球、换小节、倒退、跳跃、重置），每一步的输出逐位相同。
 - **还没做**（等和池 → 学习器会话商定）：清单里怎样带分线（三份文件的 sha256）、分线资源包的分发和安装、任务 `rest.branch_s`（协议里先加成了可选字段）、
   网关按 `rest_starts` 的 `branch:` 条目抽开局。
 

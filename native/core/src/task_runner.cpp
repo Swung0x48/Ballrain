@@ -267,6 +267,8 @@ void TaskRunner::new_episode(const StepInfo &info) {
     ep.cap_frames = cap_frames(info);
     auto rs = env_.reward().s;
     ep.mark_s = rs ? *rs : -std::numeric_limits<double>::infinity();
+    ep.stall_branch = info.has_branch && info.branch;  // worker _Episode: on the branch the odometer is local metres
+    if (ep.stall_branch && info.has_local_s) ep.mark_s = info.local_s;
     ep.max_sector_seen = ep.start_sector;
     split_start(ep, info);
     ep_ = std::move(ep);
@@ -352,16 +354,26 @@ StepResult TaskRunner::step(int a, const std::function<std::string()> &stop) {
     if (!(term || trunc)) {
         int64_t ef = env_.ep_frames();
         auto s = env_.reward().s;
-        if (s && *s > ep.mark_s + sp_.stall_progress) ep.mark_s = *s, ep.mark_frame = ef;
-        int64_t win = ep.kind == "respawn" ? stall_rsp_ : stall_all_;
-        int64_t since = ef - ep.mark_frame;
+        // worker.stall_age: the odometer is the active line's metres on the branch (never compared across a route
+        // switch: a switch restarts it), the earned main-line progress otherwise
+        bool branch = info2.has_branch && info2.branch;
+        std::optional<double> odo = branch ? (info2.has_local_s ? std::optional<double>(info2.local_s) : std::nullopt) : s;
+        std::optional<double> speed;
         if (sp_.stall_speed) {
             const Observation *o = sess ? sess->obs() : nullptr;
             if (o && o->ball) {
-                const float *v = o->ball->speed;
-                float n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);  // np.linalg.norm of float32
-                if (double(n) > *sp_.stall_speed) ep.move_frame = ef;
+                float v[3];  // float32 like the ball record; on the branch speed + speed_change
+                for (int k = 0; k < 3; ++k) v[k] = branch ? o->ball->speed[k] + o->ball->speed_change[k] : o->ball->speed[k];
+                speed = double(std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]));  // np.linalg.norm of float32
             }
+        }
+        int64_t win = ep.kind == "respawn" ? stall_rsp_ : stall_all_;
+        if (odo && (branch != ep.stall_branch || *odo > ep.mark_s + sp_.stall_progress))
+            ep.mark_s = *odo, ep.mark_frame = ef, ep.stall_branch = branch;
+        int64_t since = ef - ep.mark_frame;
+        if (sp_.stall_speed) {
+            double threshold = branch ? std::min(1.0, *sp_.stall_speed) : *sp_.stall_speed;
+            if (speed && *speed > threshold) ep.move_frame = ef;
             since = std::min(since, ef - ep.move_frame);
             if (ef - ep.mark_frame >= stall_max_) since = win;
         }

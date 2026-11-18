@@ -70,6 +70,10 @@ struct StartInfo {
     int handover_mismatches = 0;
     int64_t drive_frames = 0, rest_frames = 0;
     std::optional<double> branch_s;
+    // env._prepare: a failed branch drive relaunches a normal TAS start at the same frame (kind "tas")
+    int branch_rest_failures = 0;  // the env's running count (env.branch_rest_failures), set on a fallback start
+    std::optional<double> branch_rest_target;
+    std::string branch_rest_error;
 };
 
 struct StepInfo {
@@ -82,6 +86,7 @@ struct StepInfo {
     bool process_ended = false;
     // env._info with a branch: the route's branch / local_s / reference clock, else the branch's last timing
     bool has_branch = false, branch = false;
+    bool has_local_s = false;  // local_s comes with a projection only (not with the branch's last timing)
     double local_s = 0, ref_elapsed_ms = 0, ref_remaining_ms = 0;
     std::optional<std::string> error;
     FeatureInfo feat;
@@ -119,6 +124,8 @@ public:
 
 private:
     void start_process();
+    int launch_checked(int64_t k);  // launch with the hand-over check and its retries; the mismatch count
+    int branch_rest_failures_ = 0;
     bool launch(int64_t k);  // one process brought to control; false: the hand-over differs from the record
     bool handover_ok(int64_t k) const;
     void init_held(int64_t k);
