@@ -283,6 +283,30 @@ def test_fields_key_ignores_moving_bodies_and_the_file_is_reused(tmp_path):
     assert fr3.info["key"] == k1 and not lock.exists()
 
 
+def test_stale_lock_takeover_keeps_a_fresh_lock(tmp_path, monkeypatch):
+    """A lock older than the timeout is removed; a fresh one is not; and when another process replaces the stale lock
+    with its own fresh one between our check and our takeover, a lock is still there afterwards (no second builder)."""
+    take = FR.FastReach._take_over_stale_lock
+    lock = tmp_path / "L01-x.lock"
+    assert FR.FastReach.LOCK_BEAT_S * 4 < 25.0  # the default timeout leaves room for missed heartbeats
+    lock.write_text("1")
+    old = lock.stat().st_mtime - 1000
+    os.utime(lock, (old, old))
+    assert take(lock, 25.0) and not lock.exists()
+    lock.write_text("2")
+    assert not take(lock, 25.0) and lock.exists()  # fresh
+    os.utime(lock, (old, old))
+    real = os.rename
+
+    def racing_rename(a, b):  # the other process's fresh lock arrives just before our rename
+        os.utime(lock)
+        return real(a, b)
+    monkeypatch.setattr(os, "rename", racing_rename)
+    assert not take(lock, 25.0) and lock.exists()
+    monkeypatch.setattr(os, "rename", real)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["L01-x.lock"]  # no tombstone left
+
+
 def test_fields_key_does_not_depend_on_ck_ids(monkeypatch):
     """Retail and the headless SimTool give the same L2 static entities and meshes other CK ids (another id order):
     the fields key and the build input are canonical (entity names, triangle coordinates), not in id order."""

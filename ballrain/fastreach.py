@@ -152,7 +152,8 @@ except ImportError:  # pragma: no cover - depends on the environment
 
 
 def _jit(fn):
-    return numba.njit(cache=True)(fn) if HAVE_NUMBA else fn
+    # nogil: a long kernel (the build's, ~2 s on L2) lets other threads run, e.g. the field lock's heartbeat
+    return numba.njit(cache=True, nogil=True)(fn) if HAVE_NUMBA else fn
 
 
 NAN = math.nan
@@ -2658,15 +2659,51 @@ class FastReach:
         h.update(np.ascontiguousarray(rail, "u1").tobytes())
         return cls.cache_key(f"canon-{h.hexdigest()}", tracker.level.depth, (), fans=fan_boxes(tracker.level))
 
+    LOCK_BEAT_S = 5.0
+
+    @staticmethod
+    def _take_over_stale_lock(lock: Path, timeout_s: float) -> bool:
+        """Remove a lock whose mtime is older than timeout_s (its builder was killed). Renamed to a unique name first,
+        then checked again: a process that saw the same stale lock and already replaced it with its own fresh lock
+        between our check and the rename keeps it (recreated), so two builders never run because of a takeover.
+        True when a stale lock was removed."""
+        import uuid
+        try:
+            if time.time() - lock.stat().st_mtime <= timeout_s:
+                return False
+        except FileNotFoundError:
+            return False
+        tomb = lock.with_name(f"{lock.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.stale")
+        try:
+            os.rename(lock, tomb)
+        except (FileNotFoundError, PermissionError):
+            return False  # another process took it over (or it is being removed) first
+        try:
+            fresh = time.time() - tomb.stat().st_mtime <= timeout_s
+        except FileNotFoundError:
+            fresh = False
+        if fresh:  # we took a live builder's lock: put a lock back (unless someone has created one meanwhile)
+            try:
+                os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            except FileExistsError:
+                pass
+        try:
+            tomb.unlink()
+        except FileNotFoundError:
+            pass
+        return not fresh
+
     @classmethod
-    def fields_for_tracker(cls, tracker, cache_dir=None, lock_timeout_s: float = 120.0, geometry=None,
+    def fields_for_tracker(cls, tracker, cache_dir=None, lock_timeout_s: float = 25.0, geometry=None,
                            verbose: bool = False) -> "FastReach":
         """Static fields of the tracker's current geometry, built from canonical_geometry (identical on every engine
         and host for the same geometry) and cached content-addressed in <cache_dir>/L<nn>-<sha16 of fields_key>.npz
         (default <runtime>/fastreach, or $BALLRAIN_FASTREACH_DIR), with no unknown zones (set them with
         set_unknown_boxes). Safe when many processes on one host need the same file at once: one builds under a lock
-        file (O_EXCL; the builder refreshes its mtime every 5 s, a lock older than lock_timeout_s is taken over), the
-        others wait and load its result; the file is written atomically (save)."""
+        file (O_EXCL; the builder refreshes its mtime every LOCK_BEAT_S = 5 s from a thread, which the nogil kernels
+        let run: the largest gap on a cold L2 build is 0.16 s, 2.2 s without nogil; a lock older than lock_timeout_s = 25 s is
+        taken over by _take_over_stale_lock), the others wait and load its result; the file is written atomically
+        (save)."""
         import hashlib
         from . import geometry as G
         geom = geometry if geometry is not None else cls.canonical_geometry(tracker)
@@ -2704,15 +2741,7 @@ class FastReach:
                 fr = try_load()
                 if fr is not None:
                     return fr
-                try:
-                    stale = time.time() - lock.stat().st_mtime > lock_timeout_s
-                except FileNotFoundError:
-                    continue
-                if stale:
-                    try:
-                        lock.unlink()
-                    except FileNotFoundError:
-                        pass
+                if cls._take_over_stale_lock(lock, lock_timeout_s):
                     continue
                 time.sleep(0.25)
                 continue
@@ -2722,7 +2751,7 @@ class FastReach:
             done = threading.Event()
 
             def beat():
-                while not done.wait(5.0):
+                while not done.wait(cls.LOCK_BEAT_S):
                     try:
                         os.utime(lock)
                     except OSError:
