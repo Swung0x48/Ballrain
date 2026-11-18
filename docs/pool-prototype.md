@@ -1003,9 +1003,10 @@ L2 是原生客户端第一次在第 2 关上通过验证（纸球、风扇）�
 ## 13. r8 上线清单（自己的 3 台机器 dogfood；按顺序）
 
 **前提**
-- main 上要有原生 0.4.0 分支 `claude/native-stone-v2`（f7 可达性块的原生移植、任务的 `assets.reach`、统一的客户端数据根）。它还带着两处服务端改动，main 现在没有：
-  - `protocol.TASK.assets.reach`（`cf51370`）：没有它，带可达性场的任务过不了协议校验；
-  - f7 策略的导出（`26b598e`）：清单保留 `features.reach` / `reach_version`，`requires` 写 `reach_fastreach5_2-block1`。没有它，网关发布 r8 的 f7 策略会报 “the pool serves f6 policies only”。
+- 原生 0.4.0 已经合并进 main（`cf00c60`：f7 可达性块的原生移植、任务的 `assets.reach`、统一的客户端数据根）。它带着两处服务端改动，网关要用合并之后的代码：
+  - `protocol.TASK.assets.reach`：没有它，带可达性场的任务过不了协议校验；
+  - f7 策略的导出：清单保留 `features.reach` / `reach_version`，`requires` 写 `reach_fastreach5_2-block1`。更早的代码发布 r8 的 f7 策略会报 “the pool serves f6 policies only”。
+- f7 端到端已经跑过（`58673ca`，`docs/native-client.md`）：r8 的 f7 + 石头分支检查点，网关建场并下发，4 个任务，客户端下载安装两份场，验证器 28 个段全部通过，伪造的段被抓到。
 - 参考线不用再换：r8 已经在 `benchmarks/refpaths-v2` 上跑（L02 带 `t_ms`，sha256 `eb3ccf47…`）。网关配置的 `path_dirs` 把 `refpaths-v2` 放在 `refpaths` 前面。
 - r8 现在的检查点（f7 + 石头分支）发布后，`requires` 是 `branch_v1` 和 `reach_fastreach5_2-block1`。分支规则是 v1 默认值，所以不需要 `branch_rules_v1`。
   - 0.4.0 客户端在 hello 里报 `task_format3`、`branch_v1`、`branch_rules_v1`、`reach_fastreach5_2-block1`。
@@ -1100,12 +1101,14 @@ L2 是原生客户端第一次在第 2 关上通过验证（纸球、风扇）�
    zip 里的引擎 sha256 要在网关的 `[engines.x87soft]` 白名单里：打包脚本会打印它；没有 `[engines]` 一节时，网关默认用本机的 `runtime/hl-win/bin-x86soft`，两边是同一个文件时 sha 一致。
 3. 游戏目录用 `C:\ballrain\game`：它的 `base.cmo` 和网关参照目录 `runtime/hl-win/game-min` 的逐字节相同，已经核对过。其余三项（`Database.tdb`、`3D Entities/`、`Text/`）不一致时，hello 会回 `game_files_mismatch` 并指出是哪一项。
 4. 数据目录：不传 `--data-dir`，客户端用数据根 `%USERPROFILE%\.ballrain`（第 13 节第 4 步）。这台机器的用户目录如果不是纯英文路径，就设 `BALLRAIN_WORK_DIR` 指向一个纯英文的文件夹，下面的命令都在设了它的环境里跑。
+   以前用 `--data-dir C:\ballrain-pool\data` 登录过的话，可以把 `BALLRAIN_WORK_DIR` 设成这个文件夹，令牌和缓存照用。
 5. 登录（由用户完成）：
    `C:\ballrain-pool\app\nc_client.exe login --gateway https://<仪表盘主机名>`
    它在标准输出打一行 JSON，里面有 `browser_url` 和 `user_code`。用户在任意浏览器打开这个地址，核对登录代码，用论坛账号授权。成功后令牌存在 `<数据根>\token`。
 6. 运行（不需要界面，SSH 断开后继续跑）：参照 `C:\ballrain\ops` 的做法，写一个 `start-pool.ps1`，用 `Start-Process -WindowStyle Hidden` 启动
    `nc_client.exe run --gateway https://<仪表盘主机名> --ballance-dir C:\ballrain\game --instances 6 --quiet-file C:\ballrain-quiet`，
-   把标准输出重定向到 `<数据根>\logs\events.jsonl`，标准错误重定向到 `<数据根>\logs\client-stderr.txt`（`logs` 目录先建好）。
+   把标准输出重定向到 `<数据根>\run-logs\events.jsonl`，标准错误重定向到 `<数据根>\run-logs\client-stderr.txt`（`run-logs` 目录先建好）。
+   不放在 `logs\` 里：那是客户端自己的日志目录（`client.log` 轮转），诊断导出会打包它。
    - 停止开关：`C:\ballrain-quiet` 存在时，所有实例 1 秒内暂停，进行中的任务以 `stopped` 结束；删掉以后自动继续。BMMO 会话的计时窗口照旧用这个文件。
    - 结束：停止 `nc_client` 进程。它的 Job Object 会连带结束所有引擎；没传完的数据下次启动时接着传。
 7. 第一次连上的前 200 × 256 步是试用期，每个任务都整段重放。
