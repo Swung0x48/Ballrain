@@ -911,7 +911,8 @@ bool Controller::run_one_task(Slot *s) {
     double t0 = platform::monotonic_s();
     {
         std::lock_guard<std::mutex> lk(mu_);
-        s->state = "running", s->task_id = task.task_id, s->task_steps = 0, s->task_t0 = t0, s->detail.clear();
+        s->state = "running", s->task_id = task.task_id, s->task_steps = 0, s->task_t0 = t0;
+        s->detail = "启动引擎和开局";  // until the first step (the TUI: 本任务步数 stays 0 meanwhile)
     }
     {
         Json f = Json::object();
@@ -961,6 +962,7 @@ bool Controller::run_one_task(Slot *s) {
             },
             [&](int64_t st) {
                 std::lock_guard<std::mutex> lk(mu_);
+                if (s->task_steps == 0 && !s->detail.empty()) s->detail.clear();
                 s->task_steps = st;
             });
     } catch (const std::exception &e) {
