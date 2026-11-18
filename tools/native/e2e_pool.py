@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -111,6 +112,11 @@ def main(argv=None) -> int:
     ap.add_argument("--client-engine-env", action="append", default=[], help="NAME=VALUE for the client's engine")
     ap.add_argument("--tasks", type=int, default=3)
     ap.add_argument("--instances", type=int, default=1, help="the client's instances (engines at the same time)")
+    ap.add_argument("--max-instances", type=int, default=8, help="the gateway's max_instances (= --instances: at the limit)")
+    ap.add_argument("--outage", default="", help="AT:FOR seconds: the gateway is down from AT for FOR seconds mid-run")
+    ap.add_argument("--kill-engine-after", type=float, default=0.0, help="kill one of the client's engines mid-task")
+    ap.add_argument("--fake-player", default="", help="AT:FOR seconds: a dummy Player.exe runs (the client runs with "
+                    "--auto-pause on and must pause, then resume)")
     ap.add_argument("--tui", help="also run the terminal UI (ballrain_pool --snapshot live:25) on the client's data")
     ap.add_argument("--kill-after", type=float, default=0.0,
                     help="first hard-kill the client this many seconds into a run (its engines must die with it: the job "
@@ -147,13 +153,24 @@ def main(argv=None) -> int:
     cfg = PoolConfig(pool_dir=d / "pool", public_base_url=gateway, forum=ForumConfig(
         base_url=forum.base_url, client_id="ballrain-pool-e2e", client_secret="e2e-secret", redirect_uri=redirect),
         run="r7", datasets_dir=ds, path_dirs=[Path(a.path_dir).resolve()], max_steps=a.max_steps, max_frames=60000,
-        deadline_s=3600, heartbeat_s=a.heartbeat_s, engines={"x87soft": engine})
+        deadline_s=3600, heartbeat_s=a.heartbeat_s, engines={"x87soft": engine}, max_instances=a.max_instances)
     from tools_pool_gateway import build  # noqa: E402  (tools/pool/gateway.py, imported by path below)
     app, store, policies, verifier = build(cfg)
     if a.client_engine != a.engine:  # the client runs another build of the x87-soft engine: allow its sha256 too
         engine.sha256.append(T.file_sha256(a.client_engine))
+    down = threading.Event()  # --outage: every request gets what a broken tunnel gives (HTTP 502, an HTML page)
+    real_handle = app.handle
+
+    def handle(*args, **kw):
+        if down.is_set():
+            from ballrain.pool.server_app import Response
+            return Response(502, b"<html><body>502 Bad Gateway (tunnel down)</body></html>", "text/html",
+                            [("Connection", "close")])
+        return real_handle(*args, **kw)
+    app.handle = handle
     srv = make_server(app, "127.0.0.1", port)
     threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True).start()
+    servers = [srv]
     log(f"gateway {gateway}, mock forum {forum.base_url}")
     state = W.load_trusted_checkpoint(a.ckpt)
     if a.env_draws:
@@ -204,19 +221,79 @@ def main(argv=None) -> int:
         if not engines or alive:
             return 1
     t0 = time.time()
-    p = subprocess.run([a.client, "run", "--gateway", gateway, "--data-dir", str(client_dir), "--ballance-dir", a.client_game,
-                        "--engine", a.client_engine, "--tasks", str(a.tasks), "--instances", str(a.instances)]
-                       + [x for kv in a.client_engine_env for x in ("--engine-env", kv)], capture_output=True, text=True, encoding="utf-8",
-                       timeout=3600)
+    cmd = ([a.client, "run", "--gateway", gateway, "--data-dir", str(client_dir), "--ballance-dir", a.client_game,
+            "--engine", a.client_engine, "--tasks", str(a.tasks), "--instances", str(a.instances)]
+           + [x for kv in a.client_engine_env for x in ("--engine-env", kv)]
+           + (["--auto-pause", "on"] if a.fake_player else []))
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+    notes = []
+
+    def disturb():  # the run's disturbances, each at its time
+        plan = []
+        if a.outage:
+            at, dur = (float(x) for x in a.outage.split(":"))
+            plan.append((at, "outage", dur))
+        if a.kill_engine_after > 0:
+            plan.append((a.kill_engine_after, "kill_engine", 0.0))
+        if a.fake_player:
+            at, dur = (float(x) for x in a.fake_player.split(":"))
+            plan.append((at, "player", dur))
+        for at, what, dur in sorted(plan):
+            time.sleep(max(0.0, t0 + at - time.time()))
+            if p.poll() is not None:
+                return
+            if what == "outage":
+                down.set()
+                log(f"gateway down (HTTP 502 for everything) for {dur:.0f} s")
+                time.sleep(dur)
+                down.clear()
+                log("gateway up again")
+                notes.append("outage")
+            elif what == "kill_engine":
+                eng = children_of(p.pid)
+                if eng:
+                    subprocess.run(["taskkill", "/F", "/PID", str(eng[0])], capture_output=True)
+                    log(f"killed engine pid {eng[0]} of the client")
+                    notes.append("kill_engine")
+            elif what == "player":
+                fake = d / "fake-player" / "Player.exe"
+                fake.parent.mkdir(exist_ok=True)
+                shutil.copyfile(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PING.EXE", fake)
+                pl = subprocess.Popen([str(fake), "-n", str(int(dur) + 1), "127.0.0.1"], stdout=subprocess.DEVNULL)
+                log(f"dummy Player.exe pid {pl.pid} for {dur:.0f} s")
+                pl.wait(timeout=dur + 30)
+                notes.append("player")
+    dth = threading.Thread(target=disturb, daemon=True)
+    dth.start()
+    out_s, err_s = p.communicate(timeout=3600)
+    dth.join(timeout=5)
+
+    class _P:  # the old subprocess.run result shape
+        returncode, stdout, stderr = p.returncode, out_s, err_s
+    p = _P()
     events = [json.loads(x) for x in p.stdout.splitlines() if x.strip().startswith("{")]
     (d / "client_events.jsonl").write_text(p.stdout, encoding="utf-8")
     (d / "client_stderr.txt").write_text(p.stderr, encoding="utf-8")
+    if a.fake_player:
+        paused = "已自动暂停" in p.stderr and "自动暂停的条件已解除" in p.stderr
+        stopped = any(e["event"] == "task_end" and e["end"] == "stopped" for e in events)
+        log(f"auto-pause: paused and resumed {paused}, a task ended stopped {stopped}")
+        if not (paused and stopped):
+            return 1
     if p.returncode != 0:
         log(f"client exit {p.returncode}: {p.stderr[-2000:]}")
         return 1
     ends = [e for e in events if e["event"] == "task_end"]
     beats = sum(1 for e in events if e["event"] == "heartbeat")
     other = [e for e in events if e["event"] in ("refused", "task_failed", "error")]
+    if a.kill_engine_after > 0:  # the killed engine's task: one task_failed (end "error", its prefix is verified)
+        failed = [e for e in other if e["event"] == "task_failed"]
+        log(f"killed engine: task_failed events {len(failed)}, tasks ended error "
+            f"{sum(1 for e in events if e['event'] == 'task_end' and e['end'] == 'error')}")
+        other = [e for e in other if e["event"] != "task_failed"] + failed[1:]
+    if a.max_instances <= a.instances:
+        tmi = [e for e in other if e["event"] == "refused" and e["reason"]["code"] == "too_many_instances"]
+        log(f"at the gateway's max_instances: too_many_instances refusals {len(tmi)}")
     chunks = [e for e in events if e["event"] == "chunk"]
     log(f"client: {len(ends)} tasks in {time.time() - t0:.0f} s: " + ", ".join(
         f"{e['end']} {e['steps']} steps {e['steps_per_s']:.0f}/s" for e in ends))
@@ -281,7 +358,7 @@ def main(argv=None) -> int:
         sys.stdout.buffer.write(page.encode("utf-8")), sys.stdout.flush()
         tui_ok = t.returncode == 0 and "采样中" in page and "合格玩家" in page
         log(f"tui: exit {t.returncode}, {'OK' if tui_ok else 'NOT OK'} (the page above)")
-    srv.shutdown()
+    servers[0].shutdown()
     forum.shutdown()
     store.close()
     result = {"tasks": ends, "heartbeats": beats, "chunks": len(rows), "verify": verdict, "steps_verified": st["steps_verified"],

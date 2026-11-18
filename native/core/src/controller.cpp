@@ -223,6 +223,7 @@ struct Controller::Slot {
     double retry_at = 0;
     bool fetched = false;  // a task was fetched and is not counted in tasks_done_ yet (this slot's thread only)
     std::string path_note;  // the last engine_view note logged (this slot's thread only)
+    std::string last_task;  // the slot's previous task (its upload is waited for before the next fetch)
 };
 
 Controller::Controller(std::string data_dir, EventFn on_event)
@@ -458,6 +459,10 @@ bool Controller::connect() {
         } else {
             *cache_api_ = GatewayClient(c.gateway_url);
         }
+    }
+    try {  // the forum account of this data directory: diagnostics scrub it even when exported offline
+        write_atomic(dir_ + "/user.json", h.at("user").dump(true));
+    } catch (const Error &) {
     }
     say("已连接网关：" + name + "，上榜" + (h.at("leaderboard").as_bool() ? "开" : "关") + "，最多 " +
         std::to_string(int(h.at("max_instances").as_int())) + " 个实例。");
@@ -788,6 +793,18 @@ bool Controller::run_one_task(Slot *s) {
     auto undo = [&] {
         if (max_tasks > 0) --tasks_fetched_;
     };
+    // the previous task of this slot is open at the gateway until its last chunk (or task_end) arrived: wait for the
+    // uploader first, else a slot at the gateway's max_instances gets too_many_instances (uploads are asynchronous)
+    if (!s->last_task.empty()) {
+        std::string d = dir_ + "/queue/" + s->last_task;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            s->state = "starting", s->detail = "等上一个任务的数据上传";
+        }
+        double until = platform::monotonic_s() + 600.0;
+        while (platform::is_dir(d) && platform::monotonic_s() < until && !closing_ && !s->quit) wait_for(0.25);
+        s->last_task.clear();
+    }
     {
         std::lock_guard<std::mutex> g(mu_);
         s->state = "starting", s->detail = "取任务";
@@ -807,7 +824,8 @@ bool Controller::run_one_task(Slot *s) {
     } catch (const GatewayRefusal &e) {
         undo();
         refused(e, "task");
-        if (!e.fatal && e.code != "session_expired" && e.code != "too_many_instances") wait_for(30.0);
+        if (e.code == "too_many_instances") wait_for(10.0);  // the slots of a closing task free up shortly
+        else if (!e.fatal && e.code != "session_expired") wait_for(30.0);
         return false;
     }
     if (tm.at("type").as_string() == "no_task") {
@@ -824,6 +842,7 @@ bool Controller::run_one_task(Slot *s) {
     }
     s->fetched = true;
     Task task = Task::from_json(tm.at("task"));
+    s->last_task = task.task_id;
     queue_open(task, s->index);
     double t0 = platform::monotonic_s();
     {
@@ -1088,7 +1107,8 @@ bool Controller::upload_task(const std::string &task_id) {
                 if (final) remove_tree(d);
                 return true;
             }
-            if (e.code == "session_expired" || e.code == "rate_limited" || e.code == "server_busy") {
+            if (e.code == "session_expired" || e.code == "rate_limited" || e.code == "server_busy" ||
+                e.code == "internal_error") {  // transient: retried (the chunk stays queued)
                 if (e.code == "session_expired") refused(e, "chunk");
                 return false;
             }
@@ -1205,15 +1225,24 @@ ControllerView Controller::view() const {
 DiagFiles Controller::diagnostics() const {
     std::vector<std::pair<std::string, std::string>> rep;
     Json info = Json::object();
+    Json saved_user;
+    Bytes ub;
+    if (read_file(dir_ + "/user.json", ub)) {
+        try {
+            saved_user = Json::parse(ub, 4);
+        } catch (const Error &) {
+        }
+    }
     {
         std::lock_guard<std::mutex> g(mu_);
+        Json user = user_.is_object() ? user_ : saved_user;
         if (!token_.empty()) rep.push_back({token_, "<令牌>"});
         for (const char *k : {"username", "nickname"}) {
-            std::string v = user_.is_object() ? user_.get_string(k, "") : "";
+            std::string v = user.is_object() ? user.get_string(k, "") : "";
             if (!v.empty()) rep.push_back({v, std::string("<论坛") + (k[0] == 'u' ? "用户名" : "昵称") + ">"});
         }
-        if (user_.is_object())
-            if (const Json *id = user_.find("id"); id && id->is_number()) {
+        if (user.is_object())
+            if (const Json *id = user.find("id"); id && id->is_number()) {
                 std::string sid = std::to_string(id->as_int());
                 if (sid.size() >= 4) rep.push_back({"\"id\":" + sid, "\"id\":\"<论坛 id>\""});
             }

@@ -1,8 +1,10 @@
 // The native volunteer client (M2: command line; the TUI, several instances and the browser login are M3).
 //
 //   nc_client login --gateway URL [--data-dir D]
-//       login_start, shows the login code and the browser link, polls until the gateway hands out the token, which
-//       is saved to <D>/token (D defaults to ./ballrain-pool-data)
+//       the controller's login: login_start, shows the login code and the browser link, polls until the gateway hands
+//       out the token, which is saved to <D>/token (D defaults to ./ballrain-pool-data)
+//   nc_client diag [--data-dir D] [--out F.zip]
+//       the scrubbed diagnostics zip (default <D>/diagnostics-<time>.zip)
 //   nc_client run --gateway URL --ballance-dir G --engine BallanceMMOSimTool[.exe] [--data-dir D] [--tasks N]
 //                 [--instances K] [--engine-kind x87soft|2002] [--engine-env NAME=VALUE ...] [--leaderboard on|off]
 //                 [--auto-pause on|off]
@@ -58,11 +60,22 @@ static void sleep_s(double s) {
     while (!g_stop && platform::monotonic_s() < end) std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
 
+static void print_event(const std::string &kind, const Json &f) {
+    if (kind == "log") {
+        std::fprintf(stderr, "%s\n", f.get_string("message", "").c_str());
+        return;
+    }
+    event(kind, f);
+}
+
+// the controller's login (the same code path as the TUI's)
 static int cmd_login(int argc, char **argv) {
-    GatewayClient api(arg(argc, argv, "--gateway"));
     std::string dir = arg(argc, argv, "--data-dir", "ballrain-pool-data");
-    platform::make_dirs(dir);
-    Json ls = api.login_start();
+    Controller ctl(dir, print_event);
+    ClientConfig c = ctl.config();
+    c.gateway_url = arg(argc, argv, "--gateway");
+    ctl.set_config(c);
+    Json ls = ctl.login_start();
     Json f = Json::object();
     f.set("user_code", ls.at("user_code"));
     f.set("browser_url", ls.at("browser_url"));
@@ -73,33 +86,12 @@ static int cmd_login(int argc, char **argv) {
     double poll = double(ls.at("poll_s").as_int());
     while (!g_stop && platform::monotonic_s() < end) {
         sleep_s(poll);
-        Json st;
-        try {
-            st = api.login_poll(ls.at("login_id").as_string(), ls.at("poll_secret").as_string());
-        } catch (const GatewayRefusal &e) {
-            if (e.code == "rate_limited") continue;
-            throw;
-        }
-        std::string s = st.at("status").as_string();
-        if (s == "pending") continue;
-        if (s == "ok") {
-            write_file(dir + "/token", st.at("token").as_string());
-#ifndef _WIN32
-            std::error_code pe;  // the token is a credential: owner only (the Python controller writes it 0600)
-            std::filesystem::permissions(dir + "/token", std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                                         std::filesystem::perm_options::replace, pe);
-#endif
-            Json g = Json::object();
-            g.set("user", st.at("user"));
-            event("login_ok", g);
-            return 0;
-        }
+        std::string st = ctl.login_poll(ls);
+        if (st == "pending") continue;
+        if (st == "ok") return 0;  // the controller emitted login_ok (with the user) and saved the token
         Json g = Json::object();
-        g.set("status", Json::string(s));
-        if (const Json *r = st.find("reason")) {
-            g.set("reason", *r);
-            std::fprintf(stderr, "%s\n", r->get_string("message", "").c_str());
-        }
+        g.set("status", Json::string(st));
+        if (ctl.view().banner) g.set("message", Json::string(ctl.view().banner->message));
         event("login_failed", g);
         return 1;
     }
@@ -107,18 +99,22 @@ static int cmd_login(int argc, char **argv) {
     return 1;
 }
 
+// the diagnostics zip of a data directory (as the TUI's "导出诊断")
+static int cmd_diag(int argc, char **argv) {
+    Controller ctl(arg(argc, argv, "--data-dir", "ballrain-pool-data"), print_event);
+    std::string p = ctl.export_diagnostics(arg(argc, argv, "--out", ""));
+    Json f = Json::object();
+    f.set("path", Json::string(p));
+    event("diagnostics", f);
+    return 0;
+}
+
 static int cmd_run(int argc, char **argv) {
     std::string dir = arg(argc, argv, "--data-dir", "ballrain-pool-data");
     Bytes token;
     if (!read_file(dir + "/token", token) || token.empty()) throw Error("no token: run `nc_client login` first");
     bool fatal = false;
-    Controller ctl(dir, [&](const std::string &kind, const Json &f) {
-        if (kind == "log") {
-            std::fprintf(stderr, "%s\n", f.get_string("message", "").c_str());
-            return;
-        }
-        event(kind, f);
-    });
+    Controller ctl(dir, print_event);
     ClientConfig c = ctl.config();
     c.gateway_url = arg(argc, argv, "--gateway");
     c.ballance_dir = platform::absolute_path(arg(argc, argv, "--ballance-dir"));
@@ -174,6 +170,7 @@ int main(int argc, char **argv) {
     try {
         std::string cmd = argv[1];
         if (cmd == "login") return cmd_login(argc, argv);
+        if (cmd == "diag") return cmd_diag(argc, argv);
         if (cmd == "run") return cmd_run(argc, argv);
         std::fprintf(stderr, "unknown command %s\n", cmd.c_str());
         return 2;

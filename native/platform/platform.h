@@ -40,7 +40,8 @@ std::string executable_path();  // this program (absolute)
 std::string user_name();        // the login name (diagnostics scrub it from paths)
 // A directory for what the headless engine must read or write when the client's own paths are not plain ASCII (the
 // engine resolves its files with narrow, code-page paths): BALLRAIN_WORK_DIR if set, else Windows
-// %ProgramData%\BallrainPool (no token or personal data goes there: a game-file copy, run directories); POSIX the
+// %ProgramData%\BallrainPool\u-<user> with a DACL for this user only (no token or personal data goes there: a
+// game-file copy, the engine copy, run directories); POSIX the
 // data directory (the engine takes UTF-8 bytes there)
 std::string engine_work_dir();
 std::string short_path(const std::string &path);  // Windows: the 8.3 form when the volume has one, else path
