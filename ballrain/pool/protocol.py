@@ -343,6 +343,8 @@ STATS = Obj({"steps_accepted": Int(0), "steps_pending": Int(0), "steps_verified"
              "chunks_rejected": Int(0)}, {"last_rejection": _reason(True)})
 
 # The task (ballrain.pool.task.Task.to_dict); the client never chooses any of it
+REACH_ASSET = Obj({"level": Int(1, 13), "key_sha256": SHA, "sha256": SHA, "size": Int(1, 128 << 20), "zsha256": SHA,
+                   "zsize": Int(1, 32 << 20)})  # served at /pool/assets/<zsha256>.zst (no url field)
 TASK = Obj({
     "task_id": TASK_ID,
     "kind": Str(16, enum=TASK_KINDS),
@@ -362,8 +364,10 @@ TASK = Obj({
     "greedy": Bool(),  # eval tasks: argmax actions (behaviour log-probs still sent)
     "sample_seed": Int(0, 2 ** 53 - 1),  # sampling tasks: action draws u_t = sampling.sample_u(seed, t)
     # sha256 of the start-state pack and of the reference line asset; branch: the route-branch pack when the
-    # policy follows one (its manifest's features.branch pins the pack's three files)
-    "assets": Obj({"starts": SHA, "path": SHA}, {"branch": SHA}),
+    # policy follows one (its manifest's features.branch_sha256 pins the pack's files); reach (f7): one entry per
+    # fastreach fields file the level can need (docs/f7-native-port.md 8), served zstd-compressed at
+    # /pool/assets/<zsha256>.zst; the client picks the entry whose key_sha256 is sha256 of its geometry's fields key
+    "assets": Obj({"starts": SHA, "path": SHA}, {"branch": SHA, "reach": List(REACH_ASSET, 8)}),
 }, {
     # format 3 (docs/pool-prototype.md 5): an at-rest start after the hand-over at start_frame (the env's rest_starts):
     # drive to target (x, z) within max_frames, then brake; target null = brake only. Drawn by the server
