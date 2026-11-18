@@ -103,7 +103,8 @@ class PolicySource:
                 keep &= ~((v >= int(lo)) & (v < int(hi)))
             st.exclude(keep)  # excluded frames stay hand-over states for at-rest starts with a drive target
         ec = dict(state.get("env_config") or {})
-        draws = {k: ec.get(k) for k in ("rehearse_starts", "p_rehearse", "rest_starts", "p_rest", "rehearse_behind_frontier")}
+        draws = {k: ec.get(k) for k in ("rehearse_starts", "rehearse_always", "p_rehearse", "rest_starts", "p_rest",
+                                         "rehearse_behind_frontier")}
         cu = None
         cs = state.get("curriculum")
         if cs:
@@ -144,10 +145,14 @@ class PolicySource:
         rest = None
         with self.lock:
             k = None
-            rh, rs = d.get("rehearse_starts"), d.get("rest_starts")
+            # rehearse_always entries join the rehearsal draw but are never clipped to the frontier (env._draw_start)
+            n_rh = len(d.get("rehearse_starts") or [])
+            rh = list(d.get("rehearse_starts") or []) + list(d.get("rehearse_always") or [])
+            rs = d.get("rest_starts")
             if st is not None and rh and d.get("p_rehearse") and rng.random() < float(d["p_rehearse"]):
-                lo, hi = (int(v) for v in rh[int(rng.integers(len(rh)))])
-                if d.get("rehearse_behind_frontier") and pub.curriculum is not None and lo > 0:
+                j = int(rng.integers(len(rh)))
+                lo, hi = (int(v) for v in rh[j][:2])
+                if d.get("rehearse_behind_frontier") and j < n_rh and pub.curriculum is not None and lo > 0:
                     lo = max(lo, int(pub.curriculum.frontier))  # only the part the frontier has passed
                 if lo <= hi:
                     k = st.nearest_valid(int(rng.integers(lo, hi + 1)))

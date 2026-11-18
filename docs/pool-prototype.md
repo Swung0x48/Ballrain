@@ -884,6 +884,18 @@ python tools/pool/mock_forum.py --port 8098 --redirect-uri http://127.0.0.1:8099
   ```
   没有 `hub` 时网关照旧从检查点副本取策略（第 10.5 节）。链接连上后，策略的运行名取学习器的（`[policy] run` 不同时日志里提示并改用学习器的），否则重启后所有段都会被当成“别的 run”（`ingested = -1`，不送，日志里有记录）。`min_client_version` 读配置时不会低于 0.3.0（任务格式 3）。
 
+### 11.1a 按能力发任务（不按版本号）
+
+用户的原则是尽可能少升级志愿者那边的程序，所以网关按能力决定给谁发任务，不提高最低版本号：
+- 客户端在 hello 里报自己能跑什么：`capabilities`，比如 `task_format3`、`branch_v1`。没有这个字段的旧客户端算什么能力都没有。字段由原生客户端会话加进协议。
+- 策略清单写它的任务需要什么：`requires`，比如带石头分支的策略写 `branch_v1`。不需要任何新能力的策略不写这个字段，`policy_sha` 不变。
+- `server_app.task()` 只把一个策略的任务发给能力齐全的会话（`ballrain/pool/capabilities.py`）。缺能力的会话得到 `no_task`，600 秒后再问。
+  - 原因码沿用已有的 `client_too_old`：旧客户端会按自己的列表校验原因码，新增原因码会让它们出错。
+  - 说明文字由网关写，每个客户端都原样显示：缺的是什么新内容（`CAPABILITIES` 表里的中文说明）；为什么现在的程序不能继续（它仍按旧规则跑，算出的观测和奖励和训练器不一致，验证不会通过，已经交上来的数据和令牌不受影响）；要更新到哪个版本。参数里另有 `missing`，列出缺的能力名。
+  - 不需要新能力的策略照样发给旧客户端。
+- 以后加功能只要在 `CAPABILITIES` 里加一行，在客户端和策略清单里加同一个名字。
+- 上线顺序：网关要先于会报能力的客户端上线，因为旧网关严格解析 hello，会拒收不认识的字段。
+
 ### 11.2 训练器：`--pool-ingest`（默认关）
 
 | 参数 | 默认 | 含义 |
@@ -893,6 +905,8 @@ python tools/pool/mock_forum.py --port 8098 --redirect-uri http://127.0.0.1:8099
 | `--pool-correction vtrace\|none` | vtrace | 见下；`none` 和局域网远程数据一样处理（GAE、比值相对 behaviour 策略），只用来做对照实验 |
 | `--pool-rho-bar`、`--pool-c-bar` | 1、1 | V-trace 的截断 |
 
+- 学习器在 hub 的 worker 模板里声明 `pool_ingest: true/false`。学习器链接**只连声明了这一项的学习器**：更早的 train_m2 没有池子分支，会把池子的数据当成普通远程数据训练，没有延迟上限，也没有修正。声明为 false 时链接照常连上、照常发布策略，但不送数据。
+- 学习器的更新次数变小时（自动回退、从更早的检查点续跑），以及每次重新连上时，链接都会立刻重新发布策略，不用等再过 `publish_every` 次更新。
 - 池子的数据走自己的分支，不受 `--max-stale-remote` 影响；本地和局域网远程数据的处理**逐位不变**。被拒或被丢的池子数据不进任何统计（帧数、`reset_frac`、远程看门狗），所以开关关着时 updates.csv 和仪表盘不受影响。
 - 统计只写 TensorBoard（`pool/steps`、`pool/frac`、`pool/lag`、`pool/rho`、`pool/rho_clip`、`pool/refused`、`pool/dropped`），不加 updates.csv 的列（加列会让续跑的 run 另起 `updates.<i>.csv`）。被接收的池子步数记在 `counters["steps_pool"]`。
 
@@ -1034,3 +1048,44 @@ L2 是原生客户端第一次在第 2 关上通过验证（纸球、风扇）�
 - 学习器去掉 `--pool-ingest` 续跑即可：池子的数据被丢弃，只计数。
 - 出现可疑账号的提醒时（`runtime/pool/alerts/`），由用户决定是否吊销、是否按 `learner_updates_unreplayed.first` 回退到更早的检查点；系统自己不吊销、不回退。
 
+
+## 14. H 255 作为志愿者测试机（准备好，待原生客户端带 f7 + 石头分支发布后直接在 r8 上跑）
+
+用户的决定（2026-11-18）：不拿中间版本的策略单独测试，等原生客户端支持 f7 和石头分支以后，直接在 r8 上带 `--pool-ingest` 测。下面是到时候的步骤。网关配置用第 13 节的 `runtime/pool/config.r8-candidate.toml`；
+如果 r8 的策略需要 `branch_v1`、f7 之类的能力，只要客户端在 hello 里报了这些能力，按能力发任务的检查（第 11.1a 节）就会放行。
+
+**H 255 上**（Windows，`C:\ballrain`；同一台机器上的 Python 桥先停掉）
+1. 停 r8 的 Python runner2：按它自己的停止方式（`C:\ballrain\ops` 里的脚本）停桥和 worker，确认没有 `BallanceMMOSimTool` 还在跑。
+2. 把原生客户端发布版的 zip（原生客户端会话的 `package_win.py` 打出来的 `BallrainPool-<版本>-windows-x64.zip`）解压到 `C:\ballrain-pool\app`。
+   zip 里的引擎 sha256 要在网关的 `[engines.x87soft]` 白名单里：打包脚本会打印它；没有 `[engines]` 一节时，网关默认用本机的 `runtime/hl-win/bin-x86soft`，两边是同一个文件时 sha 一致。
+3. 游戏目录用 `C:\ballrain\game`：它的 `base.cmo` 和网关参照目录 `runtime/hl-win/game-min` 的逐字节相同，已经核对过。其余三项（`Database.tdb`、`3D Entities/`、`Text/`）不一致时，hello 会回 `game_files_mismatch` 并指出是哪一项。
+4. 登录（由用户完成）：
+   `C:\ballrain-pool\app\nc_client.exe login --gateway https://<仪表盘主机名> --data-dir C:\ballrain-pool\data`
+   它在标准输出打一行 JSON，里面有 `browser_url` 和 `user_code`。用户在任意浏览器打开这个地址，核对登录代码，用论坛账号授权。成功后令牌存在 `C:\ballrain-pool\data\token`。
+5. 运行（不需要界面，SSH 断开后继续跑）：参照 `C:\ballrain\ops` 的做法，写一个 `start-pool.ps1`，用 `Start-Process -WindowStyle Hidden` 启动
+   `nc_client.exe run --gateway https://<仪表盘主机名> --data-dir C:\ballrain-pool\data --ballance-dir C:\ballrain\game --instances 6 --quiet-file C:\ballrain-quiet`，
+   把标准输出重定向到 `C:\ballrain-pool\data\events.jsonl`，标准错误重定向到 `client-stderr.txt`。
+   - 停止开关：`C:\ballrain-quiet` 存在时，所有实例 1 秒内暂停，进行中的任务以 `stopped` 结束；删掉以后自动继续。BMMO 会话的计时窗口照旧用这个文件。
+   - 结束：停止 `nc_client` 进程。它的 Job Object 会连带结束所有引擎；没传完的数据下次启动时接着传。
+6. 第一次连上的前 200 × 256 步是试用期，每个任务都整段重放。
+
+**看什么**
+- **客户端**（`events.jsonl`，每行一个事件）：`task_end` 是每个任务的结束原因和步数；`chunk` 的 `status` 应该都是 `accepted`；`refused`、`error`、`task_failed` 不应该出现（出现时原文就是原因）；`heartbeat` 应该一直有。
+- **网关日志**：`verify …: passed up to chunk N` 是正常的。下面几行要注意：
+  - `policy-consistency check failed` 是便宜检查不通过，这个任务和账号接下来的任务会整段重放；
+  - `flagged suspect` 是重放不一致；
+  - `replay_failed` 是验证器自己的问题（引擎起不来等），不算玩家的错；
+  - `learner link: …` 是学习器链接的连接和发布。
+- **网关统计**：`uv run python tools/pool/gateway.py admin stats`（只读）：
+  - 任务按状态和结束原因的计数；
+  - 整段重放的任务比例（试用期后约 15%，加上升级的）；
+  - 数据段按验证结果和状态的计数和步数；
+  - 被便宜检查标记的段；
+  - 已送进学习器的段；
+  - 最近 1 小时和 24 小时收到的步数和每秒步数；
+  - 最近 5 分钟活跃的会话（引擎类型、客户端版本、平台）；
+  - 可疑和已吊销的账号数，以及提醒文件数。
+  `admin suspects` 列出被标记的账号和原因，`admin list` 列出每个账号的已验证 / 待验证步数。
+- **提醒**：轮询 `runtime/pool/alerts/`，一条一个 JSON 文件。`*-suspect-*.json` 是重放不一致（第 11.4 节），里面有不一致的数值和容差，以及受影响的学习器更新范围。是否吊销（`admin revoke`）、是否解除标记（`admin unflag`）、是否回退，都由用户决定。
+- **学习器**（TensorBoard）：`pool/steps`、`pool/frac`、`pool/lag`、`pool/rho`、`pool/rho_clip`、`pool/dropped`、`pool/refused`（开着 `--pool-ingest` 时应为 0）。
+- **这台机器第一次出现诚实的不一致**（不同 CPU、同一个引擎构建）时，最可能是跨机器的字节差异，而不是作弊。先看提醒里的 `detail` / `values`，再决定是否解除标记。

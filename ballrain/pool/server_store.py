@@ -69,6 +69,8 @@ CREATE INDEX IF NOT EXISTS chunks_by_account ON chunks(forum_id, verify);
 MIGRATIONS = {"logins": {"user_code": "TEXT", "confirm_hash": "TEXT", "browser_hash": "TEXT"},
               "chunks": {"ingested": "INTEGER", "ingested_at": "INTEGER", "flag": "TEXT"},
               "tasks": {"replay": "INTEGER NOT NULL DEFAULT 0"},
+              # sessions.capabilities: JSON list of hello.capabilities (absent = none; ballrain.pool.capabilities)
+              "sessions": {"capabilities": "TEXT"},
               "accounts": {"escalate": "INTEGER NOT NULL DEFAULT 0", "ingest_span": "TEXT",
                            "suspect": "INTEGER NOT NULL DEFAULT 0", "suspect_reason": "TEXT", "suspect_at": "INTEGER"}}
 
@@ -235,9 +237,9 @@ class Store:
         now = self.now()
         e = hello["engine"]
         self.q("INSERT INTO sessions(session_id, forum_id, token_hash, engine_kind, engine_sha, platform, client_version, "
-               "instances, created, last_seen) VALUES(?,?,?,?,?,?,?,?,?,?)",
+               "instances, created, last_seen, capabilities) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                (sid, int(forum_id), token_hash, e["kind"], e["sha256"], hello["platform"], hello["client_version"],
-                int(hello["instances"]), now, now))
+                int(hello["instances"]), now, now, json.dumps(sorted(set(hello.get("capabilities") or ())))))
 
     def session(self, sid: str):
         return self.one("SELECT * FROM sessions WHERE session_id=?", (sid,))
