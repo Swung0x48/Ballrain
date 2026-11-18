@@ -37,6 +37,7 @@ sys.path.insert(0, str(REPO))
 import numpy as np  # noqa: E402
 
 RECORD = "SR01_1_14_457_264"
+RECORDS = {1: RECORD, 2: "SR02_1_28_992_264"}  # default start record per level (--record overrides)
 TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "checkpoint", "stall_penalty", "gate_bonus", "split_bonus",
          "camera_off_quarter", "zone_penalty", "wall_push")
 EP_COLS = ["update", "t", "wid", "backend", "host", "copy", "kind", "probes", "death_probe", "splits", "start_frame", "start_sector", "end", "end_sector", "max_sector",
@@ -56,6 +57,15 @@ UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_pe
                                      "teacher_kl", "teacher_n", "teacher_coef")])
 RUN_COLS = ["update", "t", "copy", "run_id", "end_reason", "sr_ms", "start_frame", "frames", "lives", "deaths",
             "framelog_match", "handover_mismatches", "invalid", "ball_order", "dir"]
+
+
+def start_record(a) -> str:
+    """The TAS start record of the run: --record, else the level's default (RECORDS)."""
+    if a.record:
+        return a.record
+    if a.level not in RECORDS:
+        raise SystemExit(f"--level {a.level}: no default start record, give --record")
+    return RECORDS[a.level]
 
 
 def parse_rest_starts(spec: str):
@@ -128,6 +138,11 @@ def gated_curriculum(starts, cfg, finish_gate: float):
 def parse(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True)
+    p.add_argument("--level", type=int, default=1)
+    p.add_argument("--record", default="", help="TAS start record (tas-v1 dataset; default: RECORDS[level])")
+    p.add_argument("--rehearse-behind-frontier", action="store_true",
+                   help="rehearsal starts only from the part of each range at or after the curriculum frontier "
+                        "(EnvConfig.rehearse_behind_frontier): a section is rehearsed once the frontier has passed it")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--init-from", help="checkpoint to initialise model / obs stats from (new run)")
     p.add_argument("--init-full", action="store_true",
@@ -323,7 +338,7 @@ def make_env_config(a, out_root: Path):
     # repo-relative, so remote workers on another machine resolve it in their own checkout, plus the asset's sha256
     # (a worker whose copy of the line differs refuses to run: ballrain.path.RouteError)
     path_dir = portable_path_dir(a.path_dir)
-    asset = asset_path(1, resolve_path_dir(path_dir))
+    asset = asset_path(a.level, resolve_path_dir(path_dir))
     if path_dir is not None and not asset.is_file():
         raise SystemExit(f"--path-dir {a.path_dir}: no reference line {asset}")
     fc = FeatureConfig(hs_block=a.hs_block, camera="world" if a.world_actions else "orient_ref",
@@ -335,7 +350,8 @@ def make_env_config(a, out_root: Path):
     if a.backend == "headless":
         hl = {k: v for k, v in (("binary", a.hl_bin), ("root", a.hl_root), ("socket", a.hl_socket),
                                 ("ball_order", a.hl_ball_order)) if v}
-    return EnvConfig(level=1, mode="sr", action_repeat=a.action_repeat, out_root=str(out_root), start_record=RECORD,
+    return EnvConfig(level=a.level, mode="sr", action_repeat=a.action_repeat, out_root=str(out_root),
+                     start_record=start_record(a),
                      backend=a.backend, headless=hl,
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
                      per_life=not a.no_respawn,
@@ -343,6 +359,7 @@ def make_env_config(a, out_root: Path):
                      p_rest=a.p_rest,
                      rehearse_starts=[[int(v) for v in r.split("-")] for r in a.rehearse_starts.split(",") if r.strip()] or None,
                      p_rehearse=a.p_rehearse,
+                     rehearse_behind_frontier=a.rehearse_behind_frontier,
                      exclude_starts=[[int(v) for v in r.split("-")] for r in a.exclude_starts.split(",") if r.strip()] or None)
 
 
@@ -405,7 +422,7 @@ def main(argv=None) -> int:
         env_cfg.start_record = None
         cu_cfg = env_cfg.curriculum
         env_cfg.curriculum = None
-    starts = TasStarts(RECORD)
+    starts = TasStarts(start_record(a))
     if a.exclude_starts:
         keep = np.ones(len(starts.valid), bool)
         for r in a.exclude_starts.split(","):
@@ -691,7 +708,7 @@ def main(argv=None) -> int:
         from ballrain.path import ReferencePath, asset_path, resolve_path_dir
         lo_s, hi_s = (float(v) for v in a.watch_s.split(","))
         sl = FeatureExtractor(env_cfg.features).slices().get("path_progress")
-        asset = asset_path(1, resolve_path_dir(env_cfg.features.path_dir)) if env_cfg.features.path_dir else None
+        asset = asset_path(env_cfg.level, resolve_path_dir(env_cfg.features.path_dir)) if env_cfg.features.path_dir else None
         if sl is None or asset is None or not asset.is_file():
             raise SystemExit("--watch-s needs the path_progress feature and a reference line asset (--path-dir)")
         length = ReferencePath.load(asset).length
@@ -712,7 +729,7 @@ def main(argv=None) -> int:
         tmodel.load_state_dict(tck["model"])
         tmodel.eval()
         sl = FeatureExtractor(env_cfg.features).slices()["path_progress"]
-        length = ReferencePath.load(asset_path(1, resolve_path_dir(env_cfg.features.path_dir))).length
+        length = ReferencePath.load(asset_path(env_cfg.level, resolve_path_dir(env_cfg.features.path_dir))).length
         teacher = {"model": tmodel, "rms": tck["rms"], "col": sl.start, "lo": a.teacher_s_min / length,
                    "u0": counters["update"]}
         log.msg(f"teacher {a.teacher} (update {tck['counters']['update']}): KL coef {a.teacher_coef}"

@@ -111,6 +111,10 @@ class EnvConfig:
     # draw after the curriculum frontier moved past it
     rehearse_starts: list | None = None
     p_rehearse: float = 0.0
+    # rehearse_behind_frontier: draw a rehearsal start only from the part of its range at or after the curriculum frontier
+    # (a range the frontier has not reached yet is skipped: the draw falls through to the curriculum), so every section
+    # is rehearsed once the reverse curriculum has passed it (r8 / level 2)
+    rehearse_behind_frontier: bool = False
     # record frames [lo, hi) that are never used as start states (e.g. the TAS on a route the training does not
     # follow: L1 shortcut 2 while the reference line takes shortcut 1); applied to TasStarts, so curriculum draws,
     # rehearsal and at-rest starts all skip them
@@ -264,7 +268,10 @@ class BallanceEnv(gym.Env):
         c = self.cfg
         if c.rehearse_starts and c.p_rehearse and self._start_rng.random() < c.p_rehearse:
             lo, hi = c.rehearse_starts[int(self._start_rng.integers(len(c.rehearse_starts)))]
-            return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
+            if c.rehearse_behind_frontier and self.curriculum is not None and int(lo) > 0:
+                lo = max(int(lo), int(self.curriculum.frontier))
+            if int(lo) <= int(hi):
+                return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
         if c.rest_starts and c.p_rest and self._start_rng.random() < c.p_rest:
             e = c.rest_starts[int(self._start_rng.integers(len(c.rest_starts)))]
             lo, hi = e[0], e[1]

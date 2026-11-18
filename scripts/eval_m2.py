@@ -43,8 +43,10 @@ def build_env_config(ck: dict, out_root: str, start_frame: int, max_frames: int,
     # checkpoints from before the fix (r5, r6) carry the learner machine's absolute path_dir: map it to this checkout
     fc = FeatureConfig(**dict(e["features"], path_dir=migrate_path_dir(e["features"].get("path_dir"))))
     rc = RewardConfig(**e["reward"])
-    return EnvConfig(level=1, mode="sr", action_repeat=e["action_repeat"], out_root=out_root, features=fc, reward=rc,
-                     start_record=RECORD if start_frame else None, start_frame=start_frame or None,
+    # the checkpoint's own level and start record (checkpoints from before r8 are level 1)
+    level, record = int(e.get("level") or 1), e.get("start_record") or RECORD
+    return EnvConfig(level=level, mode="sr", action_repeat=e["action_repeat"], out_root=out_root, features=fc, reward=rc,
+                     start_record=record if start_frame else None, start_frame=start_frame or None,
                      max_process_frames=max_frames, trace=True, world_actions=e.get("world_actions", False),
                      repress_stale_keys=e.get("repress_stale_keys"), backend=backend or e.get("backend", "retail"),
                      headless=headless if headless is not None else e.get("headless"))
