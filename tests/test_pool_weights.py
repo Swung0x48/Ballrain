@@ -206,6 +206,7 @@ def test_r6_checkpoint_on_recorded_observations(tmp_path):
     except FileNotFoundError:
         pytest.skip("the run's reference line is not on this machine")
     fcfg["path_dir"] = str(line.parent)
+    state = _pool_exportable(state, tmp_path)
     m = W.export_state(state, tmp_path, "r6")
     pol = W.load_policy(tmp_path / f"{m['policy_sha']}.npz", tmp_path / f"{m['policy_sha']}.json", m["policy_sha"])
     a = state["args"]
@@ -219,3 +220,18 @@ def test_r6_checkpoint_on_recorded_observations(tmp_path):
     lp = pol.log_probs(x)
     assert np.abs(np.exp(lp) - p_t).max() < 1e-5
     assert np.abs(pol.value(x) - v_t).max() < 1e-3
+
+
+def _pool_exportable(state, tmp_path):
+    """Late r6 runs use shaping the pool's task loop does not implement (zones, wall push): export refuses such a policy
+    (correctly). Tests about the policy / env / feature / reward mapping assert that refusal, then go on with a copy of
+    the state with that shaping switched off."""
+    from ballrain.pool import weights as W
+    args = dict(state.get("args") or {})
+    used = [k for k in W.UNSUPPORTED_ARGS if args.get(k) not in (None, "", 0, 0.0, {}, [])]
+    if not used:
+        return state
+    with pytest.raises(ValueError, match="pool tasks do not implement"):
+        W.export_state(state, tmp_path / "refused", "r6")
+    off = {"zones": "", "wall_push_rate": 0.0, "rail_gate": ""}
+    return dict(state, args=dict(args, **{k: off[k] for k in used}))

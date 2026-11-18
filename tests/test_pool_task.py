@@ -191,6 +191,7 @@ def test_env_from_task_matches_the_learner_config(tmp_path):
         state = torch.load(ck, weights_only=False, map_location="cpu")
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"{ck.name} not readable: {e}")
+    state = _pool_exportable(state, tmp_path)
     m = W.export_state(state, tmp_path / "w", "r6")
     m = W.read_manifest(tmp_path / "w" / f"{m['policy_sha']}.json")
     try:
@@ -238,3 +239,18 @@ def test_env_from_task_matches_the_learner_config(tmp_path):
         bad = T.Task(**dict(t.__dict__, start_frame=excluded + 1))
         with pytest.raises(T.TaskMismatch, match="valid start frame"):
             T.build_env(bad, m, lg, sdir, pdir, tmp_path / "out", launcher=fakegame.FakeLauncher(backend="headless"))
+
+
+def _pool_exportable(state, tmp_path):
+    """Late r6 runs use shaping the pool's task loop does not implement (zones, wall push): export refuses such a policy
+    (correctly). Tests about the policy / env / feature / reward mapping assert that refusal, then go on with a copy of
+    the state with that shaping switched off."""
+    from ballrain.pool import weights as W
+    args = dict(state.get("args") or {})
+    used = [k for k in W.UNSUPPORTED_ARGS if args.get(k) not in (None, "", 0, 0.0, {}, [])]
+    if not used:
+        return state
+    with pytest.raises(ValueError, match="pool tasks do not implement"):
+        W.export_state(state, tmp_path / "refused", "r6")
+    off = {"zones": "", "wall_push_rate": 0.0, "rail_gate": ""}
+    return dict(state, args=dict(args, **{k: off[k] for k in used}))
