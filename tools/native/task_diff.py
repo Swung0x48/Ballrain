@@ -128,7 +128,7 @@ def main(argv=None) -> int:
             pin_r = validate(ba_r, level, psha)
             ec_r = dict(ec, features=dict(ec["features"], branch_sha256=pin_r))
             m_rules = export(dict(st_b, env_config=ec_r, branch_assets=ba_r), out / "weights", "r8rules")
-            assert m_rules["requires"] == ["branch_v1", "branch_rules_v1"]
+            assert m_rules["requires"][:2] == ["branch_v1", "branch_rules_v1"]
             branch = {}
             for p_, b_ in ((pin, ba), (pin_r, ba_r)):
                 bsha, bpack = T.export_branch_pack(b_, level, out / "assets", psha)
@@ -213,7 +213,9 @@ def run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir
         p = subprocess.run([a.nc_task, "--task", str(d / "task.json"), "--manifest", str(mp), "--starts", str(spack),
                             "--path-dir", str(pdir), "--engine", a.engine, "--root", a.game, "--out", str(d / "native"),
                             "--actions", actions, "--stop-after", str(stop_after)]
-                           + (["--branch-pack", str(br["pack"])] if br else []),
+                           + (["--branch-pack", str(br["pack"])] if br else [])
+                           # f7: the same fields files the Python side reads (<runtime>/fastreach)
+                           + (["--reach-dir", str(REPO / "runtime" / "fastreach")] if m["features"].get("reach") else []),
                            capture_output=True, text=True, encoding="utf-8", timeout=3600)
         if p.returncode != 0:
             log(f"{name}: nc_task failed: {p.stderr[-500:]}")

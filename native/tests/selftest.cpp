@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "ballrain/branch.h"
+#include "ballrain/chunk.h"
 #include "ballrain/diagnostics.h"
 #include "ballrain/features.h"
 #include "ballrain/geometry.h"
@@ -54,14 +55,18 @@ int main() {
         threw = true;
     }
     CHECK(threw);
-    // feature version gate: f6 (reach false or absent) parses, f7 / reach true is refused (no fastreach port)
-    FeatureConfig::from_json(Json::parse(R"({"version":"f6","reach":false})"));
-    for (const char *f7 : {R"({"version":"f6","reach":true})", R"({"version":"f7"})"}) {
+    // feature version gate (FeatureConfig.__post_init__): reach makes it f7, pinned by reach_version; an f7 label
+    // without the block is f6; another reach_version is refused
+    CHECK(FeatureConfig::from_json(Json::parse(R"({"version":"f6","reach":false})")).version == "f6");
+    CHECK(FeatureConfig::from_json(Json::parse(R"({"version":"f7"})")).version == "f6");
+    {
+        FeatureConfig f7 = FeatureConfig::from_json(Json::parse(R"({"version":"f6","reach":true})"));
+        CHECK(f7.version == "f7" && f7.reach && f7.reach_version == reach_version());
         bool refused = false;
         try {
-            FeatureConfig::from_json(Json::parse(f7));
+            FeatureConfig::from_json(Json::parse(R"({"version":"f7","reach":true,"reach_version":"fastreach4.1-block1"})"));
         } catch (const Error &e) {
-            refused = std::string(e.what()).find("fastreach") != std::string::npos;
+            refused = std::string(e.what()).find("reach_version") != std::string::npos;
         }
         CHECK(refused);
     }
@@ -88,6 +93,23 @@ int main() {
             refused = true;
         }
         CHECK(refused);
+    }
+    // zstd with an output cap (the reach fields download: a bomb guard, truncated data refused)
+    {
+        Bytes raw;
+        for (int i = 0; i < 3000000; ++i) raw.push_back(char((i * 7) % 251));
+        Bytes z = zstd_compress(raw, 9);
+        CHECK(zstd_decompress_capped(z, raw.size()) == raw);
+        for (int k = 0; k < 2; ++k) {
+            bool refused = false;
+            try {
+                if (k == 0) zstd_decompress_capped(z, raw.size() - 1);       // larger than announced
+                else zstd_decompress_capped(z.substr(0, z.size() / 2), raw.size());  // truncated
+            } catch (const Error &) {
+                refused = true;
+            }
+            CHECK(refused);
+        }
     }
     // sha256
     CHECK(Sha256::hex("abc", 3) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");

@@ -32,6 +32,15 @@ Task Task::from_json(const Json &t) {
     k.asset_starts = t.at("assets").at("starts").as_string();
     k.asset_path = t.at("assets").at("path").as_string();
     if (const Json *b = t.at("assets").find("branch"); b && !b->is_null()) k.asset_branch = b->as_string();
+    if (const Json *r = t.at("assets").find("reach"); r && !r->is_null())
+        for (auto &e : r->items()) {
+            Task::ReachAsset a;
+            a.level = int(e.at("level").as_int());
+            a.key_sha256 = e.at("key_sha256").as_string(), a.sha256 = e.at("sha256").as_string();
+            a.zsha256 = e.at("zsha256").as_string();
+            a.size = e.at("size").as_int(), a.zsize = e.at("zsize").as_int();
+            k.asset_reach.push_back(a);
+        }
     k.rest = RestStart::from_json(t.find("rest"));
     if (const Json *c = t.find("life_seed")) k.life_seed = uint64_t(c->as_int());
     if (const Json *c = t.find("respawn_frontier"); c && !c->is_null()) k.respawn_frontier = c->as_int();

@@ -87,14 +87,6 @@ std::string absolute_path(const std::string &path) {
     return narrow(out);
 }
 
-std::string temp_dir() {
-    wchar_t buf[MAX_PATH + 1];
-    DWORD n = GetTempPathW(MAX_PATH + 1, buf);
-    std::string s = narrow(std::wstring(buf, n));
-    while (!s.empty() && (s.back() == '\\' || s.back() == '/')) s.pop_back();
-    return s;
-}
-
 // ---------------------------------------------------------------------------------------------- sockets
 
 static void wsa_init() {
@@ -408,7 +400,12 @@ static std::string known_folder(REFKNOWNFOLDERID id) {
     return out;
 }
 
-std::string data_dir() { return home_dir() + "\\.ballrain"; }
+std::string data_dir() {
+    const wchar_t *w = _wgetenv(L"BALLRAIN_WORK_DIR");
+    if (w && *w) return narrow(w);
+    std::string h = home_dir();
+    return h.empty() ? std::string() : h + "\\.ballrain";
+}
 
 std::string home_dir() { return known_folder(FOLDERID_Profile); }
 

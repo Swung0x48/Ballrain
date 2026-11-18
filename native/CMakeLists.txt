@@ -67,7 +67,8 @@ endif()
 add_library(ballrain_core STATIC
     core/src/util.cpp core/src/json.cpp core/src/sha256.cpp core/src/npz.cpp core/src/wire.cpp core/src/state.cpp
     core/src/geometry.cpp core/src/path.cpp core/src/branch.cpp core/src/features.cpp core/src/policy.cpp core/src/stream.cpp
-    core/src/engine_chain.cpp core/src/chunk.cpp core/src/starts.cpp core/src/reward.cpp)
+    core/src/engine_chain.cpp core/src/chunk.cpp core/src/starts.cpp core/src/reward.cpp core/src/fastreach.cpp
+    core/src/reach_block.cpp)
 target_include_directories(ballrain_core PUBLIC core/include)
 target_link_libraries(ballrain_core PRIVATE ballrain_miniz ballrain_zstd)
 
@@ -108,6 +109,8 @@ if(BALLRAIN_APPS)
     target_link_libraries(nc_task PRIVATE ballrain_engine)
     add_executable(nc_branch_diff apps/nc_branch_diff.cpp)
     target_link_libraries(nc_branch_diff PRIVATE ballrain_engine)
+    add_executable(nc_reach_diff apps/nc_reach_diff.cpp)
+    target_link_libraries(nc_reach_diff PRIVATE ballrain_engine)
     # the volunteer client's terminal UI (FTXUI 7.0.3, MIT, vendored in third_party/ftxui)
     if(BALLRAIN_TUI)
         set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)

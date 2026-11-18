@@ -2,7 +2,7 @@
 //
 //   nc_client login --gateway URL [--data-dir D]
 //       the controller's login: login_start, shows the login code and the browser link, polls until the gateway hands
-//       out the token, which is saved to <D>/token (D defaults to ./ballrain-pool-data)
+//       out the token, which is saved to <D>/token (D defaults to the client data dir: BALLRAIN_WORK_DIR or ~/.ballrain)
 //   nc_client diag [--data-dir D] [--out F.zip]
 //       the scrubbed diagnostics zip (default <D>/diagnostics-<time>.zip)
 //   nc_client run [--gateway URL] [--ballance-dir G] [--engine BallanceMMOSimTool[.exe]] [--data-dir D] [--tasks N]
@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "ballrain/controller.h"
+#include "platform.h"
 #include "ballrain/pool_client.h"
 #include "ballrain/task_runner.h"
 #include "platform.h"
@@ -71,7 +72,7 @@ static void print_event(const std::string &kind, const Json &f) {
 
 // the controller's login (the same code path as the TUI's)
 static int cmd_login(int argc, char **argv) {
-    std::string dir = arg(argc, argv, "--data-dir", "ballrain-pool-data");
+    std::string dir = arg(argc, argv, "--data-dir", platform::data_dir().c_str());
     Controller ctl(dir, print_event);
     ClientConfig c = ctl.config();
     c.gateway_url = arg(argc, argv, "--gateway");
@@ -102,7 +103,7 @@ static int cmd_login(int argc, char **argv) {
 
 // the diagnostics zip of a data directory (as the TUI's "导出诊断")
 static int cmd_diag(int argc, char **argv) {
-    Controller ctl(arg(argc, argv, "--data-dir", "ballrain-pool-data"), print_event);
+    Controller ctl(arg(argc, argv, "--data-dir", platform::data_dir().c_str()), print_event);
     std::string p = ctl.export_diagnostics(arg(argc, argv, "--out", ""));
     Json f = Json::object();
     f.set("path", Json::string(p));
@@ -111,7 +112,7 @@ static int cmd_diag(int argc, char **argv) {
 }
 
 static int cmd_run(int argc, char **argv) {
-    std::string dir = arg(argc, argv, "--data-dir", "ballrain-pool-data");
+    std::string dir = arg(argc, argv, "--data-dir", platform::data_dir().c_str());
     Bytes token;
     if (!read_file(dir + "/token", token) || token.empty()) throw Error("no token: run `nc_client login` first");
     bool fatal = false;

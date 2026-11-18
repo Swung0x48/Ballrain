@@ -151,3 +151,43 @@ Bytes encode_chunk(const ChunkData &c, int zstd_level) {
 }
 
 }  // namespace ballrain
+
+namespace ballrain {
+
+Bytes zstd_decompress_capped(const Bytes &in, size_t max_out) {
+    ZSTD_DCtx *d = ZSTD_createDCtx();
+    if (!d) throw Error("zstd: out of memory");
+    Bytes out;
+    std::string buf(1 << 20, '\0');
+    ZSTD_inBuffer ib{in.data(), in.size(), 0};
+    size_t ret = 1;
+    try {
+        while (ib.pos < ib.size || ret != 0) {
+            ZSTD_outBuffer ob{&buf[0], buf.size(), 0};
+            size_t before = ib.pos;
+            ret = ZSTD_decompressStream(d, &ob, &ib);
+            if (ZSTD_isError(ret)) throw Error(std::string("zstd: ") + ZSTD_getErrorName(ret));
+            if (out.size() + ob.pos > max_out) throw Error("zstd: the data is larger than announced");
+            out.append(buf.data(), ob.pos);
+            if (ib.pos == ib.size && ob.pos == 0 && ib.pos == before) {
+                if (ret != 0) throw Error("zstd: truncated data");
+                break;
+            }
+        }
+    } catch (...) {
+        ZSTD_freeDCtx(d);
+        throw;
+    }
+    ZSTD_freeDCtx(d);
+    return out;
+}
+
+Bytes zstd_compress(const Bytes &in, int level) {
+    Bytes out(ZSTD_compressBound(in.size()), '\0');
+    size_t n = ZSTD_compress(&out[0], out.size(), in.data(), in.size(), level);
+    if (ZSTD_isError(n)) throw Error(std::string("zstd: ") + ZSTD_getErrorName(n));
+    out.resize(n);
+    return out;
+}
+
+}  // namespace ballrain

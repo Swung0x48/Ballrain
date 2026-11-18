@@ -362,7 +362,7 @@ def test_l2_fields_carry_the_fans(tmp_path):
 
 # ------------------------------------------------------------------------------------------------ pool gate
 
-def test_pool_refuses_f7_and_f6_manifests_have_no_reach_field(tmp_path):
+def test_pool_gates_f7_by_capability_and_f6_manifests_have_no_reach_field(tmp_path):
     pytest.importorskip("torch")
     from ballrain.pool import weights as W
     from ballrain.train import ppo
@@ -375,7 +375,9 @@ def test_pool_refuses_f7_and_f6_manifests_have_no_reach_field(tmp_path):
                 "n_obs": n_obs, "n_act": 9, "args": {"activation": "tanh", "hidden": "16"}, "env_config": ec,
                 "counters": {"update": 1, "steps": 1}}
 
-    with pytest.raises(ValueError, match="f7"):
-        W.export_state(state(FeatureConfig(camera="world", reach=True)), tmp_path / "a", "r-test")
+    # f7: exported with the block's pin; its tasks need clients with the block's capability (the native port)
+    f7 = W.export_state(state(FeatureConfig(camera="world", reach=True)), tmp_path / "a", "r-test")
+    assert f7["features"]["version"] == "f7" and f7["features"]["reach_version"] == RF.reach_version()
+    assert f7["requires"] == [W.reach_capability(RF.reach_version())]
     m = W.export_state(state(FeatureConfig(camera="world")), tmp_path / "b", "r-test")
     assert "reach" not in m["features"] and "reach_version" not in m["features"] and m["features"]["version"] == "f6"

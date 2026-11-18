@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "ballrain/reach_block.h"
 #include "ballrain/branch.h"
 #include "ballrain/geometry.h"
 #include "ballrain/json.h"
@@ -46,6 +47,10 @@ struct FeatureConfig {
     bool dynamic_geometry = true, counters = true, hs_block = true;
     int follower_sources = 4;
     double checkpoint_frames_scale = 10000, clip = 10;
+    // f7 (features.FeatureConfig.reach): the fastreach reach block appended after every other entry (core/reach_block)
+    bool reach = false;
+    std::string reach_version;  // the learner's pin (reach_features.reach_version()); another one is refused
+    std::string reach_dir;      // where the fields files are (the client's install of the task's reach assets)
 
     static FeatureConfig from_json(const Json &j);  // the manifest's "features" (unknown keys: Error)
 };
@@ -53,6 +58,7 @@ struct FeatureConfig {
 // What compute() learned besides the vector (the parts of the Python info dict the env / rewards read)
 struct FeatureInfo {
     bool have_ball = false;
+    std::string reach_key;  // the fields key of this step's reach block ("" without one)
     V3 pos{}, vel{};
     std::optional<Projection> path;  // with a branch: path->s = the earned main-line progress
     std::string path_source;
@@ -115,6 +121,7 @@ private:
     std::shared_ptr<const ReferencePath> path_;
     std::unique_ptr<PathFollower> follower_;
     std::unique_ptr<BranchFollower> branch_;
+    std::unique_ptr<ReachBlock> reach_;
     bool have_key_ = false;
     uint64_t key_tracker_ = 0;
     int key_version_ = -1, key_rows_ = -1;

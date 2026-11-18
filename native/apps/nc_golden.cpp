@@ -86,6 +86,7 @@ int main(int argc, char **argv) {
         FeatureConfig fc = FeatureConfig::from_json(manifest.at("features"));
         fc.path_dir = pdir;
         fc.branch_dir = arg(argc, argv, "--branch-dir", "");  // the ball-type diversion (golden.py --branch-dir)
+        fc.reach_dir = arg(argc, argv, "--reach-dir", "");  // the f7 fields directory (L<nn>-<sha16 of the key>.npz)
         auto recs = read_stream(spath);
         Cursor cur{recs};
         std::unique_ptr<FeatureExtractor> fx;

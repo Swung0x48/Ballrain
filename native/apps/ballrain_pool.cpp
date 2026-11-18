@@ -173,7 +173,7 @@ int main(int argc, char **argv) {
         "  --instances N                 实例数（1–8）\n"
         "  --quiet-file 路径             暂停开关文件（\"\" 表示不用）\n"
         "  --auto-pause on|off           玩 Ballance / 用电池时自动暂停\n"
-        "  --data-dir 目录               数据目录（默认 %USERPROFILE%\\.ballrain）\n"
+        "  --data-dir 目录               数据目录（默认 BALLRAIN_WORK_DIR，没设时 %USERPROFILE%\\.ballrain）\n"
         "  --version                     打印版本号\n"
         "以 --gateway 等给出的设置会保存下来，下次不用再给。\n";
     std::string data_dir = platform::data_dir(), opt_page, snapshot_arg;

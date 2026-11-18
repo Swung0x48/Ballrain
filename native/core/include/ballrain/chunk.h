@@ -41,5 +41,8 @@ struct ChunkData {
 };
 
 Bytes encode_chunk(const ChunkData &c, int zstd_level = 3);
+// one or more zstd frames -> their bytes; Error when the output would exceed max_out (a bomb guard) or on corrupt input
+Bytes zstd_decompress_capped(const Bytes &in, size_t max_out);
+Bytes zstd_compress(const Bytes &in, int level);  // one frame (tests)
 
 }  // namespace ballrain

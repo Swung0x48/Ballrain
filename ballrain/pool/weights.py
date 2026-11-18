@@ -135,6 +135,12 @@ def _file_sha(p: Path) -> str:
 
 # ============================================================================================== export (server)
 
+def reach_capability(version: str) -> str:
+    """The client capability of an f7 reach block version (hello.capabilities / manifest.requires; ID_RE has no dots):
+    fastreach5.2-block1 -> reach_fastreach5_2-block1."""
+    return "reach_" + version.replace(".", "_")
+
+
 def export_state(state: dict, out_dir, run: str) -> dict:
     """A learner checkpoint dict (scripts/train_m2.py save_ckpt) -> <out_dir>/<sha>.npz + <sha>.json; returns the
     manifest. Only allowlisted configuration fields are written, each checked by assert_public."""
@@ -198,12 +204,18 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     else:
         feats.pop("branch_sha256", None)
     feats["path_dir"] = None  # the client installs the asset itself (task assets, sha256 below)
-    # feature version gate: the native client (native/core/src/features.cpp) and the verifier compute f6 only; the f7
-    # reach block (FeatureConfig.reach, ballrain/fastreach.py) has no native port yet (docs/native-client.md)
-    feats.pop("reach_version", None)  # (None for f6)
-    if feats.pop("reach", False) or feats.get("version") == "f7":
-        raise ValueError(f"feature version {feats.get('version')!r}: the pool serves f6 policies only (the f7 reach "
-                         "block needs a native port of ballrain/fastreach.py, docs/native-client.md)")
+    # f7: the reach block (FeatureConfig.reach, pinned by reach_version; the native port is core/reach_block +
+    # core/fastreach). Clients that compute exactly this block declare its capability (the version in the name, so a
+    # later fastreach / block version gates again instead of failing at task time)
+    if feats.get("reach"):
+        from ballrain.reach_features import reach_version
+        if feats.get("reach_version") != reach_version():
+            raise ValueError(f"the run's reach block {feats.get('reach_version')!r} is not this gateway's "
+                             f"{reach_version()!r}: the verifier would compute another block")
+        requires.append(reach_capability(feats["reach_version"]))
+    else:
+        feats.pop("reach", None)
+        feats.pop("reach_version", None)
     rc = ec.get("reward") or {}
     reward = _plain({f.name: rc.get(f.name, getattr(RewardConfig(), f.name)) for f in fields(RewardConfig)})
     for k in UNSUPPORTED_ARGS:

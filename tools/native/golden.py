@@ -172,7 +172,13 @@ def env_config(a, manifest):
     feats["path_dir"] = a.path_dir
     for k in ("far_waypoints", "ref_speed_at"):
         feats[k] = tuple(feats.get(k) or ())
-    return EnvConfig(**env, start_record=None, start_frame=None, curriculum=None, rest_starts=None, p_rest=0.0,
+    bundle = None
+    if feats.get("branch_sha256"):  # the env installs the learner's bundle itself (EnvConfig.branch_assets)
+        if not a.branch_dir:
+            raise SystemExit("the policy follows a route branch: give --branch-dir")
+        from ballrain.branch_assets import read_bundle
+        bundle = read_bundle(int(env["level"]), a.branch_dir)
+    return EnvConfig(**env, branch_assets=bundle, start_record=None, start_frame=None, curriculum=None, rest_starts=None, p_rest=0.0,
                      rehearse_starts=None, p_rehearse=0.0, warm_pool=False, warm_copy=None, trace=False, prefix=None,
                      seed=int(a.ball_seed), copy="nc-py", out_root=str(Path(a.out).resolve() / "runs"),
                      backend="headless", headless=headless_cfg(a, manifest), features=FeatureConfig(**feats),

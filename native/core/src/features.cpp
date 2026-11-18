@@ -1,4 +1,5 @@
 #include "ballrain/features.h"
+#include "ballrain/reach_block.h"
 
 #include <algorithm>
 #include <limits>
@@ -77,17 +78,24 @@ FeatureConfig FeatureConfig::from_json(const Json &j) {
         else if (k == "follower_sources") c.follower_sources = int(v.as_int());
         else if (k == "checkpoint_frames_scale") c.checkpoint_frames_scale = v.as_double();
         else if (k == "clip") c.clip = v.as_double();
-        else if (k == "reach") {
-            // f7 (ballrain/features.py FeatureConfig.reach): the fastreach block has no port here yet
-            if (v.as_bool())
-                throw Error("feature version f7 (the fastreach reach block) is not supported by the native client: "
-                            "it needs a port of ballrain/fastreach.py (docs/native-client.md)");
-        } else throw Error("unknown feature config field " + k);
+        else if (k == "reach") c.reach = v.as_bool();
+        else if (k == "reach_version") c.reach_version = v.is_null() ? "" : v.as_string();
+        else if (k == "reach_dir") c.reach_dir = v.is_null() ? "" : v.as_string();
+        else throw Error("unknown feature config field " + k);
     }
-    if (c.version == "f7")
-        throw Error("feature version f7 (the fastreach reach block) is not supported by the native client: it needs "
-                    "a port of ballrain/fastreach.py (docs/native-client.md)");
-    if (c.version != "f6") throw Error("feature version " + c.version + " is not supported (f6)");
+    // FeatureConfig.__post_init__: reach makes it f7 (pinned by reach_version), an f7 label without the block is f6
+    if (c.reach) {
+        if (c.version != "f6" && c.version != "f7") throw Error("feature version " + c.version + " is not supported (f6 / f7)");
+        c.version = "f7";
+        if (c.reach_version.empty()) c.reach_version = ::ballrain::reach_version();
+        if (c.reach_version != ::ballrain::reach_version())
+            throw Error("FeatureConfig.reach_version " + c.reach_version + ": this client's reach block is " +
+                        ::ballrain::reach_version() + " (the policy was trained on another block: update the client)");
+    } else {
+        if (c.version == "f7") c.version = "f6";
+        c.reach_version.clear();
+    }
+    if (c.version != "f6" && c.version != "f7") throw Error("feature version " + c.version + " is not supported (f6 / f7)");
     if (c.fan_rule != "step" && c.fan_rule != "contact") throw Error("unknown fan_rule " + c.fan_rule);
     if (c.camera != "world" && c.camera != "orient_ref" && c.camera != "orient") throw Error("unknown camera " + c.camera);
     return c;
@@ -224,6 +232,10 @@ FeatureExtractor::FeatureExtractor(FeatureConfig c) : cfg_(std::move(c)) {
     }
     if (!cfg_.far_waypoints.empty()) L.push_back({"far_waypoints", 3 * int(cfg_.far_waypoints.size())});
     if (!cfg_.ref_speed_at.empty()) L.push_back({"ref_speed", int(cfg_.ref_speed_at.size())});
+    if (cfg_.reach) {  // f7: always the last block
+        L.push_back({"reach", N_REACH});
+        reach_ = std::make_unique<ReachBlock>(cfg_.reach_dir, cfg_.body_radius, cfg_.reach_version);
+    }
     int o = 0;
     for (auto &p : L) off_[p.first] = o, o += p.second;
     size_ = o;
@@ -486,6 +498,19 @@ std::vector<float> FeatureExtractor::compute(const GameTracker &t, FeatureInfo *
             }
         }
         if (c.bodies) bodies(t, F, pos, vel);
+        if (reach_ && valid) {
+            // FeatureExtractor.action_quarter: 0 in the world frame, else the Cam_OrientRef quarter turn (Python round:
+            // half to even, then mod 4)
+            int q = 0;
+            if (c.camera != "world" && obs && obs->cams) {
+                const float *m0 = obs->cams->cams[0].matrix;
+                double y = std::atan2(double(m0[6]), double(m0[8]));
+                long long r = std::llrint(y / (PI / 2));  // the default rounding mode: to nearest, ties to even
+                q = int(((r % 4) + 4) % 4);
+            }
+            double raw[N_REACH];
+            reach_->compute(t, geometry(t), pos, vel, q, bt, at("reach"), raw, &info.reach_key);
+        }
     }
     if (c.counters) {
         *at("lives") = t.lives() / 10.0;
