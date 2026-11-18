@@ -254,6 +254,9 @@ class BallanceEnv(gym.Env):
         self._repress = c.world_actions if c.repress_stale_keys is None else bool(c.repress_stale_keys)
         self._ms_since_turn = float("inf")  # game ms since the last camera turn press (camera guard)
         self.camera_violations = 0
+        # pool tasks (ballrain.pool.engine_chain): the digest every session of this env feeds; reset at each launch, so
+        # a process discarded by the hand-over check leaves nothing in it. None = not recorded
+        self.engine_digest = None
 
     # ------------------------------------------------------------------------------ process
     def _out_root(self) -> Path:
@@ -442,6 +445,9 @@ class BallanceEnv(gym.Env):
                           feature_config=self.cfg.features.to_dict(), reward_config=self.cfg.reward_config().to_dict())
         t0 = time.perf_counter()
         sess = AgentSession(sc, self.launcher)
+        if self.engine_digest is not None:
+            self.engine_digest.reset()
+            sess.digest = self.engine_digest
         sess.start()  # closes (kills) its process on failure
         t1 = time.perf_counter()
         rec.meta.mod_version = (sess.hello or {}).get("mod_version", "")

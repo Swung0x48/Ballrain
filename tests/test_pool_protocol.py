@@ -43,10 +43,15 @@ def _chunk(obs, chain, seq, step0, steps, final=False, seed=1, **over):
     return P.encode_chunk(header, arrays), rows
 
 
+def _digests(obs):
+    """Stand-in engine digests of the rows (engine_chain row digests are 32 bytes; their content does not matter here)."""
+    return [hashlib.sha256(b"engine row" + r.astype("<f4").tobytes()).digest() for r in obs]
+
+
 @pytest.fixture
 def task_chunks():
     obs = _task_obs(2 * 32 + 1)
-    chain = P.chain_hashes(obs, P.chain_seed(TID))
+    chain = P.chain_from_digests(_digests(obs), P.chain_seed(TID))
     b0, r0 = _chunk(obs, chain, 0, 0, 32)
     b1, r1 = _chunk(obs, chain, 1, 32, 32, final=True)
     return obs, chain, (b0, r0), (b1, r1)
@@ -99,28 +104,35 @@ def test_chunk_round_trip_and_chain(task_chunks):
     assert c0.arrays["obs"].shape == (33, N_OBS) and c0.arrays["obs_hash"].shape == (33, 32)
     np.testing.assert_array_equal(c0.arrays["obs"], r0.astype(np.float16))
     assert not c0.arrays["rewards"].flags.writeable
-    # continuity and replay check
+    # continuity
     assert P.check_chain_link(c0, c1) is None
-    assert P.verify_chain(c0, r0) is None and P.verify_chain(c1, r1) is None
-    # a replay that differs at task step 32 + 7 is reported there (the chain and the float16 copy)
-    r1b = r1.copy()
-    r1b[7, 100] += 1e-3
-    assert P.verify_chain(c1, r1b) == 32 + 7
-    # a bit flip far below float16 precision still breaks the chain (it is over float32)
-    r1c = r1.copy()
-    r1c[3, 5] = np.nextafter(r1c[3, 5], np.float32(np.inf))
-    assert P.verify_chain(c1, r1c) == 32 + 3
-    # a replay of the wrong length
-    assert P.verify_chain(c1, r1[:-1]) == 32 + 32
-    # chain definition: h(i) = sha256(h(i-1) || float32 row i)
-    assert bytes(chain[0]) == hashlib.sha256(P.chain_seed(TID) + obs[0].astype("<f4").tobytes()).digest()
+    # chain definition (v2): h(i) = sha256(h(i-1) || engine digest of row i), seeded with the task id
+    d = _digests(obs)
+    assert bytes(chain[0]) == hashlib.sha256(P.chain_seed(TID) + d[0]).digest()
+    assert bytes(chain[1]) == hashlib.sha256(bytes(chain[0]) + d[1]).digest()
+    assert P.chain_seed(TID) == hashlib.sha256(b"ballrain-pool/engine-chain/v3\0" + TID.encode()).digest()
+    # the float16 copy is checked with a tolerance against the verifier's own float32 features
+    assert P.obs_close(c1.arrays["obs"][3], r1[3])
+    near = r1[3] + np.float32(5e-5)  # another CPU's rounding: within OBS_TOL beyond the float16 step
+    assert P.obs_close(c1.arrays["obs"][3], near)
+    far = r1[3].copy()
+    far[5] += np.float32(0.05)
+    assert not P.obs_close(c1.arrays["obs"][3], far)
+    # near 10 the float16 spacing is 2**-7: the client's value just above the rounding midpoint lands one float16 step
+    # away from where the verifier's own value (just below it) rounds; tolerated, a few steps are not
+    own = np.full(N_OBS, 9.99608, np.float32)
+    client = np.float16(own + np.float32(4e-5))
+    assert np.float16(own)[0] != client[0] and P.obs_close(client, own)
+    assert not P.obs_close(np.float16(own) + np.float16(0.03), own)
+    assert P.value_close(1.0, 1.0 + 5e-5, P.REWARD_TOL) and not P.value_close(1.0, 1.001, P.REWARD_TOL)
+    assert P.value_close(float("nan"), float("nan"), P.ARC_TOL) and not P.value_close(float("nan"), 1.0, P.ARC_TOL)
 
 
 def test_chain_link_detects_breaks(task_chunks):
     obs, chain, (b0, _), _ = task_chunks
     c0 = P.decode_chunk(b0)
     other = _task_obs(65, seed=7)
-    b1x, _ = _chunk(other, P.chain_hashes(other, P.chain_seed(TID)), 1, 32, 32, final=True)
+    b1x, _ = _chunk(other, P.chain_from_digests(_digests(other), P.chain_seed(TID)), 1, 32, 32, final=True)
     assert P.check_chain_link(c0, P.decode_chunk(b1x)) is not None
     b2, _ = _chunk(obs, chain, 2, 32, 32, final=True)
     assert P.check_chain_link(c0, P.decode_chunk(b2)) == "not consecutive"
@@ -302,7 +314,7 @@ def test_oversize_rejected(task_chunks):
 # ============================================================================================== messages
 
 def _hello(**over):
-    d = dict(client_version="0.1.0", platform="windows",
+    d = dict(client_version="0.3.0", platform="windows",
              engine={"kind": "2002", "sha256": "c" * 64, "version": "1.0"},
              game_files={n: "d" * 64 for n in P.GAME_FILE_LIST_2002}, instances=4)
     d.update(over)
@@ -342,7 +354,7 @@ def test_every_message_kind_has_a_valid_example():
             "greedy": False, "assets": {"starts": "c" * 64, "path": "d" * 64}}
     stats = {"steps_accepted": 1, "steps_pending": 0, "steps_verified": 1, "chunks_accepted": 1, "chunks_rejected": 0}
     examples = {
-        "login_start": dict(client_version="0.1.0"),
+        "login_start": dict(client_version="0.3.0"),
         "login_started": dict(login_id="L" * 16, poll_secret="s" * 32, browser_url="https://example.invalid/pool/login", user_code="ABCD-EF23",
                               expires_in_s=600, poll_s=2),
         "login_poll": dict(login_id="L" * 16, poll_secret="s" * 32),

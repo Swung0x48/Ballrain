@@ -22,12 +22,15 @@ choose them. A zstd section is decompressed with an output bound equal to the ex
 at most 8 MiB; its stored size may not exceed zstd_bound(decoded size) (no padded frames), a raw section's stored size
 is exactly its decoded size.
 
-Observation hash chain (per task, across its chunks): h(-1) = chain_seed(task_id), h(i) = sha256(h(i-1) || raw
-observation i as little-endian float32 bytes), over the task's observation sequence (the observation before each
-step, plus the one after the last step). Chunk seq s carries rows i = step0 .. step0 + steps (steps + 1 rows) and
-chain_prev = h(step0 - 1); so the last row of chunk s is the first row of chunk s + 1. The float16 copy of the
-observations ("obs") is lossy and only for the learner; the chain is over the float32 values the policy saw before
-normalisation, and the verifier's replay must reproduce it bit for bit.
+Engine-state hash chain (chain v3, per task, across its chunks; ballrain.pool.engine_chain): h(-1) =
+chain_seed(task_id), h(i) = sha256(h(i-1) || d_i), d_i = the digest of the canonical engine messages (OBS1 and LVL1
+bytes, address-carrying fields left out) received after row i-1 up to row i, over the task's observation rows (the
+observation before each step, plus the one after the last step). Chunk seq s carries rows i = step0 .. step0 + steps
+(steps + 1 rows) and chain_prev = h(step0 - 1); so the last row of chunk s is the first row of chunk s + 1. The chain
+commits to what the engine sent, not to the features computed from it: the verifier's replay must reproduce the
+engine bytes exactly (the engine is deterministic), while the features, policy outputs and rewards it recomputes
+are compared with tolerances (another CPU / compiler rounds slightly differently). The float16 copy of the
+observations ("obs") is what the learner trains on; it must lie within obs_tolerance of the verifier's own features.
 """
 from __future__ import annotations
 
@@ -43,7 +46,7 @@ import numpy as np
 from .reasons import Reason, payload
 
 PROTOCOL_VERSION = 1
-CHUNK_FORMAT = 1
+CHUNK_FORMAT = 3  # 2: the obs_hash chain over the engine state (chain v2); 3: chain v3 (machine-dependent fields out)
 CHUNK_MAGIC = b"BRPC"
 _PREAMBLE = struct.Struct("<4sHHI")
 
@@ -474,23 +477,46 @@ class Chunk:
 
 
 def chain_seed(task_id: str) -> bytes:
-    return hashlib.sha256(b"ballrain-pool/obs-chain/v1\0" + task_id.encode("utf-8")).digest()
+    from .engine_chain import chain_seed as _seed
+    return _seed(task_id)
 
 
-def obs_bytes(row) -> bytes:
-    """The bytes an observation row contributes to the chain: little-endian float32."""
-    return np.ascontiguousarray(np.asarray(row, dtype="<f4")).tobytes()
-
-
-def chain_hashes(obs32, prev: bytes) -> np.ndarray:
-    """Chain values after each row of obs32 ((R, n_obs) float32), starting from prev: (R, 32) uint8."""
-    o = np.ascontiguousarray(np.asarray(obs32, dtype="<f4"))
-    out = np.zeros((len(o), 32), np.uint8)
+def chain_from_digests(digests, prev: bytes) -> np.ndarray:
+    """Chain values after each row from the rows' engine digests (R x 32 bytes), starting from prev: (R, 32) uint8."""
+    out = np.zeros((len(digests), 32), np.uint8)
     h = bytes(prev)
-    for i in range(len(o)):
-        h = hashlib.sha256(h + o[i].tobytes()).digest()
+    for i, d in enumerate(digests):
+        h = hashlib.sha256(h + bytes(d)).digest()
         out[i] = np.frombuffer(h, np.uint8)
     return out
+
+
+# Tolerances of the verifier's comparisons (docs/pool-prototype.md 10.6): the features, rewards and arc lengths the
+# verifier recomputes may differ from the client's by float rounding of another CPU / compiler / BLAS
+OBS_TOL = 1e-4  # beyond the float16 rounding of the submitted copy: |obs16 - own| <= half a float16 ulp + OBS_TOL x max(1, |own|)
+REWARD_TOL = 1e-4  # |r - own r| <= REWARD_TOL x max(1, |own r|) (rewards and env_rewards)
+ARC_TOL = 1e-3  # |arc - own arc| <= ARC_TOL x max(1, |own arc|); both NaN = equal
+
+
+def obs_tolerance(own32) -> np.ndarray:
+    """Per-entry tolerance of a submitted float16 observation against the verifier's own float32 one."""
+    own = np.abs(np.asarray(own32, np.float64))
+    ulp = np.spacing(np.abs(np.asarray(own32, np.float32)).astype(np.float16)).astype(np.float64)
+    return ulp + OBS_TOL * np.maximum(1.0, own)  # one float16 ulp: the client's value may round to either neighbour
+
+
+def obs_close(sub16, own32) -> bool:
+    sub = np.asarray(sub16, np.float16).astype(np.float64)
+    own = np.asarray(own32, np.float32).astype(np.float64)
+    return bool((np.abs(sub - own) <= obs_tolerance(own32)).all())
+
+
+def value_close(sub, own, tol: float) -> bool:
+    """|sub - own| <= tol x max(1, |own|); NaN only equals NaN."""
+    sub, own = float(sub), float(own)
+    if np.isnan(sub) or np.isnan(own):
+        return bool(np.isnan(sub) and np.isnan(own))
+    return abs(sub - own) <= tol * max(1.0, abs(own))
 
 
 def first_mismatch(a, b) -> int | None:
@@ -735,18 +761,6 @@ def check_chain_link(prev: Chunk, nxt: Chunk) -> str | None:
     if not np.array_equal(nxt.arrays["obs"][0].view(np.uint16), prev.arrays["obs"][-1].view(np.uint16)):
         return "first observation differs from the previous chunk's last"
     return None
-
-
-def verify_chain(chunk: Chunk, obs32, prev: bytes | None = None) -> int | None:
-    """Replay check of one chunk: obs32 = the verifier's own float32 observation rows for the chunk (steps + 1
-    rows); returns the first task step whose chain value or float16 copy differs from the chunk's, or None."""
-    h = chunk.header
-    p = bytes.fromhex(h["chain_prev"]) if prev is None else prev
-    mine = chain_hashes(obs32, p)
-    i = first_mismatch(mine, chunk.arrays["obs_hash"])
-    j = first_mismatch(np.asarray(obs32, "<f4").astype("<f2").view(np.uint16), chunk.arrays["obs"].view(np.uint16))
-    bad = [x for x in (i, j) if x is not None]
-    return h["step0"] + min(bad) if bad else None
 
 
 # ============================================================================================== game files

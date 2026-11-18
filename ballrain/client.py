@@ -146,6 +146,9 @@ class AgentSession:
         self.n_prefix_obs = 0
         self.timing: dict = {}  # perf_counter stamps: launch, spawned, hello, first_obs
         self.backend = getattr(self.launcher, "backend", "retail")  # "retail" | "headless"
+        # pool tasks: ballrain.pool.engine_chain.EngineDigest fed with every OBS1 message and every level-message read
+        # (the engine-state hash chain); None = not recorded
+        self.digest = None
 
     # lifecycle ----------------------------------------------------------------------------
     def start(self) -> P.Observation:
@@ -202,6 +205,8 @@ class AgentSession:
                 if h["mod_state"] == P.ModState.ERROR:
                     raise SessionError(f"mod error (last_error {h['last_error']}); see ModLoader.log")
                 return None
+            if self.digest is not None:
+                self.digest.obs(data)
             obs = P.parse_observation(data)
             self._ingest(obs)
             if obs.flags & P.OBS_PREFIX and not obs.final and not self.ended:
@@ -251,7 +256,10 @@ class AgentSession:
         p = self.paths["levelmsg"]
         if not p.exists() or (self._level_loaded and not full):
             return
-        lm, _ = P.parse_level_message(p.read_bytes())
+        data = p.read_bytes()
+        lm, _ = P.parse_level_message(data)
+        if self.digest is not None:
+            self.digest.level(b"F", data)
         self.tracker.merge_level(lm)
         self._level_loaded = True
 
@@ -261,6 +269,8 @@ class AgentSession:
             return
         data = p.read_bytes()
         msgs, used = P.parse_level_stream(data[self._inc_pos:])
+        if self.digest is not None:
+            self.digest.level(b"I", data[self._inc_pos:self._inc_pos + used])
         for lm in msgs:
             self.tracker.merge_level(lm)
         self._inc_pos += used

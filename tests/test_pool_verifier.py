@@ -21,7 +21,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from test_pool_gateway import ENGINE_SHA, GAME, PUBLIC as PUBLIC_, Gw  # noqa: E402
 
 FORGERS = {f"forger_{i}": {"id": 2000 + i, "username": f"forger{i}", "nickname": f"伪造者{i}", "joined_days_ago": 400,
-                            "is_email_confirmed": True, "comment_count": 9} for i in range(8)}
+                            "is_email_confirmed": True, "comment_count": 9} for i in range(10)}
 
 
 @pytest.fixture(scope="module")
@@ -236,10 +236,50 @@ FORGERIES = {
     "logp": (lambda j: {"logp": lambda a: _set(a, j, a[j] - 0.5)}, Reason.REPLAY_LOGP_MISMATCH, 0),
     "value": (lambda j: {"values": lambda a: _set(a, j, a[j] + 3.0)}, Reason.REPLAY_VALUE_MISMATCH, 0),
     "action": (lambda j: {"actions": lambda a: _set(a, j, (int(a[j]) + 1) % 9)}, Reason.REPLAY_LOGP_MISMATCH, 0),
-    # the float16 copy and the chain recomputed from the forged row on (the gateway's checks all pass)
+    # the float16 copy of one row changed (the engine-state chain does not cover it: the gateway's checks all pass);
+    # the verifier compares it with its own features
     "observation": (lambda j: "obs", Reason.REPLAY_MISMATCH, 1),
+    # the chain recomputed from a forged row digest on (it no longer links to the honest next chunk)
+    "engine_state": (lambda j: "chain", Reason.REPLAY_MISMATCH, 1),
     "flags": (lambda j: {"flags": lambda a: _set(a, j, 0 if a[j] else P.FLAG_TERMINATED)}, Reason.REPLAY_MISMATCH, 0),
 }
+
+
+def test_float_noise_of_another_cpu_is_tolerated(pool, tmp_path):
+    """Chain v2: a client on another CPU / compiler (the native C++ client) rounds its features, policy outputs and
+    rewards slightly differently. Such noise in every float array of every chunk passes the verifier (the
+    engine-state chain is untouched); the forgery tests below show what does not."""
+    pl = Player(pool, "forger_9", tmp_path)
+    t = pl.task()
+    chunks, _, _ = pl.play(t)
+
+    def noisy(data, k):
+        rng = np.random.default_rng(k)
+        o = lambda a: (np.asarray(a, np.float32) + rng.uniform(-3e-5, 3e-5, np.shape(a)).astype(np.float32)).astype(np.float16)  # noqa: E731
+        f = lambda rel: (lambda a: (np.asarray(a, np.float64) * (1 + rng.uniform(-rel, rel, np.shape(a)))).astype(np.float32))  # noqa: E731
+        lp = lambda a: np.minimum(np.asarray(a, np.float32) + np.float32(2e-5), np.float32(0))  # noqa: E731
+        return reseal(data, obs=o, rewards=f(5e-5), env_rewards=f(5e-5), values=f(5e-5), logp=lp, arc=f(1e-6))
+    # the first row of chunk s + 1 must still equal the last row of chunk s (the gateway's link check)
+    out, last = [], None
+    for k, c in enumerate(chunks):
+        n = P.decode_chunk(noisy(c, k))
+        if last is not None:
+            h = {kk: v for kk, v in n.header.items() if kk not in ("arrays", "protocol", "type")}
+            arrays = {kk: np.array(v) for kk, v in n.arrays.items()}
+            arrays["obs"][0] = last
+            out.append(P.encode_chunk(h, arrays))
+        else:
+            out.append(P.encode_chunk({kk: v for kk, v in n.header.items() if kk not in ("arrays", "protocol", "type")},
+                                      {kk: np.array(v) for kk, v in n.arrays.items()}))
+        last = P.decode_chunk(out[-1]).arrays["obs"][-1].copy()
+    assert any(P.decode_chunk(a).arrays["obs"].tobytes() != P.decode_chunk(b).arrays["obs"].tobytes()
+               for a, b in zip(out, chunks))
+    for c in out:
+        assert pl.send(c).status == 200
+    assert pool.verifier.run_once() == 1
+    rows = pool.store.chunks(t.task_id)
+    assert all(r["verify"] == "passed" for r in rows), [(r["seq"], r["verify"], r["reason"]) for r in rows]
+    assert pl.me()["token_state"] == "active"
 
 
 def _set(a, j, v):
@@ -250,17 +290,19 @@ def _set(a, j, v):
 
 def _forge(data: bytes, kind: str, j: int) -> bytes:
     spec = FORGERIES[kind][0](j)
-    if spec != "obs":
+    if spec not in ("obs", "chain"):
         return reseal(data, **spec)
-    # row j + 1 (the observation after step j; not the chunk's first or last row, which the link check compares):
-    # the float16 copy changed and the chain recomputed from that row on, so every gateway check still passes
+    # row j + 1 (the observation after step j; not the chunk's first or last row, which the link check compares)
     c = P.decode_chunk(data)
     h = {k: v for k, v in c.header.items() if k not in ("arrays", "protocol", "type")}
     arrays = {k: np.array(v) for k, v in c.arrays.items()}
-    o32 = arrays["obs"].astype("<f4")
-    o32[j + 1, 3] += 0.75
-    arrays["obs"] = o32.astype("<f2")
-    arrays["obs_hash"][j + 1:] = P.chain_hashes(o32[j + 1:], bytes(c.arrays["obs_hash"][j]))
+    if spec == "obs":  # the float16 copy changed far beyond the tolerance
+        o32 = arrays["obs"].astype("<f4")
+        o32[j + 1, 3] += 0.75
+        arrays["obs"] = o32.astype("<f2")
+    else:  # another engine state from row j + 1 on: the chain recomputed over forged row digests
+        n = len(arrays["obs_hash"]) - (j + 1)
+        arrays["obs_hash"][j + 1:] = P.chain_from_digests([b"\x01" * 32] * n, bytes(c.arrays["obs_hash"][j]))
     return P.encode_chunk(h, arrays)
 
 
@@ -277,7 +319,7 @@ def test_forged_chunks_are_caught_and_the_account_revoked(pool, tmp_path, kind):
     j = 5
     forged = _forge(chunks[s], kind, j)
     later = chunks[s + 1:]
-    if kind == "observation" and later:
+    if kind == "engine_state" and later:
         # a recomputed chain no longer links to the honest next chunk: the gateway refuses that one already
         for x in chunks[:s] + [forged]:
             assert pl.send(x).status == 200
@@ -482,22 +524,22 @@ def test_a_trajectory_resigned_onto_another_task_is_caught(pool, tmp_path, monke
     monkeypatch.setattr(pool.policies, "pick_start", lambda pub: k)
     tb = pl.task()
     assert tb.start_frame == k and tb.sample_seed != ta.sample_seed
-    rows32 = []  # the attacker keeps the float32 rows of its honest run (the chunk only has float16 copies)
-    real = P.chain_hashes
+    rows = []  # the attacker keeps the engine row digests of its honest run (the chunk only has the chain values)
+    real = P.chain_from_digests
 
-    def keep(obs32, prev):
-        rows32.append(np.array(obs32, "<f4"))
-        return real(obs32, prev)
-    monkeypatch.setattr(P, "chain_hashes", keep)
+    def keep(digests, prev):
+        rows.append([bytes(d) for d in digests])
+        return real(digests, prev)
+    monkeypatch.setattr(P, "chain_from_digests", keep)
     chunks, _, _ = pl.play(ta)
-    monkeypatch.setattr(P, "chain_hashes", real)
-    assert len(rows32) == len(chunks)
+    monkeypatch.setattr(P, "chain_from_digests", real)
+    assert len(rows) == len(chunks)
     prev = P.chain_seed(tb.task_id)
-    for data, o32 in zip(chunks, rows32):
+    for data, dg in zip(chunks, rows):
         c = P.decode_chunk(data)
         h = {kk: v for kk, v in c.header.items() if kk not in ("arrays", "protocol", "type")}
         arrays = {kk: np.array(v) for kk, v in c.arrays.items()}
-        arrays["obs_hash"] = P.chain_hashes(o32, prev)
+        arrays["obs_hash"] = P.chain_from_digests(dg, prev)
         h.update(task_id=tb.task_id, chain_prev=prev.hex())
         prev = bytes(arrays["obs_hash"][-2])
         assert pl.send(P.encode_chunk(h, arrays)).status == 200

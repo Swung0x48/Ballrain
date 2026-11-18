@@ -19,7 +19,7 @@ from pathlib import Path
 from . import protocol as P
 from .reasons import TOKEN_FATAL, Reason
 
-CLIENT_VERSION = "0.1.0"
+CLIENT_VERSION = "0.3.0"  # 0.2: chunk format 2 (the engine-state chain); 0.3: format 3 (chain v3)
 MAX_RESPONSE = P.MAX_JSON_BYTES
 MAX_MANIFEST = 256 * 1024
 MAX_DOWNLOAD = 64 * 1024 * 1024

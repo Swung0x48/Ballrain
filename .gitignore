@@ -16,3 +16,6 @@ __pycache__/
 /BallrainIO/build/
 # dedicated game copies (proprietary game files, never committed)
 /runtime/
+
+# native client build trees (native/build_win.cmd, cmake -B build/...)
+/build/

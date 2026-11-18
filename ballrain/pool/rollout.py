@@ -23,9 +23,12 @@ Rules that differ from the worker, because a task is one process that the verifi
   the same order, so the verifier reproduces the controller's chunks; tests/test_pool_verifier.py checks the two
   against each other.
 
-Per step the chunk carries: action, training reward (float32, bit-exact on replay), behaviour log-prob and value
-(float32, checked with a tolerance: different CPUs / BLAS round differently), flags, and the optional env reward,
-sector, frames, IGT and arc length (bit-exact on replay).
+Per step the chunk carries: action, training reward, behaviour log-prob and value, flags, and the optional env
+reward, sector, frames, IGT and arc length; per row the float16 observation and the engine-state chain value
+(ballrain.pool.engine_chain). The replay checks the chain bit for bit (the engine is deterministic) and everything
+computed from the engine state -- features, log-prob, value, rewards, arc length -- with tolerances (the client may
+be the native C++ client on another CPU: protocol.OBS_TOL / REWARD_TOL / ARC_TOL, LOGP_TOL, VALUE_TOL); flags, end,
+sector, frames and IGT (engine integers / the engine's own SR double sum) bit for bit.
 """
 from __future__ import annotations
 
@@ -37,6 +40,7 @@ from pathlib import Path
 import numpy as np
 
 from . import protocol as P
+from .engine_chain import EngineDigest
 from .reasons import Reason
 from .sampling import action_consistent, sample_u
 
@@ -111,6 +115,7 @@ class StepResult:
     arc: float  # nan: no projection
     next_obs: np.ndarray  # the next observation row (respawn observation after a death)
     end: str | None  # set when the task ended with this step (protocol.END_REASONS)
+    digest: bytes = b""  # engine digest of the next row (engine_chain): every engine message since the previous row
 
 
 class TaskRunner:
@@ -131,6 +136,8 @@ class TaskRunner:
             self.fx_info = fi
             return o, fi
         env.fx.compute = compute
+        env.engine_digest = EngineDigest()
+        self.digest = b""  # engine digest of the current row
         sp = self.spec
         self.stall_all = int(1000 * sp.stall_s / sp.env.delta_ms)
         self.stall_rsp = int(1000 * (sp.respawn_stall_s or sp.stall_s) / sp.env.delta_ms)
@@ -156,6 +163,7 @@ class TaskRunner:
         except Exception as e:  # noqa: BLE001  launch failure, hand-over mismatch, crashed engine
             raise EngineFailure(f"start: {type(e).__name__}: {str(e)[:300]}") from e
         self.obs, self.info = np.asarray(obs, np.float32), info
+        self.digest = self.env.engine_digest.take()
         self.f_hand = int(info.get("frames_done") or 0)
         self._new_episode(info)
         return self.obs
@@ -260,9 +268,11 @@ class TaskRunner:
         arc = float(p["s"]) if p.get("s") is not None else float("nan")
         self.end = task_end or None
         self.obs = nxt
+        self.digest = env.engine_digest.take()
         return StepResult(action=a, reward=np.float32(r), env_reward=np.float32(env_r), flags=int(flags),
                           frames=int(frames), sector=int(info2.get("sector") or 0),
-                          sr_ms=float(info2.get("sr_ms") or 0.0), arc=arc, next_obs=nxt, end=self.end)
+                          sr_ms=float(info2.get("sr_ms") or 0.0), arc=arc, next_obs=nxt, end=self.end,
+                          digest=self.digest)
 
     def close(self):
         try:
@@ -291,12 +301,14 @@ class ChunkAssembler:
         self.seq = 0
         self.step0 = 0
         self.rows: list = []
+        self.digests: list = []
         self.values: list = []
         self.cols = {k: [] for k in ("actions", "rewards", "logp", "flags") + self.OPTIONAL}
         self.wall0 = None
 
-    def begin(self, obs, value: float):
+    def begin(self, obs, value: float, digest: bytes):
         self.rows = [np.asarray(obs, "<f4")]
+        self.digests = [bytes(digest)]
         self.values = [float(value)]
 
     def add(self, logp: float, st: StepResult, next_value: float):
@@ -311,6 +323,7 @@ class ChunkAssembler:
         c["sr_ms"].append(st.sr_ms)
         c["arc"].append(st.arc)
         self.rows.append(np.asarray(st.next_obs, "<f4"))
+        self.digests.append(bytes(st.digest))
         self.values.append(float(next_value))
 
     @property
@@ -326,7 +339,7 @@ class ChunkAssembler:
         if T == 0:
             raise ValueError("no steps to cut")
         rows = np.stack(self.rows).astype("<f4")
-        hashes = P.chain_hashes(rows, self.prev)
+        hashes = P.chain_from_digests(self.digests, self.prev)
         c = self.cols
         flags = np.asarray(c["flags"], np.uint8)
         if end is not None and not flags[-1]:
@@ -346,7 +359,7 @@ class ChunkAssembler:
         self.prev = bytes(hashes[-2])
         self.seq += 1
         self.step0 += T
-        self.rows, self.values = [self.rows[-1]], [self.values[-1]]
+        self.rows, self.digests, self.values = [self.rows[-1]], [self.digests[-1]], [self.values[-1]]
         self.cols = {k: [] for k in self.cols}
         return data
 
@@ -364,7 +377,7 @@ def sample_task(runner: TaskRunner, policy, rng: np.random.Generator | None, on_
     asm = ChunkAssembler(task, policy.n_obs, policy.n_act, policy.sha)
     obs = runner.start()
     x = policy.normalize(obs)
-    asm.begin(obs, float(policy.value(x)))
+    asm.begin(obs, float(policy.value(x)), runner.digest)
     end = None
     def _stop():
         if stop():
@@ -429,10 +442,13 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
             return Mismatch(Reason.REPLAY_MISMATCH, s, step0, "chunk does not continue the replay")
         for j in range(T + 1):
             i = step0 + j
-            # ---- observation row i (chain value and float16 copy)
+            # ---- observation row i: the engine-state chain value (exact) and the float16 copy (within tolerance of
+            # the features this replay computed itself)
             r32 = np.asarray(row, "<f4")
-            hv = hashlib.sha256(prev + r32.tobytes()).digest()
-            if hv != bytes(A["obs_hash"][j]) or not _bits_equal(r32.astype("<f2"), A["obs"][j]):
+            hv = hashlib.sha256(prev + runner.digest).digest()
+            if hv != bytes(A["obs_hash"][j]):
+                return Mismatch(Reason.REPLAY_MISMATCH, s, i, "engine state")
+            if not P.obs_close(A["obs"][j], r32):
                 return Mismatch(Reason.REPLAY_MISMATCH, s, i, "observation")
             x = policy.normalize(r32)
             v = float(policy.value(x))
@@ -455,7 +471,7 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
             # a stop / deadline the client declared after this step: the runner ends the task there too (no respawn)
             st = runner.step(a, stop=h["end"] if is_last and h["end"] in ("stopped", "deadline") else None)
             # ---- the step's results
-            if not _bits_equal(np.float32(st.reward), A["rewards"][j]):
+            if not P.value_close(A["rewards"][j], np.float32(st.reward), P.REWARD_TOL):
                 return Mismatch(Reason.REPLAY_REWARD_MISMATCH, s, i, "reward")
             sub_flag = int(A["flags"][j])
             if is_last and h["end"] == "error":  # the client's engine failed on the NEXT step: this one went on
@@ -468,10 +484,14 @@ def replay_task(runner: TaskRunner, policy, chunks: list, upto: int | None = Non
                     return Mismatch(Reason.REPLAY_MISMATCH, s, i, f"end {h['end']} != replay {st.end}")
             if not is_last and st.end is not None:
                 return Mismatch(Reason.REPLAY_MISMATCH, s, i, f"the replay ended ({st.end})")
-            for name, got in (("env_rewards", np.float32(st.env_reward)), ("sector", np.uint8(min(max(st.sector, 0), 255))),
+            for name, got in (("sector", np.uint8(min(max(st.sector, 0), 255))),
                               ("frames", np.dtype("<u2").type(min(max(st.frames, 0), 65535))),
-                              ("sr_ms", np.float64(st.sr_ms)), ("arc", np.float32(st.arc))):
+                              ("sr_ms", np.float64(st.sr_ms))):
                 if name in A and not _bits_equal(np.asarray(got, A[name].dtype), A[name][j]):
                     return Mismatch(Reason.REPLAY_MISMATCH, s, i, name)
+            if "env_rewards" in A and not P.value_close(A["env_rewards"][j], np.float32(st.env_reward), P.REWARD_TOL):
+                return Mismatch(Reason.REPLAY_MISMATCH, s, i, "env_rewards")
+            if "arc" in A and not P.value_close(A["arc"][j], np.float32(st.arc), P.ARC_TOL):
+                return Mismatch(Reason.REPLAY_MISMATCH, s, i, "arc")
             row = st.next_obs
     return None

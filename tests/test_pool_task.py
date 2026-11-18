@@ -151,7 +151,7 @@ def test_hash_game_files(tmp_path):
     assert h["3D Entities/"] == P.tree_digest({"sub/x.nmo": T.file_sha256(root / "3D Entities" / "sub" / "x.nmo")})
     h2 = T.hash_game_files(root, "2002")
     assert h2["BuildingBlocks/physics_RT.dll"] == "0" * 64
-    P.validate("hello", P.make_message("hello", client_version="0.1.0", platform="linux",
+    P.validate("hello", P.make_message("hello", client_version="0.3.0", platform="linux",
                                        engine={"kind": "x87soft", "sha256": "c" * 64, "version": "1"},
                                        game_files=h, instances=2))
     with pytest.raises(ValueError):
