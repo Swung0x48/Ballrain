@@ -172,6 +172,11 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     fc = dict(ec.get("features") or {})
     feats = _plain({f.name: fc.get(f.name, getattr(FeatureConfig(), f.name)) for f in fields(FeatureConfig)})
     feats["path_dir"] = None  # the client installs the asset itself (task assets, sha256 below)
+    # feature version gate: the native client (native/core/src/features.cpp) and the verifier compute f6 only; the f7
+    # reach block (FeatureConfig.reach, ballrain/fastreach.py) has no native port yet (docs/native-client.md)
+    if feats.pop("reach", False) or feats.get("version") == "f7":
+        raise ValueError(f"feature version {feats.get('version')!r}: the pool serves f6 policies only (the f7 reach "
+                         "block needs a native port of ballrain/fastreach.py, docs/native-client.md)")
     rc = ec.get("reward") or {}
     reward = _plain({f.name: rc.get(f.name, getattr(RewardConfig(), f.name)) for f in fields(RewardConfig)})
     ws = {f.name: f.default for f in fields(WorkerSpec) if f.name in ROLLOUT_FIELDS}

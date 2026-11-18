@@ -2142,15 +2142,162 @@ class FastReach:
         return fr
 
     def save(self, path) -> None:
+        """Atomic: written to a unique temporary file next to `path`, then renamed over it, so a reader (another
+        worker on the same host) never sees a partial file. When the rename fails (Windows: the target is open in
+        another process) and `path` already exists, the existing file is kept (a concurrent writer of the same key
+        produced it)."""
         import json
-        np.savez(path, info=np.array(json.dumps(self.info, default=float)), **{k: getattr(self, k) for k in self.ARRAYS})
+        import uuid
+        path = Path(path)
+        tmp = path.with_name(f".{path.stem}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp.npz")
+        try:
+            np.savez(tmp, info=np.array(json.dumps(self.info, default=float)),
+                     **{k: getattr(self, k) for k in self.ARRAYS})
+            for attempt in range(20):
+                try:
+                    os.replace(tmp, path)
+                    return
+                except PermissionError:
+                    if attempt == 19:
+                        if path.is_file():
+                            return
+                        raise
+                    time.sleep(0.1)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     @classmethod
     def load(cls, path) -> "FastReach":
         import json
-        z = np.load(path)
-        info = json.loads(str(z["info"])) if "info" in z.files else {}
-        return cls({k: z[k] for k in cls.ARRAYS}, info)
+        with np.load(path) as z:  # closed here: an open handle would block another process's rename on Windows
+            info = json.loads(str(z["info"])) if "info" in z.files else {}
+            arrays = {k: z[k] for k in cls.ARRAYS}
+        return cls(arrays, info)
+
+    # ------------------------------------------------------------------------------- fields keyed by static geometry
+    @staticmethod
+    def zone_boxes(level, exclude_names=()) -> list:
+        """Rest-pose boxes [(lo, hi)] of the physicalized non-fixed entities (moving platforms, boxes, bridges, ball
+        pieces) of a state.LevelData, stoppers and the entities named in exclude_names left out (e.g. the player
+        balls: their Physicalize record is where the ball was transformed or respawned, not an obstacle)."""
+        from .state import G_STOPPER
+        ex = set(exclude_names)
+        out = []
+        for ck, p in level.phys_by_ent.items():
+            if p.unphysicalize or p.fixed or level.in_group(ck, G_STOPPER) or level.name(ck) in ex:
+                continue
+            bb = level.mesh_world_bbox(ck)
+            if bb is not None:
+                out.append(bb)
+        return out
+
+    def set_unknown_boxes(self, boxes) -> None:
+        """Replace the unknown zones (rest-pose boxes [(lo, hi)], inflated by 4 as in build). The static fields do
+        not depend on them, so one build serves every moving-body state of the same static geometry."""
+        self.uzones = np.array([np.r_[np.asarray(lo, np.float64) - 4.0, np.asarray(hi, np.float64) + 4.0]
+                                for lo, hi in boxes], np.float64).reshape(-1, 6)
+
+    @classmethod
+    def fields_key(cls, tracker, static_key: str | None = None) -> str:
+        """Cache key of the static fields only (static geometry hash, death boxes, build parameters, physics constants,
+        BUILD_VERSION): cache_key without moving-body zones. tracker_key also hashes the moving-body boxes, which change
+        at every sector start, transformation and respawn (L2 TAS: 7 distinct tracker keys over 2 static geometries)."""
+        lvl = tracker.level
+        return cls.cache_key(static_key if static_key is not None else lvl.static_key(), lvl.depth, ())
+
+    @classmethod
+    def fields_for_tracker(cls, tracker, cache_dir=None, static_key: str | None = None, lock_timeout_s: float = 120.0,
+                           verbose: bool = False) -> "FastReach":
+        """Static fields of the tracker's current geometry, cached content-addressed in
+        <cache_dir>/L<nn>-<sha16 of fields_key>.npz (default <runtime>/fastreach, or $BALLRAIN_FASTREACH_DIR), with
+        no unknown zones (set them with set_unknown_boxes). Safe when many processes on one host need the same file
+        at once: one builds under a lock file (O_EXCL; a lock older than lock_timeout_s is taken over), the others
+        wait and load its result; the file is written atomically (save). Identical keys on every host: the key is a
+        hash of the level content, not of the host or the time."""
+        import hashlib
+        from .features import level_geometry
+        key = cls.fields_key(tracker, static_key)
+        if cache_dir is None:
+            env = os.environ.get("BALLRAIN_FASTREACH_DIR")
+            if env:
+                cache_dir = Path(env)
+            else:
+                from . import instances
+                cache_dir = instances.runtime_dir() / "fastreach"
+        cache_dir = Path(cache_dir)
+        name = f"L{int(getattr(tracker, 'level_no', 0) or 0):02d}-{hashlib.sha256(key.encode()).hexdigest()[:16]}"
+        path = cache_dir / f"{name}.npz"
+
+        def try_load():
+            if not path.is_file():
+                return None
+            try:
+                fr = cls.load(path)
+            except Exception:  # noqa: BLE001 - unreadable (should not happen with atomic writes): rebuild
+                return None
+            return fr if fr.info.get("key") == key else None
+
+        fr = try_load()
+        if fr is not None:
+            return fr
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        lock = cache_dir / f"{name}.lock"
+        t0 = time.time()
+        while True:
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                fr = try_load()
+                if fr is not None:
+                    return fr
+                try:
+                    stale = time.time() - lock.stat().st_mtime > lock_timeout_s
+                except FileNotFoundError:
+                    continue
+                if stale:
+                    try:
+                        lock.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                time.sleep(0.25)
+                continue
+            # heartbeat: the lock's mtime is refreshed while this process builds, so a lock left by a killed
+            # process (a worker restart during a build) goes stale after lock_timeout_s, a live build never does
+            import threading
+            done = threading.Event()
+
+            def beat():
+                while not done.wait(5.0):
+                    try:
+                        os.utime(lock)
+                    except OSError:
+                        pass
+            hb = threading.Thread(target=beat, daemon=True)
+            try:
+                os.write(fd, f"{os.getpid()}\n".encode())
+                os.close(fd)
+                hb.start()
+                fr = try_load()  # built by another process between our check and the lock
+                if fr is None:
+                    lvl = tracker.level
+                    geo = level_geometry(tracker)
+                    fr = cls.build(geo.tris, geo.rails, lvl.depth, (), verbose=verbose)
+                    fr.info["key"] = key
+                    fr.info["wait_s"] = time.time() - t0
+                    fr.info["built_by"] = os.getpid()
+                    fr.save(path)
+                return fr
+            finally:
+                done.set()
+                try:
+                    lock.unlink()
+                except FileNotFoundError:
+                    pass
 
     def sizes(self) -> dict:
         """Bytes per component (in memory = on disk, uncompressed npz)."""

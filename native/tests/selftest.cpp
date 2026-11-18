@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "ballrain/features.h"
 #include "ballrain/geometry.h"
 #include "ballrain/json.h"
 #include "ballrain/policy.h"
@@ -50,6 +51,17 @@ int main() {
         threw = true;
     }
     CHECK(threw);
+    // feature version gate: f6 (reach false or absent) parses, f7 / reach true is refused (no fastreach port)
+    FeatureConfig::from_json(Json::parse(R"({"version":"f6","reach":false})"));
+    for (const char *f7 : {R"({"version":"f6","reach":true})", R"({"version":"f7"})"}) {
+        bool refused = false;
+        try {
+            FeatureConfig::from_json(Json::parse(f7));
+        } catch (const Error &e) {
+            refused = std::string(e.what()).find("fastreach") != std::string::npos;
+        }
+        CHECK(refused);
+    }
     // sha256
     CHECK(Sha256::hex("abc", 3) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     std::string mil(1000000, 'a');

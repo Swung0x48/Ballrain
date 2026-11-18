@@ -202,7 +202,14 @@ class BallanceEnv(gym.Env):
             raise ValueError(f"launcher backend {getattr(launcher, 'backend', 'retail')!r} != EnvConfig.backend "
                              f"{self.cfg.backend!r}")
         self.launcher = launcher
-        self.fx = FeatureExtractor(self.cfg.features)
+        fc = self.cfg.features
+        if fc.reach and (fc.camera == "world") != bool(self.cfg.world_actions):
+            # the reach block's 8 directions are the arrow keys under FeatureExtractor.action_quarter: world actions
+            # need the world frame (quarter 0), camera-relative keys a camera frame (the Cam_OrientRef quarter)
+            raise ValueError(f"FeatureConfig.reach with camera {fc.camera!r} and world_actions={self.cfg.world_actions}: "
+                             "the reach directions would not be the action directions (world actions need "
+                             "camera='world', camera-relative actions a camera frame)")
+        self.fx = FeatureExtractor(fc)
         self.reward = Reward(self.cfg.reward_config())
         if self.cfg.esc_frames < 3:
             raise ValueError("esc_frames must be >= 3 (Esc must be released, the toggle lands 2 frames later)")

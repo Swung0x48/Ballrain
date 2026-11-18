@@ -206,6 +206,10 @@ def parse(argv=None):
     p.add_argument("--hs-block", action="store_true", help="keep the HS feature block (off for SR)")
     p.add_argument("--far-waypoints", default="", help="f6: line points this far ahead in arc units, e.g. 20,30,45")
     p.add_argument("--ref-speed-at", default="", help="f6: reference speed at these arc offsets, e.g. 0,15,30")
+    p.add_argument("--reach", action="store_true",
+                   help="f7: append the fastreach reach block (FeatureConfig.reach, ballrain.reach_features; 59 entries) "
+                        "after every other observation entry; a checkpoint without it is grown with zero input weights "
+                        "(--resume / --init-from). Sticky: a run resumed from a reach checkpoint keeps it. Needs numba")
     p.add_argument("--world-actions", action="store_true",
                    help="world-frame directional features (FeatureConfig camera=world) and world-direction actions")
     p.add_argument("--reward", default="{}", help="RewardConfig overrides as JSON")
@@ -343,7 +347,7 @@ def make_env_config(a, out_root: Path):
         raise SystemExit(f"--path-dir {a.path_dir}: no reference line {asset}")
     fc = FeatureConfig(hs_block=a.hs_block, camera="world" if a.world_actions else "orient_ref",
                        far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=path_dir,
-                       path_sha256=file_sha256(asset) if asset.is_file() else None)
+                       path_sha256=file_sha256(asset) if asset.is_file() else None, reach=bool(getattr(a, "reach", False)))
     cu = {"start_back": a.start_back, "step": a.cu_step, "band": a.cu_band, "recent": a.cu_recent,
           "advance_at": a.advance_at, "min_episodes": a.min_episodes, "p_level_start": a.p_level_start}
     hl = None
@@ -405,6 +409,7 @@ def main(argv=None) -> int:
         saved = ck["args"]
         for k in ("hidden", "activation", "action_repeat", "hs_block", "world_actions"):  # architecture / observation: keep
             setattr(a, k, saved.get(k, getattr(a, k)))
+        a.reach = bool(a.reach or saved.get("reach"))  # on stays on (the observation never shrinks); off -> on grows it
     else:
         ck = None
     (run_dir / ("config.json" if not a.resume else f"config.resume-{time.strftime('%Y%m%d-%H%M%S')}.json")).write_text(
@@ -446,32 +451,21 @@ def main(argv=None) -> int:
     counters = {"update": 0, "steps": 0, "frames": 0, "episodes": 0, "runs": 0, "wall_s": 0.0, "finish_runs": 0,
                 "dropped_chunks": 0, "worker_restarts": 0}
     best = {"sr_ms_k0": None, "sr_ms_any": None}
-    def load_policy(src: dict) -> bool:
-        """Model + observation statistics from a checkpoint; a checkpoint with fewer observation entries (the f6
-        look-ahead block appended at the end) is extended with zero input weights and neutral statistics (mean 0,
-        var 1), so the policy and value are unchanged at the switch. Returns True when it was extended."""
-        sd, n_old = src["model"], int(src["n_obs"])
-        st = src["rms"]
-        if n_old == n_obs:
-            model.load_state_dict(sd)
-            rms.load_state_dict(st)
-            return False
-        if n_old > n_obs:
-            raise SystemExit(f"checkpoint has {n_old} observation entries, this config {n_obs}")
-        sd = dict(sd)
-        for k in ("pi.0.weight", "v.0.weight"):
-            w = sd[k]
-            sd[k] = torch.cat([w, torch.zeros(w.shape[0], n_obs - n_old, dtype=w.dtype)], 1)
-        model.load_state_dict(sd)
-        rms.load_state_dict({"mean": np.r_[np.asarray(st["mean"]), np.zeros(n_obs - n_old)],
-                             "var": np.r_[np.asarray(st["var"]), np.ones(n_obs - n_old)], "count": st["count"]})
-        log.msg(f"policy extended from {n_old} to {n_obs} observation entries (zero input weights)")
-        return True
+    from ballrain.train.grow import GrowError, load_grown
+    new_features = asdict(env_cfg)["features"]
+
+    def load_policy(src: dict, load_opt: bool) -> bool:
+        """Model, observation statistics and (load_opt) optimiser state from a checkpoint; a checkpoint with fewer
+        observation entries (a block appended at the end: f6 look-ahead, f7 reach) is grown with zero input weights,
+        zero Adam moments for the new columns and neutral statistics (mean 0, var 1), so the policy and value are
+        unchanged at the switch (ballrain.train.grow). Returns True when it was grown."""
+        try:
+            return load_grown(model, opt, rms, src, n_obs, new_features, load_opt=load_opt, log=log.msg)
+        except GrowError as e:
+            raise SystemExit(str(e))
 
     if ck is not None:
-        extended = load_policy(ck)
-        if not extended:
-            opt.load_state_dict(ck["opt"])
+        load_policy(ck, load_opt=True)
         for g in opt.param_groups:
             g["lr"] = a.lr
         cu.load_state_dict(ck["curriculum"])
@@ -480,10 +474,8 @@ def main(argv=None) -> int:
         log.msg(f"resumed from {ckpt_path} at update {counters['update']}, frontier {cu.frontier}")
     elif a.init_from:
         ck0 = torch.load(a.init_from, weights_only=False)
-        extended = load_policy(ck0)
+        load_policy(ck0, load_opt=a.init_full)
         if a.init_full:
-            if not extended:
-                opt.load_state_dict(ck0["opt"])
             for g in opt.param_groups:
                 g["lr"] = a.lr
             cu.load_state_dict(ck0["curriculum"])
@@ -721,17 +713,26 @@ def main(argv=None) -> int:
         from ballrain.path import ReferencePath, asset_path, resolve_path_dir
         tck = torch.load(a.teacher, weights_only=False)
         mine, theirs = asdict(env_cfg)["features"], tck["env_config"]["features"]
-        diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k))
-        if int(tck["n_obs"]) != n_obs or int(tck["n_act"]) != n_act or diff:
+        # a teacher without the f7 reach block reads the first n_obs entries (the block is appended at the end)
+        appended = {"reach", "version"} if (mine.get("reach") and not theirs.get("reach")) else set()
+        diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k) and k not in appended)
+        t_obs = int(tck["n_obs"])
+        if (t_obs != n_obs and not appended) or int(tck["n_act"]) != n_act or diff:
             raise SystemExit(f"--teacher {a.teacher}: observations differ (n_obs {tck['n_obs']} vs {n_obs}, features {diff})")
+        if appended:
+            try:
+                from ballrain.train.grow import check_prefix
+                check_prefix(theirs, mine, t_obs, n_obs)
+            except GrowError as e:
+                raise SystemExit(f"--teacher {a.teacher}: {e}")
         ta = tck["args"]
-        tmodel = ActorCritic(n_obs, n_act, tuple(int(x) for x in ta["hidden"].split(",")), ta["activation"]).to(a.device)
+        tmodel = ActorCritic(t_obs, n_act, tuple(int(x) for x in ta["hidden"].split(",")), ta["activation"]).to(a.device)
         tmodel.load_state_dict(tck["model"])
         tmodel.eval()
         sl = FeatureExtractor(env_cfg.features).slices()["path_progress"]
         length = ReferencePath.load(asset_path(env_cfg.level, resolve_path_dir(env_cfg.features.path_dir))).length
         teacher = {"model": tmodel, "rms": tck["rms"], "col": sl.start, "lo": a.teacher_s_min / length,
-                   "u0": counters["update"]}
+                   "u0": counters["update"], "n_obs": t_obs}
         log.msg(f"teacher {a.teacher} (update {tck['counters']['update']}): KL coef {a.teacher_coef}"
                 + (f" -> {a.teacher_coef_floor} over {a.teacher_decay_updates} updates" if a.teacher_decay_updates else "")
                 + f" on route s >= {a.teacher_s_min:g} (line length {length:.1f})")
@@ -740,7 +741,7 @@ def main(argv=None) -> int:
         """Teacher log-probabilities on the batch (the teacher's own observation statistics), the route mask, the
         coefficient of this update."""
         with torch.no_grad():
-            x = torch.as_tensor(normalize(raw, teacher["rms"]), device=a.device)
+            x = torch.as_tensor(normalize(raw[:, :teacher["n_obs"]], teacher["rms"]), device=a.device)
             logits, _ = teacher["model"](x)
             lt = torch.log_softmax(logits, -1).cpu().numpy()
         mask = raw[:, teacher["col"]] >= teacher["lo"]
@@ -777,8 +778,7 @@ def main(argv=None) -> int:
             guard.rolled_back(u)
         else:
             src = torch.load(f, weights_only=False)
-            load_policy(src)
-            opt.load_state_dict(src["opt"])
+            load_policy(src, load_opt=True)  # a checkpoint from before a growth is grown again (optimiser included)
             for g in opt.param_groups:
                 g["lr"] = a.lr
             cu.load_state_dict(src["curriculum"])
