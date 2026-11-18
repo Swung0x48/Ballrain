@@ -525,15 +525,59 @@ def run_own_steps(run: Run) -> tuple[int, int]:
     return res
 
 
-def discarded_steps(runs, current: str) -> dict:
-    """All steps trained across the runs minus the steps in the current model's lineage (its step counter):
-    abandoned runs, the part of a parent trained after the checkpoint a later run branched from, and rollbacks."""
-    total, cur = 0, 0
-    for r in runs:
+_CKPT_U_RE = re.compile(r"(?:ckpt_|-u)(\d+)\.pt$")
+
+
+def _counter_at(run: Run, update: int) -> int | None:
+    """The run's step counter at its last logged update <= update (from train.log)."""
+    lp = run.path / "train.log"
+    if not lp.is_file():
+        return None
+    best = None
+    for line in lp.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = _STEPS_RE.search(line)
+        if m and int(m.group(1)) <= update:
+            best = int(m.group(2))
+    return best
+
+
+def _lineage_steps(runs, current: str) -> int:
+    """Steps in the current model's lineage: its own counter, plus, when a run was initialised from another run's
+    checkpoint with a fresh counter (e.g. a new level), the parent's counter at that checkpoint (recursively)."""
+    by = {r.name: r for r in runs}
+    total, name, seen = 0, current, set()
+    while name in by and name not in seen:
+        seen.add(name)
+        r = by[name]
         own, last = run_own_steps(r)
-        total += own
-        if r.name == current:
-            cur = last
+        total += last
+        try:
+            cfg = json.loads((r.path / "config.json").read_text(encoding="utf-8"))
+            init = str((cfg.get("args") or cfg).get("init_from") or "")
+        except (OSError, ValueError):
+            break
+        parts = init.replace("\\", "/").split("/")
+        m = _CKPT_U_RE.search(init)
+        parent = parts[-2] if len(parts) >= 2 else None
+        if not parent or parent not in by or not m:
+            break
+        at = _counter_at(by[parent], int(m.group(1)))
+        first = _counter_at(r, 10 ** 12)
+        # the counter carried on from the parent: the parent's steps are already in `last`
+        if at is None or (first is not None and last >= at):
+            break
+        total += at
+        # continue with the parent's own lineage before that checkpoint is already inside `at` (carried counters)
+        break
+    return total
+
+
+def discarded_steps(runs, current: str) -> dict:
+    """All steps trained across the runs minus the steps in the current model's lineage: abandoned runs, the part of a
+    parent trained after the checkpoint a later run branched from, and rollbacks. A run initialised with a fresh step
+    counter (a new level) still counts its parent's steps up to the branch checkpoint as lineage."""
+    total = sum(run_own_steps(r)[0] for r in runs)
+    cur = _lineage_steps(runs, current)
     return {"total": total, "current": cur, "discarded": max(0, total - cur)}
 
 
