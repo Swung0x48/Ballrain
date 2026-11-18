@@ -125,6 +125,14 @@ Json GatewayClient::heartbeat(bool running, const Json &instances, double sps) {
     return call("POST", "/pool/heartbeat", {"heartbeat_ok"}, json_body(make_message("heartbeat", f)), JSON_CT, true, true);
 }
 
+Json GatewayClient::task_end(const std::string &task_id, int64_t chunks, const std::string &reason) {
+    Json f = Json::object();
+    f.set("task_id", Json::string(task_id));
+    f.set("chunks", Json::integer(chunks));
+    f.set("reason", Json::string(reason.substr(0, 300)));
+    return call("POST", "/pool/task", {"task_end_ok"}, json_body(make_message("task_end", f)), JSON_CT, true, true);
+}
+
 Json GatewayClient::me() { return call("GET", "/pool/me", {"me"}, Bytes(), "", true, false); }
 
 Json GatewayClient::set_leaderboard(bool on) {
@@ -205,21 +213,26 @@ TasStarts PoolCache::starts(const std::string &sha) { return TasStarts::load_pac
 
 std::string PoolCache::path_dir(const std::string &sha, int level) {
     std::string src = asset(sha);
-    // task.install_path_asset: points <f4 (n,3), sector |u1 (n), t_ms <f8 (n), meta a JSON string naming the level
+    // task.install_path_asset: points <f4 (n,3), sector |u1 (n), meta a JSON string naming the level; optional
+    // t_ms <f8 (n) (without it the ref_speed features are zero, e.g. L02.npz)
     auto z = load_npz(src);
     for (auto &kv : z)
         if (kv.first != "points" && kv.first != "sector" && kv.first != "t_ms" && kv.first != "meta")
             throw Error("reference line: unexpected array " + kv.first);
-    if (!z.count("points") || !z.count("sector") || !z.count("t_ms") || !z.count("meta")) throw Error("reference line: arrays");
-    const NpyArray &pts = z.at("points"), &sec = z.at("sector"), &t = z.at("t_ms"), &meta = z.at("meta");
-    if (pts.descr != "<f4" || sec.descr != "|u1" || t.descr != "<f8" || !meta.shape.empty()) throw Error("reference line: dtypes");
+    if (!z.count("points") || !z.count("sector") || !z.count("meta")) throw Error("reference line: arrays");
+    const NpyArray &pts = z.at("points"), &sec = z.at("sector"), &meta = z.at("meta");
+    const NpyArray *t = z.count("t_ms") ? &z.at("t_ms") : nullptr;
+    if (pts.descr != "<f4" || sec.descr != "|u1" || (t && t->descr != "<f8") || !meta.shape.empty())
+        throw Error("reference line: dtypes");
     int64_t n = pts.shape.empty() ? 0 : pts.shape[0];
-    if (pts.shape != std::vector<int64_t>{n, 3} || sec.shape != std::vector<int64_t>{n} || t.shape != std::vector<int64_t>{n})
+    if (pts.shape != std::vector<int64_t>{n, 3} || sec.shape != std::vector<int64_t>{n} ||
+        (t && t->shape != std::vector<int64_t>{n}))
         throw Error("reference line: shapes");
     for (float v : pts.f32())
         if (!std::isfinite(v)) throw Error("reference line: non-finite points");
-    for (double v : t.f64())
-        if (!std::isfinite(v)) throw Error("reference line: non-finite t_ms");
+    if (t)
+        for (double v : t->f64())
+            if (!std::isfinite(v)) throw Error("reference line: non-finite t_ms");
     Json m = Json::parse(meta.unicode(), 12);
     if (!m.is_object() || m.get_int("level", -1) != level) throw Error("reference line is not level " + std::to_string(level));
     std::string d = root_ + "/refpaths/" + sha;
@@ -253,8 +266,10 @@ static std::string lower_ascii(std::string s) {
 }
 
 Json hash_game_files(const std::string &root, const std::string &engine) {
-    std::vector<std::string> names{"base.cmo", "Database.tdb", "Bin/VxMath.dll", "3D Entities/", "Text/"};
-    if (engine == "2002") names.push_back("BuildingBlocks/physics_RT.dll");
+    // protocol.GAME_FILE_LIST(_2002): the x87-soft edition reads only these four; the 2002 engine also the retail
+    // Bin/VxMath.dll and BuildingBlocks/physics_RT.dll
+    std::vector<std::string> names{"base.cmo", "Database.tdb", "3D Entities/", "Text/"};
+    if (engine == "2002") names.insert(names.end(), {"Bin/VxMath.dll", "BuildingBlocks/physics_RT.dll"});
     else if (engine != "x87soft") throw Error("engine " + engine);
     Json out = Json::object();
     std::string zeros(64, '0');

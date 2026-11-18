@@ -287,11 +287,15 @@ class TaskSampler(_worker_base()):
         self.version = 0
         self.stop = False
         orig = env.fx.compute
+        self.rollout = dict(rollout)
+        self.counter_spec = dict(rollout.get("counter_rand") or {})
+        self._cr = None  # the current life's counter values (ballrain.pool.counters, as rollout.TaskRunner)
 
         def compute(tracker):
+            from . import counters as CR
             o, fi = orig(tracker)
             self.fx_info = fi
-            return o, fi
+            return CR.apply(o, self._cr), fi
         env.fx.compute = compute
         st = env.starts
         if st is not None:
@@ -311,9 +315,21 @@ class TaskSampler(_worker_base()):
         sp, env = self.spec, self.env
         n_obs = env.observation_space.shape[0]
         b = ChunkBuilder(task.task_id, task.policy_sha, n_obs, n_act or env.action_space.n)
+        from . import counters as CR
         from .engine_chain import EngineDigest
-        env.engine_digest = EngineDigest()  # the engine-state chain (protocol chain v2)
+        env.engine_digest = EngineDigest()  # the engine-state chain (protocol chain v3)
+        lives = [0]
+
+        def new_life(o):
+            self._cr = None
+            if CR.active(self.counter_spec, task.start_frame):
+                self._cr = CR.draw(self.counter_spec, int(getattr(task, "life_seed", 0) or 0), lives[0],
+                                   env.fx.slices())
+            lives[0] += 1
+            return CR.apply(o, self._cr)
+        self._cr = None
         obs, info = env.reset()
+        obs = new_life(obs)
         digest = env.engine_digest.take()
         self._collect_runs()
         if on_start is not None:
@@ -406,7 +422,10 @@ class TaskSampler(_worker_base()):
             steps += 1
             respawn = bool(term and end not in ("stall",) and getattr(env, "_after_death", False))
             flag = P.FLAG_TERMINATED if term else (P.FLAG_TRUNCATED if trunc else 0)
-            if trunc or (term and not respawn):
+            if respawn and end == "BallOff" and CR.skip_respawn(self.rollout, task, lives[0] - 1,
+                                                                int(info2.get("sector") or 0), self._tas_cross_frame):
+                final_end = "respawn_skipped"  # the learner's early-respawn rule (as rollout.TaskRunner)
+            elif trunc or (term and not respawn):
                 final_end = _end_name(info2, end)
             else:
                 lim = None
@@ -425,6 +444,7 @@ class TaskSampler(_worker_base()):
                 episodes += 1
                 ep.finish(info2, end or "truncated", env, env._ep_frames)
             if final_end is None and term:  # a respawn in the same process (or the process ends during it)
+                self._cr = None
                 try:
                     o3, i3 = env.reset(options={"relaunch": False})
                 except Exception as e:  # noqa: BLE001  (PeerGone / Timeout during the respawn fast-forward)
@@ -434,7 +454,7 @@ class TaskSampler(_worker_base()):
                 if o3 is None:
                     final_end = "GameOver"
                 else:
-                    next_obs, next_info = o3, i3
+                    next_obs, next_info = new_life(o3), i3
                     ep = _Episode(i3, env, self.version, self._cap_frames(i3))
                     self._split_start(ep, i3)
             arc = (self.fx_info.get("path") or {}).get("s")

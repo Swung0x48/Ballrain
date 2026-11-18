@@ -76,7 +76,7 @@
 ### 2.2 会话和任务
 
 - `hello` 报告这几项：客户端版本、平台（`windows` / `macos` / `linux`）、引擎（`kind` 为 `2002` 或 `x87soft`，带引擎文件 sha256 和版本）、`game_files`、想跑的实例数。
-- `game_files` 的键正好是 `GAME_FILE_LIST`（2002 引擎再加 `BuildingBlocks/physics_RT.dll`），值是 sha256：
+- `game_files` 的键正好是 `GAME_FILE_LIST`（2002 引擎再加 `Bin/VxMath.dll` 和 `BuildingBlocks/physics_RT.dll`），值是 sha256：
   - 目录项（以 `/` 结尾）的值是 `tree_digest`，即每行“文件 sha256 + 空格 + 小写正斜杠相对路径”，按路径排序后整体取 sha256；
   - 缺失的文件记为 64 个 0；
   - 计算方法见 `task.hash_game_files`。
@@ -287,8 +287,21 @@
 | `greedy` | 是 | 布尔 |
 | `sample_seed` | 是 | 整数 0..2^53-1（采样任务的动作抽取，见第 10.6 节） |
 | `assets` | 是 | {starts, path} |
+| `rest` | 否 | 格式 3：静止开局 {target: [x, z] \| null, max_frames?} 或 null（第 5 节） |
+| `life_seed` | 否 | 格式 3：整数 0..2^53-1，每条命的抽取（计数随机化、提前重生，第 5 节） |
+| `respawn_frontier` | 否 | 格式 3：整数 0..10000000，发任务时的课程前沿（提前重生规则，第 5 节） |
 
-`game_files`：对象，键正好是 `base.cmo`、`Database.tdb`、`Bin/VxMath.dll`、`3D Entities/`、`Text/`、`BuildingBlocks/physics_RT.dll` 中的名称（x87-soft 引擎不带 physics_RT.dll），值是 sha256。
+**`task_end`**（POST /pool/task 请求，格式 3）：任务没有最终段就结束了（引擎在开局时失败，或者刚切完一段就失败），客户端把手上的段全部提交以后发它，网关立即像到了期限一样关掉任务（验证器照常处理已收到的段），实例名额马上空出来；否则要等 `deadline_s`。
+
+| 字段 | 必需 | 类型 |
+|---|---|---|
+| `task_id` | 是 | 字符串 1..64 `[A-Za-z0-9_-]` |
+| `chunks` | 是 | 整数 0..1000000：客户端已提交的段数（必须等于网关收到的段数，否则 `chunk_out_of_order`） |
+| `reason` | 是 | 字符串 ..300（只记进任务的结束原因） |
+
+**`task_end_ok`**（POST /pool/task 响应）：`task_id`、`state`（`closed`，或任务已有的状态：重复发送也返回 200）。
+
+`game_files`：对象，键正好是 `base.cmo`、`Database.tdb`、`Bin/VxMath.dll`、`3D Entities/`、`Text/`、`BuildingBlocks/physics_RT.dll` 中的名称（x87-soft 引擎只有 `base.cmo`、`Database.tdb`、`3D Entities/`、`Text/` 四项：它只读这些，2026-11-18 起去掉了 `Bin/VxMath.dll`；2002 引擎另加 `Bin/VxMath.dll` 和 `BuildingBlocks/physics_RT.dll`），值是 sha256。
 
 ## 3. 数据段（`POST /pool/chunk` 的请求体）
 
@@ -316,7 +329,7 @@ digest  sha256                   32 字节，覆盖它前面的全部内容
 **header 的字段（`CHUNK_HEADER`）：**
 - `protocol`、`type: "chunk"`、`task_id`、`seq`、`step0`（本段第一步在任务里的序号）、`steps`（1..4096）、`n_obs`、`n_act`、`policy_sha`；
 - `chain_prev`：本段第一行之前的哈希链值；
-- `final`、`end`：只在最后一段设置，取值为 `LevelFinish` / `GameOver` / `truncated` / `cap` / `stall` / `max_steps` / `max_frames` / `deadline` / `stopped` / `error`；
+- `final`、`end`：只在最后一段设置，取值为 `LevelFinish` / `GameOver` / `truncated` / `cap` / `stall` / `max_steps` / `max_frames` / `deadline` / `stopped` / `error` / `respawn_skipped`（格式 3：学习器的提前重生规则在这里结束进程，第 5 节）；
 - 可选的 `stats`（`frames`、`wall_s`、`episodes`）；
 - `arrays`：每段 `{name, codec: raw | zstd, nbytes（存储大小）, sha256（解码后的 sha256）}`。
 
@@ -439,7 +452,11 @@ r6 当前的权重文件约 0.97 MB。
 - `ball_order_seed`：32 位，引擎用 `retail:<seed>`；
 - `engine`：`2002` 或 `x87soft`；
 - `chunk_steps`、`max_steps`、`max_frames`、`deadline_s`、`issued_at`；
-- `assets`：`{starts, path}` 两个 sha256。
+- `assets`：`{starts, path}` 两个 sha256；
+- 格式 3（2026-11-18）的三个可选字段，让池子任务的开局分布和学习器一样（服务端抽，客户端不做任何随机抽取，验证器照样重放）：
+  - `rest`：静止开局（训练器的 `rest_starts`）。交接后先把球推到 `target` (x, z)（`max_frames` 帧以内，默认清单的 `rest_max_frames`），再刹停到 `rest_speed` 以下（`env._drive` / `_brake`）；`target` 为 null 时只刹车。带目标时 k 可以落在 `exclude_starts` 的范围里（`TasStarts.nearest_any`）。开局类型记成 `tas_rest`，分段奖励的参考时间少算 `split_rest_allow_s`（k 在排除范围里时没有参考时间）；
+  - `life_seed`：每条命的抽取 `u_j = sample_u(life_seed, 4 i + j)`（第 i 条命：0 是交接那条命，之后每次重生加一）。j = 0..2 是计数随机化（清单 `rollout.counter_rand`：只在不是从关卡加载开始的进程里，`lives` 按概率取值替换，`sr_s` / `points` 加均匀偏移，`ballrain/pool/counters.py`）；j = 3 是提前重生的抽取；
+  - `respawn_frontier`：清单 `rollout.p_early_respawn < 1` 时带上发任务时的课程前沿。死亡（BallOff，进程还在）时，如果记录进入死亡所在小节的帧在前沿之前，并且 `u_3 >= p_early_respawn`，重生那条命不玩，任务以 `respawn_skipped` 结束（学习器的 `Worker._skip_respawn`；`respawn_level_starts` 时从关卡加载开始的任务照样玩所有重生）。学习器拿实时的前沿比，任务拿发任务时的前沿。
 
 **客户端怎么用：**
 1. 下载 `GET /pool/assets/<assets.starts>.npz`，用 `install_starts_pack` 校验后整理成 `<cache>/starts/<sha>/<record>/` 记录目录（raw.npz 里只有 record_frames，另有 starts.npz、camera.npz 和精简的 meta.json），`TasStarts` 直接读这个目录；
@@ -448,7 +465,7 @@ r6 当前的权重文件约 0.97 MB。
    - 配置取清单里的 env / features / reward / engine_options；
    - 开局用任务给的记录目录和第 k 帧；
    - 球序用任务的种子，后端用本机引擎；
-   - **关掉所有客户端侧的随机抽取**：没有课程，`p_rest = p_rehearse = 0`；
+   - **关掉所有客户端侧的随机抽取**：没有课程，`p_rest = p_rehearse = 0`；任务的 `rest` 作为给定的静止开局（`EnvConfig.start_rest`）；
    - 动作集、观测维度、k 的有效性和清单不一致时，抛出 `TaskMismatch`。
 
 **服务端：**
@@ -756,7 +773,8 @@ python tools/pool/mock_forum.py --port 8098 --redirect-uri http://127.0.0.1:8099
 ### 10.5 任务来源（`server_tasks.py`）
 
 - `PolicySource.refresh()` 取 `ckpt_dir` 里最新的可读检查点。最新的一个可能还在拷贝中，读不了就往前试，最多 3 个。检查点用 `weights.load_trusted_checkpoint` 读（`torch.load` 仍然只在 `weights.py` 里），导出权重和两个素材，并取**同一个检查点**的课程状态。之后每 `refresh_s`（默认 900 秒）检查一次；旧版本的权重留在磁盘上，进行中的任务照常验证。
-- **开局帧 k 的抽法和训练器相同：** 在去掉 `exclude_starts` 的有效开局帧上建 `ReverseCurriculum`，载入这个检查点的 `frontier`、`history`、`bin_fail`，再调用 `sample`（前沿带、按失败率加权的分箱、到达关卡开头后的 k = 0）。随机数生成器的种子来自 `secrets`。训练器的静止开局、复习开局不用。球序种子每个任务重新抽 32 位。
+- **开局帧 k 的抽法和训练器相同：** 在去掉 `exclude_starts` 的有效开局帧上建 `ReverseCurriculum`，载入这个检查点的 `frontier`、`history`、`bin_fail`，再调用 `sample`（前沿带、按失败率加权的分箱、到达关卡开头后的 k = 0）。随机数生成器的种子来自 `secrets`。球序种子每个任务重新抽 32 位。
+- **格式 3 起复习开局和静止开局也照训练器抽**（`pick_start`，顺序和 `BallanceEnv._draw_start` 一样：复习、静止、课程）：参数取检查点 `env_config` 的 `rehearse_starts` / `p_rehearse` / `rehearse_behind_frontier`（复习范围只取前沿以后的部分，范围整个在前沿之前时落到后面的抽法）和 `rest_starts` / `p_rest`（带目标的条目在抖动框里抽目标，交接帧可以在排除范围里）。`tools/native/start_dist.py` 对比了两边：r7 检查点各抽 8 万次，各类开局（关卡开头、只刹车、推到目标、前沿前、前沿后）的比例相差不到 0.003，k 的分位数一致，有效开局帧集合完全相同。
 - `chunk_steps` 取清单的 `rollout.chunk`（r6 是 256）；`max_steps` / `max_frames` / `deadline_s` 取配置（默认 8192 / 60000 / 3600）。
 
 ### 10.6 验证器（`server_verify.py`、`rollout.py`）

@@ -110,7 +110,9 @@ struct Uploader {  // posts a task's chunks in order; network errors retried wit
     std::string refusal_message;
     bool fatal = false, failed = false;
     int64_t accepted_steps = 0;
-    void post(const Bytes &data, int64_t seq) {
+    int64_t posted = 0;   // chunks the gateway has (accepted, or a duplicate of an earlier attempt)
+    bool final_posted = false;
+    void post(const Bytes &data, int64_t seq, bool final = false) {
         if (failed) return;
         double delay = 2.0;
         for (int tried = 0;; ++tried) {
@@ -129,6 +131,7 @@ struct Uploader {  // posts a task's chunks in order; network errors retried wit
                     if (const Json *rs = r.find("reason")) refusal_message = rs->get_string("message", "");
                 } else {
                     accepted_steps += r.at("steps").as_int();
+                    ++posted, final_posted = final;
                 }
                 return;
             } catch (const GatewayUnavailable &e) {
@@ -141,7 +144,10 @@ struct Uploader {  // posts a task's chunks in order; network errors retried wit
                 sleep_s(delay);
                 delay = std::min(delay * 2, 30.0);
             } catch (const GatewayRefusal &e) {
-                if (tried && e.code == "chunk_duplicate") return;  // our own earlier attempt arrived
+                if (tried && e.code == "chunk_duplicate") {  // our own earlier attempt arrived
+                    ++posted, final_posted = final;
+                    return;
+                }
                 failed = true;
                 fatal = e.fatal;
                 refusal_message = e.message;
@@ -270,8 +276,25 @@ static int cmd_run(int argc, char **argv) {
             sleep_s(double(tm.at("retry_s").as_int()));
             continue;
         }
+        std::string open_task;  // the fetched task (task_end when it ends without a final chunk)
+        Uploader up{api, std::string(), false, false, 0};
+        // close a task that ended without a final chunk once everything it has was posted (best effort: the deadline
+        // closes it otherwise), so the gateway frees its instance slot now
+        auto close_open = [&](const std::string &why) {
+            if (open_task.empty() || up.failed || up.final_posted) return;
+            try {
+                api.task_end(open_task, up.posted, why);
+                Json f = Json::object();
+                f.set("task_id", Json::string(open_task));
+                f.set("chunks", Json::integer(up.posted));
+                event("task_closed", f);
+            } catch (const std::exception &e) {
+                std::fprintf(stderr, "task_end %s: %s\n", open_task.c_str(), e.what());
+            }
+        };
         try {
         Task task = Task::from_json(tm.at("task"));
+        open_task = task.task_id;
         double deadline = platform::monotonic_s() + double(task.deadline_s) - std::min(30.0, double(task.deadline_s) / 10);
         {
             Json f = Json::object();
@@ -294,7 +317,9 @@ static int cmd_run(int argc, char **argv) {
         FeatureConfig fc = FeatureConfig::from_json(m.at("features"));
         if (fc.path_sha256 != task.asset_path) throw Error("the task's reference line is not the policy's");
         fc.path_dir = cache.path_dir(task.asset_path, task.level);
-        if (task.start_frame > 0 && !starts.index_of(task.start_frame))
+        bool drive = task.rest && task.rest->drive;  // an at-rest start with a target may hand over in an excluded range
+        if (task.start_frame > 0 && !(drive ? starts.expected(task.start_frame).has_value()
+                                            : starts.index_of(task.start_frame).has_value()))
             throw Error("start frame is not a valid start frame of the record");
         EngineConfig eng;
         eng.binary = engine_bin, eng.root = game;
@@ -316,17 +341,17 @@ static int cmd_run(int argc, char **argv) {
             eng.extra_env.push_back({kv.substr(0, eq), kv.substr(eq + 1)});
         }
         std::string runs = dir + "/runs/" + task.task_id;
-        BallanceEnv env(ec, fc, eng, runs, nullptr, &starts, task.start_frame, RewardConfig::from_json(m.at("reward")));
+        BallanceEnv env(ec, fc, eng, runs, nullptr, &starts, task.start_frame, RewardConfig::from_json(m.at("reward")),
+                        task.rest);
         if (env.features().size() != pol.n_obs) throw Error("the env's observation size differs from the policy's");
         for (size_t i = 0; i < env.actions().size(); ++i)
             if (env.actions()[i] != pol.action_keys[i]) throw Error("the env's action set differs from the policy's");
         TaskRunner runner(env, &starts, task, RolloutSpec::from_json(m.at("rollout")), m.at("env").at("delta_ms").as_double());
-        Uploader up{api, std::string(), false, false, 0};
         double t0 = platform::monotonic_s();
         std::string end = sample_task(
             runner, pol, task,
-            [&](const Bytes &data) {
-                up.post(data, -1);
+            [&](const Bytes &data, bool final) {
+                up.post(data, -1, final);
             },
             [&]() -> std::string {
                 heartbeat(true, task.task_id, runner.steps);
@@ -351,13 +376,16 @@ static int cmd_run(int argc, char **argv) {
         f.set("wall_s", Json::number(dt));
         f.set("steps_per_s", Json::number(dt > 0 ? double(runner.steps) / dt : 0.0));
         event("task_end", f);
+        close_open("end " + end + " without a final chunk");
         if (up.failed && !up.refusal_message.empty()) std::fprintf(stderr, "%s\n", up.refusal_message.c_str());
         if (up.fatal) fatal = true, g_stop = true;
         failures = 0;
         } catch (const GatewayRefusal &e) {  // a download refused, or the policy / assets of the task
+            close_open(std::string("refused: ") + e.code);
             refused(e, "task");
             ++done;
         } catch (const std::exception &e) {  // an engine failure at the start, a mismatching asset, ...: next task
+            close_open(std::string("failed: ") + e.what());
             ++done;
             backoff(std::string("task: ") + e.what());
         }

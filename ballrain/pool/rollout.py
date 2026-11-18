@@ -39,7 +39,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import protocol as P
+from . import counters as CR, protocol as P
 from .engine_chain import EngineDigest
 from .reasons import Reason
 from .sampling import action_consistent, sample_u
@@ -131,10 +131,14 @@ class TaskRunner:
         self.fx_info: dict = {}
         orig = env.fx.compute
 
-        def compute(tracker):  # as Worker._make_env: the step's feature info (path jumps, arc length)
+        self.counter_spec = dict((manifest.get("rollout") or {}).get("counter_rand") or {})
+        self._cr = None  # the current life's counter values (ballrain.pool.counters)
+        self.lives = 0
+
+        def compute(tracker):  # as Worker._make_env: the step's feature info (path jumps, arc length), the life's counters
             o, fi = orig(tracker)
             self.fx_info = fi
-            return o, fi
+            return CR.apply(o, self._cr), fi
         env.fx.compute = compute
         env.engine_digest = EngineDigest()
         self.digest = b""  # engine digest of the current row
@@ -152,6 +156,15 @@ class TaskRunner:
         self.episodes = 0
 
     # ------------------------------------------------------------------------------------------ episodes
+    def _new_life_counters(self, obs):
+        """A new life's counter set (as Worker._reset: the reset observation was computed with the true counters)."""
+        self._cr = None
+        if CR.active(self.counter_spec, self.task.start_frame):
+            self._cr = CR.draw(self.counter_spec, int(getattr(self.task, "life_seed", 0) or 0), self.lives,
+                               self.env.fx.slices())
+        self.lives += 1
+        return CR.apply(obs, self._cr)
+
     def _new_episode(self, info):
         self.ep = self.W._Episode(info, self.env, 0, self.sh._cap_frames(info))
         self.sh._split_start(self.ep, info)
@@ -162,6 +175,7 @@ class TaskRunner:
             obs, info = self.env.reset()
         except Exception as e:  # noqa: BLE001  launch failure, hand-over mismatch, crashed engine
             raise EngineFailure(f"start: {type(e).__name__}: {str(e)[:300]}") from e
+        obs = self._new_life_counters(obs)
         self.obs, self.info = np.asarray(obs, np.float32), info
         self.digest = self.env.engine_digest.take()
         self.f_hand = int(info.get("frames_done") or 0)
@@ -239,7 +253,10 @@ class TaskRunner:
         respawn = bool(term and end != "stall" and getattr(env, "_after_death", False))
         flags = P.FLAG_TERMINATED if term else (P.FLAG_TRUNCATED if trunc else 0)
         task_end = None
-        if trunc or (term and not respawn):
+        if respawn and end == "BallOff" and CR.skip_respawn(self.manifest.get("rollout") or {}, self.task, self.lives - 1,
+                                                            int(info2.get("sector") or 0), self.sh._tas_cross_frame):
+            task_end = "respawn_skipped"  # the learner's early-respawn rule: the process would end here
+        elif trunc or (term and not respawn):
             task_end = end_name(info2, end)
         else:
             if self.steps >= int(self.task.max_steps):
@@ -253,6 +270,7 @@ class TaskRunner:
         self.frames = int(info2.get("frames_done") or 0) - self.f_hand
         nxt = np.asarray(obs2, np.float32)
         if task_end is None and term:  # a respawn in the same process (or the process ends during it)
+            self._cr = None
             try:
                 o_n, i_n = env.reset(options={"relaunch": False})
             except Exception as e:  # noqa: BLE001
@@ -260,7 +278,7 @@ class TaskRunner:
             if o_n is None:
                 task_end = "GameOver"
             else:
-                nxt = np.asarray(o_n, np.float32)
+                nxt = np.asarray(self._new_life_counters(o_n), np.float32)
                 self.info = i_n
                 self._new_episode(i_n)
         # arc length: the feature info of the next row (after a respawn: the respawn's), as the client records it

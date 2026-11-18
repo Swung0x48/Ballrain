@@ -51,7 +51,8 @@ int main(int argc, char **argv) {
             }
         std::string out = arg(argc, argv, "--out");
         platform::make_dirs(out + "/runs");
-        BallanceEnv env(ec, fc, eng, out + "/runs", nullptr, &starts, task.start_frame, RewardConfig::from_json(m.at("reward")));
+        BallanceEnv env(ec, fc, eng, out + "/runs", nullptr, &starts, task.start_frame, RewardConfig::from_json(m.at("reward")),
+                        task.rest);
         TaskRunner runner(env, &starts, task, RolloutSpec::from_json(m.at("rollout")), m.at("env").at("delta_ms").as_double());
         std::string mode = arg(argc, argv, "--actions", "policy");
         int64_t stop_after = std::atoll(arg(argc, argv, "--stop-after", "0").c_str());
@@ -74,7 +75,7 @@ int main(int argc, char **argv) {
         int64_t seq = 0;
         std::string end = sample_task(
             runner, pol, task,
-            [&](const Bytes &data) {
+            [&](const Bytes &data, bool) {
                 char n[32];
                 std::snprintf(n, sizeof n, "/%06lld.brpc", (long long)seq++);
                 write_file(out + n, data);

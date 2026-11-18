@@ -25,6 +25,9 @@ struct Task {  // protocol.TASK
     bool greedy = false;
     uint64_t sample_seed = 0;
     std::string asset_starts, asset_path;
+    std::optional<RestStart> rest;  // format 3: an at-rest start after the hand-over (server-drawn)
+    uint64_t life_seed = 0;          // format 3: the per-life draws (ballrain/pool/counters.py)
+    std::optional<int64_t> respawn_frontier;  // format 3: the curriculum frontier of the early-respawn rule
     static Task from_json(const Json &t);
 };
 
@@ -42,7 +45,30 @@ struct RolloutSpec {
     Json gates = Json::object();
     double split_k = 0.0, split_min_ref_s = 5.0, split_rest_allow_s = 1.0;
     std::vector<std::array<double, 3>> split_extra;
+    Json counter_rand = Json::object();  // WorkerSpec.counter_rand (CounterRand)
+    double p_early_respawn = 1.0;        // WorkerSpec.p_early_respawn (counters.skip_respawn)
+    bool respawn_level_starts = false;
     static RolloutSpec from_json(const Json &r);
+};
+
+// ballrain/pool/counters.py: one set of counter-feature values per life in processes not started from level load,
+// drawn from the task's life_seed (u_j = sample_u(seed, 4 life + j): j = 0 lives, 1 sr_s, 2 points)
+class CounterRand {
+public:
+    CounterRand(const Json &spec, const FeatureExtractor &fx);
+    bool active(int64_t start_frame) const { return any_ && start_frame > 0; }
+    void draw(uint64_t seed, int64_t life);  // the set of life `life`
+    void clear() { ops_.clear(); }
+    void apply(std::vector<float> &o) const;
+
+private:
+    struct Op { int index; bool set; double value; };
+    bool any_ = false;
+    int i_lives_ = -1, i_sr_ = -1, i_points_ = -1;
+    std::vector<double> values_, cdf_;
+    double sr_lo_ = 0, sr_hi_ = 0, pt_lo_ = 0, pt_hi_ = 0;
+    bool has_lives_ = false, has_sr_ = false, has_pt_ = false;
+    std::vector<Op> ops_;
 };
 
 struct EngineFailure : Error {
@@ -96,6 +122,8 @@ private:
     std::optional<double> tas_cross(int sector) const;
     std::optional<int64_t> tas_cross_frame(int sector) const;
     void split_start(Episode &ep);
+    std::vector<float> new_life(std::vector<float> obs);
+    bool skip_respawn(int sector) const;
     double split_bonus(Episode &ep, const StepInfo &info, bool finished);
     double gate(Episode &ep, const double pos[3], const double vel[3]);
 
@@ -111,6 +139,8 @@ private:
     Episode ep_;
     EngineDigest dg_;
     StepInfo info_;
+    CounterRand cr_;
+    int64_t lives_ = 0;
 };
 
 // rollout.ChunkAssembler: a task's steps cut into encoded chunks of task.chunk_steps steps
@@ -138,10 +168,12 @@ private:
 };
 
 // rollout.sample_task: play the task with the policy (the task's deterministic draws), hand every encoded chunk to
-// on_chunk as soon as it is complete; returns the end. stop(): "" or "stopped" / "deadline".
+// on_chunk(data, final) as soon as it is complete; returns the end. stop(): "" or "stopped" / "deadline". An engine
+// failure right after a chunk was cut leaves no final chunk (end "error", no final on_chunk): the caller closes the
+// task with task_end.
 // choose (tests only): the action of step t instead of the policy's draw (forced actions; a gateway refuses them)
 std::string sample_task(TaskRunner &runner, const Policy &policy, const Task &task,
-                        const std::function<void(const Bytes &)> &on_chunk,
+                        const std::function<void(const Bytes &, bool final)> &on_chunk,
                         const std::function<std::string()> &stop = nullptr,
                         const std::function<int(int64_t, const std::vector<float> &)> &choose = nullptr);
 

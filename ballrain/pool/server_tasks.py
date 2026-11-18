@@ -8,7 +8,11 @@ reference line the policy was trained on -> <pool>/assets/<sha>.npz), and keeps 
 checkpoint. A task's start frame is drawn like the trainer draws it: ballrain.curriculum.ReverseCurriculum.sample
 over the record's valid start frames after the run's exclude_starts, with that state (frontier band, failure-weighted
 bins, k = 0 at the start of the level), from an unpredictable server-side generator; the ball-order seed is a fresh 32-bit
-draw. The at-rest and rehearsal draws of the trainer are not used (the client runs no random start draws).
+draw. Format 3: the trainer's rehearsal and at-rest draws too (the checkpoint's env_config rehearse_starts / p_rehearse,
+rest_starts / p_rest and rehearse_behind_frontier, drawn in BallanceEnv._draw_start's order: rehearsal, at-rest,
+curriculum), the at-rest drive target and limit going into the task ("rest"); a life_seed for the per-life draws
+(counter_rand, the early-respawn draw) and, when the rollout skips early respawns (p_early_respawn < 1), the current
+curriculum frontier (respawn_frontier). The client runs no random draw of its own.
 """
 from __future__ import annotations
 
@@ -38,6 +42,8 @@ class Published:
     curriculum: object  # ReverseCurriculum or None
     source: str  # checkpoint file name (or "state")
     published_at: int
+    starts: object = None  # TasStarts of the record with exclude_starts applied (nearest_valid / nearest_any)
+    draws: dict | None = None  # the trainer's start draws: rehearse_starts, p_rehearse, rest_starts, p_rest
 
     @property
     def n_obs(self) -> int:
@@ -95,7 +101,9 @@ class PolicySource:
             keep = np.ones(len(v), bool)
             for lo, hi in excl:
                 keep &= ~((v >= int(lo)) & (v < int(hi)))
-            st.restrict(keep)
+            st.exclude(keep)  # excluded frames stay hand-over states for at-rest starts with a drive target
+        ec = dict(state.get("env_config") or {})
+        draws = {k: ec.get(k) for k in ("rehearse_starts", "p_rehearse", "rest_starts", "p_rest", "rehearse_behind_frontier")}
         cu = None
         cs = state.get("curriculum")
         if cs:
@@ -107,7 +115,7 @@ class PolicySource:
         pub = Published(manifest=m, policy_sha=m["policy_sha"], run=self.run, record=record,
                         record_sha256=meta["record_sha256"], starts_sha=ssha, path_sha=psha,
                         level=int(m["env"]["level"]), valid=T.valid_start_frames(rd, excl), curriculum=cu,
-                        source=source, published_at=int(self.clock()))
+                        source=source, published_at=int(self.clock()), starts=st, draws=draws)
         with self.lock:
             self.current = pub
             self.history[pub.policy_sha] = pub
@@ -129,16 +137,48 @@ class PolicySource:
         return self.current
 
     # ------------------------------------------------------------------------------------------ tasks
-    def pick_start(self, pub: Published) -> int:
+    def pick_start(self, pub: Published) -> tuple[int, dict | None]:
+        """(k, rest): the start frame and the at-rest start spec (protocol TASK "rest", None = a plain start), drawn as
+        BallanceEnv._draw_start draws them (same order and distributions, the server's generator)."""
+        d, st, rng = pub.draws or {}, pub.starts, self.rng
+        rest = None
         with self.lock:
-            if pub.curriculum is not None:
-                k = int(pub.curriculum.sample(self.rng))
-            else:
-                k = int(pub.valid[int(self.rng.integers(len(pub.valid)))])
-        i = int(np.searchsorted(pub.valid, k))
-        if not (i < len(pub.valid) and int(pub.valid[i]) == k):  # never hand out a start the env would snap
-            raise ValueError(f"start frame {k} is not valid")
-        return k
+            k = None
+            rh, rs = d.get("rehearse_starts"), d.get("rest_starts")
+            if st is not None and rh and d.get("p_rehearse") and rng.random() < float(d["p_rehearse"]):
+                lo, hi = (int(v) for v in rh[int(rng.integers(len(rh)))])
+                if d.get("rehearse_behind_frontier") and pub.curriculum is not None and lo > 0:
+                    lo = max(lo, int(pub.curriculum.frontier))  # only the part the frontier has passed
+                if lo <= hi:
+                    k = st.nearest_valid(int(rng.integers(lo, hi + 1)))
+            # (a rehearsal range the frontier has not reached falls through, as in the env)
+            if k is None and st is not None and rs and d.get("p_rest") and rng.random() < float(d["p_rest"]):
+                e = rs[int(rng.integers(len(rs)))]
+                lo, hi = e[0], e[1]
+                rest = {"target": None}
+                if len(e) >= 5:
+                    j = float(e[4])
+                    rest["target"] = [float(e[2]) + float(rng.uniform(-j, j)), float(e[3]) + float(rng.uniform(-j, j))]
+                    if len(e) >= 6:
+                        rest["max_frames"] = int(e[5])
+                    k = st.nearest_any(int(rng.integers(int(lo), int(hi) + 1)))
+                else:
+                    k = st.nearest_valid(int(rng.integers(int(lo), int(hi) + 1)))
+            elif k is None and pub.curriculum is not None:
+                k = int(pub.curriculum.sample(rng))
+            elif k is None:
+                k = int(pub.valid[int(rng.integers(len(pub.valid)))])
+        k = int(k)
+        if rest is not None and rest["target"] is not None:
+            if k <= 0 or st.expected(k) is None:
+                raise ValueError(f"at-rest start frame {k} is not a hand-over state")
+        else:
+            i = int(np.searchsorted(pub.valid, k))
+            if not (i < len(pub.valid) and int(pub.valid[i]) == k):  # never hand out a start the env would snap
+                raise ValueError(f"start frame {k} is not valid")
+        if rest is not None and k <= 0:
+            rest = None
+        return k, rest
 
     def new_task(self, engine: str, now: int, max_steps: int, max_frames: int, deadline_s: int,
                  kind: str = "sample") -> T.Task:
@@ -146,8 +186,13 @@ class PolicySource:
         if pub is None:
             raise LookupError("no policy published")
         chunk = int(pub.manifest["rollout"].get("chunk") or 256)
+        k, rest = self.pick_start(pub)
+        ro = pub.manifest["rollout"]
+        # the early-respawn rule needs the frontier the learner compares with (Worker._skip_respawn: off without one)
+        rf = int(pub.curriculum.frontier) if pub.curriculum is not None and float(ro.get("p_early_respawn", 1.0)) < 1.0             else None
         return T.Task(task_id=T.new_task_id(), run=pub.run, policy_sha=pub.policy_sha, level=pub.level,
-                      record=pub.record, record_sha256=pub.record_sha256, start_frame=self.pick_start(pub),
+                      record=pub.record, record_sha256=pub.record_sha256, start_frame=k, rest=rest, life_seed=T.new_sample_seed(),
+                      respawn_frontier=rf,
                       ball_order_seed=T.new_ball_order_seed(), engine=engine,
                       assets={"starts": pub.starts_sha, "path": pub.path_sha}, chunk_steps=min(chunk, 4096),
                       max_steps=int(max_steps), max_frames=int(max_frames), deadline_s=int(deadline_s),

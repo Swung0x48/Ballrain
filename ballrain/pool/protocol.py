@@ -66,7 +66,7 @@ PLATFORMS = ("windows", "macos", "linux")
 TASK_KINDS = ("sample", "eval")
 # why a task's last chunk ended (the "end" of a final chunk)
 END_REASONS = ("LevelFinish", "GameOver", "truncated", "cap", "stall", "max_steps", "max_frames", "deadline",
-               "stopped", "error")
+               "stopped", "error", "respawn_skipped")  # respawn_skipped: format 3 (counters.skip_respawn)
 # ends the client declares (the replay cannot reproduce them: the player stopped, the deadline passed, the local
 # engine failed); the final step is then marked truncated by the client. Every other end is checked by the replay.
 CLIENT_ENDS = ("deadline", "stopped", "error")
@@ -81,9 +81,11 @@ USER_CODE_RE = re.compile(r"[A-Z2-9]{4}-[A-Z2-9]{4}")
 
 PHYSICS_RT_2002_SHA256 = "e72e4afcfa5c33a7d3d27776137f8c997b3c52d89d8a8a4745f1ca21e45893ec"
 # files of the player's Ballance folder the client hashes (docs/volunteer-compute.md 1); directories end in "/"
-# and are hashed as a tree (tree_digest); the 2002 engine also loads BuildingBlocks/physics_RT.dll
-GAME_FILE_LIST = ("base.cmo", "Database.tdb", "Bin/VxMath.dll", "3D Entities/", "Text/")
-GAME_FILE_LIST_2002 = GAME_FILE_LIST + ("BuildingBlocks/physics_RT.dll",)
+# and are hashed as a tree (tree_digest). The x87-soft edition loads only these four (measured: the engine runs
+# bit-identically with nothing else of the folder); the 2002 engine also loads BuildingBlocks/physics_RT.dll and the
+# retail Bin/VxMath.dll (phys2002's VxQuaternion::FromMatrix import)
+GAME_FILE_LIST = ("base.cmo", "Database.tdb", "3D Entities/", "Text/")
+GAME_FILE_LIST_2002 = GAME_FILE_LIST + ("Bin/VxMath.dll", "BuildingBlocks/physics_RT.dll")
 
 
 class ProtocolError(ValueError):
@@ -360,6 +362,17 @@ TASK = Obj({
     "greedy": Bool(),  # eval tasks: argmax actions (behaviour log-probs still sent)
     "sample_seed": Int(0, 2 ** 53 - 1),  # sampling tasks: action draws u_t = sampling.sample_u(seed, t)
     "assets": Obj({"starts": SHA, "path": SHA}),  # sha256 of the start-state pack and of the reference line asset
+}, {
+    # format 3 (docs/pool-prototype.md 5): an at-rest start after the hand-over at start_frame (the env's rest_starts):
+    # drive to target (x, z) within max_frames, then brake; target null = brake only. Drawn by the server
+    # (max_frames absent = the env's rest_max_frames)
+    "rest": Obj({"target": List(Float(-1e6, 1e6), 2, 2, nullable=True)}, {"max_frames": Int(1, 10 ** 6)}, nullable=True),
+    # the per-life draws (ballrain.pool.counters): counter randomisation (the manifest's rollout.counter_rand) and the
+    # early-respawn draw (rollout.p_early_respawn)
+    "life_seed": Int(0, 2 ** 53 - 1),
+    # the curriculum frontier when the task was issued: a death whose respawn sector the record enters before it
+    # skips the respawn life (rollout.p_early_respawn; absent = every respawn is played)
+    "respawn_frontier": Int(0, 10 ** 7),
 })
 
 
@@ -391,6 +404,11 @@ MESSAGES: dict[str, Obj] = {
                                   "leaderboard": Bool(), "server_time": Int(0, 2 ** 40)},
                      {"notice": Str(500)}),
     "task": _msg("task", {"task": TASK}),
+    # POST /pool/task: the client closes a task that ended without a final chunk (its engine failed at the start, or
+    # right after a chunk was cut) once every chunk it has was posted: chunks = how many (next seq). The gateway
+    # closes it as at its deadline (the verifier takes what arrived) and the instance slot is free at once
+    "task_end": _msg("task_end", {"task_id": TASK_ID, "chunks": Int(0, 10 ** 6), "reason": Str(300)}),
+    "task_end_ok": _msg("task_end_ok", {"task_id": TASK_ID, "state": Str(16)}),
     "no_task": _msg("no_task", {"reason": REASON, "retry_s": Int(1, 3600)}),
     "chunk_result": _msg("chunk_result", {"task_id": TASK_ID, "seq": Int(0, 10 ** 6),
                                           "status": Str(16, enum=("accepted", "held", "rejected")),

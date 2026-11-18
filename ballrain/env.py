@@ -111,10 +111,17 @@ class EnvConfig:
     # draw after the curriculum frontier moved past it
     rehearse_starts: list | None = None
     p_rehearse: float = 0.0
+    # rehearse_behind_frontier: draw a rehearsal start only from the part of its range at or after the curriculum frontier
+    # (a range the frontier has not reached yet is skipped: the draw falls through to the curriculum), so every section
+    # is rehearsed once the reverse curriculum has passed it (r8 / level 2)
+    rehearse_behind_frontier: bool = False
     # record frames [lo, hi) that are never used as start states (e.g. the TAS on a route the training does not
     # follow: L1 shortcut 2 while the reference line takes shortcut 1); applied to TasStarts, so curriculum draws,
     # rehearsal and at-rest starts all skip them
     exclude_starts: list | None = None
+    # an at-rest start given by the caller instead of drawn (pool tasks: the server draws it): {"target": [x, z] |
+    # None, "max_frames": n} applied to the start_frame hand-over (target None = brake only)
+    start_rest: dict | None = None
     rest_speed: float = 0.5
     rest_max_frames: int = 600
     warm_pool: bool = False  # pre-launch the next process on warm_copy while the current one runs
@@ -267,7 +274,10 @@ class BallanceEnv(gym.Env):
         c = self.cfg
         if c.rehearse_starts and c.p_rehearse and self._start_rng.random() < c.p_rehearse:
             lo, hi = c.rehearse_starts[int(self._start_rng.integers(len(c.rehearse_starts)))]
-            return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
+            if c.rehearse_behind_frontier and self.curriculum is not None and int(lo) > 0:
+                lo = max(int(lo), int(self.curriculum.frontier))
+            if int(lo) <= int(hi):
+                return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
         if c.rest_starts and c.p_rest and self._start_rng.random() < c.p_rest:
             e = c.rest_starts[int(self._start_rng.integers(len(c.rest_starts)))]
             lo, hi = e[0], e[1]
@@ -284,6 +294,11 @@ class BallanceEnv(gym.Env):
             return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
         if self.curriculum is not None:
             return self.curriculum.sample(self._start_rng)
+        if c.start_rest is not None and (c.start_frame or 0) > 0:  # a given at-rest start (pool task): not snapped
+            t = c.start_rest.get("target")
+            mf = c.start_rest.get("max_frames")
+            self._rest_next = True if t is None else ((float(t[0]), float(t[1])) + ((int(mf),) if mf else ()))
+            return int(c.start_frame)
         k = self.cfg.start_frame or 0
         return self.starts.nearest_valid(k) if k > 0 else 0
 

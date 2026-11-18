@@ -239,7 +239,8 @@ def run_tas(a, manifest, stream: Stream) -> dict:
         feats[k] = tuple(feats.get(k) or ())
     fx = FeatureExtractor(FeatureConfig(**feats))
     out = Path(a.out).resolve() / "runs" / "tas"
-    sc = C.SessionConfig(level=1, out_dir=out, copy="nc-py", max_frames=len(frames) + 10, body_radius=60.0, sr_tail=32)
+    sc = C.SessionConfig(level=int(manifest["env"]["level"]), out_dir=out, copy="nc-py", max_frames=len(frames) + 10,
+                         body_radius=60.0, sr_tail=32)
     s = C.AgentSession(sc, HeadlessLauncher(HeadlessConfig(**headless_cfg(a, manifest))))
     t0 = time.perf_counter()
     s.start()

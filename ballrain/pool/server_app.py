@@ -181,7 +181,7 @@ class PoolApp:
             return P.MAX_CHUNK_BYTES
         if path == "/pool/login":
             return LOGIN_LIMIT
-        if path in ("/pool/hello", "/pool/heartbeat", "/pool/me"):
+        if path in ("/pool/hello", "/pool/heartbeat", "/pool/me", "/pool/task"):  # POST /pool/task: task_end
             return JSON_LIMIT
         return 0
 
@@ -255,7 +255,7 @@ class PoolApp:
             self._limit("public", client)
             return self.sha_file(path)
         elif path in ("/pool/hello", "/pool/task", "/pool/chunk", "/pool/heartbeat", "/pool/me"):
-            want = {"/pool/hello": ("POST",), "/pool/task": ("GET",), "/pool/chunk": ("POST",),
+            want = {"/pool/hello": ("POST",), "/pool/task": ("GET", "POST"), "/pool/chunk": ("POST",),
                     "/pool/heartbeat": ("POST",), "/pool/me": ("GET", "POST")}[path]
             if method not in want:
                 return _error(payload(Reason.BAD_MESSAGE, detail=f"{method} not allowed"), 405)
@@ -267,7 +267,7 @@ class PoolApp:
                 return self.me(acct, body if method == "POST" else None)
             sess = self._session(headers, tok, acct)
             if path == "/pool/task":
-                return self.task(acct, sess)
+                return self.task(acct, sess) if method == "GET" else self.task_end(acct, body)
             if path == "/pool/chunk":
                 return self.chunk(acct, sess, body)
             return self.heartbeat(acct, sess, body)
@@ -530,6 +530,18 @@ class PoolApp:
         d = t.to_dict()
         self.store.add_task(d, acct["forum_id"], sess["session_id"])
         return _json("task", task=d)
+
+    def task_end(self, acct, body: bytes) -> Response:
+        m = P.parse_message("task_end", body)
+        tid = m["task_id"]
+        st = self.store.close_task(tid, acct["forum_id"], m["chunks"], m["reason"])
+        if st is None:
+            row = self.store.task(tid)
+            raise _err(Reason.TASK_UNKNOWN if row is None else Reason.TASK_NOT_YOURS, task_id=tid)
+        if st == "order":
+            row = self.store.task(tid)
+            raise _err(Reason.CHUNK_OUT_OF_ORDER, task_id=tid, chunk=m["chunks"], expected=int(row["next_seq"]))
+        return _json("task_end_ok", task_id=tid, state=st)
 
     # ------------------------------------------------------------------------------------------ chunk
     def chunk(self, acct, sess, body: bytes) -> Response:

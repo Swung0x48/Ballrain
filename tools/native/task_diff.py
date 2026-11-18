@@ -60,11 +60,13 @@ def main(argv=None) -> int:
              "spawn": {"center": [0.0, 0.0, 0.0], "radius": 1e5, "bonus": 0.25, "min_speed": 1.0, "heading": 90,
                        "heading_tol": 120}}
     m_cap = export(state, out / "weights", "r7cap", cap_mult=0.05, gates=json.dumps(gates))
+    # the early-respawn rule with a draw (r7 itself: p_early_respawn 0, every early respawn skipped)
+    m_er = export(state, out / "weights", "r7er", p_early_respawn=0.5, respawn_level_starts=False)
     ssha, spack = T.export_starts_pack(a.record, out / "assets")
     psha, passet = T.export_path_asset(a.path_asset, out / "assets")
     assert psha == m_r7["features"]["path_sha256"]
     sdir = T.install_starts_pack(spack, out / "cache", ssha)
-    pdir = T.install_path_asset(passet, out / "cache", 1, psha)
+    pdir = T.install_path_asset(passet, out / "cache", int(m_r7["env"]["level"]), psha)
     from ballrain.curriculum import TasStarts
     st = TasStarts(str(sdir))
     ex = m_r7["env"].get("exclude_starts") or []
@@ -72,12 +74,51 @@ def main(argv=None) -> int:
     keep = np.ones(len(st.valid), bool)
     for lo, hi in ex:
         keep &= ~((st.valid >= lo) & (st.valid < hi))
-    st.restrict(keep)
-    k_mid, k_late = st.nearest_valid(9900), st.nearest_valid(13500)
+    st.exclude(keep)  # excluded frames stay hand-over states (at-rest starts with a drive target)
+    level = int(m_r7["env"]["level"])
     record = Path(a.record).name
     rec_sha = json.loads((Path(a.record) / "meta.json").read_text(encoding="utf-8"))["record_sha256"]
-    # name: (manifest, k, actions, max_steps, max_frames, stop_after, ball seed, what it is for)
+    if level != 1:  # another level (r8: L2): generic scenarios at the record's quartiles
+        q = [st.nearest_valid(int(np.percentile(st.valid, p))) for p in (25, 50, 75)]
+        pos = st.expected(q[1])["pos"]
+        m_er = export(state, out / "weights", "er", p_early_respawn=0.5, respawn_level_starts=False)
+        scenarios = {
+            "sticky_spawn": (m_r7, 0, "sticky:1", 4000, 60000, 0, 31, "deaths, respawns from level load"),
+            "policy_spawn": (m_r7, 0, "policy", 4000, 60000, 0, 32, "the policy from level load"),
+            "sticky_q1": (m_r7, q[0], "sticky:2", 4000, 60000, 0, 33, "TAS start (first quartile): deaths, respawns"),
+            "policy_q2": (m_r7, q[1], "policy", 4000, 60000, 0, 34, "TAS start (median)"),
+            "policy_q3": (m_r7, q[2], "policy", 4000, 60000, 0, 35, "TAS start (third quartile)"),
+            "policy_stop": (m_r7, q[1], "policy", 4000, 60000, 99, 36, "the player's stop"),
+            "rest_brake": (m_r7, q[1], "sticky:3", 3000, 60000, 0, 37, "brake-only at-rest start", {"target": None}),
+            "rest_drive": (m_r7, q[1], "policy", 3000, 60000, 0, 38, "at-rest start driven 1 unit aside",
+                           {"target": [pos[0] + 0.8, pos[2] + 0.6], "max_frames": 300}),
+            "early_respawn_frontier": (m_r7, q[0], "sticky:4", 3000, 60000, 0, 39,
+                                       "the run's own early-respawn rule (p 0) with its frontier", None,
+                                       int(np.percentile(st.valid, 60))),
+            "early_respawn_draw": (m_er, 0, "sticky:5", 3000, 60000, 0, 40, "early-respawn draw (p 0.5) from level load",
+                                   None, int(np.percentile(st.valid, 60))),
+        }
+        return run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir, np)
+    k_mid, k_late = st.nearest_valid(9900), st.nearest_valid(13500)
+    k_ex = st.nearest_any(2000)  # inside r7's exclude_starts
+    ex_pos = st.expected(k_ex)["pos"]
+    # name: (manifest, k, actions, max_steps, max_frames, stop_after, ball seed, what it is for[, rest])
+    # (r7's manifest has counter_rand: every k > 0 scenario carries per-life counter values from the task's life_seed)
     scenarios = {
+        "rest_drive": (m_r7, st.nearest_valid(1860), "policy", 3000, 60000, 0, 21,
+                       "at-rest start driven to r7's (3.5, -170) target", {"target": [3.4, -170.6]}),
+        "rest_drive_excl": (m_r7, k_ex, "sticky:5", 3000, 60000, 0, 22,
+                            "at-rest start handed over in an excluded range (no split reference), max_frames",
+                            {"target": [ex_pos[0] + 0.7, ex_pos[2] - 0.6], "max_frames": 300}),
+        "rest_brake": (m_r7, k_late, "sticky:6", 3000, 60000, 0, 23, "brake-only at-rest start, respawns",
+                       {"target": None}),
+        "rest_drive_late": (m_r7, st.nearest_any(14260), "policy", 3000, 60000, 0, 24,
+                            "at-rest start driven to r7's (342, -831) target", {"target": [342.2, -830.7]}),
+        "early_respawn": (m_er, k_mid, "sticky:7", 3000, 60000, 0, 25,
+                          "early-respawn rule with a draw (p 0.5, frontier 12000): respawn_skipped or played",
+                          None, 12000),
+        "early_respawn_spawn": (m_er, 0, "sticky:8", 3000, 60000, 0, 26,
+                                "early-respawn rule from level load (respawn_level_starts off)", None, 12000),
         "idle_spawn": (m_r7, 0, "idle", 4000, 60000, 0, 11, "stall_terminal + stall_compensate from level load"),
         "sticky_spawn": (m_r7, 0, "sticky:1", 4000, 60000, 0, 12, "deaths, respawns from level load"),
         "sticky_mid": (m_r7, k_mid, "sticky:2", 4000, 60000, 0, 13, "TAS start: deaths, respawns (kind respawn)"),
@@ -87,16 +128,23 @@ def main(argv=None) -> int:
         "cap_gates": (m_cap, k_mid, "policy", 4000, 60000, 0, 17, "frame cap and gates (variant export)"),
         "sticky_cap_gates": (m_cap, 0, "sticky:4", 4000, 60000, 0, 18, "gates with forced actions, cap"),
     }
+    return run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir, np)
+
+
+def run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir, np) -> int:
     if a.only:
         scenarios = {k: v for k, v in scenarios.items() if k in a.only.split(",")}
     results, failed = {}, 0
-    for name, (m, k, actions, max_steps, max_frames, stop_after, ball, what) in scenarios.items():
+    for name, (m, k, actions, max_steps, max_frames, stop_after, ball, what, *opt) in scenarios.items():
+        rest = opt[0] if opt else None
+        frontier = opt[1] if len(opt) > 1 else None
         d = out / name
         d.mkdir()
-        task = T.Task(task_id=f"diff-{name}", run=m["source"]["run"], policy_sha=m["policy_sha"], level=1, record=record,
+        task = T.Task(task_id=f"diff-{name}", run=m["source"]["run"], policy_sha=m["policy_sha"], level=level, record=record,
                       record_sha256=rec_sha, start_frame=int(k), ball_order_seed=ball, engine="x87soft",
                       assets={"starts": ssha, "path": psha}, chunk_steps=int(m["rollout"]["chunk"]),
-                      max_steps=max_steps, max_frames=max_frames, deadline_s=3600, issued_at=0, sample_seed=1000 + ball)
+                      max_steps=max_steps, max_frames=max_frames, deadline_s=3600, issued_at=0, sample_seed=1000 + ball,
+                      rest=rest, life_seed=5000 + ball, respawn_frontier=frontier)
         (d / "task.json").write_text(json.dumps(task.to_dict()), encoding="utf-8")
         mp = out / "weights" / f"{m['policy_sha']}.json"
         t0 = time.time()
@@ -124,7 +172,7 @@ def main(argv=None) -> int:
             runner.close()
             R.remove_run_dirs(env)
         rewards = np.concatenate([c.arrays["rewards"] for c in chunks]) if chunks else np.zeros(0)
-        results[name] = dict(res, what=what, k=int(k), mismatch=None if mm is None else
+        results[name] = dict(res, what=what, k=int(k), rest=rest, respawn_frontier=frontier, mismatch=None if mm is None else
                              {"reason": mm.reason.value, "step": mm.step, "detail": mm.detail},
                              min_reward=float(rewards.min()) if len(rewards) else None,
                              max_reward=float(rewards.max()) if len(rewards) else None)

@@ -108,6 +108,12 @@ Python 同种子跑两次（`policy_s1` / `policy_s1b`），C++ 与 Python 之�
 
 ## 5. M2：池协议客户端，校验不再依赖跨 CPU 逐位一致
 
+### 5.0 任务格式 3（M3，2026-11-18）
+池子任务的开局分布改成和学习器一样（`pool-prototype.md` 第 5 节）：任务可以带 `rest`（静止开局：推到目标再刹车，或只刹车）、`life_seed`（每条命的计数随机化和提前重生抽取）、`respawn_frontier`（提前重生规则：任务以 `respawn_skipped` 结束）；网关按检查点的 `rehearse_starts` / `rehearse_behind_frontier` / `rest_starts` 抽开局。原生客户端移植了 `env._drive` / `_brake`（开局类型 `tas_rest`）、`counters.py`（`CounterRand`）和提前重生规则；`task_end` 让没有最终段的任务马上关掉（开局失败不再占一个小时的实例名额）。
+- 对照：`tools/native/task_diff.py` 14 个场景全部通过（新增推到目标、交接帧在排除范围里、只刹车、推到 14232 附近的目标、两种提前重生；r7 清单带 `counter_rand`，k > 0 的场景都带每条命的计数值）；`tools/native/e2e_pool.py --env-draws '{"p_rest": 0.8, "p_rehearse": 0.1}'` 经网关发 6 个任务（推到目标 1 个、只刹车 2 个、普通 TAS 开局 3 个，`respawn_frontier` 4100），36 段全部验证通过，伪造段照样查出。
+- 第 2 关（r8，`SR02_1_28_992_264`，参考线 `benchmarks/refpaths/L02.npz`）：`nc_golden` 对 SR02 全关 TAS 按 2 帧一块回放（12198 行，木球 6357 行、纸球 5789 行，变球 329 行，接触运动物体 253 行，`bodies` 非零 2419 行）、r8 从出生点（6584 行）、随机粘滞动作（758 行）**全部逐位相同**（最大差 0）；`task_diff.py` 对 r8 跑 10 个场景（关卡开头、四分位 TAS 开局、只刹车、推到目标、r8 自己的提前重生规则和带抽取的变体，含 LevelFinish 和 stall）全部通过；`start_dist.py` 对 r8（`rehearse_behind_frontier`，前沿 17093）两边一致。顺带修了两处只在别的关卡出现的问题：`nc_golden` 的关卡号写死成 1；`L02.npz` 没有 `t_ms`，网关导出和客户端安装参考线时都要求它（现在可选）。注意：没有 `t_ms` 时 `ref_speed` 特征恒为 0，r8 的这 3 维一直是 0（Python 和 C++ 一样）。
+- 游戏文件清单：x87-soft 引擎只报 `base.cmo`、`Database.tdb`、`3D Entities/`、`Text/` 四项（不再报 `Bin/VxMath.dll`）。网关只看自己清单里的名称，参考表里多出的 `Bin/VxMath.dll` 不影响；多报一项的客户端会被拒（只有这个分支上没发布过的 0.3.0 构建会这样）。
+
 ### 5.1 校验方式改了（Python 侧，链 v3）
 
 **适用范围先说清楚**：本机上原生客户端算出的特征和 Python 逐位相同，所以端到端测试里验证器的容差其实**没有被原生客户端用到**；

@@ -521,7 +521,7 @@ def test_a_trajectory_resigned_onto_another_task_is_caught(pool, tmp_path, monke
     pl = Player(pool, "forger_2", tmp_path)
     ta = pl.task()
     k = ta.start_frame
-    monkeypatch.setattr(pool.policies, "pick_start", lambda pub: k)
+    monkeypatch.setattr(pool.policies, "pick_start", lambda pub: (k, None))
     tb = pl.task()
     assert tb.start_frame == k and tb.sample_seed != ta.sample_seed
     rows = []  # the attacker keeps the engine row digests of its honest run (the chunk only has the chain values)
@@ -640,3 +640,178 @@ def test_verifier_engine_dying_mid_replay_is_replay_failed(pool, tmp_path, monke
     monkeypatch.setattr(R.TaskRunner, "start", orig)  # the engine works again: the retry passes
     pool.verifier.run_once()
     assert all(r["verify"] == "passed" for r in pool.store.chunks(t.task_id))
+
+
+# ---------------------------------------------------------------------------------------------- format 3 starts
+COUNTER_RAND = {"lives": {"values": [0.0, 0.1, 0.2, 0.3]}, "sr_s": [0.0, 0.3], "points": [-0.05, 0.45]}
+
+
+@pytest.fixture(scope="module")
+def world3(tmp_path_factory):
+    """The toy run with the trainer's at-rest starts (a drive target and a brake-only entry) and counter_rand."""
+    w = dev.fake_world(tmp_path_factory.mktemp("pool-world3"),
+                       rollout={"counter_rand": json.dumps(COUNTER_RAND), "p_early_respawn": 0.5})
+    ec = w["state"]["env_config"]
+    # [100, 200] lies before the frontier (the middle of the record): rehearse_behind_frontier never draws it
+    ec.update(rest_starts=[[300, 330, 1.0, -42.0, 0.5, 400], [200, 230]], p_rest=0.7,
+              rehearse_starts=[[500, 560], [100, 200]], p_rehearse=0.3, rehearse_behind_frontier=True)
+    return w
+
+
+@pytest.fixture
+def pool3(tmp_path, world3):
+    g = Gw(tmp_path, users=FORGERS, max_steps=120, probation_chunks=200, sample_rate=0.1)
+    g.policies.datasets_dir = world3["datasets"]
+    g.policies.path_dirs = world3["path_dirs"]
+    g.pub = g.policies.publish_state(world3["state"])
+    g.verifier = Verifier(g.store, g.cfg.pool_dir, g.cfg.engines,
+                          launcher_factory=lambda: fakegame.FakeLauncher(backend="headless"), log=g.logs.append)
+    yield g
+    g.close()
+
+
+def test_counter_draws_are_the_tasks():
+    from ballrain.pool import counters as CR
+    sl = {"lives": slice(10, 11), "points": slice(11, 12), "sr_s": slice(12, 13)}
+    assert not CR.active(COUNTER_RAND, 0) and CR.active(COUNTER_RAND, 5) and not CR.active({}, 5)
+    a = [CR.draw(COUNTER_RAND, 1234, i, sl) for i in range(400)]
+    assert a == [CR.draw(COUNTER_RAND, 1234, i, sl) for i in range(400)]  # replayable from the seed
+    assert a[0] != CR.draw(COUNTER_RAND, 1235, 0, sl)
+    lives = [d[sl["lives"]] for d in a]
+    assert {op for op, _ in lives} == {"set"} and {v for _, v in lives} == {0.0, 0.1, 0.2, 0.3}
+    sr = [v for op, v in (d[sl["sr_s"]] for d in a)]
+    pts = [v for op, v in (d[sl["points"]] for d in a)]
+    assert 0.0 <= min(sr) and max(sr) <= 0.3 and -0.05 <= min(pts) and max(pts) <= 0.45
+    p = CR.draw({"lives": {"values": [1.0, 2.0], "p": [0.0, 1.0]}}, 9, 3, sl)
+    assert p == {sl["lives"]: ("set", 2.0)}
+    o = np.zeros(16, np.float32)
+    o[11], o[12] = 0.5, 0.25
+    r = CR.apply(o, a[0])
+    assert r.dtype == np.float32 and o[10] == 0 and r[10] == np.float32(a[0][sl["lives"]][1])
+    assert r[11] == np.float32(0.5) + a[0][sl["points"]][1]
+
+
+def test_format3_tasks_follow_the_trainers_start_draws(pool3):
+    ts = [pool3.policies.new_task("x87soft", 1000, 120, 60000, 3600) for _ in range(300)]
+    for t in ts:
+        P.check(P.TASK, t.to_dict())
+    rest = [t for t in ts if t.rest is not None]
+    drive = [t for t in rest if t.rest["target"] is not None]
+    brake = [t for t in rest if t.rest["target"] is None]
+    assert drive and brake and len(rest) < len(ts)
+    assert all(300 <= t.start_frame <= 330 and t.rest["max_frames"] == 400 for t in drive)
+    assert all(abs(t.rest["target"][0] - 1.0) <= 0.5 and abs(t.rest["target"][1] + 42.0) <= 0.5 for t in drive)
+    assert all(200 <= t.start_frame <= 230 and "max_frames" not in t.rest for t in brake)
+    assert any(500 <= t.start_frame <= 560 and t.rest is None for t in ts)  # rehearsal draws
+    assert not any(100 <= t.start_frame < 200 for t in ts)  # behind the frontier only
+    assert all(t.life_seed and t.respawn_frontier == pool3.pub.curriculum.frontier for t in ts)
+    assert T.Task.from_dict(drive[0].to_dict()) == drive[0]
+
+
+@pytest.mark.parametrize("sampler", ["rollout", "client"])
+def test_format3_tasks_pass_the_verifier(pool3, tmp_path, sampler):
+    """At-rest starts (driven / braked) and per-life counter values: what the client samples, the verifier replays."""
+    pl = Player(pool3, "eligible", tmp_path)
+    kinds = set()
+    for _ in range(4):
+        t = pl.task()
+        chunks, end, pol = pl.play(t, sampler=sampler)
+        dec = [P.decode_chunk(c, n_act=pol.n_act, n_obs=pol.n_obs) for c in chunks]
+        kinds.add("drive" if t.rest and t.rest["target"] else "brake" if t.rest else "tas" if t.start_frame else "level")
+        if t.start_frame > 0:  # the lives feature carries the drawn value, not the true 3 lives
+            li = _slices(pool3.pub.manifest)["lives"].start
+            seen = sorted({round(float(v), 3) for d in dec for v in d.arrays["obs"][:, li]})
+            assert set(seen) <= {0.0, 0.1, 0.2, 0.3}, seen
+        for c in chunks:
+            assert pl.send(c).status == 200
+        assert pool3.verifier.run_once() == 1
+        rows = pool3.store.chunks(t.task_id)
+        assert rows and all(r["verify"] == "passed" for r in rows), (sampler, t.rest, end, pool3.logs[-3:])
+    assert kinds - {"level"}, kinds
+
+
+def test_early_respawns_are_skipped_as_the_learner_does(pool3, tmp_path):
+    """p_early_respawn 0.5: a death whose respawn sector the record enters before the frontier ends the task
+    (respawn_skipped) for about half the deaths; the verifier replays the decision."""
+    from ballrain.pool import counters as CR
+    pl = Player(pool3, "eligible", tmp_path)
+    ends = []
+    for i in range(40):  # the policy's own deaths (the task's draws): until a skipped respawn and a played one
+        t = pl.task()
+        chunks, end, _ = pl.play(t, sampler="client" if i % 2 else "rollout")
+        ends.append(end)
+        for c in chunks:
+            assert pl.send(c).status == 200
+        assert pool3.verifier.run_once() == 1
+        assert all(r["verify"] == "passed" for r in pool3.store.chunks(t.task_id)), (end, pool3.logs[-3:])
+        if "respawn_skipped" in ends and i >= 3:
+            break
+    assert "respawn_skipped" in ends, ends
+    t = T.Task.from_dict(dict(pl.task().to_dict(), start_frame=0))
+    ro = {"p_early_respawn": 0.0, "respawn_level_starts": True}
+    assert not CR.skip_respawn(ro, t, 0, 1, lambda s: 0)  # level starts play every respawn
+    assert CR.skip_respawn(dict(ro, respawn_level_starts=False), t, 0, 1, lambda s: 0)
+    assert not CR.skip_respawn({"p_early_respawn": 0.0}, t, 0, 1, lambda s: t.respawn_frontier)  # at the frontier
+    assert not CR.skip_respawn({"p_early_respawn": 1.0}, t, 0, 1, lambda s: 0)
+
+
+def _slices(m) -> dict:
+    from ballrain.features import FeatureConfig, FeatureExtractor
+    f = dict(m["features"])
+    for k in ("far_waypoints", "ref_speed_at"):
+        f[k] = tuple(f.get(k) or ())
+    return FeatureExtractor(FeatureConfig(**f)).slices()
+
+
+def test_wrong_counter_values_are_caught(pool3, tmp_path, monkeypatch):
+    """A client that leaves the counters true (or draws its own) sends observations the replay does not reproduce."""
+    from ballrain.pool import counters as CR
+    pl = Player(pool3, "forger_3", tmp_path)
+    for _ in range(20):
+        t = pl.task()
+        if t.start_frame > 0:
+            break
+    else:
+        pytest.skip("no TAS start drawn")
+    monkeypatch.setattr(CR, "draw", lambda spec, seed, life, slices: None)
+    chunks, end, _ = pl.play(t)
+    monkeypatch.undo()
+    for c in chunks:
+        pl.send(c)
+    pool3.verifier.run_once()
+    rows = pool3.store.chunks(t.task_id)
+    assert any(r["verify"] == "failed" for r in rows), rows
+
+
+def test_task_end_closes_a_task_without_a_final_chunk(pool, tmp_path):
+    """A task whose engine failed at the start (no chunks) or right after a cut (no final chunk): the client's task_end
+    closes it at once (instance slot free, the verifier takes what arrived); a wrong chunk count is refused."""
+    pl = Player(pool, "eligible", tmp_path)
+
+    def end(tid, n, why="failed: engine"):
+        return pool.call("POST", "/pool/task", P.encode_message("task_end", task_id=tid, chunks=n, reason=why),
+                         token=pl.token, session=pl.sid)
+    t = pl.task()
+    assert pool.store.task(t.task_id)["state"] == "open"
+    r = end(t.task_id, 1)
+    assert r.status == 409 and pool.js(r)["reason"]["code"] == "chunk_out_of_order"
+    r = end(t.task_id, 0)
+    assert r.status == 200 and P.parse_message("task_end_ok", r.body)["state"] == "closed"
+    assert pool.store.task(t.task_id)["state"] == "closed"
+    assert pool.store.open_tasks(pool.store.task(t.task_id)["forum_id"], 3600) == 0
+    assert P.parse_message("task_end_ok", end(t.task_id, 0).body)["state"] == "closed"  # idempotent
+    assert pool.verifier.run_once() == 1 and pool.store.task(t.task_id)["state"] == "done"  # "empty"
+    # some chunks, then the engine died right after a cut: the prefix is verified as at a deadline
+    t2 = pl.task()
+    chunks, _, _ = pl.play(t2)
+    assert len(chunks) >= 2
+    assert pl.send(chunks[0]).status == 200
+    other = Player(pool, "forger_1", tmp_path)
+    r = pool.call("POST", "/pool/task", P.encode_message("task_end", task_id=t2.task_id, chunks=1, reason="x"),
+                  token=other.token, session=other.sid)
+    assert r.status == 403 and pool.js(r)["reason"]["code"] == "task_not_yours"
+    assert end(t2.task_id, 1).status == 200
+    assert pl.send(chunks[1]).status == 409  # closed: nothing more is accepted
+    assert pool.verifier.run_once() == 1
+    rows = pool.store.chunks(t2.task_id)
+    assert [r["verify"] for r in rows] == ["passed"]

@@ -80,7 +80,6 @@ def test_game_dir_messages_name_the_file(tmp_path):
     msgs = [p.message for p in G.check_game_dir(empty, "all")]
     assert msgs == ["缺少文件：base.cmo。游戏文件不完整，请检查安装目录。",
                     "缺少文件：Database.tdb。游戏文件不完整，请检查安装目录。",
-                    "缺少文件：Bin/VxMath.dll。游戏文件不完整，请检查安装目录。",
                     "缺少文件夹：3D Entities（应在 Ballance 安装目录下）", "缺少文件夹：Text（应在 Ballance 安装目录下）"]
     root = _ballance(tmp_path / "Ballance")
     assert G.check_game_dir(root, "all") == []  # the x87-soft edition does not load physics_RT.dll

@@ -44,7 +44,9 @@ _STARTS_ARRAYS = {  # name in the pack -> (dtype, ndim); starts.npz keys without
     "camera_quarter": (np.dtype("|i1"), 1), "camera_dev": (np.dtype("<f4"), 1),
     "meta_json": (np.dtype("|u1"), 1),
 }
-PATH_ARRAYS = {"points": (np.dtype("<f4"), 2), "sector": (np.dtype("|u1"), 1), "t_ms": (np.dtype("<f8"), 1)}
+PATH_ARRAYS = {"points": (np.dtype("<f4"), 2), "sector": (np.dtype("|u1"), 1)}
+# optional: the line's TAS times (ReferencePath.t_ms; without them the ref_speed features are zero, e.g. L02.npz)
+PATH_OPTIONAL = {"t_ms": (np.dtype("<f8"), 1)}
 MAX_ASSET_BYTES = 64 * 1024 * 1024
 
 
@@ -75,6 +77,9 @@ class Task:
     kind: str = "sample"  # "sample" | "eval"
     greedy: bool = False
     sample_seed: int = 0  # the action draws of the task (ballrain.pool.sampling); server-side random
+    rest: dict | None = None  # format 3: an at-rest start {"target": [x, z] | None, "max_frames": n} (server-drawn)
+    life_seed: int = 0  # format 3: the per-life draws (counters, early respawns: ballrain.pool.counters)
+    respawn_frontier: int | None = None  # format 3: the curriculum frontier for the early-respawn rule
 
     @classmethod
     def from_dict(cls, d: dict) -> "Task":
@@ -83,6 +88,12 @@ class Task:
 
     def to_dict(self) -> dict:
         d = {k: getattr(self, k) for k in P.TASK.required}
+        if self.rest is not None:
+            d["rest"] = self.rest
+        if self.life_seed:
+            d["life_seed"] = int(self.life_seed)
+        if self.respawn_frontier is not None:
+            d["respawn_frontier"] = int(self.respawn_frontier)
         return P.check(P.TASK, d, "task")
 
     @property
@@ -229,7 +240,7 @@ def export_starts_pack(record_dir, out_dir) -> tuple[str, Path]:
     return sha, dst
 
 
-def _load_checked(path: Path, spec: dict, expect_sha: str, extra_ok=()) -> dict:
+def _load_checked(path: Path, spec: dict, expect_sha: str, extra_ok=(), optional: dict | None = None) -> dict:
     if path.stat().st_size > MAX_ASSET_BYTES:
         raise ValueError(f"{path.name}: larger than {MAX_ASSET_BYTES} bytes")
     if file_sha256(path) != expect_sha:
@@ -237,8 +248,10 @@ def _load_checked(path: Path, spec: dict, expect_sha: str, extra_ok=()) -> dict:
     out = {}
     with np.load(path, allow_pickle=False) as z:
         names = set(z.files)
-        if not set(spec) <= names or names - set(spec) - set(extra_ok):
-            raise ValueError(f"{path.name}: arrays {sorted(names ^ set(spec))} unexpected / missing")
+        opt = set(optional or {})
+        if not set(spec) <= names or names - set(spec) - opt - set(extra_ok):
+            raise ValueError(f"{path.name}: arrays {sorted((names - opt - set(extra_ok)) ^ set(spec))} unexpected / missing")
+        spec = dict(spec, **(optional or {}))
         for k in z.files:
             a = z[k]
             if a.dtype.hasobject:
@@ -293,7 +306,7 @@ def install_starts_pack(pack, cache_dir, expect_sha: str) -> Path:
 def export_path_asset(asset, out_dir) -> tuple[str, Path]:
     """Server side: copy a reference line L<nn>.npz into the asset store as <sha>.npz (sha = its file sha256, the
     value FeatureConfig.path_sha256 holds)."""
-    a = _load_checked(Path(asset), PATH_ARRAYS, file_sha256(asset), extra_ok=("meta",))
+    a = _load_checked(Path(asset), PATH_ARRAYS, file_sha256(asset), extra_ok=("meta",), optional=PATH_OPTIONAL)
     meta = a.get("meta")
     if meta is None or meta.dtype.kind != "U" or meta.ndim != 0:
         raise ValueError("reference line: meta must be a string")
@@ -322,7 +335,7 @@ def find_path_asset(level: int, sha256: str, dirs) -> Path:
 def install_path_asset(asset, cache_dir, level: int, expect_sha: str) -> Path:
     """Client side: check a downloaded reference line (sha256, arrays, meta level) and place it as
     <cache_dir>/refpaths/<sha>/L<nn>.npz; returns the directory (the FeatureConfig.path_dir to use)."""
-    a = _load_checked(Path(asset), PATH_ARRAYS, expect_sha, extra_ok=("meta",))
+    a = _load_checked(Path(asset), PATH_ARRAYS, expect_sha, extra_ok=("meta",), optional=PATH_OPTIONAL)
     meta = a.get("meta")
     if meta is None or meta.dtype.kind != "U" or meta.ndim != 0:
         raise ValueError("reference line: meta must be a string")
@@ -330,7 +343,7 @@ def install_path_asset(asset, cache_dir, level: int, expect_sha: str) -> Path:
     if not isinstance(m, dict) or m.get("level") != int(level):
         raise ValueError(f"reference line is not level {level}")
     n = len(a["points"])
-    if a["points"].shape != (n, 3) or len(a["sector"]) != n or len(a["t_ms"]) != n:
+    if a["points"].shape != (n, 3) or len(a["sector"]) != n or ("t_ms" in a and len(a["t_ms"]) != n):
         raise ValueError("reference line: shapes")
     d = Path(cache_dir) / "refpaths" / expect_sha
     d.mkdir(parents=True, exist_ok=True)
@@ -377,6 +390,7 @@ def build_env_config(task: Task, manifest: dict, local: LocalGame, starts_dir, p
         feats[k] = tuple(feats.get(k) or ())
     env.pop("start_record")
     return EnvConfig(**env, start_record=str(sd.resolve()), start_frame=int(task.start_frame) or None,
+                     start_rest=dict(task.rest) if task.rest is not None else None,
                      curriculum=None, rest_starts=None, p_rest=0.0, rehearse_starts=None, p_rehearse=0.0,
                      warm_pool=False, warm_copy=None, trace=False, prefix=None, seed=int(task.ball_order_seed),
                      copy=copy, out_root=str(out_root), backend="headless",
@@ -397,8 +411,12 @@ def build_env(task: Task, manifest: dict, local: LocalGame, starts_dir, path_dir
         if e.observation_space.shape[0] != int(manifest["arch"]["n_obs"]):
             raise TaskMismatch("the env's observation size differs from the policy's")
         k = int(task.start_frame)
-        if k and (e.starts is None or e.starts.index_of(k) is None):
+        # an at-rest start with a drive target may hand over in an excluded range (TasStarts.expected knows it)
+        drive = task.rest is not None and task.rest.get("target") is not None
+        if k and (e.starts is None or (e.starts.expected(k) is None if drive else e.starts.index_of(k) is None)):
             raise TaskMismatch(f"start frame {k} is not a valid start frame of {task.record}")
+        if task.rest is not None and not k:
+            raise TaskMismatch("an at-rest start needs a TAS start frame")
     except BaseException:
         e.close()
         raise

@@ -98,6 +98,10 @@ def main(argv=None) -> int:
     ap.add_argument("--max-steps", type=int, default=3000)
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--heartbeat-s", type=int, default=5, help="the gateway's heartbeat interval (5: heartbeats during tasks)")
+    ap.add_argument("--env-draws", default="", help="JSON over the checkpoint's env_config start draws, e.g. "
+                    '{"p_rest": 0.8} (format 3: at-rest / rehearsal starts at test rates)')
+    ap.add_argument("--rollout", default="", help="JSON over the checkpoint's args (rollout fields), e.g. "
+                    '{"p_early_respawn": 0.5}')
     a = ap.parse_args(argv)
     a.client, a.engine, a.game = (str(Path(x).resolve()) for x in (a.client, a.engine, a.game))
     a.client_engine = str(Path(a.client_engine).resolve()) if a.client_engine else a.engine
@@ -131,8 +135,23 @@ def main(argv=None) -> int:
     srv = make_server(app, "127.0.0.1", port)
     threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True).start()
     log(f"gateway {gateway}, mock forum {forum.base_url}")
-    pub = policies.publish_state(W.load_trusted_checkpoint(a.ckpt), source=Path(a.ckpt).name)
+    state = W.load_trusted_checkpoint(a.ckpt)
+    if a.env_draws:
+        state["env_config"] = dict(state["env_config"], **json.loads(a.env_draws))
+    if a.rollout:
+        state["args"] = dict(state["args"], **json.loads(a.rollout))
+    pub = policies.publish_state(state, source=Path(a.ckpt).name)
     log(f"policy {pub.policy_sha[:12]} (record {pub.record}, {len(pub.valid)} start frames)")
+    issued = []
+    new_task = policies.new_task
+
+    def logged_task(*args, **kw):  # the tasks the gateway hands out (format 3: start kind, frontier)
+        t = new_task(*args, **kw)
+        issued.append(t)
+        log(f"task {t.task_id[:8]}: k={t.start_frame} rest={t.rest} life_seed={'yes' if t.life_seed else 'no'} "
+            f"respawn_frontier={t.respawn_frontier}")
+        return t
+    policies.new_task = logged_task
 
     client_dir = d / "client"
     # ---- login: the native client's login_start / login_poll, the browser part scripted

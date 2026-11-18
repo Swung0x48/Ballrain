@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
                         if (n != pol.n_obs) throw Error("feature size " + std::to_string(n) + " != policy n_obs");
                     }
                     src = std::make_unique<ReplayLevelSource>(cur);
-                    ing = std::make_unique<Ingest>(1, src.get(), nullptr);
+                    ing = std::make_unique<Ingest>(int(manifest.at("env").get_int("level", 1)), src.get(), nullptr);
                     ing->digest = &dg;
                     dg.reset();
                     break;

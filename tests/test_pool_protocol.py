@@ -364,6 +364,8 @@ def test_every_message_kind_has_a_valid_example():
                          leaderboard=True, server_time=1),
         "task": dict(task=task),
         "no_task": dict(reason=reason, retry_s=30),
+        "task_end": dict(task_id="t" * 32, chunks=2, reason="failed: start: the game did not connect"),
+        "task_end_ok": dict(task_id="t" * 32, state="closed"),
         "chunk_result": dict(task_id=TID, seq=0, status="accepted", verify="pending", steps=256),
         "heartbeat": dict(session_id="S" * 16, running=True, steps_per_s=200.0,
                           instances=[{"slot": 0, "state": "running", "steps": 10, "task_id": TID}]),
