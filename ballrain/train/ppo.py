@@ -10,6 +10,8 @@ the proximal policy's, the behaviour policy enters through the truncated importa
 """
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import torch
 from torch import nn
@@ -152,7 +154,14 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
                teacher_logp=None, teacher_mask=None, teacher_coef: float = 0.0) -> dict:
     """teacher_logp (n, n_act) log-probabilities of a frozen teacher policy on the batch states, teacher_mask (n,) bool:
     the loss gets + teacher_coef * KL(teacher || policy) averaged over the masked states of each minibatch (e.g. keep the
-    back half of a level near a faster earlier policy while the front changes); stats teacher_kl / teacher_n."""
+    back half of a level near a faster earlier policy while the front changes); stats teacher_kl / teacher_n.
+
+    Non-finite guard (gradient clipping does not help: one NaN / inf gradient makes every parameter NaN): a minibatch
+    whose loss or gradient norm is not finite is not stepped, the parameters and the optimiser state of the start of
+    the update are restored (earlier minibatches of this update are undone) and the update ends; the same when a
+    parameter is not finite after the last minibatch. The stats then carry "nonfinite": {"term" (pg_loss, v_loss,
+    entropy, teacher_kl, grad_norm or params), "epoch", "minibatch", "rows" (batch rows of that minibatch), the values
+    of the terms}, and the caller must treat the update as not done. A finite update is unchanged (no extra key)."""
     obs = torch.as_tensor(batch["obs"], device=device)
     act = torch.as_tensor(batch["actions"], dtype=torch.long, device=device)
     old_logp = torch.as_tensor(batch["logp"], device=device)
@@ -165,8 +174,10 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
         t_logp = torch.as_tensor(teacher_logp, dtype=torch.float32, device=device)
         t_mask = torch.as_tensor(teacher_mask, dtype=torch.bool, device=device)
         stats["teacher_kl"] = []
-    stop = False
-    for _ in range(epochs):
+    snap = {k: v.detach().clone() for k, v in model.state_dict().items()}  # restored when the update turns non-finite
+    opt_snap = copy.deepcopy(opt.state_dict())
+    stop, nonfinite, ep = False, None, 0
+    for ep in range(epochs):
         perm = torch.randperm(n, generator=gen).to(device)
         for i in range(0, n, minibatch):
             idx = perm[i:i + minibatch]
@@ -190,6 +201,14 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # total norm before clipping
+            if not (torch.isfinite(loss) and torch.isfinite(gn)):  # no step: back to the start of the update (below)
+                terms = {"pg_loss": pg.item(), "v_loss": vl.item(), "entropy": ent.item()}
+                if use_teacher and bool(m.any()):
+                    terms["teacher_kl"] = kl_t.item()
+                terms["grad_norm"] = float(gn)
+                nonfinite = {"term": next((k for k, x in terms.items() if not np.isfinite(x)), "loss"), "epoch": ep,
+                             "minibatch": i // minibatch, "rows": idx.cpu().numpy(), **terms}
+                break
             opt.step()
             with torch.no_grad():
                 lr = logp - old_logp[idx]
@@ -203,10 +222,18 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
             if target_kl is not None and kl > 1.5 * target_kl:
                 stop = True
                 break
-        if stop:
+        if stop or nonfinite is not None:
             break
+    if nonfinite is None and not all(bool(torch.isfinite(p).all()) for p in model.parameters()):
+        nonfinite = {"term": "params", "epoch": ep, "minibatch": -1, "rows": None}
+    if nonfinite is not None:
+        model.load_state_dict(snap)
+        opt.load_state_dict(opt_snap)
+        opt.zero_grad(set_to_none=True)
     out = {k: float(np.mean(v)) if v else float("nan") for k, v in stats.items()}
     out["early_stop"] = float(stop)
+    if nonfinite is not None:
+        out["nonfinite"] = nonfinite
     if use_teacher:
         out["teacher_n"] = float(t_mask.sum().item())
         out["teacher_coef"] = float(teacher_coef)

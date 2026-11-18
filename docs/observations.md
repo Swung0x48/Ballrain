@@ -668,6 +668,13 @@ random = 随机粘滞动作（2–39 步换一次），curr = 从课程抽的 TA
   `episodes.csv`（每个回合：起点、结束原因、回报和各奖励项、步数、游戏时间、平均前进速度、跳变次数、动作分布）、`runs.csv`（每个游戏进程：结束原因、正式 SR、死亡数）、
   `tb/`（tensorboard，含起点分布直方图）、`train.log`、`ckpt_*.pt` / `latest.pt`（模型、优化器、观测统计量、课程状态、计数器；`--resume` 续训）。
   种子：learner `--seed`，worker i 用 `seed·1000 + i`（worker 重启时加 100 × 重启次数，续训时加 7919 × 已完成的更新数），写在 `config.json`。异步采集本身不可逐位复现。
+- **非有限值防护**（`ballrain.train.nonfinite`）：更新前检查 batch（原始观测在进入观测统计量之前；归一化观测、动作、旧 log-prob、优势、回报、旧价值、teacher 项在 `ppo_update` 之前）；
+  `ppo_update` 里某个小批量的损失或梯度范数非有限时不走这一步，把参数和优化器状态恢复到本次更新开始时（最后一个小批量之后再检查一次参数）。两种情况这次更新都跳过：
+  模型、优化器、观测统计量保持更新前的值；更新计数照常加 1（和只拟合统计量的第一个 batch 一样，版本号、广播、日志和 checkpoint 的节奏不变），这一行的损失列为空。
+  `train.log` 写一行 `NON-FINITE ...`（自有 worker 的行数、池子的行数及其 task/seq 和 lag），batch 存成 `nonfinite-u<update>.npz`（每个 run 目录最多 5 个：batch 的各数组、每行所属 chunk 和是否池子数据、
+  chunk 的 worker 号 / 版本 / lag / 池子 task 和 seq、非有限的项和小批量、更新开始时的参数和优化器状态；不含主机名、拷贝名、路径）。累计次数是 `counters["nonfinite_skipped"]`
+  （updates.csv 的 `nonfinite_skipped` 列、TensorBoard `train/nonfinite_skipped`；日志行只在非零时带上）。连续跳过超过 20 次 learner 停止。保存和广播之前再检查一次：
+  含非有限参数的 checkpoint 不写、参数不发布（learner 停止），`--resume` / `--init-from` 遇到这样的 checkpoint 在启动 worker 之前退出。
 - **磁盘**：每个进程目录约 1.8 MB（主要是 level.msg）。worker 读完元数据后删掉没有通关的进程目录，通关的只留 `.json`、`.tas`、`events.txt`（`--prune none` 全留）。
 - **停止**：在 run 目录下建 `STOP` 文件；learner 通知 worker 关闭游戏进程，之后按路径（`instances.running_in_copy`）停掉所用拷贝里还在运行的 Player.exe。
 - **评估与导出**（`scripts/eval_m2.py`）：从关卡加载（k = 0，脚本化的 Q）闭环运行，argmax 或低温采样（每个 run 一个种子），死亡后同进程重生；

@@ -8,7 +8,8 @@ Learner in this process, one rollout worker process per game copy (ballrain.trai
 train-<copy_offset> .. ). Outputs in <runtime>/m2-train/<run>/: config.json, updates.csv (one row per update),
 episodes.csv (one row per RL episode), runs.csv (one row per game process), tb/ (tensorboard), ckpt_*.pt and
 latest.pt (model, optimiser, observation statistics, curriculum state, counters), episodes/<copy>/<run_id>/ (kept
-runs: finishing processes, .json + .tas), pids.json, train.log.
+runs: finishing processes, .json + .tas), pids.json, train.log, nonfinite-u<update>.npz (the batch of a skipped
+non-finite update, ballrain.train.nonfinite; at most 5).
 
 Stop: create the file <run>/STOP (the learner stops the workers, which close their game processes; any game
 process still running in the copies used is then stopped by path, never by image name).
@@ -47,7 +48,7 @@ UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_pe
                 "band_success", "band_n", "band_finish", "gate_blocked", "episodes", "ret_mean", "ret_tas", "ret_respawn", "success_cp_tas", "finish_tas",
                 "deaths", "finishes", "stalls", "caps", "camera_off_quarter", "invalid_runs", "speed_mean", "runs", "finish_runs", "sr_ms_min", "sr_ms_k0_min",
                 "k_p10", "k_p50", "k0_eps", "update_s", "collect_s", "reset_frac", "dropped_chunks", "worker_restarts",
-                "best_sr_k0", "best_sr_any"] + [f"deaths_s{s}" for s in range(1, 5)]
+                "nonfinite_skipped", "best_sr_k0", "best_sr_any"] + [f"deaths_s{s}" for s in range(1, 5)]
                + [f"{p}_bin{b}" for b in range(12) for p in ("cp", "fin")]
                + [f"{p}_sec{s}" for s in range(1, 5) for p in ("cp", "fin")]
                + [f"{p}_sec{s}" for s in range(1, 5) for p in ("rsp_cp", "rsp_n")]
@@ -433,7 +434,8 @@ def main(argv=None) -> int:
     import torch
     from ballrain import instances
     from ballrain.curriculum import CurriculumConfig, ReverseCurriculum, TasStarts
-    from ballrain.train.ppo import ActorCritic, RunningMeanStd, explained_variance, gae, normalize, ppo_update, vtrace
+    from ballrain.train.nonfinite import NonFiniteError, NonFiniteGuard, nonfinite_keys
+    from ballrain.train.ppo import ActorCritic, RunningMeanStd, explained_variance, gae, normalize, vtrace
     from ballrain.train.worker import WorkerSpec, worker_main
 
     run_dir = instances.runtime_dir() / "m2-train" / a.run
@@ -495,7 +497,7 @@ def main(argv=None) -> int:
     opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
     rms = RunningMeanStd(n_obs)
     counters = {"update": 0, "steps": 0, "frames": 0, "episodes": 0, "runs": 0, "wall_s": 0.0, "finish_runs": 0,
-                "dropped_chunks": 0, "worker_restarts": 0}
+                "dropped_chunks": 0, "worker_restarts": 0, "nonfinite_skipped": 0}
     best = {"sr_ms_k0": None, "sr_ms_any": None}
     from ballrain.train.grow import GrowError, load_grown
     new_features = asdict(env_cfg)["features"]
@@ -533,6 +535,21 @@ def main(argv=None) -> int:
             best.update(ck0.get("best", {}))
         log.msg(f"initialised from {a.init_from}" + (f" (full: update {counters['update']}, frontier {cu.frontier})"
                                                      if a.init_full else ""))
+
+    def learner_state() -> dict:
+        return {"model": model.state_dict(), "opt": opt.state_dict(), "rms": rms.state_dict()}
+
+    def require_finite(what: str, state: dict):
+        """The last line of defence of the non-finite guard: nothing non-finite is saved or published."""
+        bad = nonfinite_keys(state)
+        if bad:
+            raise NonFiniteError(f"refusing to {what} non-finite parameters ({', '.join(bad[:5])}"
+                                 f"{', ...' if len(bad) > 5 else ''})")
+
+    try:  # before any worker starts: a checkpoint written by a learner without the guard may hold NaN
+        require_finite("start from", learner_state())
+    except NonFiniteError as e:
+        raise SystemExit(f"{e}: --resume / --init-from an earlier checkpoint")
     # the command line is authoritative for the curriculum parameters (a resumed state carries the old ones)
     for k, v in (("step", a.cu_step), ("band", a.cu_band), ("recent", a.cu_recent), ("advance_at", a.advance_at),
                  ("min_episodes", a.min_episodes), ("weighted", a.cu_weighted), ("bin_floor", a.cu_bin_floor),
@@ -596,6 +613,7 @@ def main(argv=None) -> int:
         msg = {"version": counters["update"], "rms": rms.state_dict(), "curriculum": cu.state_dict()}
         if with_model:
             msg["model"] = {k: v.detach().cpu().numpy() for k, v in model.state_dict().items()}
+        require_finite("publish", {k: msg[k] for k in ("model", "rms") if k in msg})
         for q in (qs or ctrl_qs):
             q.put(msg)
         if hub is not None and qs is None and with_model:
@@ -726,6 +744,7 @@ def main(argv=None) -> int:
             log.msg(f"MILESTONE first finish: start frame {r['start_frame']}, SR {r['sr_ms']}")
 
     def save_ckpt():
+        require_finite("save", learner_state())  # latest.pt stays the last finite checkpoint
         state = {"model": model.state_dict(), "opt": opt.state_dict(), "rms": rms.state_dict(),
                  "curriculum": cu.state_dict(), "counters": dict(counters, wall_s=counters["wall_s"] + time.time() - t_start),
                  "best": best, "args": vars(a), "n_obs": n_obs, "n_act": n_act, **checkpoint_config(env_cfg)}
@@ -753,6 +772,7 @@ def main(argv=None) -> int:
     pool_lags: list = []
     pool_warned = [False]
     pool_rho: list = []
+    nf_guard = NonFiniteGuard(run_dir, log.msg, counters)
 
     def pool_correction(chunks, obs_n) -> dict:
         """--pool-correction vtrace: chunk index -> (adv, ret, logp_prox, v_prox) for the pool chunks of the batch: the
@@ -980,12 +1000,21 @@ def main(argv=None) -> int:
                 break
             collect_times.append(time.perf_counter() - tc)
             raw = np.concatenate([c["raw"] for c in chunks])
-            rms.update(raw)
+            # Non-finite guard (ballrain.train.nonfinite): a batch with a non-finite value, or an update whose loss /
+            # gradient turns non-finite, is skipped: model, optimiser and observation statistics stay as before it. It
+            # still counts as an update, like the first batch (version, broadcast, log / checkpoint cadence unchanged).
+            u_next = counters["update"] + 1
+            rms_prev = rms.state_dict()
+            skipped = nf_guard.check(u_next, chunks, {"raw": raw}, model, opt)  # before it reaches the statistics
+            if not skipped:
+                rms.update(raw)
             counters["steps"] += len(raw)
             tu = time.perf_counter()
-            if first:  # the first batch only fits the observation statistics
+            ustats = {}
+            if skipped:
+                pass
+            elif first:  # the first batch only fits the observation statistics
                 first = False
-                ustats = {}
             else:
                 obs_n = normalize(raw, rms.state_dict())
                 pool_terms = pool_correction(chunks, obs_n) if a.pool_correction == "vtrace" else {}
@@ -1003,15 +1032,23 @@ def main(argv=None) -> int:
                 wstats = watch_entropy(batch["obs"], raw) if watch is not None else {}
                 model.train()
                 tl, tm, tc = teacher_terms(raw) if teacher is not None else (None, None, 0.0)
-                ustats = ppo_update(model, opt, batch, a.epochs, a.minibatch, a.clip, a.vf_coef, a.ent_coef,
-                                    a.max_grad_norm, a.device, gen, a.target_kl, tl, tm, tc)
+                ustats = nf_guard.update(u_next, chunks, {"values": np.concatenate(vals)}, model, opt, batch, a.epochs,
+                                         a.minibatch, a.clip, a.vf_coef, a.ent_coef, a.max_grad_norm, a.device, gen,
+                                         a.target_kl, teacher_logp=tl, teacher_mask=tm, teacher_coef=tc)
                 model.eval()
-                ustats["explained_var"] = explained_variance(np.concatenate(vals), batch["ret"])
-                for k, v in pool_stats(chunks).items():  # TensorBoard only: updates.csv keeps its columns
-                    log.tb.add_scalar(f"pool/{k}", v, counters["steps"])
-                ustats["adv_std"] = float(batch["adv"].std())
-                ustats["ret_mean"] = float(batch["ret"].mean())
-                ustats.update(wstats)
+                if ustats is None:  # skipped (logged, dumped): model and optimiser are the pre-update ones
+                    skipped, ustats = True, {}
+                    rms.load_state_dict(rms_prev)
+                else:
+                    ustats["explained_var"] = explained_variance(np.concatenate(vals), batch["ret"])
+                    for k, v in pool_stats(chunks).items():  # TensorBoard only: updates.csv keeps its columns
+                        log.tb.add_scalar(f"pool/{k}", v, counters["steps"])
+                    ustats["adv_std"] = float(batch["adv"].std())
+                    ustats["ret_mean"] = float(batch["ret"].mean())
+                    ustats.update(wstats)
+            if skipped:  # counted in counters["nonfinite_skipped"] by the guard
+                pool_lags.clear()  # the skipped batch's pool statistics do not enter the next update's
+                pool_rho.clear()
             update_times.append(time.perf_counter() - tu)
             counters["update"] += 1
             broadcast()
@@ -1053,6 +1090,7 @@ def main(argv=None) -> int:
                        "update_s": round(float(np.mean(update_times)), 3), "collect_s": round(float(np.mean(collect_times)), 3),
                        "reset_frac": round(float(np.mean(reset_frac)), 3) if reset_frac else None,
                        "dropped_chunks": counters["dropped_chunks"], "worker_restarts": counters["worker_restarts"],
+                       "nonfinite_skipped": counters["nonfinite_skipped"],
                        "best_sr_k0": best["sr_ms_k0"], "best_sr_any": best["sr_ms_any"]}
                 for s in range(1, 5):
                     d = [e for e in eps if e["end"] == "BallOff" and e["end_sector"] == s]
@@ -1148,13 +1186,17 @@ def main(argv=None) -> int:
                         f"ret {row['ret_mean']:.2f} deaths {row['deaths']} stalls {row['stalls']} fin_runs {row['finish_runs']} "
                         f"sr_min {row['sr_ms_min']} ent {ustats.get('entropy', float('nan')):.3f} "
                         f"kl {ustats.get('approx_kl', float('nan')):.4f} ev {ustats.get('explained_var', float('nan')):.2f} "
-                        f"upd {row['update_s']}s reset {row['reset_frac']} rsp_skip {n_skip}")
+                        f"upd {row['update_s']}s reset {row['reset_frac']} rsp_skip {n_skip}"
+                        + (f" nonfinite_skipped {row['nonfinite_skipped']}" if row["nonfinite_skipped"] else ""))
                 log.flush()
                 win_eps, win_runs = [], []
             if u % a.ckpt_every == 0:
                 save_ckpt()
             if guard is not None and u % 5 == 0:
                 auto_rollback()
+    except NonFiniteError as e:
+        log.msg(f"STOPPED by the non-finite guard: {e}")
+        raise
     finally:
         log.msg("stopping workers")
         if hub is not None:
