@@ -33,7 +33,7 @@ import gymnasium as gym
 import numpy as np
 
 from . import instances, protocol as P, tas
-from .branch_assets import bundle_rules
+from .branch_assets import bundle_rules, rest_member
 from .branch_rules import DEFAULT_RULES
 from .client import AgentSession, SessionConfig
 from .curriculum import CurriculumConfig, ReverseCurriculum, TasStarts
@@ -156,6 +156,8 @@ class EnvConfig:
     def __reduce_ex__(self, protocol):
         if self.branch_assets is not None:
             # An older spawned worker must not silently drop an unfamiliar dataclass field.
+            if self.branch_assets.get("version") == 2:
+                return _restore_branch_env_v2, (vars(self),)
             if bundle_rules(self.branch_assets) != DEFAULT_RULES:
                 return _restore_branch_env_rules_v1, (vars(self),)
             return _restore_branch_env_v1, (vars(self),)
@@ -163,6 +165,10 @@ class EnvConfig:
 
     def reward_config(self) -> RewardConfig:
         return self.reward if self.reward is not None else RewardConfig(mode=self.mode)
+
+
+def _restore_branch_env_v2(fields):
+    return EnvConfig(**fields)
 
 
 def _restore_branch_env_v1(fields):
@@ -239,6 +245,10 @@ class BallanceEnv(gym.Env):
                              "camera='world', camera-relative actions a camera frame)")
         self._branch_temp = install(self.cfg.branch_assets, self.cfg.level, fc.path_sha256, fc.branch_sha256)
         self.branch_rules = bundle_rules(self.cfg.branch_assets) if self._branch_temp else DEFAULT_RULES
+        if self.cfg.branch_assets and self.cfg.branch_assets.get("version") == 2:
+            for start in self.cfg.rest_starts or []:
+                if len(start) == 3 and isinstance(start[2], dict):
+                    rest_member(self.cfg.branch_assets, start[2].get("id"))
         self.fx = FeatureExtractor(fc, branch_root=self._branch_temp.name if self._branch_temp else None)
         self.reward = Reward(self.cfg.reward_config())
         if self.cfg.esc_frames < 3:
@@ -422,13 +432,13 @@ class BallanceEnv(gym.Env):
         if rest and k:
             if isinstance(rest, dict):
                 try:
-                    self._branch_rest(p, k, rest["branch_s"])
+                    self._branch_rest(p, k, rest["branch_s"], key=rest.get("id"))
                 except Exception as exc:
                     # The failed simulation is not a valid handover. Launch once without
                     # the drive, preserving the requested TAS frame (and curriculum band).
                     p["session"].close(kill=True)
                     self.branch_rest_failures += 1
-                    if self.branch_rules.rest_fallback == "error":
+                    if self._rules_for_rest(rest).rest_fallback == "error":
                         raise
                     p = self._prepare(copy, k, rest=False)
                     failure = dict(branch_rest_failures=self.branch_rest_failures,
@@ -444,9 +454,15 @@ class BallanceEnv(gym.Env):
             self._brake(p)
         return p
 
-    def _branch_rest(self, p, k, station):
+    def _rules_for_rest(self, rest):
+        if self.cfg.branch_assets and self.cfg.branch_assets.get("version") == 2:
+            _, member = rest_member(self.cfg.branch_assets, rest.get("id"))
+            return bundle_rules(member)
+        return self.branch_rules
+
+    def _branch_rest(self, p, k, station, key=None):
         """Replay the measured drive through the trafo, then close the loop on an arc target.
-        Never synthesize a transform, teleport, or accept a paper / unsupported handover.
+        Never synthesize a transform, teleport, or accept the wrong material / surface.
         Use a private extractor: warm-preparation can run concurrently with training.
         """
         from .path import asset_path, file_sha256
@@ -460,31 +476,55 @@ class BallanceEnv(gym.Env):
         branch = fx.branch
         if branch is None:
             raise ValueError('no matching branch at handover')
+        multi = None
+        if hasattr(branch, 'by_id'):
+            multi = branch
+            key, _ = rest_member(self.cfg.branch_assets, key)
+            entry, branch = multi.by_id[key]
+            root = root / key
         with np.load(root / 'drive.npz', allow_pickle=False) as drive:
             if (str(drive['record_sha256']) != p['start'].get('record_sha256') or
                     str(drive['branch_sha256']) != file_sha256(asset_path(self.cfg.level, root))):
                 raise ValueError('drive replay does not match TAS recording or branch asset')
             samples = drive['samples']
             if k != int(drive['prefix_frame']) or not samples[:, 1].min() <= station <= samples[:, 1].max():
-                raise ValueError('prefix frame or target outside the recorded stone drive')
+                raise ValueError('prefix frame or target outside the recorded branch drive')
             offset = int(samples[np.argmin(abs(samples[:, 1] - station)), 0])
             frames = drive['frames'][:offset]
+            phase = 0
+            required = branch.ball_type
+            required_sector = branch.sector
+            if multi and not entry.get('legacy'):
+                phase = max(i for i, piece in enumerate(entry['phases'])
+                            if piece['local_s'][0] <= station <= piece['local_s'][1])
+                condition = entry['phases'][phase]['when']
+                required = condition['ball']
+                seg = branch.alt._segments(station, station)[0]
+                required_sector = condition.get('sector', int(branch.alt.seg_sector[seg]))
         for block in range(0, len(frames), 512):
             s.act(frames[block:block+512], stop=(Ev.BallOff, Ev.GameOver, Ev.LevelFinish))
             if s.ended or s.tracker.flags.ball_off:
                 raise RuntimeError('ball lost during branch drive replay')
         target = branch.alt.point_at(station)
-        if s.tracker.ball_type() != branch.ball_type or s.tracker.sector != branch.sector:
+        if s.tracker.ball_type() != required or s.tracker.sector != required_sector:
             raise RuntimeError('branch drive did not produce the required ball type and sector')
         rules = branch.rules
         self._drive(p, target[[0, 2]], rules)
         self._brake(p, rules)
+        if multi:
+            multi.restore(key, phase, station)
         _, fi = fx.compute(s.tracker)
         o = s.tracker.obs.ball
         if ((rules.rest_require_support and not fi.get('supported')) or not fi.get('path', {}).get('branch') or
                 np.linalg.norm(o['pos'] - target) > rules.rest_position_tolerance or
                 np.linalg.norm(fi['vel'][[0, 2]]) > (rules.rest_stop_speed or self.cfg.rest_speed)):
             raise RuntimeError('branch rest target not reached at rest on the correct surface')
+        if multi:
+            if (s.tracker.ball_type() != required or s.tracker.sector != required_sector
+                    or fi['path'].get('branch_id') != key or fi['path'].get('phase') != phase):
+                raise RuntimeError('branch phase mismatch')
+            p['start'].update(branch_id=key, phase=phase)
+            p['recorder'].meta.start_state.update(branch_id=key, phase=phase)
         p['start']['branch_s'] = station
         p['recorder'].meta.start_state.update(branch_s=station)
 
@@ -733,6 +773,9 @@ class BallanceEnv(gym.Env):
         self._ep_steps = self._ep_frames = self._ep_pause_frames = 0
         self._ep_start = s.frames_done
         self.fx.reset_episode()  # path projection state: re-acquired at every episode start
+        if self._start.get("branch_id"):
+            self.fx.reference_path(s.tracker)
+            self.fx.branch.restore(self._start["branch_id"], self._start["phase"], self._start["branch_s"])
         obs, finfo = self.fx.compute(s.tracker)
         self.reward.begin(s.tracker, self._arc(finfo))
         info = self._info(finfo, [])
@@ -987,6 +1030,10 @@ class BallanceEnv(gym.Env):
                 "life": len(self.recorder.lives) - 1 if self.recorder else None,
                 "run_id": self.recorder.meta.run_id if self.recorder else None, "start": self._start}
         route = finfo.get("path") or {}
+        if "branch_id" in route:
+            key = route["branch_id"]
+            self.branch_rules = self.fx.branch.by_id[key][1].rules if key else DEFAULT_RULES
+            info.update(branch_id=key, phase=route["phase"])
         if "branch" in route:
             info.update({key: route[key] for key in ("branch", "local_s", "ref_elapsed_ms", "ref_remaining_ms")})
         elif self.fx.branch is not None:

@@ -107,6 +107,12 @@ class BranchFollower:
 
 
 def load_branch(main, level, root, main_root, **kw):
+    manifest_path = resolve_path_dir(root) / "branches.json"
+    if manifest_path.is_file():
+        from .multi_branch import MultiFollower, manifest
+        members = [(e, load_branch(main, level, manifest_path.parent/e["id"], main_root, **kw))
+                   for e in manifest(manifest_path.read_bytes())]
+        return MultiFollower(main, members)
     asset = asset_path(level, resolve_path_dir(root))
     desc = json.loads(asset.with_suffix(".json").read_text(encoding="utf-8-sig"))
     if desc["level"] != level or desc["main_sha256"] != file_sha256(
