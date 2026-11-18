@@ -289,7 +289,7 @@ def main(argv=None) -> int:
             plan.append((at, "quiet", dur))
         for at, what, dur in sorted(plan):
             time.sleep(max(0.0, t0 + at - time.time()))
-            if p.poll() is not None:
+            if not hasattr(p, "poll") or p.poll() is not None:  # the client already finished (p is its result)
                 return
             if what == "outage":
                 down.set()
