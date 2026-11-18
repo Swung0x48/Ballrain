@@ -84,7 +84,7 @@ def test_resumed_policy_is_bit_identical_for_any_values_in_the_new_block():
         assert float(d64.abs().max()) <= 1e-12
 
 
-def test_adam_moments_grown_with_zeros_and_kept_for_the_old_columns():
+def test_adam_moments_grown_seeded_and_kept_for_the_old_columns():
     src, _, _ = trained_checkpoint()
     model, opt, rms = grown(src)
     names = [n for n, _ in model.named_parameters()]
@@ -95,7 +95,12 @@ def test_adam_moments_grown_with_zeros_and_kept_for_the_old_columns():
         for k in ("exp_avg", "exp_avg_sq"):
             if n in ("pi.0.weight", "v.0.weight"):
                 assert s[k].shape == (256, N7)
-                assert torch.equal(s[k][:, :N6], o[k]) and not s[k][:, N6:].any()
+                assert torch.equal(s[k][:, :N6], o[k])
+                if k == "exp_avg":
+                    assert not s[k][:, N6:].any()
+                else:  # each row's new columns: the mean of its old columns
+                    want = o[k].mean(1, keepdim=True).expand(256, N7 - N6)
+                    assert torch.equal(s[k][:, N6:], want) and (s[k][:, N6:] > 0).all()
             else:
                 assert torch.equal(s[k], o[k])
     assert np.array_equal(rms.mean[:N6], src["rms"]["mean"]) and not rms.mean[N6:].any()
@@ -107,6 +112,54 @@ def test_adam_moments_grown_with_zeros_and_kept_for_the_old_columns():
     (logits.logsumexp(-1).mean() + (v ** 2).mean()).backward()
     opt.step()
     assert model.pi[0].weight[:, N6:].abs().sum() > 0
+
+
+def test_first_steps_of_the_new_columns_are_not_larger_than_the_learning_rate():
+    """With the checkpoint's step count large (bias correction gone: r8 is at 2.9e5 optimiser steps) a gradient of the
+    old columns' typical size moves a new column by about 0.1 lr per step for the first steps; with zero second
+    moments it would move ~3.2 lr (0.1 g / sqrt(0.001 g^2)), the 3-6x the seeding avoids. Logits stay bit-identical."""
+    from ballrain.train.grow import grow_optimizer_state
+    src, old, old_rms = trained_checkpoint()
+    gen = torch.Generator().manual_seed(3)
+    for s in src["opt"]["state"].values():
+        s["step"] = torch.tensor(293411.0)  # the r8 latest checkpoint
+        if s["exp_avg_sq"].shape == (256, N6):  # its pi.0.weight second moments: median 3.4e-7, sqrt 6e-4 >> eps
+            s["exp_avg_sq"] = 1e-7 + 9e-7 * torch.rand(256, N6, generator=gen, dtype=s["exp_avg_sq"].dtype)
+    lr = 1.5e-4
+
+    def first_steps(seed: bool):
+        model = ActorCritic(N7, 9, (256, 256), "tanh")
+        opt = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-5)
+        rms = RunningMeanStd(N7)
+        load_grown(model, opt, rms, src, N7, F7, load_opt=True)
+        if not seed:  # the zero-moment growth, for comparison
+            sd = grow_optimizer_state(src["opt"], model, N6, N7)
+            for s in sd["state"].values():
+                if s["exp_avg_sq"].dim() == 2 and s["exp_avg_sq"].shape[1] == N7:
+                    s["exp_avg_sq"][:, N6:] = 0
+            opt.load_state_dict(sd)
+        w = model.pi[0].weight
+        v_old = opt.state[w]["exp_avg_sq"][:, :N6].mean(1, keepdim=True)
+        g = torch.sqrt(v_old).expand(w.shape[0], N7 - N6)  # a gradient of the old columns' rms size
+        moves = []
+        for _ in range(5):
+            before = w.detach().clone()
+            opt.zero_grad()
+            w.grad = torch.zeros_like(w)
+            w.grad[:, N6:] = g
+            opt.step()
+            moves.append(float((w.detach() - before)[:, N6:].abs().max()) / lr)
+        return moves
+
+    seeded, zero = first_steps(True), first_steps(False)
+    assert max(seeded) < 0.6 and min(zero) > 1.5 and max(zero) > 3.0, (seeded, zero)
+    # at resume (no step yet) the grown policy is the old one
+    new, _, new_rms = grown(src)
+    x = np.random.default_rng(1).normal(size=(1, N6))
+    with torch.no_grad():
+        la, va = old(torch.as_tensor(normalize(x, old_rms.state_dict())))
+        lb, vb = new(torch.as_tensor(normalize(np.c_[x, np.ones((1, N7 - N6))], new_rms.state_dict())))
+    assert torch.equal(la, lb) and torch.equal(va, vb)
 
 
 def test_same_size_loads_as_is_and_shrink_or_non_prefix_is_refused():
