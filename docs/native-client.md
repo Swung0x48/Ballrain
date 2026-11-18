@@ -302,30 +302,36 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - **`core/branch`**：`BranchFollower` 维护两条线（主线 `L02.npz`、石线 `L02-stone/L02.npz`）的投影，按 `L02.json` 的站点把石线米数换成主线米数；
   只有在可见球是石球、在小节 4、并且投影落在石线区间内时用石线。进度 `path.s` 是本命单调的主线进度，换线那一拍不付进度，之后线性追回到下一个共同站点；
   参考时钟只积分新走过区间的活动线 `t_ms`（主线没有 `t_ms` 时用描述文件里的 `main_span_t_ms` 拼出来）。`load_branch` 核对关卡和主线 sha256。
-- **特征**：`FeatureConfig.branch_dir`；路径块（路标、切线、剩余距离、参考速度、小节除数）用活动线，`path_progress` 用主线总长归一化；没开时布局和数值都不变。
+- **规则也是下发的数据**（`L<nn>.json` 的 `rules`，`ballrain/branch_rules.py`，`docs/l2-stone-branch.md` 的 v1 约定）：`core/branch` 的
+  `BranchRules` 按同样的封闭格式解析（未知名字、类型或取值不对就拒绝任务），用于石线上的停滞判定（`stall_pause_speed`、`stall_speed_source`、
+  `stall_odometer`）和石球静止开局（`rest_stop_speed`、驱动 / 制动帧数、`rest_control_repeat`、`drive_*`、`rest_require_support`、
+  `rest_position_tolerance`、`rest_fallback`）；客户端代码里不再有这些常数，改规则只需重新打包，不用升级客户端。
+- **特征**：`FeatureConfig.branch_dir`（安装好的分线目录，客户端自己填；清单里只有学习器的钉 `branch_sha256`）；路径块（路标、切线、剩余距离、参考速度、小节除数）用活动线，`path_progress` 用主线总长归一化；没开时布局和数值都不变。
 - **环境**：每步信息带 `branch` / `local_s` / `ref_elapsed_ms` / `ref_remaining_ms`（看不到球时用跟随器上一次的时钟）；石球静止开局（`RestStart.branch_s`）
   回放 `drive.npz` 已验证的按键流到对应站点，核对石球和小节，再闭环开到目标、制动，检查支撑、位置和速度。
   任何一步失败都不算有效交接：关掉这个进程，在同一帧重新做一次普通 TAS 开局（`kind` 为 `tas`，带 `branch_rest_failures` / `branch_rest_target` / `branch_rest_error`，同 `env._prepare`）。
   只有分线自己的检查失败才回退（资源、范围、球掉了、球型 / 小节不对、没有停稳在石线上）；引擎、连接故障照旧报错（任务失败，不上传），免得上传一个校验端会判成不一致的开局。
 - **奖励整形**：分段奖励用活动线参考时钟，帧数上限用 `(ref_elapsed + ref_remaining) × cap_mult`，换线时重算（Python 的 `rollout.TaskRunner`、`client_sampler` 也补上了这一步）。
-  停滞判定同 `worker.stall_age`：在石线上里程用活动线米数 `local_s`（换线就重新起算），速度用 `speed + speed_change`，静止阈值取 `min(1, stall_speed)`；
-  主线上不变。`rollout.TaskRunner` 和 `client_sampler` 改成直接调用 `worker.stall_age`。
+  停滞判定同 `worker.stall_age`：在石线上按规则取里程（默认活动线米数 `local_s`，换线就重新起算）和速度（默认 `speed + speed_change`），
+  静止阈值取 `min(stall_pause_speed, stall_speed)`；主线上不变。`rollout.TaskRunner` 和 `client_sampler` 直接调用 `worker.stall_age`，规则取 `env.branch_rules`。
 - **对照**（主线 `benchmarks/refpaths-v2/L02.npz`，分线 `benchmarks/refpaths-alt/L02-stone`，r8 v2 清单）：`golden.py branch`（SR02 录像到 `drive.npz` 的前缀帧，再接上它的按键流，球经变球器变石球、走南环）：22402 帧、11202 行特征 C++ 与 Python
-  **逐位相同**；同一条流不带分线回放时最大差 10，3204 行读到了石线的 `t_ms`，说明确实走在石线上。`task_diff.py --branch-dir`（r8 检查点，分线目录暂时在清单之外给两边）6 个场景全部通过：石球静止开局 + 策略、石球静止开局 + 随机粘滞动作、变球器上游的 TAS 开局 + 策略、小节 3–4 的 TAS 开局 + 随机粘滞动作，以及两个回退场景：目标超出按键流范围、一开始就失败的 `branch_rest_fallback`，`rest_speed` 设成 0、回放和刹车跑完才失败的 `branch_rest_late_fallback`。
+  **逐位相同**；同一条流不带分线回放时最大差 10，3204 行读到了石线的 `t_ms`，说明确实走在石线上。`task_diff.py --branch-dir`（r8 检查点，分线目录暂时在清单之外给两边）走清单和分线包，8 个场景全部通过：石球静止开局 + 策略、石球静止开局 + 随机粘滞动作、变球器上游的 TAS 开局 + 策略、小节 3–4 的 TAS 开局 + 随机粘滞动作，以及两个回退场景：目标超出按键流范围、一开始就失败的 `branch_rest_fallback`，`rest_speed` 设成 0、回放和刹车跑完才失败的 `branch_rest_late_fallback`；再加两个改了规则的场景
+  （`branch_rules_rest` / `branch_rules_sticky`：停滞阈值 0.5、里程用主线进度、驱动增益 0.6、限速 4、死区 0.2、每条指令 3 帧、制动 400 帧、位置容差 3）。
   `tools/native/branch_diff.py`（`nc_branch_diff`）把跟随器单独拿出来对照：`tests/test_stone_branch.py` 的几个场景加 40 组随机游走（横向噪声、换球、换小节、倒退、跳跃、重置），每一步的输出逐位相同。
 - **分发**（分线是学习器下发的配置，不写死在任何程序里，也没有哪个组件去读自己本地的分线文件）：学习器把三份文件的原始字节放在状态里
-  （`state["branch_assets"] = {level, line_npz, desc_json, drive_npz}`）；`weights.export_state` 检查后把它们的 sha256 钉进清单
-  `features.branch = {line_sha256, desc_sha256, drive_sha256}`（训练配置里有 `branch_dir` 却没带文件就拒绝导出）；网关 `publish_state`
+  （`state["branch_assets"] = {level, line_npz, desc_json, drive_npz, sha256}`，`ballrain/branch_assets.py`），特征配置里是它的钉
+  `features.branch_sha256`（三份文件 32 字节摘要按顺序拼起来再取 sha256）；`weights.export_state` 用 `branch_assets.validate` 检查
+  （关卡、摘要、主线配对、规则）后把这个钉原样写进清单（没带文件或文件不是这个钉就拒绝导出）；网关 `publish_state`
   打成分线包（`task.export_branch_pack`，三个 uint8 数组，内容相同 sha 就相同），任务带 `assets.branch`；客户端和校验端
-  `install_branch_pack` 装到缓存 `branch/<sha>/`，`build_env` / `play_task` 再核对一次三份文件。网关按 `rest_starts` 的
+  `install_branch_pack` 装到缓存 `branch/<sha>/`，`build_env` / `play_task` 再核对一次摘要（Python 端把文件交给环境的 `EnvConfig.branch_assets`）。网关按 `rest_starts` 的
   `lo-hi@branch:s` 条目抽石球静止开局（和环境同样的随机数调用顺序），发 `rest = {"target": null, "branch_s": s}`。
-  端到端（`e2e_pool.py --branch-dir`，r8 检查点，`rest_starts` 两个 `@branch:` 条目、`p_rest` 0.8）：网关导出带 `features.branch` 的清单和分线包，
+  端到端（`e2e_pool.py --branch-dir`，r8 检查点，`rest_starts` 两个 `@branch:` 条目、`p_rest` 0.8）：网关导出带 `features.branch_sha256` 的清单和分线包，
   发出 4 个任务（3 个石球静止开局），原生客户端下载安装分线包跑完，校验端 23 个块全部通过，伪造的块被抓到。
-- **能力门控**（不提版本下限，旧客户端照常拿不需要新功能的任务）：客户端在 hello 里报 `capabilities`（0.4.0：`task_format3`、`branch_v1`），
-  带分线的清单写 `"requires": ["branch_v1"]`（不带分线时没有这个字段；它不进 policy_sha）；网关只把任务发给具备全部 `requires` 的会话，
+- **能力门控**（不提版本下限，旧客户端照常拿不需要新功能的任务）：客户端在 hello 里报 `capabilities`（0.4.0：`task_format3`、`branch_v1`、
+  `branch_rules_v1`），带分线的清单写 `"requires": ["branch_v1"]`，规则不是 v1 默认值时再加 `branch_rules_v1`（不带分线时没有这个字段；它不进 policy_sha）；网关只把任务发给具备全部 `requires` 的会话，
   缺能力的拿到 `no_task`（沿用 `client_too_old`，网关写好的说明原样显示，客户端继续轮询）。`ballrain/pool/capabilities.py` 归池会话。
   部署顺序：先换网关再发 0.4.0（旧网关的 hello 校验不认识 `capabilities` 字段）。0.3.0 万一拿到带分线的清单，也会报
-  “unknown feature config field”放弃任务，不会悄悄跑出校验不过的数据。
+  “unknown feature config field branch_sha256”放弃任务，不会悄悄跑出校验不过的数据。
   端到端（门控生效）：4 个石球静止开局任务，20 个块全部通过。
 
 ## 11. 还没有做 / 限制

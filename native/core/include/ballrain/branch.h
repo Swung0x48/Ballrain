@@ -16,6 +16,29 @@
 
 namespace ballrain {
 
+// ballrain/branch_rules.py BranchRules: the tunable rules of a diversion, from its description's "rules" object
+// (docs/l2-stone-branch.md, v1). Closed schema: an unknown name or an invalid value refuses the task
+struct BranchRules {
+    double stall_pause_speed = 1.0;                      // the branch's stall pause threshold: min(this, stall_speed)
+    std::string stall_speed_source = "speed+speed_change";  // | "speed"
+    std::string stall_odometer = "local_s";              // | "s" (the main-line credit)
+    std::optional<double> rest_stop_speed;               // none: the env's rest_speed
+    std::optional<int64_t> rest_max_drive_frames, rest_max_brake_frames;  // none: the env's rest_max_frames
+    bool rest_require_support = true;
+    double rest_position_tolerance = 2.0;
+    std::string rest_fallback = "same_tas_frame";        // | "error"
+    double drive_arrival_radius = 1.0, drive_gain = 0.8, drive_speed_cap = 6.0, drive_deadband = 0.3;
+    int64_t rest_control_repeat = 2;
+
+    static BranchRules from_desc(const Json &desc);
+    bool is_default() const;
+};
+// the rules of <dir>/L<nn>.json (BranchRules::from_desc)
+BranchRules load_branch_rules(const std::string &dir, int level);
+// ballrain.branch_assets.validate's digest: sha256 over the three files' raw 32-byte digests (line, description,
+// drive): features.branch_sha256
+std::string branch_bundle_sha256(const Bytes &line, const Bytes &desc, const Bytes &drive);
+
 struct BranchStep {
     const ReferencePath *path = nullptr;  // the active line (local quantities: lookahead, tangent, remaining)
     Projection pr;                        // pr.s = the earned main-line progress (credit)
@@ -42,6 +65,7 @@ public:
     std::vector<double> ms, bs;  // the station pairs: main-line and branch-line metres
     std::vector<double> clocks[2];
     BranchTiming timing;
+    BranchRules rules;
 
 private:
     PathFollower routes_[2];

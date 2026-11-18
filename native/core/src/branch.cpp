@@ -1,6 +1,8 @@
 #include "ballrain/branch.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 
 #include "ballrain/sha256.h"
 #include "ballrain/util.h"
@@ -14,10 +16,92 @@ static int64_t ss_right(const std::vector<double> &a, double x) {
     return int64_t(std::upper_bound(a.begin(), a.end(), x) - a.begin());
 }
 
+BranchRules BranchRules::from_desc(const Json &desc) {
+    BranchRules r;
+    const Json *raw = desc.find("rules");
+    if (!raw) return r;
+    if (!raw->is_object()) throw RouteError("branch rules must be an object");
+    auto bad = [](const std::string &k) { return RouteError("invalid branch rule " + k); };
+    auto number = [&](const std::string &k, const Json &v) {  // float fields: int or float, 0 <= v (finite)
+        if (!v.is_number()) throw bad(k);
+        double x = v.as_double();
+        if (!(x >= 0) || !std::isfinite(x)) throw bad(k);
+        return x;
+    };
+    auto frames = [&](const std::string &k, const Json &v) {  // int fields: an integer in [1, 2147483647]
+        if (!v.is_int()) throw bad(k);
+        int64_t x = v.as_int();
+        if (x < 1 || x > 2147483647) throw bad(k);
+        return x;
+    };
+    auto choice = [&](const std::string &k, const Json &v, const char *a, const char *b) {
+        if (!v.is_string() || (v.as_string() != a && v.as_string() != b)) throw bad(k);
+        return v.as_string();
+    };
+    for (auto &kv : raw->members()) {
+        const std::string &k = kv.first;
+        const Json &v = kv.second;
+        if (k == "stall_pause_speed") r.stall_pause_speed = number(k, v);
+        else if (k == "stall_speed_source") r.stall_speed_source = choice(k, v, "speed", "speed+speed_change");
+        else if (k == "stall_odometer") r.stall_odometer = choice(k, v, "local_s", "s");
+        else if (k == "rest_stop_speed") {
+            if (v.is_null()) r.rest_stop_speed.reset();
+            else if (double x = number(k, v); x == 0) throw bad(k);
+            else r.rest_stop_speed = x;
+        } else if (k == "rest_max_drive_frames") {
+            if (v.is_null()) r.rest_max_drive_frames.reset();
+            else r.rest_max_drive_frames = frames(k, v);
+        } else if (k == "rest_max_brake_frames") {
+            if (v.is_null()) r.rest_max_brake_frames.reset();
+            else r.rest_max_brake_frames = frames(k, v);
+        } else if (k == "rest_require_support") {
+            if (!v.is_bool()) throw bad(k);
+            r.rest_require_support = v.as_bool();
+        } else if (k == "rest_position_tolerance") r.rest_position_tolerance = number(k, v);
+        else if (k == "rest_fallback") r.rest_fallback = choice(k, v, "same_tas_frame", "error");
+        else if (k == "drive_arrival_radius") r.drive_arrival_radius = number(k, v);
+        else if (k == "drive_gain") r.drive_gain = number(k, v);
+        else if (k == "drive_speed_cap") r.drive_speed_cap = number(k, v);
+        else if (k == "drive_deadband") r.drive_deadband = number(k, v);
+        else if (k == "rest_control_repeat") r.rest_control_repeat = frames(k, v);
+        else throw RouteError("unknown branch rule: " + k);
+    }
+    return r;
+}
+
+bool BranchRules::is_default() const {
+    BranchRules d;
+    return stall_pause_speed == d.stall_pause_speed && stall_speed_source == d.stall_speed_source &&
+           stall_odometer == d.stall_odometer && rest_stop_speed == d.rest_stop_speed &&
+           rest_max_drive_frames == d.rest_max_drive_frames && rest_max_brake_frames == d.rest_max_brake_frames &&
+           rest_require_support == d.rest_require_support && rest_position_tolerance == d.rest_position_tolerance &&
+           rest_fallback == d.rest_fallback && drive_arrival_radius == d.drive_arrival_radius &&
+           drive_gain == d.drive_gain && drive_speed_cap == d.drive_speed_cap && drive_deadband == d.drive_deadband &&
+           rest_control_repeat == d.rest_control_repeat;
+}
+
+static Json read_desc(const std::string &dir, int level) {
+    char n[16];
+    std::snprintf(n, sizeof n, "/L%02d.json", level);
+    Bytes jb;
+    if (!read_file(dir + n, jb)) throw RouteError("branch description " + dir + n + " missing");
+    if (jb.compare(0, 3, "\xEF\xBB\xBF") == 0) jb = jb.substr(3);  // utf-8-sig
+    return Json::parse(jb, 16);
+}
+
+BranchRules load_branch_rules(const std::string &dir, int level) { return BranchRules::from_desc(read_desc(dir, level)); }
+
+std::string branch_bundle_sha256(const Bytes &line, const Bytes &desc, const Bytes &drive) {
+    Sha256 h;
+    for (const Bytes *b : {&line, &desc, &drive}) h.update(Sha256::hash(b->data(), b->size()));
+    return h.hexdigest();
+}
+
 BranchFollower::BranchFollower(std::shared_ptr<const ReferencePath> m, std::shared_ptr<const ReferencePath> a,
                                const Json &meta, double back, double ahead, double margin, double reacquire)
     : main(std::move(m)), alt(std::move(a)),
       routes_{PathFollower(main, back, ahead, margin, reacquire), PathFollower(alt, back, ahead, margin, reacquire)} {
+    rules = BranchRules::from_desc(meta);
     ball_type = int(meta.at("ball_type").as_int());
     sector = int(meta.at("sector").as_int());
     lo = meta.at("branch_s").at(size_t(0)).as_double();

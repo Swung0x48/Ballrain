@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "ballrain/branch.h"
 #include "ballrain/diagnostics.h"
 #include "ballrain/features.h"
 #include "ballrain/geometry.h"
@@ -61,6 +62,30 @@ int main() {
             FeatureConfig::from_json(Json::parse(f7));
         } catch (const Error &e) {
             refused = std::string(e.what()).find("fastreach") != std::string::npos;
+        }
+        CHECK(refused);
+    }
+    // branch rules (ballrain/branch_rules.py, docs/l2-stone-branch.md v1): defaults, overrides, the closed schema
+    {
+        BranchRules d = BranchRules::from_desc(Json::parse(R"({"level":2})"));
+        CHECK(d.is_default() && d.drive_gain == 0.8 && d.rest_control_repeat == 2 && !d.rest_stop_speed);
+        BranchRules r = BranchRules::from_desc(Json::parse(
+            R"({"rules":{"stall_pause_speed":2,"stall_odometer":"s","rest_max_brake_frames":300,)"
+            R"("rest_require_support":false,"rest_fallback":"error","rest_stop_speed":null}})"));
+        CHECK(!r.is_default() && r.stall_pause_speed == 2.0 && r.stall_odometer == "s" && !r.rest_stop_speed &&
+              r.rest_max_brake_frames && *r.rest_max_brake_frames == 300 && !r.rest_require_support &&
+              r.rest_fallback == "error");
+    }
+    for (const char *bad : {R"({"rules":{"stall_pasue_speed":0}})", R"({"rules":{"rest_require_support":1}})",
+                            R"({"rules":{"stall_speed_source":"velocity"}})", R"({"rules":{"rest_control_repeat":0}})",
+                            R"({"rules":{"rest_control_repeat":2.0}})", R"({"rules":{"rest_stop_speed":0}})",
+                            R"({"rules":{"drive_gain":-1}})", R"({"rules":{"drive_gain":true}})",
+                            R"({"rules":{"stall_pause_speed":null}})", R"({"rules":[]})"}) {
+        bool refused = false;
+        try {
+            BranchRules::from_desc(Json::parse(bad));
+        } catch (const Error &) {
+            refused = true;
         }
         CHECK(refused);
     }

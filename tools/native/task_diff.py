@@ -106,18 +106,34 @@ def main(argv=None) -> int:
             with np.load(bd / "drive.npz", allow_pickle=False) as dz:
                 kb = int(dz["prefix_frame"])
             # as the learner: the run follows the branch and its state carries the files (the export pins them)
-            ba = {"level": level, "line_npz": (bd / f"L{level:02d}.npz").read_bytes(),
-                  "desc_json": (bd / f"L{level:02d}.json").read_bytes(), "drive_npz": (bd / "drive.npz").read_bytes()}
-            ec = dict(state["env_config"], features=dict(state["env_config"]["features"], branch_dir="branch"))
+            from ballrain.branch_assets import read_bundle, validate
+            ba = read_bundle(level, bd)
+            pin = validate(ba, level, psha)
+            ec = dict(state["env_config"], features=dict(state["env_config"]["features"], branch_sha256=pin,
+                                                         branch_dir=None))
             st_b = dict(state, env_config=ec, branch_assets=ba)
             m_r7 = export(st_b, out / "weights", "r8b")
             # rest_speed 0: the drive replays in full, the brake runs to its frame limit, the at-rest check fails (a late
             # fallback after a full replay)
             m_slow = export(dict(st_b, env_config=dict(ec, rest_speed=0.0)), out / "weights", "r8slow")
-            assert m_slow["env"]["rest_speed"] == 0.0 and m_r7["features"]["branch"] == m_slow["features"]["branch"]
-            bsha, bpack = T.export_branch_pack(ba, level, out / "assets", psha)
-            branch = {"sha": bsha, "pack": bpack,
-                      "dir": T.install_branch_pack(bpack, out / "cache", level, bsha, m_r7["features"]["branch"])}
+            assert m_slow["env"]["rest_speed"] == 0.0 and m_r7["features"]["branch_sha256"] == pin
+            # other rules (L02.json "rules", distributed with the files): the client must apply them as the env does
+            desc = json.loads(ba["desc_json"])
+            desc["rules"] = dict(desc.get("rules") or {}, stall_pause_speed=0.5, stall_odometer="s", drive_gain=0.6,
+                                 drive_speed_cap=4.0, drive_deadband=0.2, rest_control_repeat=3,
+                                 rest_max_brake_frames=400, rest_position_tolerance=3.0)
+            import hashlib
+            ba_r = dict(ba, desc_json=json.dumps(desc, indent=2).encode())
+            ba_r["sha256"] = dict(ba["sha256"], desc_json=hashlib.sha256(ba_r["desc_json"]).hexdigest())
+            pin_r = validate(ba_r, level, psha)
+            ec_r = dict(ec, features=dict(ec["features"], branch_sha256=pin_r))
+            m_rules = export(dict(st_b, env_config=ec_r, branch_assets=ba_r), out / "weights", "r8rules")
+            assert m_rules["requires"] == ["branch_v1", "branch_rules_v1"]
+            branch = {}
+            for p_, b_ in ((pin, ba), (pin_r, ba_r)):
+                bsha, bpack = T.export_branch_pack(b_, level, out / "assets", psha)
+                branch[p_] = {"sha": bsha, "pack": bpack,
+                              "dir": T.install_branch_pack(bpack, out / "cache", level, bsha, p_, psha)}
             scenarios = {
                 "branch_rest_policy": (m_r7, kb, "policy", 2500, 60000, 0, 41,
                                        "stone rest start (drive.npz replay, drive, brake) + the policy", {"target": None, "branch_s": 1700.0}),
@@ -130,6 +146,12 @@ def main(argv=None) -> int:
                 "branch_rest_late_fallback": (m_slow, kb, "policy", 2500, 60000, 0, 46,
                                               "the drive replays, the at-rest check fails, the TAS start follows",
                                               {"target": None, "branch_s": 1700.0}),
+                "branch_rules_rest": (m_rules, kb, "policy", 2500, 60000, 0, 47,
+                                      "other distributed rules: stone rest start (drive gain, cap, repeat, brake frames, "
+                                      "tolerance) + the stall rules (pause speed, main-line odometer)",
+                                      {"target": None, "branch_s": 1800.0}),
+                "branch_rules_sticky": (m_rules, kb, "sticky:8", 2500, 60000, 0, 48,
+                                        "other distributed rules + sticky actions", {"target": None, "branch_s": 1700.0}),
                 "branch_tas_policy": (m_r7, st.nearest_valid(kb), "policy", 2500, 60000, 0, 43, "TAS start upstream of the trafo + the policy"),
                 "branch_tas_sticky": (m_r7, st.nearest_valid(kb - 600), "sticky:7", 2500, 60000, 0, 44,
                                       "TAS start in 小节 3-4 + sticky actions"),
@@ -174,13 +196,14 @@ def run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir
     results, failed = {}, 0
     for name, (m, k, actions, max_steps, max_frames, stop_after, ball, what, *opt) in scenarios.items():
         rest = opt[0] if opt else None
+        br = (branch or {}).get(m["features"].get("branch_sha256"))  # the policy's branch pack (None: no branch)
         frontier = opt[1] if len(opt) > 1 else None
         d = out / name
         d.mkdir()
         task = T.Task(task_id=f"diff-{name}", run=m["source"]["run"], policy_sha=m["policy_sha"], level=level, record=record,
                       record_sha256=rec_sha, start_frame=int(k), ball_order_seed=ball, engine="x87soft",
                       assets=dict({"starts": ssha, "path": psha},
-                                  **({"branch": branch["sha"]} if m["features"].get("branch") else {})),
+                                  **({"branch": br["sha"]} if br else {})),
                       chunk_steps=int(m["rollout"]["chunk"]),
                       max_steps=max_steps, max_frames=max_frames, deadline_s=3600, issued_at=0, sample_seed=1000 + ball,
                       rest=rest, life_seed=5000 + ball, respawn_frontier=frontier)
@@ -190,7 +213,7 @@ def run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir
         p = subprocess.run([a.nc_task, "--task", str(d / "task.json"), "--manifest", str(mp), "--starts", str(spack),
                             "--path-dir", str(pdir), "--engine", a.engine, "--root", a.game, "--out", str(d / "native"),
                             "--actions", actions, "--stop-after", str(stop_after)]
-                           + (["--branch-pack", str(branch["pack"])] if m["features"].get("branch") else []),
+                           + (["--branch-pack", str(br["pack"])] if br else []),
                            capture_output=True, text=True, encoding="utf-8", timeout=3600)
         if p.returncode != 0:
             log(f"{name}: nc_task failed: {p.stderr[-500:]}")
@@ -201,7 +224,7 @@ def run(a, out, scenarios, level, record, rec_sha, ssha, spack, psha, pdir, sdir
         # the verifier's replay of those chunks
         pol = W.load_policy(mp.with_suffix(".npz"), m, expect_sha=m["policy_sha"])
         env = T.build_env(task, m, T.LocalGame(engine="x87soft", binary=a.engine, root=a.game), sdir, pdir, d / "replay",
-                          branch_dir=branch["dir"] if m["features"].get("branch") else None)
+                          branch_dir=br["dir"] if br else None)
         runner = R.TaskRunner(env, task, m)
         real = R.action_consistent
         if actions != "policy":

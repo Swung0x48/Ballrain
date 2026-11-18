@@ -136,6 +136,8 @@ BallanceEnv::BallanceEnv(EnvConfig cfg, FeatureConfig features, EngineConfig eng
     if (cfg_.esc_frames < 3) throw Error("esc_frames must be >= 3");
     repress_ = cfg_.repress_stale_keys ? *cfg_.repress_stale_keys : cfg_.world_actions;
     ms_since_turn_ = std::numeric_limits<double>::infinity();
+    // env.branch_rules: the installed bundle's rules (the task is refused when they do not parse)
+    if (!fx_.config().branch_dir.empty()) branch_rules_ = load_branch_rules(fx_.config().branch_dir, cfg_.level);
 }
 
 BallanceEnv::~BallanceEnv() { close(); }
@@ -237,6 +239,12 @@ void BallanceEnv::start_process() {
             branch_rest(*rest_->branch_s);
         } catch (const BranchRestFailed &e) {  // the drive's own checks; engine and session faults propagate
             err = e.what();
+            if (branch_rules_.rest_fallback == "error") {  // the rules ask for no relaunch
+                if (sess_) sess_->close(true), sess_.reset();
+                after_death_ = false;
+                ++branch_rest_failures_;
+                throw;
+            }
         } catch (...) {
             if (sess_) sess_->close(true), sess_.reset();
             after_death_ = false;
@@ -340,10 +348,11 @@ void BallanceEnv::branch_rest(double station) {
     V3 target = br->alt->point_at(station);
     if (s.tracker().ball_type() != br->ball_type || s.tracker().sector() != br->sector)
         throw BranchRestFailed("branch drive did not produce the required ball type and sector");
+    const BranchRules &rules = br->rules;
     RestStart r;
     r.drive = true, r.x = target[0], r.z = target[2];
-    drive(r);
-    brake();
+    drive(r, rules);
+    brake(rules);
     FeatureInfo fi;
     fx.compute(s.tracker(), &fi);
     const Observation *o = s.obs();
@@ -353,16 +362,20 @@ void BallanceEnv::branch_rest(double station) {
                       (o->ball->pos[1] - target[1]) * (o->ball->pos[1] - target[1]) +
                       (o->ball->pos[2] - target[2]) * (o->ball->pos[2] - target[2]));
     double vxz = std::sqrt(fi.vel[0] * fi.vel[0] + fi.vel[2] * fi.vel[2]);
-    if (!fi.supported || !(fi.has_branch && fi.branch) || d > 2 || vxz > cfg_.rest_speed)
+    double stop = rules.rest_stop_speed ? *rules.rest_stop_speed : cfg_.rest_speed;
+    if ((rules.rest_require_support && !fi.supported) || !(fi.has_branch && fi.branch) ||
+        d > rules.rest_position_tolerance || vxz > stop)
         throw BranchRestFailed("branch rest target not reached at rest on the correct surface");
 }
 
 // env._drive: push the ball with world arrows towards (x, z), aiming at a velocity proportional to the remaining
 // distance (capped), until it is within 1 unit and slower than rest_speed or max_frames passed
-void BallanceEnv::drive(const RestStart &r) {
+void BallanceEnv::drive(const RestStart &r, const BranchRules &rules) {
     Session &s = *sess_;
     uint32_t n0 = s.frames_done();
-    int64_t max_frames = r.max_frames ? *r.max_frames : cfg_.rest_max_frames;
+    int64_t max_frames = r.max_frames ? *r.max_frames
+                                      : (rules.rest_max_drive_frames ? *rules.rest_max_drive_frames : cfg_.rest_max_frames);
+    double stop = rules.rest_stop_speed ? *rules.rest_stop_speed : cfg_.rest_speed;
     while (int64_t(s.frames_done() - n0) < max_frames && !s.ended()) {
         const Observation *o = s.obs();
         if (!o || !o->ball) break;
@@ -370,30 +383,32 @@ void BallanceEnv::drive(const RestStart &r) {
         double vx = double(o->ball->speed[0]) + double(o->ball->speed_change[0]);
         double vz = double(o->ball->speed[2]) + double(o->ball->speed_change[2]);
         double dx = r.x - px, dz = r.z - pz;
-        if (std::sqrt(dx * dx + dz * dz) < 1.0 && std::sqrt(vx * vx + vz * vz) < cfg_.rest_speed) break;
-        double wx = dx * 0.8, wz = dz * 0.8;
+        if (std::sqrt(dx * dx + dz * dz) < rules.drive_arrival_radius && std::sqrt(vx * vx + vz * vz) < stop) break;
+        double wx = dx * rules.drive_gain, wz = dz * rules.drive_gain;
         double wn = std::sqrt(wx * wx + wz * wz);
-        if (wn > 6.0) {
-            double f = 6.0 / wn;
+        if (wn > rules.drive_speed_cap) {  // want *= cap / |want|
+            double f = rules.drive_speed_cap / wn;
             wx *= f, wz *= f;
         }
         wx -= vx, wz -= vz;
         uint32_t keys = 0;
-        if (std::sqrt(wx * wx + wz * wz) > 0.3) {
+        if (std::sqrt(wx * wx + wz * wz) > rules.drive_deadband) {
             keys = best_arrows(wx, wz);
             if (o->cams) keys = world_to_camera_keys(keys, o->cams->cams[0].matrix);
         }
         size_t ev0 = s.tracker().events.size();
-        s.act({{cfg_.delta, keys}}, 2, episode_stop());
+        s.act({{cfg_.delta, keys}}, uint32_t(rules.rest_control_repeat), episode_stop());
         if (episode_event(s.tracker(), ev0)) break;
     }
 }
 
 // env._brake: push against the ball's horizontal velocity until it is slower than rest_speed, release the arrows
-void BallanceEnv::brake() {
+void BallanceEnv::brake(const BranchRules &rules) {
     Session &s = *sess_;
     uint32_t n0 = s.frames_done();
-    while (int64_t(s.frames_done() - n0) < cfg_.rest_max_frames && !s.ended()) {
+    int64_t max_frames = rules.rest_max_brake_frames ? *rules.rest_max_brake_frames : cfg_.rest_max_frames;
+    double stop = rules.rest_stop_speed ? *rules.rest_stop_speed : cfg_.rest_speed;
+    while (int64_t(s.frames_done() - n0) < max_frames && !s.ended()) {
         const Observation *o = s.obs();
         double vx = 0.0, vz = 0.0;
         if (o && o->ball) {
@@ -401,11 +416,11 @@ void BallanceEnv::brake() {
             vz = double(o->ball->speed[2]) + double(o->ball->speed_change[2]);
         }
         double n = std::sqrt(vx * vx + 0.0 + vz * vz);
-        if (n < cfg_.rest_speed) break;
+        if (n < stop) break;
         uint32_t keys = best_arrows(-vx / n, -vz / n);
         if (o && o->cams) keys = world_to_camera_keys(keys, o->cams->cams[0].matrix);
         size_t ev0 = s.tracker().events.size();
-        s.act({{cfg_.delta, keys}}, 2, episode_stop());
+        s.act({{cfg_.delta, keys}}, uint32_t(rules.rest_control_repeat), episode_stop());
         if (episode_event(s.tracker(), ev0)) break;
     }
     s.act({{cfg_.delta, 0u}}, 1, episode_stop());  // release the arrows

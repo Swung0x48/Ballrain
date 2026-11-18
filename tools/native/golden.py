@@ -247,11 +247,21 @@ def run_tas(a, manifest, stream: Stream) -> dict:
         frames = np.concatenate([frames[:k].astype(drive.dtype), drive])
     feats = dict(manifest["features"])
     feats["path_dir"] = a.path_dir
-    if a.branch_dir:
-        feats["branch_dir"] = a.branch_dir
+    root = None
+    if a.branch_dir:  # as the learner's workers: the pinned bundle (ballrain.branch_assets), never the directory itself
+        from ballrain.branch_assets import install, read_bundle, validate
+        from ballrain.path import asset_path, file_sha256
+        lv = int(manifest["env"]["level"])
+        bundle = read_bundle(lv, a.branch_dir)
+        main_sha = file_sha256(asset_path(lv, Path(a.path_dir)))
+        feats["branch_sha256"] = validate(bundle, lv, main_sha)
+        feats["path_sha256"] = main_sha
+        feats.pop("branch_dir", None)
+        tmp = install(bundle, lv, main_sha, feats["branch_sha256"])
+        root = tmp.name
     for k in ("far_waypoints", "ref_speed_at"):
         feats[k] = tuple(feats.get(k) or ())
-    fx = FeatureExtractor(FeatureConfig(**feats))
+    fx = FeatureExtractor(FeatureConfig(**feats), branch_root=root)
     out = Path(a.out).resolve() / "runs" / "tas"
     sc = C.SessionConfig(level=int(manifest["env"]["level"]), out_dir=out, copy="nc-py", max_frames=len(frames) + 10,
                          body_radius=60.0, sr_tail=32)

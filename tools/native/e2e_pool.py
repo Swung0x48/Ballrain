@@ -186,12 +186,12 @@ def main(argv=None) -> int:
     if a.rollout:
         state["args"] = dict(state["args"], **json.loads(a.rollout))
     if a.branch_dir:
-        bd, lv = Path(a.branch_dir), int(state["env_config"]["level"])
-        state["branch_assets"] = {"level": lv, "line_npz": (bd / f"L{lv:02d}.npz").read_bytes(),
-                                  "desc_json": (bd / f"L{lv:02d}.json").read_bytes(),
-                                  "drive_npz": (bd / "drive.npz").read_bytes()}
-        state["env_config"] = dict(state["env_config"],
-                                   features=dict(state["env_config"]["features"], branch_dir="branch"))
+        from ballrain.branch_assets import read_bundle, validate
+        lv = int(state["env_config"]["level"])
+        state["branch_assets"] = read_bundle(lv, a.branch_dir)  # as the learner's save_ckpt
+        main_sha = state["env_config"]["features"]["path_sha256"]
+        state["env_config"] = dict(state["env_config"], features=dict(
+            state["env_config"]["features"], branch_sha256=validate(state["branch_assets"], lv, main_sha), branch_dir=None))
     pub = policies.publish_state(state, source=Path(a.ckpt).name)
     log(f"policy {pub.policy_sha[:12]} (record {pub.record}, {len(pub.valid)} start frames"
         f"{', branch pack ' + pub.branch_sha[:12] if pub.branch_sha else ''})")

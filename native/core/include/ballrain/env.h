@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ballrain/engine_chain.h"
+#include "ballrain/branch.h"
 #include "ballrain/features.h"
 #include "ballrain/json.h"
 #include "ballrain/reward.h"
@@ -104,6 +105,7 @@ public:
 
     const std::vector<uint32_t> &actions() const { return actions_; }
     FeatureExtractor &features() { return fx_; }
+    const BranchRules &branch_rules() const { return branch_rules_; }
     Session *session() { return sess_.get(); }
     bool after_death() const { return after_death_; }
     const StartInfo &start_info() const { return start_; }
@@ -129,8 +131,9 @@ private:
     bool launch(int64_t k);  // one process brought to control; false: the hand-over differs from the record
     bool handover_ok(int64_t k) const;
     void init_held(int64_t k);
-    void drive(const RestStart &r);
-    void brake();
+    void drive(const RestStart &r, const BranchRules &rules = BranchRules());
+    void brake(const BranchRules &rules = BranchRules());
+    BranchRules branch_rules_;  // the installed branch's rules (env.branch_rules), the defaults without a branch
     void branch_rest(double station);
     void intro();
     void finish_process();
