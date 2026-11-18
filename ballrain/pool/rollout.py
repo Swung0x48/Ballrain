@@ -50,7 +50,8 @@ VALUE_TOL = 1e-3  # |v - replayed v| <= VALUE_TOL * max(1, |v|)
 # the client's port and this replay. A row whose reach entries differ beyond OBS_TOL ("reach-deviant") is checked on the
 # hybrid row (this replay's features, reach replaced by the submitted values: what the client's policy saw) with the
 # float16-copy tolerances of the cheap check, and the steering bound applies; per chunk, at most REACH_MAX_ROW_FRAC of
-# the rows (at least one) may deviate. PROVISIONAL defaults until the native port's measured flip / jump rates set them
+# the rows (at least one) may deviate. Set 2026-11-18 (docs/f7-native-port.md 7.1: the native port measured no flips or
+# jumps on 55,745 states, so the bounds are an anomaly guard)
 REACH_MAX_ROW_FRAC = 0.02
 REACH_MAX_LOGP_SHIFT = 1.0  # |log pi(a | submitted reach) - log pi(a | replayed reach)| of the taken action, nats
 REACH_LOGP_TOL = 0.05  # on a deviant row the policy runs on float16 reach values: the cheap check's tolerances
