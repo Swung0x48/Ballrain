@@ -78,6 +78,7 @@ ClientConfig ClientConfig::load(const std::string &dir) {
                 c.instances = int(j.get_int("instances", c.instances));
                 c.auto_pause_player = j.get_bool("auto_pause_player", c.auto_pause_player);
                 c.auto_pause_battery = j.get_bool("auto_pause_battery", c.auto_pause_battery);
+                c.prefetch = j.get_bool("prefetch", c.prefetch);
                 c.setup_done = j.get_bool("setup_done", c.setup_done);
                 c.quiet_file = j.get_string("quiet_file", c.quiet_file);
             }
@@ -99,6 +100,7 @@ void ClientConfig::save(const std::string &dir) const {
     j.set("instances", Json::integer(instances));
     j.set("auto_pause_player", Json::boolean(auto_pause_player));
     j.set("auto_pause_battery", Json::boolean(auto_pause_battery));
+    j.set("prefetch", Json::boolean(prefetch));
     j.set("setup_done", Json::boolean(setup_done));
     j.set("quiet_file", Json::string(quiet_file));
     write_atomic(dir + "/config.json", j.dump());
@@ -230,6 +232,17 @@ struct Controller::Slot {
     bool fetched = false;  // a task was fetched and is not counted in tasks_done_ yet (this slot's thread only)
     std::string path_note;  // the last engine_view note logged (this slot's thread only)
     std::string last_task;  // the slot's previous task (its upload is waited for before the next fetch)
+    std::unique_ptr<Controller::Pending> next;  // the prefetched next task (this slot's thread only)
+    int run_alt = 0;  // the run directory of the next preparation (two alternate: one plays, one is prepared)
+};
+
+struct Controller::Pending {
+    Task task;
+    std::unique_ptr<PreparedTask> prep;
+    std::string error;  // the preparation failed (reported when it is the slot's turn)
+    std::string run_dir;
+    double t_issue = 0, wait_s = 0, fetch_s = 0;
+    bool prefetched = false;
 };
 
 Controller::Controller(std::string data_dir, EventFn on_event)
@@ -440,7 +453,7 @@ bool Controller::connect() {
     GatewayClient g(c.gateway_url, tok);
     Json h;
     try {
-        h = g.hello(platform_name(), eng, files, c.instances);
+        h = g.hello(platform_name(), eng, files, c.instances, c.prefetch);
     } catch (const GatewayRefusal &e) {
         refused(e, "hello");
         return false;
@@ -806,6 +819,7 @@ void Controller::slot_loop(Slot *s) {
             }
         }
         if (!can) {
+            if (s->next) discard_next(s, "prefetched, not played");
             wait_for(0.5);
             continue;
         }
@@ -830,33 +844,86 @@ void Controller::slot_loop(Slot *s) {
             s->fails++, s->retry_at = platform::monotonic_s() + 30.0;
         }
     }
+    if (s->next) discard_next(s, "prefetched, not played");
     std::lock_guard<std::mutex> g(mu_);
     s->state = "idle", s->task_id.clear(), s->task_steps = 0;
     s->done = true;
 }
 
+void Controller::discard_next(Slot *s, const char *why) {
+    std::unique_ptr<Pending> p = std::move(s->next);
+    if (!p) return;
+    std::string id = p->task.task_id;
+    p.reset();  // the held engine closes, its run directory goes
+    queue_end(id, 0, why);
+    if (max_tasks > 0) --tasks_fetched_;
+}
+
+// one task of the slot: the prefetched one when there is one (its engine waits at the hand-over), else fetched and
+// prepared now; meanwhile the next one is fetched and prepared (task_prefetch_v1)
 bool Controller::run_one_task(Slot *s) {
+    std::unique_ptr<Pending> cur = std::move(s->next);
+    if (!cur) {
+        double w = 0, f = 0;
+        std::optional<Task> t = fetch_task(s, false, w, f);
+        if (!t) return false;
+        cur = prepare_pending(s, *t, false);
+        cur->wait_s = w, cur->fetch_s = f;
+    }
+    std::unique_ptr<Pending> nxt;
+    std::thread pre;
+    if (cur->error.empty() && config().prefetch)
+        pre = std::thread([&] {
+            try {
+                double w = 0, f = 0;
+                std::optional<Task> t = fetch_task(s, true, w, f);
+                if (t) nxt = prepare_pending(s, *t, true);
+            } catch (const std::exception &e) {
+                log_.line(std::string("预取下一个任务时出错：") + e.what());
+            }
+        });
+    play_pending(s, *cur);
+    double tj = platform::monotonic_s();
+    if (pre.joinable()) pre.join();
+    if (nxt) nxt->wait_s = platform::monotonic_s() - tj;  // the slot waited for the next preparation (critical path)
+    s->next = std::move(nxt);
+    return true;
+}
+
+// the task request (prefetch: quietly, the slot's state stays its current task's; no wait for the previous upload)
+std::optional<Task> Controller::fetch_task(Slot *s, bool prefetch, double &wait_s, double &fetch_s) {
     if (max_tasks > 0 && tasks_fetched_.fetch_add(1) >= max_tasks) {
         --tasks_fetched_;
-        return false;
+        return std::nullopt;
     }
     auto undo = [&] {
         if (max_tasks > 0) --tasks_fetched_;
     };
-    // the previous task of this slot is open at the gateway until its last chunk (or task_end) arrived: wait for the
-    // uploader first, else a slot at the gateway's max_instances gets too_many_instances (uploads are asynchronous)
-    double t_wait0 = platform::monotonic_s(), t_wait1 = t_wait0, t_fetch1 = t_wait0;
-    if (!s->last_task.empty()) {
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        if (prefetch && (!is_running() || closing_ || s->quit)) {
+            undo();
+            return std::nullopt;
+        }
+    }
+    double t_wait0 = platform::monotonic_s(), t_wait1 = t_wait0;
+    bool near_limit;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        near_limit = 2 * cfg_.instances > max_instances_;  // the open tasks (playing + uploading) could reach the limit
+    }
+    if (!prefetch && near_limit && !config().prefetch && !s->last_task.empty()) {
+        // the previous task is open at the gateway until its last chunk (or task_end) arrived: wait for the uploader
         std::string d = dir_ + "/queue/" + s->last_task;
         {
             std::lock_guard<std::mutex> g(mu_);
             s->state = "starting", s->detail = "等上一个任务的数据上传";
         }
-        double t0 = platform::monotonic_s(), until = t0 + 600.0;
+        double until = t_wait0 + 600.0;
         bool told = false;
         while (platform::is_dir(d) && platform::monotonic_s() < until && !closing_ && !s->quit) {
             wait_for(0.25);
-            if (!told && platform::monotonic_s() - t0 >= 60.0) {  // the uploads fall behind (network): say so once
+            if (!told && platform::monotonic_s() - t_wait0 >= 60.0) {  // the uploads fall behind (network): say so once
                 told = true;
                 int64_t mb = queue_bytes() >> 20;
                 log_.line("实例 " + std::to_string(s->index + 1) + " 已等上一个任务的数据上传 60 秒（上传队列约 " +
@@ -868,7 +935,7 @@ bool Controller::run_one_task(Slot *s) {
         s->last_task.clear();
     }
     t_wait1 = platform::monotonic_s();
-    {
+    if (!prefetch) {
         std::lock_guard<std::mutex> g(mu_);
         s->state = "starting", s->detail = "取任务";
     }
@@ -878,21 +945,25 @@ bool Controller::run_one_task(Slot *s) {
         tm = g.task();
     } catch (const GatewayUnavailable &e) {
         undo();
+        if (prefetch) return std::nullopt;
         log_.line(std::string("取任务失败：") + e.what());
         Json f = Json::object();
         f.set("error", Json::string(e.what()));
         emit("task_unavailable", f);
         wait_for(30.0);
-        return false;
+        return std::nullopt;
     } catch (const GatewayRefusal &e) {
         undo();
+        if (prefetch && e.code == "too_many_instances") return std::nullopt;  // the account is at its limit: no prefetch now
         refused(e, "task");
+        if (prefetch) return std::nullopt;
         if (e.code == "too_many_instances") wait_for(10.0);  // the slots of a closing task free up shortly
         else if (!e.fatal && e.code != "session_expired") wait_for(30.0);
-        return false;
+        return std::nullopt;
     }
     if (tm.at("type").as_string() == "no_task") {
         undo();
+        if (prefetch) return std::nullopt;
         Json f = Json::object();
         f.set("reason", tm.at("reason"));
         emit("no_task", f);
@@ -901,26 +972,21 @@ bool Controller::run_one_task(Slot *s) {
             s->state = "idle", s->detail = tm.at("reason").get_string("message", "");
         }
         wait_for(double(tm.at("retry_s").as_int()));
-        return false;
+        return std::nullopt;
     }
-    s->fetched = true;
-    t_fetch1 = platform::monotonic_s();
     Task task = Task::from_json(tm.at("task"));
-    s->last_task = task.task_id;
     queue_open(task, s->index);
-    double t0 = platform::monotonic_s();
-    {
+    wait_s = t_wait1 - t_wait0, fetch_s = platform::monotonic_s() - t_wait1;
+    return task;
+}
+
+std::unique_ptr<Controller::Pending> Controller::prepare_pending(Slot *s, const Task &task, bool prefetched) {
+    auto p = std::make_unique<Pending>();
+    p->task = task, p->prefetched = prefetched, p->t_issue = platform::monotonic_s();
+    if (!prefetched) {
         std::lock_guard<std::mutex> lk(mu_);
-        s->state = "running", s->task_id = task.task_id, s->task_steps = 0, s->task_t0 = t0;
+        s->state = "running", s->task_id = task.task_id, s->task_steps = 0, s->task_t0 = p->t_issue;
         s->detail = "启动引擎和开局";  // until the first step (the TUI: 本任务步数 stays 0 meanwhile)
-    }
-    {
-        Json f = Json::object();
-        f.set("task_id", Json::string(task.task_id));
-        f.set("slot", Json::integer(s->index));
-        f.set("start_frame", Json::integer(task.start_frame));
-        f.set("ball_order_seed", Json::integer(task.ball_order_seed));
-        emit("task", f);
     }
     ClientConfig c = config();
     LocalEngine le;
@@ -930,14 +996,10 @@ bool Controller::run_one_task(Slot *s) {
         std::lock_guard<std::mutex> lk(mu_);
         files = game_files_;
     }
-    double deadline = t0 + double(task.deadline_s) - std::min(30.0, double(task.deadline_s) / 10);
-    char rn[32];
-    std::snprintf(rn, sizeof rn, "/runs/slot-%02d", s->index + 1);
+    char rn[40];
+    std::snprintf(rn, sizeof rn, "/runs/slot-%02d%s", s->index + 1, s->run_alt ? "-b" : "");
+    s->run_alt ^= 1;
     // the engine writes its run files by narrow paths too: a non-ASCII data directory runs under the work directory
-    std::string run_dir;
-    TaskOutcome out;
-    std::string error;
-    bool threw = false;
     try {
         PoolCache *cache;
         {
@@ -945,30 +1007,69 @@ bool Controller::run_one_task(Slot *s) {
             cache = cache_.get();
         }
         if (!cache) throw Error("not connected");
-        run_dir = (plain_ascii(dir_) ? dir_ : engine_work_dir(dir_)) + rn;
+        p->run_dir = (plain_ascii(dir_) ? dir_ : engine_work_dir(dir_)) + rn;
         std::string note;
         le = engine_view(le, files, dir_, &note);
         if (!note.empty() && note != s->path_note) say(note), s->path_note = note;
-        out = play_task(
-            task, *cache, cache_mu_, le, run_dir,
-            [&](int64_t seq, const Bytes &data, bool final) { queue_chunk(task.task_id, seq, data, final); },
-            [&]() -> std::string {
-                if (closing_ || s->quit) return "stopped";
-                {
-                    std::lock_guard<std::mutex> lk(mu_);
-                    if (!is_running() || refused_.count(task.task_id)) return "stopped";
-                }
-                return platform::monotonic_s() >= deadline ? "deadline" : "";
-            },
-            [&](int64_t st) {
-                std::lock_guard<std::mutex> lk(mu_);
-                if (s->task_steps == 0 && !s->detail.empty()) s->detail.clear();
-                s->task_steps = st;
-            });
+        p->prep = prepare_task(task, *cache, cache_mu_, le, p->run_dir);
     } catch (const std::exception &e) {
-        threw = true;
-        error = e.what();
+        p->error = e.what();
+        if (p->error.empty()) p->error = "the task could not be prepared";
     }
+    return p;
+}
+
+void Controller::play_pending(Slot *s, Pending &p) {
+    const Task &task = p.task;
+    s->fetched = true;
+    s->last_task = task.task_id;
+    double t0 = platform::monotonic_s();
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        s->state = "running", s->task_id = task.task_id, s->task_steps = 0, s->task_t0 = t0;
+        if (!p.prep) s->detail = "启动引擎和开局";
+    }
+    {
+        Json f = Json::object();
+        f.set("task_id", Json::string(task.task_id));
+        f.set("slot", Json::integer(s->index));
+        f.set("start_frame", Json::integer(task.start_frame));
+        f.set("ball_order_seed", Json::integer(task.ball_order_seed));
+        f.set("prefetched", Json::boolean(p.prefetched));
+        emit("task", f);
+    }
+    double deadline = p.t_issue + double(task.deadline_s) - std::min(30.0, double(task.deadline_s) / 10);
+    std::string run_dir = p.run_dir;
+    TaskOutcome out;
+    std::string error;
+    bool threw = false;
+    if (!p.prep) {
+        threw = true;
+        error = p.error;
+    } else {
+        try {
+            out = run_prepared(
+                *p.prep, [&](int64_t seq, const Bytes &data, bool final) { queue_chunk(task.task_id, seq, data, final); },
+                [&]() -> std::string {
+                    if (closing_ || s->quit) return "stopped";
+                    {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        if (!is_running() || refused_.count(task.task_id)) return "stopped";
+                    }
+                    return platform::monotonic_s() >= deadline ? "deadline" : "";
+                },
+                [&](int64_t st) {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (s->task_steps == 0 && !s->detail.empty()) s->detail.clear();
+                    s->task_steps = st;
+                });
+        } catch (const std::exception &e) {
+            threw = true;
+            error = e.what();
+        }
+        p.prep.reset();  // the engine closes, the run directory goes (its log kept as <run_dir>.headless.log)
+    }
+    double t_wait0 = 0, t_wait1 = p.wait_s, t_fetch1 = p.wait_s + p.fetch_s;  // (the phases below)
     double now = platform::monotonic_s();
     bool failed = threw || out.end == "error";
     if (failed) {
@@ -1011,7 +1112,7 @@ bool Controller::run_one_task(Slot *s) {
         if (recovered) say("实例 " + std::to_string(s->index + 1) + " 已恢复正常。");
     }
     if (!failed && !out.final_chunk) queue_end(task.task_id, out.chunks, "end " + out.end + " without a final chunk");
-    if (!threw) add_phases(t_wait1 - t_wait0, t_fetch1 - t_wait1, out);
+    if (!threw) add_phases(t_wait1 - t_wait0, t_fetch1 - t_wait1, out, p.prefetched);
     if (!threw) {
         Json f = Json::object();
         f.set("task_id", Json::string(task.task_id));
@@ -1027,6 +1128,7 @@ bool Controller::run_one_task(Slot *s) {
         ph.set("wait", Json::number(t_wait1 - t_wait0)), ph.set("fetch", Json::number(t_fetch1 - t_wait1));
         ph.set("assets", Json::number(out.assets_s)), ph.set("start", Json::number(out.start_s));
         ph.set("play", Json::number(out.play_s)), ph.set("close", Json::number(out.close_s));
+        ph.set("prefetched", Json::boolean(p.prefetched));
         f.set("phases", ph);
         emit("task_end", f);
     }
@@ -1037,17 +1139,19 @@ bool Controller::run_one_task(Slot *s) {
     s->busy_s += now - t0;
     s->state = "idle", s->task_id.clear(), s->task_steps = 0;
     refused_.erase(task.task_id);
-    return true;
 }
 
-void Controller::add_phases(double wait, double fetch, const TaskOutcome &out) {
+void Controller::add_phases(double wait, double fetch, const TaskOutcome &out, bool prefetched) {
     std::string line;
     {
         std::lock_guard<std::mutex> g(mu_);
         double now = platform::monotonic_s();
         if (phases_t0_ < 0) phases_t0_ = now;
         Phases &p = phases_;
-        p.wait += wait, p.fetch += fetch, p.assets += out.assets_s, p.start += out.start_s, p.play += out.play_s;
+        // a prefetched task's fetch, assets and engine start overlapped the previous task's play (hidden); its wait is
+        // the time the slot still waited for it after the previous task ended
+        if (prefetched) p.wait += wait, p.hidden += fetch + out.assets_s + out.start_s, p.play += out.play_s;
+        else p.wait += wait, p.fetch += fetch, p.assets += out.assets_s, p.start += out.start_s, p.play += out.play_s;
         p.close += out.close_s, ++p.tasks, p.steps += out.steps;
         if (now - phases_t0_ < 300.0) return;
         double tot = p.wait + p.fetch + p.assets + p.start + p.play + p.close;
@@ -1056,7 +1160,8 @@ void Controller::add_phases(double wait, double fetch, const TaskOutcome &out) {
         std::snprintf(head, sizeof head, "最近 %.0f 秒：%lld 个任务、%lld 步（%.0f 步/秒）；实例时间：", now - phases_t0_,
                       (long long)p.tasks, (long long)p.steps, double(p.steps) / std::max(now - phases_t0_, 1e-9));
         line = std::string(head) + "等上传 " + pc(p.wait) + "，取任务 " + pc(p.fetch) + "，准备资源 " + pc(p.assets) +
-               "，启动引擎和开局 " + pc(p.start) + "，采样 " + pc(p.play) + "，收尾 " + pc(p.close);
+               "，启动引擎和开局 " + pc(p.start) + "，采样 " + pc(p.play) + "，收尾 " + pc(p.close) +
+               "（另有 " + std::to_string(int(p.hidden + 0.5)) + " 秒的准备与上一个任务的采样重叠）";
         p = Phases();
         phases_t0_ = now;
     }

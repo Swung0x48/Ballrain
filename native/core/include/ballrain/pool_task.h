@@ -4,6 +4,7 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -49,6 +50,28 @@ bool plain_ascii(const std::string &s);
 // before the first chunk when the task does not fit this machine or the engine cannot start (the caller backs off);
 // an engine failure after that returns end "error". run_dir is removed afterwards (headless.log of a failed run is
 // kept as <run_dir>.headless.log for the caller's logs).
+// A task up to its first observation (assets, checks, the engine launched, the TAS prefix, the hand-over check, the
+// rest start): its engine then waits without advancing a frame until run_prepared (task_prefetch_v1: the next task
+// is prepared while the current one plays). Destroying it closes the engine and removes the run directory.
+struct PreparedTask {
+    Task task;
+    Policy pol;
+    TasStarts starts;
+    std::string run_dir;
+    std::unique_ptr<BallanceEnv> env;
+    std::unique_ptr<TaskRunner> runner;
+    std::vector<float> obs0;
+    double assets_s = 0, start_s = 0;
+    PreparedTask() = default;
+    PreparedTask(const PreparedTask &) = delete;
+    PreparedTask &operator=(const PreparedTask &) = delete;
+    ~PreparedTask();
+};
+// throws on a failure (the engine log kept as <run_dir>.headless.log, as play_task)
+std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, const LocalEngine &eng,
+                                           const std::string &run_dir);
+TaskOutcome run_prepared(PreparedTask &p, const std::function<void(int64_t, const Bytes &, bool)> &on_chunk,
+                         const std::function<std::string()> &stop, const std::function<void(int64_t)> &on_step = nullptr);
 TaskOutcome play_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, const LocalEngine &eng,
                       const std::string &run_dir, const std::function<void(int64_t, const Bytes &, bool)> &on_chunk,
                       const std::function<std::string()> &stop, const std::function<void(int64_t)> &on_step = nullptr);

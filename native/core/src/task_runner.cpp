@@ -506,8 +506,14 @@ Bytes ChunkAssembler::cut(const std::string &end) {
 std::string sample_task(TaskRunner &runner, const Policy &policy, const Task &task,
                         const std::function<void(const Bytes &, bool)> &on_chunk, const std::function<std::string()> &stop,
                         const std::function<int(int64_t, const std::vector<float> &)> &choose) {
+    return sample_task_started(runner, runner.start(), policy, task, on_chunk, stop, choose);
+}
+
+std::string sample_task_started(TaskRunner &runner, const std::vector<float> &obs, const Policy &policy, const Task &task,
+                                const std::function<void(const Bytes &, bool)> &on_chunk,
+                                const std::function<std::string()> &stop,
+                                const std::function<int(int64_t, const std::vector<float> &)> &choose) {
     ChunkAssembler asm_(task, policy.n_obs, policy.n_act, policy.sha);
-    std::vector<float> obs = runner.start();
     std::vector<float> x = policy.normalize(obs);
     asm_.begin(obs, policy.value(x), runner.digest);
     std::string end;

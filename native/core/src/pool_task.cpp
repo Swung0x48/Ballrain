@@ -110,13 +110,24 @@ static void remove_tree(const std::string &d) {
     std::filesystem::remove_all(std::filesystem::u8path(d), ec);  // a task keeps nothing locally
 }
 
-TaskOutcome play_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, const LocalEngine &le,
-                      const std::string &run_dir, const std::function<void(int64_t, const Bytes &, bool)> &on_chunk,
-                      const std::function<std::string()> &stop, const std::function<void(int64_t)> &on_step) {
+PreparedTask::~PreparedTask() {
+    try {
+        runner.reset();
+        if (env) env->close();
+        env.reset();
+    } catch (...) {
+    }
+    if (!run_dir.empty()) remove_tree(run_dir);
+}
+
+std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, const LocalEngine &le,
+                                           const std::string &run_dir) {
     if (task.engine != le.kind) throw Error("task engine " + task.engine + ", local engine " + le.kind);
     double ta = platform::monotonic_s();
-    Policy pol;
-    TasStarts starts;
+    auto p = std::make_unique<PreparedTask>();
+    p->task = task;
+    Policy &pol = p->pol;
+    TasStarts &starts = p->starts;
     std::string path_dir, branch_dir, reach_dir;
     {
         std::lock_guard<std::mutex> g(cache_mu);
@@ -172,49 +183,69 @@ TaskOutcome play_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, 
         eng.extra_env.push_back(kv);
     }
     remove_tree(run_dir);
-    TaskOutcome out;
     double t0 = platform::monotonic_s();
-    out.assets_s = t0 - ta;
-    double t_first = -1;
-    bool failed = false;
+    p->assets_s = t0 - ta;
     try {
-        BallanceEnv env(ec, fc, eng, run_dir, nullptr, &starts, task.start_frame,
-                        RewardConfig::from_json(m.at("reward")), task.rest);
-        if (env.features().size() != pol.n_obs) throw Error("the env's observation size differs from the policy's");
-        for (size_t i = 0; i < env.actions().size(); ++i)
-            if (env.actions()[i] != pol.action_keys[i]) throw Error("the env's action set differs from the policy's");
-        TaskRunner runner(env, &starts, task, RolloutSpec::from_json(m.at("rollout")),
-                          m.at("env").at("delta_ms").as_double());
+        p->env = std::make_unique<BallanceEnv>(ec, fc, eng, run_dir, nullptr, &starts, task.start_frame,
+                                               RewardConfig::from_json(m.at("reward")), task.rest);
+        if (p->env->features().size() != pol.n_obs) throw Error("the env's observation size differs from the policy's");
+        for (size_t i = 0; i < p->env->actions().size(); ++i)
+            if (p->env->actions()[i] != pol.action_keys[i]) throw Error("the env's action set differs from the policy's");
+        p->runner = std::make_unique<TaskRunner>(*p->env, &starts, task, RolloutSpec::from_json(m.at("rollout")),
+                                                 m.at("env").at("delta_ms").as_double());
+        p->obs0 = p->runner->start();  // the hand-over: from here on the engine waits for the first action
+    } catch (...) {
+        p->runner.reset();
+        p->env.reset();
+        keep_engine_log(run_dir);
+        remove_tree(run_dir);
+        throw;
+    }
+    p->run_dir = run_dir;
+    p->start_s = platform::monotonic_s() - t0;
+    return p;
+}
+
+TaskOutcome run_prepared(PreparedTask &p, const std::function<void(int64_t, const Bytes &, bool)> &on_chunk,
+                         const std::function<std::string()> &stop, const std::function<void(int64_t)> &on_step) {
+    TaskOutcome out;
+    out.assets_s = p.assets_s, out.start_s = p.start_s;
+    double t0 = platform::monotonic_s();
+    bool failed = false;
+    TaskRunner &runner = *p.runner;
+    try {
         int64_t seq = 0;
-        out.end = sample_task(
-            runner, pol, task,
+        out.end = sample_task_started(
+            runner, p.obs0, p.pol, p.task,
             [&](const Bytes &data, bool final) {
                 on_chunk(seq++, data, final);
                 out.final_chunk = final;
             },
             [&]() -> std::string {
-                if (t_first < 0) t_first = platform::monotonic_s();
                 if (on_step) on_step(runner.steps);
                 return stop ? stop() : "";
             });
-        double t_end = platform::monotonic_s();
-        if (t_first < 0) t_first = t_end;
-        out.start_s = t_first - t0, out.play_s = t_end - t_first;
-        env.close();
+        out.play_s = platform::monotonic_s() - t0;
+        p.env->close();
         out.steps = runner.steps, out.frames = runner.frames, out.episodes = runner.episodes, out.chunks = seq;
         failed = out.end == "error";
         if (failed) out.error = "the engine failed during the task";
     } catch (...) {
-        keep_engine_log(run_dir);
-        remove_tree(run_dir);
-        throw;
+        keep_engine_log(p.run_dir);
+        throw;  // ~PreparedTask removes the run directory
     }
-    if (failed) keep_engine_log(run_dir);
-    remove_tree(run_dir);
+    if (failed) keep_engine_log(p.run_dir);
     double t1 = platform::monotonic_s();
-    out.wall_s = t1 - t0;
-    out.close_s = t1 - t0 - out.start_s - out.play_s;
+    out.close_s = t1 - t0 - out.play_s;
+    out.wall_s = out.start_s + (t1 - t0);
     return out;
+}
+
+TaskOutcome play_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, const LocalEngine &le,
+                      const std::string &run_dir, const std::function<void(int64_t, const Bytes &, bool)> &on_chunk,
+                      const std::function<std::string()> &stop, const std::function<void(int64_t)> &on_step) {
+    auto p = prepare_task(task, cache, cache_mu, le, run_dir);
+    return run_prepared(*p, on_chunk, stop, on_step);
 }
 
 }  // namespace ballrain
