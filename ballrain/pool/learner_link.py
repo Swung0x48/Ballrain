@@ -93,6 +93,9 @@ def state_from_params(template: dict, msg: dict) -> dict:
     return state
 
 
+DEFAULT_MAX_LAG = 300  # train_m2 --pool-max-lag's default (the template's pool_max_lag when the learner sends it)
+
+
 class LearnerLink:
     def __init__(self, addr, authkey: bytes, policies, store, pool_dir, publish_every: int = 10,
                  publish_min_s: float = 20.0, ingest: bool = True, log=None, clock=time.time, batch: int = 64):
@@ -114,7 +117,9 @@ class LearnerLink:
         self.stop_event = threading.Event()
         self.learner_ingests = False  # the hub's template says the learner runs with --pool-ingest
         self._refused_logged = False
-        self.counts = {"published": 0, "fed": 0, "fed_steps": 0, "other_run": 0, "errors": 0, "reconnects": 0}
+        self.counts = {"published": 0, "fed": 0, "fed_steps": 0, "other_run": 0, "errors": 0, "reconnects": 0,
+                       "stale": 0}
+        self._stale_pass_done = False
         self.last_error: str | None = None
 
     # ------------------------------------------------------------------------------------------ connection
@@ -173,9 +178,38 @@ class LearnerLink:
 
     def _forget_params(self):
         """Drop the cached parameters and the learner version (nothing is published or fed until the current
-        session's learner sends its own)."""
+        session's learner sends its own); the next feed starts with a stale pass."""
         self._latest = None
         self.version = None
+        self._stale_pass_done = False
+
+    def max_lag(self) -> int:
+        """The learner's --pool-max-lag (its template's pool_max_lag; 300, the learner's default, when absent)."""
+        try:
+            return int((self.template or {}).get("pool_max_lag", DEFAULT_MAX_LAG))
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_LAG
+
+    def _stale_pass(self, version: int) -> int:
+        """Once per ingesting session, at its first parameters: every released, unfed chunk whose policy is more than
+        max_lag updates behind the learner is marked stale in one pass (the learner would drop it: pool_max_lag),
+        instead of being decoded, sent and dropped. Returns the number marked."""
+        self._stale_pass_done = True
+        lim = version - self.max_lag()
+        old = []
+        for sha in self.store.releasable_policies():
+            try:
+                run, v = self._version_of(sha)
+            except Exception:  # noqa: BLE001  (an unreadable manifest: feed_once marks those -1)
+                continue
+            if run == self.run and v < lim:
+                old.append(sha)
+        n, st = self.store.mark_stale_policies(old)
+        if n:
+            self.counts["stale"] = self.counts.get("stale", 0) + n
+            self.log(f"learner link: {n} released chunks ({st} steps) more than {self.max_lag()} updates behind the "
+                     f"learner (update {version}) marked stale, not fed")
+        return n
 
     def _lost(self):
         c, self.conn = self.conn, None
@@ -239,10 +273,14 @@ class LearnerLink:
 
     def feed_once(self) -> int:
         """Send up to `batch` released chunks to the learner; returns the number sent."""
-        if not self.ingest or not self.learner_ingests or self.conn is None or self.version is None:
+        version = self.version  # this call's learner version (a drop below clears self.version)
+        if not self.ingest or not self.learner_ingests or self.conn is None or version is None:
             return 0
+        version = int(version)
+        if not getattr(self, "_stale_pass_done", False):
+            self._stale_pass(version)
         rows = self.store.to_ingest(self.batch)
-        sent, other = [], []
+        sent, other, stale = [], [], []
         for r in rows:
             try:
                 run, ver = self._version_of(r["policy_sha"])
@@ -252,6 +290,9 @@ class LearnerLink:
                 continue
             if run != self.run:  # a chunk of another run (an older gateway policy): never this learner's data
                 other.append((r["task_id"], r["seq"]))
+                continue
+            if version - ver > self.max_lag():  # the learner would drop it (lag > pool_max_lag): not sent
+                stale.append((r["task_id"], r["seq"]))
                 continue
             try:
                 from .server_verify import read_reach_patch
@@ -273,7 +314,11 @@ class LearnerLink:
             self.counts["fed"] += 1
             self.counts["fed_steps"] += int(r["steps"])
         if sent:
-            self.store.mark_ingested(sent, int(self.version))
+            self.store.mark_ingested(sent, version)
+        if stale:
+            from .server_store import INGEST_STALE
+            self.counts["stale"] = self.counts.get("stale", 0) + len(stale)
+            self.store.mark_ingested(stale, INGEST_STALE)
         if other:
             self.counts["other_run"] += len(other)
             self.store.mark_ingested(other, -1)  # -1: not for this learner (never sent)
