@@ -22,6 +22,7 @@
 #include <thread>
 #include <vector>
 
+#include "ballrain/diagnostics.h"
 #include "ballrain/json.h"
 #include "ballrain/pool_client.h"
 #include "ballrain/pool_task.h"
@@ -96,6 +97,7 @@ struct ControllerView {
     std::vector<InstanceView> inst;
     int64_t queued_chunks = 0, tasks_done = 0;
     std::vector<std::string> log;
+    std::string update_version, update_url, update_notes;  // a newer signed release (empty: none known)
 };
 
 class Controller {
@@ -127,6 +129,12 @@ public:
     void start_service();           // service / heartbeat / upload threads (once)
     void shutdown();                // every instance and engine ends, the threads join
     ControllerView view() const;
+
+    // ---- diagnostics and updates
+    DiagFiles diagnostics() const;                             // the scrubbed files (shown before saving)
+    std::string export_diagnostics(const std::string &zip_path = "");  // default <data dir>/diagnostics-<time>.zip
+    // the signed release manifest (update.h); a newer version shows in view(); runs in the calling thread
+    void check_update(const std::string &manifest_url, const std::string &pubkey_hex);
 
     // the command-line driver: stop fetching after this many tasks (0 = no limit); extra engine environment
     int64_t max_tasks = 0;
@@ -184,6 +192,7 @@ private:
     std::map<std::string, std::string> refused_;    // task_id -> why its chunks are refused (the instance stops)
     std::map<std::string, int> read_fail_;          // the uploader's unreadable chunk files (its thread only)
     double t_start_ = 0;
+    std::string update_version_, update_url_, update_notes_;
 };
 
 }  // namespace ballrain

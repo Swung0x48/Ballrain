@@ -2,6 +2,7 @@
 
 #include <filesystem>
 
+#include "ballrain/sha256.h"
 #include "platform.h"
 
 namespace ballrain {
@@ -17,6 +18,78 @@ static void keep_engine_log(const std::string &run_dir) {
         if (b.size() > 256 * 1024) b = b.substr(b.size() - 256 * 1024);
         write_file(run_dir + ".headless.log", b);
     }
+}
+
+bool plain_ascii(const std::string &s) {
+    for (unsigned char c : s)
+        if (c >= 0x80) return false;
+    return true;
+}
+
+static std::string parent_of(const std::string &p) {
+    size_t i = p.find_last_of("/\\");
+    return i == std::string::npos ? std::string(".") : p.substr(0, i);
+}
+
+static void copy_tree(const std::string &from, const std::string &to) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(fs::u8path(to), ec);
+    fs::copy(fs::u8path(from), fs::u8path(to), fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    if (ec) throw Error("cannot copy " + from + " for the engine: " + ec.message());
+}
+
+LocalEngine engine_view(const LocalEngine &le, const Json &game_files, std::string *note) {
+    static std::mutex mu;  // instances share the copies: one copies, the others wait and reuse it
+    std::lock_guard<std::mutex> g(mu);
+    LocalEngine out = le;
+    std::string why;
+    if (!plain_ascii(le.binary)) {
+        std::string sp = platform::short_path(le.binary);
+        if (plain_ascii(sp)) {
+            out.binary = sp;
+        } else {  // the engine's own directory (its DLLs, ENGINE_VERSION), keyed by the binary's sha256
+            std::string sha = file_sha256(le.binary);
+            std::string d = platform::engine_work_dir() + "/engine-" + sha.substr(0, 16);
+            std::string name = le.binary.substr(le.binary.find_last_of("/\\") + 1);
+            if (!file_exists(d + "/" + name) || file_sha256(d + "/" + name) != sha) copy_tree(parent_of(le.binary), d);
+            out.binary = d + "/" + name;
+            why += "引擎路径含非 ASCII 字符，已复制到 " + d + "；";
+        }
+        if (!plain_ascii(out.binary)) throw Error("no plain-ASCII path for the engine (set BALLRAIN_WORK_DIR)");
+    }
+    if (!plain_ascii(le.root)) {
+        std::string sp = platform::short_path(le.root);
+        if (plain_ascii(sp)) {
+            out.root = sp;
+        } else {  // the entries the engine reads, keyed by their hashes (hello's game_files)
+            std::string key = Sha256::hex(game_files.dump(true));
+            std::string d = platform::engine_work_dir() + "/game-" + key.substr(0, 16);
+            if (!file_exists(d + "/.complete")) {
+                platform::make_dirs(d);
+                for (const char *n : {"base.cmo", "Database.tdb"}) {
+                    Bytes b;
+                    if (!read_file(le.root + "/" + n, b)) throw Error(std::string("cannot read ") + n);
+                    write_file(d + "/" + n, b);
+                }
+                for (const char *n : {"3D Entities", "Text"}) copy_tree(le.root + "/" + n, d + "/" + n);
+                if (le.kind == "2002") {
+                    platform::make_dirs(d + "/Bin"), platform::make_dirs(d + "/BuildingBlocks");
+                    for (const char *n : {"Bin/VxMath.dll", "BuildingBlocks/physics_RT.dll"}) {
+                        Bytes b;
+                        if (!read_file(le.root + "/" + n, b)) throw Error(std::string("cannot read ") + n);
+                        write_file(d + "/" + n, b);
+                    }
+                }
+                write_file(d + "/.complete", key);
+            }
+            out.root = d;
+            why += "Ballance 目录路径含非 ASCII 字符，引擎用的四项游戏文件已复制到 " + d + "；";
+        }
+        if (!plain_ascii(out.root)) throw Error("no plain-ASCII path for the game files (set BALLRAIN_WORK_DIR)");
+    }
+    if (note) *note = why;
+    return out;
 }
 
 static void remove_tree(const std::string &d) {

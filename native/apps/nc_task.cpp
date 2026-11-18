@@ -13,6 +13,7 @@
 #include <string>
 
 #include "ballrain/sha256.h"
+#include "ballrain/pool_task.h"
 #include "ballrain/task_runner.h"
 #include "platform.h"
 
@@ -43,6 +44,14 @@ int main(int argc, char **argv) {
         EngineConfig eng;
         eng.binary = platform::absolute_path(arg(argc, argv, "--engine"));
         eng.root = platform::absolute_path(arg(argc, argv, "--root"));
+        {  // as the client: non-ASCII paths through the engine work directory
+            LocalEngine le;
+            le.binary = eng.binary, le.root = eng.root, le.kind = task.engine;
+            std::string note;
+            le = engine_view(le, hash_game_files(eng.root, task.engine), &note);
+            if (!note.empty()) std::fprintf(stderr, "%s\n", note.c_str());
+            eng.binary = le.binary, eng.root = le.root;
+        }
         eng.ball_order = "retail:" + std::to_string(task.ball_order_seed);
         for (int i = 1; i + 1 < argc; ++i)
             if (std::strcmp(argv[i], "--engine-env") == 0) {

@@ -354,6 +354,7 @@ std::unique_ptr<Process> Process::spawn(const Spec &spec) { return std::make_uni
 #include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
+#include <cctype>
 #include <cwctype>
 #include <ctime>
 
@@ -415,6 +416,25 @@ std::string data_dir() {
 
 std::string home_dir() { return known_folder(FOLDERID_Profile); }
 
+std::string engine_work_dir() {
+    wchar_t buf[1024];
+    DWORD n = GetEnvironmentVariableW(L"BALLRAIN_WORK_DIR", buf, 1024);
+    if (n > 0 && n < 1024) return narrow(std::wstring(buf, n));
+    std::string base = known_folder(FOLDERID_ProgramData);
+    if (base.empty()) base = "C:\\ProgramData";
+    return base + "\\BallrainPool";
+}
+
+std::string short_path(const std::string &path) {
+    std::wstring w = widen(path);
+    DWORD n = GetShortPathNameW(w.c_str(), nullptr, 0);
+    if (!n) return path;
+    std::wstring out(n, L'\0');
+    n = GetShortPathNameW(w.c_str(), &out[0], n);
+    out.resize(n);
+    return n ? narrow(out) : path;
+}
+
 std::string executable_path() {
     std::wstring buf(32768, L'\0');
     DWORD n = GetModuleFileNameW(nullptr, &buf[0], DWORD(buf.size()));
@@ -432,6 +452,15 @@ bool open_url(const std::string &url) {
     if (url.rfind("https://", 0) != 0 && url.rfind("http://", 0) != 0) return false;  // never a file or a program
     return reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", widen(url).c_str(), nullptr, nullptr,
                                                    SW_SHOWNORMAL)) > 32;
+}
+
+bool single_instance(const std::string &data_dir) {
+    std::wstring name = L"Local\\BallrainPool-";
+    uint32_t h = 2166136261u;  // FNV-1a of the folded path: one mutex per data directory
+    for (char c : data_dir) h = (h ^ uint32_t(std::tolower(static_cast<unsigned char>(c == '\\' ? '/' : c)))) * 16777619u;
+    name += std::to_wstring(h);
+    HANDLE m = CreateMutexW(nullptr, TRUE, name.c_str());  // never closed: held until the process exits
+    return m && GetLastError() != ERROR_ALREADY_EXISTS;
 }
 
 bool process_running(const std::string &image_name) {

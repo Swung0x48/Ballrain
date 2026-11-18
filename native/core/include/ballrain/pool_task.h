@@ -29,6 +29,12 @@ struct TaskOutcome {
     double wall_s = 0;
 };
 
+// The engine's view of le (Windows): a binary or Ballance folder whose path is not plain ASCII is replaced by its 8.3
+// form, else by a copy under platform::engine_work_dir() (the engine's directory; the four game entries the x87-soft
+// edition reads, re-copied when the folder's game-file hashes change). note: what was done (for the log), or "".
+LocalEngine engine_view(const LocalEngine &le, const Json &game_files, std::string *note = nullptr);
+bool plain_ascii(const std::string &s);
+
 // Plays the task. on_chunk(seq, data, final) receives every encoded chunk in order; stop() is sample_task's;
 // on_step(steps) after every step (progress). cache_mu serialises the cache (several instances share it). Throws
 // before the first chunk when the task does not fit this machine or the engine cannot start (the caller backs off);

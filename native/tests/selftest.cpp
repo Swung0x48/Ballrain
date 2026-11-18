@@ -5,10 +5,12 @@
 #include <string>
 #include <vector>
 
+#include "ballrain/diagnostics.h"
 #include "ballrain/geometry.h"
 #include "ballrain/json.h"
 #include "ballrain/policy.h"
 #include "ballrain/sha256.h"
+#include "ballrain/update.h"
 #include "ballrain/wire.h"
 
 using namespace ballrain;
@@ -72,6 +74,22 @@ int main() {
     act.stop_mask = event_mask({Ev::BallOff, Ev::LevelFinish, Ev::GameOver});
     Bytes b = encode_action(act, 5);
     CHECK(b.size() == 44 && b.substr(0, 4) == "ACT1");
+    // update check: versions, ed25519 (RFC 8032 test 1: the empty message)
+    CHECK(compare_versions("0.3.10", "0.3.9") == 1 && compare_versions("0.4.0-beta1", "0.4.0") == -1 &&
+          compare_versions("0.3.0", "0.3") == 0 && compare_versions("1.0.0", "0.9.9") == 1);
+    const char *pub = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    std::string sig = "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46b"
+                      "d25bf5f0595bbe24655141438e7a100b";
+    CHECK(verify_release_signature("", sig, pub));
+    CHECK(!verify_release_signature("x", sig, pub));
+    sig[0] = 'f';
+    CHECK(!verify_release_signature("", sig, pub) && !verify_release_signature("", "zz", pub));
+    // diagnostics scrub: replacements (case / slash insensitive, longest first), IPv4, versions kept
+    std::string s = scrub_text("C:\\Users\\Wang\\AppData\\Local\\BallrainPool\\logs and c:/users/wang/x, token abcdefgh, "
+                               "from 192.168.1.20:80, client 0.3.0, 1.2.3.4.5 stays",
+                               {{"C:/Users/Wang", "~"}, {"C:/Users/Wang/AppData/Local/BallrainPool", "<数据目录>"},
+                                {"abcdefgh", "<令牌>"}});
+    CHECK(s == "<数据目录>\\logs and ~/x, token <令牌>, from <ip>:80, client 0.3.0, 1.2.3.4.5 stays");
     std::printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures ? 1 : 0;
 }

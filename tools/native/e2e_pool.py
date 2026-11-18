@@ -111,6 +111,7 @@ def main(argv=None) -> int:
     ap.add_argument("--client-engine-env", action="append", default=[], help="NAME=VALUE for the client's engine")
     ap.add_argument("--tasks", type=int, default=3)
     ap.add_argument("--instances", type=int, default=1, help="the client's instances (engines at the same time)")
+    ap.add_argument("--tui", help="also run the terminal UI (ballrain_pool --snapshot live:25) on the client's data")
     ap.add_argument("--kill-after", type=float, default=0.0,
                     help="first hard-kill the client this many seconds into a run (its engines must die with it: the job "
                          "object), then run it again: the killed run's queued chunks are posted and its tasks closed")
@@ -270,11 +271,21 @@ def main(argv=None) -> int:
     caught = mm is not None and mm.reason == Reason.REPLAY_REWARD_MISMATCH and mm.step == 10
     log(f"forged chunk: {mm.reason.value if mm else None} at step {mm.step if mm else None} -> "
         f"{'caught' if caught else 'NOT CAUGHT'}")
+    tui_ok = True
+    if a.tui:  # the terminal UI on the same data directory: the real controller for 25 s, then its main page
+        t = subprocess.run([str(Path(a.tui).resolve()), "--data-dir", str(client_dir), "--snapshot", "live:25"],
+                           capture_output=True, text=True, encoding="utf-8", timeout=600)
+        import re
+        page = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", t.stdout)
+        (d / "tui_snapshot.txt").write_text(page, encoding="utf-8")
+        sys.stdout.buffer.write(page.encode("utf-8")), sys.stdout.flush()
+        tui_ok = t.returncode == 0 and "采样中" in page and "合格玩家" in page
+        log(f"tui: exit {t.returncode}, {'OK' if tui_ok else 'NOT OK'} (the page above)")
     srv.shutdown()
     forum.shutdown()
     store.close()
     result = {"tasks": ends, "heartbeats": beats, "chunks": len(rows), "verify": verdict, "steps_verified": st["steps_verified"],
-              "forged_caught": caught, "passed": bool(ok and caught)}
+              "forged_caught": caught, "tui": tui_ok if a.tui else None, "passed": bool(ok and caught and tui_ok)}
     (d / "result.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
     log("PASSED" if result["passed"] else "FAILED")
     return 0 if result["passed"] else 1

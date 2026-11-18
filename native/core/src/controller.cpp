@@ -8,6 +8,7 @@
 #include <fstream>
 
 #include "ballrain/sha256.h"
+#include "ballrain/update.h"
 #include "platform.h"
 
 namespace ballrain {
@@ -221,6 +222,7 @@ struct Controller::Slot {
     int fails = 0;
     double retry_at = 0;
     bool fetched = false;  // a task was fetched and is not counted in tasks_done_ yet (this slot's thread only)
+    std::string path_note;  // the last engine_view note logged (this slot's thread only)
 };
 
 Controller::Controller(std::string data_dir, EventFn on_event)
@@ -616,7 +618,7 @@ void Controller::shutdown() {
 }
 
 void Controller::service_loop() {
-    double last_hb = platform::monotonic_s();
+    double last_hb = -1e9;  // the first heartbeat right after connecting
     while (!closing_) {
         double now = platform::monotonic_s();
         try {
@@ -839,10 +841,16 @@ bool Controller::run_one_task(Slot *s) {
     ClientConfig c = config();
     LocalEngine le;
     le.binary = engine_binary(), le.root = c.ballance_dir, le.kind = c.engine_kind, le.extra_env = engine_env;
+    Json files;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        files = game_files_;
+    }
     double deadline = t0 + double(task.deadline_s) - std::min(30.0, double(task.deadline_s) / 10);
     char rn[32];
     std::snprintf(rn, sizeof rn, "/runs/slot-%02d", s->index + 1);
-    std::string run_dir = dir_ + rn;
+    // the engine writes its run files by narrow paths too: a non-ASCII data directory runs under the work directory
+    std::string run_dir = (plain_ascii(dir_) ? dir_ : platform::engine_work_dir()) + rn;
     TaskOutcome out;
     std::string error;
     bool threw = false;
@@ -853,6 +861,9 @@ bool Controller::run_one_task(Slot *s) {
             cache = cache_.get();
         }
         if (!cache) throw Error("not connected");
+        std::string note;
+        le = engine_view(le, files, &note);
+        if (!note.empty() && note != s->path_note) say(note), s->path_note = note;
         out = play_task(
             task, *cache, cache_mu_, le, run_dir,
             [&](int64_t seq, const Bytes &data, bool final) { queue_chunk(task.task_id, seq, data, final); },
@@ -1175,6 +1186,7 @@ ControllerView Controller::view() const {
     v.auto_pause = auto_pause_, v.banner = banner_, v.user_name = user_name_, v.notice = notice_;
     v.leaderboard = leaderboard_, v.instances = cfg_.instances, v.max_instances = max_instances_, v.stats = stats_;
     v.queued_chunks = queued, v.tasks_done = tasks_done_;
+    v.update_version = update_version_, v.update_url = update_url_, v.update_notes = update_notes_;
     double now = platform::monotonic_s();
     for (auto &s : slots_) {
         InstanceView i;
@@ -1186,6 +1198,113 @@ ControllerView Controller::view() const {
         v.inst.push_back(i);
     }
     return v;
+}
+
+// ---------------------------------------------------------------------------------------------- diagnostics, updates
+
+DiagFiles Controller::diagnostics() const {
+    std::vector<std::pair<std::string, std::string>> rep;
+    Json info = Json::object();
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        if (!token_.empty()) rep.push_back({token_, "<令牌>"});
+        for (const char *k : {"username", "nickname"}) {
+            std::string v = user_.is_object() ? user_.get_string(k, "") : "";
+            if (!v.empty()) rep.push_back({v, std::string("<论坛") + (k[0] == 'u' ? "用户名" : "昵称") + ">"});
+        }
+        if (user_.is_object())
+            if (const Json *id = user_.find("id"); id && id->is_number()) {
+                std::string sid = std::to_string(id->as_int());
+                if (sid.size() >= 4) rep.push_back({"\"id\":" + sid, "\"id\":\"<论坛 id>\""});
+            }
+        info.set("client_version", Json::string(CLIENT_VERSION));
+        info.set("platform", Json::string(platform_name() + " " + release_platform_key()));
+        info.set("engine", engine_);
+        info.set("game_files", game_files_);
+        info.set("instances", Json::integer(cfg_.instances));
+        info.set("max_instances", Json::integer(max_instances_));
+        info.set("connected", Json::boolean(connected_));
+        info.set("want_running", Json::boolean(want_running_));
+        info.set("auto_pause", Json::string(auto_pause_));
+        if (banner_) {
+            Json b = Json::object();
+            b.set("kind", Json::string(banner_->kind));
+            b.set("code", Json::string(banner_->code));
+            b.set("message", Json::string(banner_->message));
+            info.set("banner", b);
+        }
+        info.set("stats", stats_);
+        info.set("tasks_done", Json::integer(tasks_done_));
+        Json sl = Json::array();
+        for (auto &s : slots_) {
+            Json j = Json::object();
+            j.set("slot", Json::integer(s->index));
+            j.set("state", Json::string(s->state));
+            j.set("fails", Json::integer(s->fails));
+            j.set("total_steps", Json::integer(s->total_steps));
+            j.set("accepted_steps", Json::integer(s->accepted));
+            sl.push(j);
+        }
+        info.set("instances_state", sl);
+        info.set("update_version", Json::string(update_version_));
+    }
+    rep.push_back({dir_, "<数据目录>"});
+    std::string home = platform::home_dir(), user = platform::user_name();
+    if (!home.empty()) rep.push_back({home, "~"});
+    if (user.size() >= 2) rep.push_back({user, "<用户>"});
+    rep.push_back({platform::engine_work_dir(), "<引擎工作目录>"});
+    info.set("queued_chunks", Json::integer(view().queued_chunks));
+    DiagFiles out;
+    out.push_back({"info.json", scrub_text(info.dump(true), rep)});
+    Bytes b;
+    if (read_file(dir_ + "/config.json", b)) out.push_back({"config.json", scrub_text(b, rep)});
+    std::vector<std::string> logs = platform::list_dir(log_.dir());
+    std::sort(logs.begin(), logs.end());
+    for (auto &n : logs) {
+        if (n.rfind("client.log", 0) != 0 && !(n.rfind("engine-", 0) == 0 && n.find(".log") != std::string::npos)) continue;
+        Bytes lb;
+        if (!read_file(log_.dir() + "/" + n, lb)) continue;
+        if (lb.size() > (4 << 20)) lb = lb.substr(lb.size() - (4 << 20));
+        out.push_back({"logs/" + n, scrub_text(lb, rep)});
+    }
+    return out;
+}
+
+std::string Controller::export_diagnostics(const std::string &zip_path) {
+    std::string p = zip_path;
+    if (p.empty()) {
+        std::time_t t = std::time(nullptr);
+        std::tm tm{};
+#ifdef _WIN32
+        localtime_s(&tm, &t);
+#else
+        localtime_r(&t, &tm);
+#endif
+        char ts[32];
+        std::strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", &tm);
+        p = dir_ + "/diagnostics-" + ts + ".zip";
+    }
+    write_zip(diagnostics(), p);
+    say("诊断信息已导出：" + p);
+    return p;
+}
+
+void Controller::check_update(const std::string &url, const std::string &pubkey) {
+    std::string err;
+    auto r = check_for_update(url, pubkey, CLIENT_VERSION, release_platform_key(), &err);
+    if (r) {
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            update_version_ = r->version, update_url_ = r->url, update_notes_ = r->notes;
+        }
+        say("有新版本 " + r->version + "：" + r->url);
+        Json f = Json::object();
+        f.set("version", Json::string(r->version));
+        f.set("url", Json::string(r->url));
+        emit("update_available", f);
+    } else if (!err.empty()) {
+        log_.line(err);
+    }
 }
 
 }  // namespace ballrain

@@ -132,6 +132,13 @@ std::string executable_path() {
 #endif
 }
 
+std::string engine_work_dir() {
+    const char *w = std::getenv("BALLRAIN_WORK_DIR");
+    return w && *w ? std::string(w) : data_dir();
+}
+
+std::string short_path(const std::string &path) { return path; }
+
 std::string user_name() {
     passwd *pw = getpwuid(getuid());
     return pw && pw->pw_name ? pw->pw_name : "";
@@ -151,6 +158,15 @@ bool open_url(const std::string &url) {
     int st;
     waitpid(pid, &st, 0);
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+bool single_instance(const std::string &data_dir) {
+    make_dirs(data_dir);
+    int fd = open((data_dir + "/.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);  // kept open until exit
+    if (fd < 0) return true;
+    struct flock fl {};
+    fl.l_type = F_WRLCK, fl.l_whence = SEEK_SET;
+    return fcntl(fd, F_SETLK, &fl) == 0;
 }
 
 bool process_running(const std::string &image_name) {

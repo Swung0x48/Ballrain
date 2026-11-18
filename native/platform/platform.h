@@ -38,7 +38,15 @@ std::string data_dir();
 std::string home_dir();
 std::string executable_path();  // this program (absolute)
 std::string user_name();        // the login name (diagnostics scrub it from paths)
+// A directory for what the headless engine must read or write when the client's own paths are not plain ASCII (the
+// engine resolves its files with narrow, code-page paths): BALLRAIN_WORK_DIR if set, else Windows
+// %ProgramData%\BallrainPool (no token or personal data goes there: a game-file copy, run directories); POSIX the
+// data directory (the engine takes UTF-8 bytes there)
+std::string engine_work_dir();
+std::string short_path(const std::string &path);  // Windows: the 8.3 form when the volume has one, else path
 bool open_url(const std::string &url);  // the system browser (ShellExecute / open / xdg-open)
+// One client per data directory: true when this process holds the lock (kept until it exits)
+bool single_instance(const std::string &data_dir);
 
 // Automatic-pause probes (best effort: false when unknown). process_running compares image names case-insensitively
 // (Windows: the process list; Linux: /proc/<pid>/cmdline contains the name, e.g. Player.exe under Wine)
