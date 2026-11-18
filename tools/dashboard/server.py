@@ -446,7 +446,7 @@ class Dashboard:
             compute = D.discarded_steps(runs, D.default_run(runs))
         except Exception:
             compute = None
-        res = {"now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "now_ts": int(time.time()), "tz": D.tz_label(), "milestone": "M2",
+        res = {"now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "now_ts": int(time.time()), "tz": D.tz_label(), "milestone": "M3",
                "runs": [r.name for r in mac], "default_run": D.default_run(runs), "status": st, "gen": gen,
                "interval_s": self.interval, "min_refresh_s": self.min_refresh, "machines": self.machines,
                "tensorboard_url": self.tensorboard_url, "data": summ.get("data") or {},
