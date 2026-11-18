@@ -3,3 +3,4 @@
 headless/** text=auto eol=lf
 models/**/*.pt filter=lfs diff=lfs merge=lfs -text
 models/**/*.npz filter=lfs diff=lfs merge=lfs -text
+benchmarks/refpaths-alt/**/L*.json text eol=lf

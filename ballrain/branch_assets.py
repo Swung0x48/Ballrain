@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 
+from .branch_rules import BranchRules
 from .path import RouteError, resolve_path_dir
 
 
@@ -19,6 +20,10 @@ def read_bundle(level, directory):
     root = resolve_path_dir(directory)
     blobs = {k: (root / name).read_bytes() for k, name in filenames(level).items()}
     return dict(level=level, **blobs, sha256={k: hashlib.sha256(v).hexdigest() for k, v in blobs.items()})
+
+
+def bundle_rules(bundle):
+    return BranchRules.from_desc(json.loads(bundle["desc_json"]))
 
 
 def validate(bundle, level, main_sha):
@@ -33,6 +38,7 @@ def validate(bundle, level, main_sha):
     if hashes != bundle.get("sha256"):
         raise RouteError("branch bundle sha256 mismatch")
     desc = json.loads(bundle["desc_json"])
+    BranchRules.from_desc(desc)
     if (desc.get("level") != level or not main_sha or desc.get("main_sha256") != main_sha
             or desc.get("branch_sha256") != hashes["line_npz"]):
         raise RouteError("branch description does not match level, main or branch line")

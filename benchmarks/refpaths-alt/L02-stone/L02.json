@@ -450,5 +450,21 @@
     59700.450537689845,
     59720.41170611631,
     59740.48210787599
-  ]
+  ],
+  "rules": {
+    "stall_pause_speed": 1.0,
+    "stall_speed_source": "speed+speed_change",
+    "stall_odometer": "local_s",
+    "rest_stop_speed": null,
+    "rest_max_drive_frames": null,
+    "rest_max_brake_frames": null,
+    "rest_require_support": true,
+    "rest_position_tolerance": 2.0,
+    "rest_fallback": "same_tas_frame",
+    "drive_arrival_radius": 1.0,
+    "drive_gain": 0.8,
+    "drive_speed_cap": 6.0,
+    "drive_deadband": 0.3,
+    "rest_control_repeat": 2
+  }
 }

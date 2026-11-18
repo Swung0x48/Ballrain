@@ -1,4 +1,5 @@
 """Build the L2 south-loop branch against the recorded collision world, then audit the float32 asset."""
+from dataclasses import asdict
 from pathlib import Path
 import sys
 import json
@@ -7,6 +8,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from ballrain.branch_rules import DEFAULT_RULES
 from ballrain.features import level_geometry
 from ballrain import protocol as P, geometry as G
 from ballrain.state import GameTracker
@@ -276,7 +278,8 @@ def build():
         )
     ]
     desc["main_span_t_ms"] = main.t_ms[i : j + 1].tolist()
-    ASSET.with_suffix(".json").write_text(json.dumps(desc, indent=2) + "\n")
+    desc["rules"] = asdict(DEFAULT_RULES)
+    ASSET.with_suffix(".json").write_text(json.dumps(desc, indent=2) + "\n", encoding="utf-8", newline="\n")
     owners = {}
     gaps = []
     for pt in out.P[i : k + 1]:

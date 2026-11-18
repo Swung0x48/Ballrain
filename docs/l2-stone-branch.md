@@ -27,3 +27,26 @@
 `env_config.features.branch_sha256` 是按 `line_npz`、`desc_json`、`drive_npz` 顺序拼接三个 **32 字节原始摘要** 后再取的 SHA-256（小写十六进制）。worker 先验关号、各摘要、总指纹及主线配对，再写入带总指纹的私有临时目录；投影和静止交接读取同一份安装件。`--resume` 默认用 checkpoint 原件，显式指定目录时要求逐字节相同，否则拒绝；老式仅存目录的分线 checkpoint 必须在 learner 显式补给目录。
 
 Python bridge 在 hello 声明 `branch_assets_version: 1`，否则分线任务在发送模板前拒绝。pool/native 接入方须从 `state["branch_assets"]` 打包三份原件，将摘要绑定到策略与任务，验包后才启用分线；任务协议须排除不支持分线的老客户端，不能只加 hello 标记。完成 gateway、`weights.export_state` 和 native 端支持前保留拒绝导出和连接的行为。**主线不随本包发送**：Python worker 仍需提供 `path_dir` 中 `path_sha256` 对应的主线，pool 已有独立的主线安装协议；本次不改变两者的寻址方式。
+
+## `L<nn>.json.rules`：原生客户端读取约定（v1）
+
+`rules` 是封闭的 JSON 对象；整项缺省等于 `{}`，缺键使用下表默认值。先验包和主线配对，再校验所有键和值，错误须拒绝任务，不得静默回退。数值须有限、非负，不能用布尔代替；帧数为 `1..2147483647` 的整数。只有标为 `null` 的三项可显式置空，表示继承**本任务**的环境配置，不是用常量覆盖它。规则只用于分线；普通 TAS 静止起点及主线停滞判定不变。
+
+|键|默认值|单位、取值和作用|
+|---|---|---|
+|`stall_pause_speed`|`1.0`|m/s；启用速度豁免时，有效阈值为本值与 worker `stall_speed` 的较小值，三维速率严格大于它才暂停。硬超时不变。|
+|`stall_speed_source`|`"speed+speed_change"`|先作向量和再取范数；另一可选值 `"speed"` 只取原速度。|
+|`stall_odometer`|`"local_s"`|停滞判定取活动线物理米数；`"s"` 取主线进度信用。换线时重新设基准，不跨线求差。|
+|`rest_stop_speed`|`null`|正数，m/s；继承 `env.rest_speed`（默认 0.5）。驱动与制动以水平速率 `<` 判停，最终交接允许 `<=`。|
+|`rest_max_drive_frames` / `rest_max_brake_frames`|各 `null`|追踪、制动各自的游戏帧预算；分别继承 `env.rest_max_frames`（默认 600）。每轮发指令前检查，制动结束另发一帧松键。|
+|`rest_control_repeat`|`2`|追踪、制动每次控制指令的重复帧数。|
+|`drive_arrival_radius`|`1.0`|水平目标距离严格小于此值（米）且足够慢，结束追踪。|
+|`drive_gain` / `drive_speed_cap`|`0.8` / `6.0`|水平目标速度 = 水平位移乘增益（每秒），按范数限速（m/s）。|
+|`drive_deadband`|`0.3`|目标与当前水平速度之差的范数严格大于此值（m/s）才按方向键。|
+|`rest_require_support`|`true`|布尔；交接时要求现有接触特征 `supported` 为真。`false` 仅解除支撑要求，不解除分线匹配。|
+|`rest_position_tolerance`|`2.0`|最终交接允许的最大三维欧氏位置误差（米，含端点）。|
+|`rest_fallback`|`"same_tas_frame"`|驱动或交接失败时关闭失败进程，在同一 TAS 帧重开普通起点一次；`"error"` 则关闭并报错，不重开。|
+
+没有单独的“0.25434”参数。`stations` 的每行是 `[main_s, branch_s]`；相邻站间以 `Δmain_s / Δbranch_s` 换算，换线不发放投影跳变的信用。改奖励密度应改站点，而非在客户端存近似斜率。球种、小节、分线起止、轨迹和时间均取自资产；有效观测才推进投影、物理前视走活动线、主线和回放哈希匹配、所需球种和小节匹配均为算法或完整性约束，不是 L2 调参项。回放每 512 帧分块仅为传输，不是驱动帧预算。
+
+桥接 hello 保留 `branch_assets_version: 1`，另宣告 `branch_rules_version: 1`。只有规则解析结果与旧行为**不等价**时才要求这个能力；默认规则包仍可交给已支持分线资产的旧客户端。原生调度端也应在派工前按此检查。新增规则名或枚举值仍须更新读取器；修改支持范围内的值只需重新打包。摘要仍按原始字节计算，JSON 固定 UTF-8/LF；`drive.npz` 中的 `branch_sha256` 固定的是轨迹 NPZ，非描述 JSON。

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import numpy as np
 
+from .branch_rules import BranchRules
 from .path import (
     PathFollower,
     RouteError,
@@ -17,6 +18,7 @@ from .path import (
 
 class BranchFollower:
     def __init__(self, main, alt, meta, **kw):
+        self.rules = BranchRules.from_desc(meta)
         self.main, self.alt = main, alt
         self.ball_type, self.sector = meta["ball_type"], meta["sector"]
         self.lo, self.hi = meta["branch_s"]
