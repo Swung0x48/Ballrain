@@ -79,13 +79,17 @@ class Verifier:
                 self._policies[sha] = (m, W.load_policy(wd / f"{sha}.npz", m, expect_sha=sha))
             return self._policies[sha]
 
-    def _assets(self, task: T.Task):
+    def _assets(self, task: T.Task, manifest: dict):
         cache = self.pool_dir / "cache"
         ad = self.pool_dir / "assets"
+        bdir = None
         with self._plock:  # parallel workers: one installs a pack at a time (Windows refuses a replace of an open file)
             sdir = T.install_starts_pack(ad / f"{task.assets['starts']}.npz", cache, task.assets["starts"])
             pdir = T.install_path_asset(ad / f"{task.assets['path']}.npz", cache, task.level, task.assets["path"])
-        return sdir, pdir
+            br, bsha = manifest["features"].get("branch"), task.assets.get("branch")
+            if br and bsha:  # the route branch: the pack the gateway exported from the learner's files
+                bdir = T.install_branch_pack(ad / f"{bsha}.npz", cache, task.level, bsha, br)
+        return sdir, pdir, bdir
 
     def _decoded(self, task_id: str, rows: list, upto: int, n_obs: int, n_act: int) -> list:
         out = []
@@ -128,10 +132,11 @@ class Verifier:
             eng = self.engines.get(task.engine)
             if eng is None or (self.launcher_factory is None and not eng.binary):
                 raise R.EngineFailure(f"no {task.engine} engine configured for the verifier")
-            sdir, pdir = self._assets(task)
+            sdir, pdir, bdir = self._assets(task, manifest)
             lg = T.LocalGame(engine=task.engine, binary=eng.binary, root=eng.root)
             launcher = self.launcher_factory() if self.launcher_factory else None
-            env = T.build_env(task, manifest, lg, sdir, pdir, out_root, copy="verify-00", launcher=launcher)
+            env = T.build_env(task, manifest, lg, sdir, pdir, out_root, copy="verify-00", launcher=launcher,
+                              branch_dir=bdir)
             runner = R.TaskRunner(env, task, manifest)
             self.replays += 1
             mm = R.replay_task(runner, policy, decoded)

@@ -240,3 +240,7 @@ class Cache:
     def path(self, sha: str, level: int) -> Path:
         from . import task as T
         return T.install_path_asset(self.asset(sha), self.root, level, sha)
+
+    def branch(self, sha: str, level: int, pins: dict) -> Path:
+        from . import task as T
+        return T.install_branch_pack(self.asset(sha), self.root, level, sha, pins)

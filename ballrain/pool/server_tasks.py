@@ -44,6 +44,7 @@ class Published:
     published_at: int
     starts: object = None  # TasStarts of the record with exclude_starts applied (nearest_valid / nearest_any)
     draws: dict | None = None  # the trainer's start draws: rehearse_starts, p_rehearse, rest_starts, p_rest
+    branch_sha: str | None = None  # the route-branch pack (export_branch_pack) when the policy follows a branch
 
     @property
     def n_obs(self) -> int:
@@ -94,6 +95,9 @@ class PolicySource:
             raise ValueError("the policy does not pin its reference line (features.path_sha256)")
         line = T.find_path_asset(int(m["env"]["level"]), psha_want, self.path_dirs)
         psha, _ = T.export_path_asset(line, self.assets_dir)
+        bsha = None
+        if m["features"].get("branch"):  # the learner's branch files, as export_state pinned them
+            bsha, _ = T.export_branch_pack(state["branch_assets"], int(m["env"]["level"]), self.assets_dir, psha)
         excl = m["env"].get("exclude_starts")
         st = TasStarts(str(rd))
         if excl:
@@ -115,7 +119,7 @@ class PolicySource:
         pub = Published(manifest=m, policy_sha=m["policy_sha"], run=self.run, record=record,
                         record_sha256=meta["record_sha256"], starts_sha=ssha, path_sha=psha,
                         level=int(m["env"]["level"]), valid=T.valid_start_frames(rd, excl), curriculum=cu,
-                        source=source, published_at=int(self.clock()), starts=st, draws=draws)
+                        source=source, published_at=int(self.clock()), starts=st, draws=draws, branch_sha=bsha)
         with self.lock:
             self.current = pub
             self.history[pub.policy_sha] = pub
@@ -156,7 +160,10 @@ class PolicySource:
                 e = rs[int(rng.integers(len(rs)))]
                 lo, hi = e[0], e[1]
                 rest = {"target": None}
-                if len(e) >= 5:
+                if len(e) == 3 and isinstance(e[2], dict):  # lo-hi@branch:s (the env: the measured branch drive)
+                    rest["branch_s"] = float(e[2]["branch_s"])
+                    k = st.nearest_any(int(rng.integers(int(lo), int(hi) + 1)))
+                elif len(e) >= 5:
                     j = float(e[4])
                     rest["target"] = [float(e[2]) + float(rng.uniform(-j, j)), float(e[3]) + float(rng.uniform(-j, j))]
                     if len(e) >= 6:
@@ -169,7 +176,7 @@ class PolicySource:
             elif k is None:
                 k = int(pub.valid[int(rng.integers(len(pub.valid)))])
         k = int(k)
-        if rest is not None and rest["target"] is not None:
+        if rest is not None and (rest["target"] is not None or rest.get("branch_s") is not None):
             if k <= 0 or st.expected(k) is None:
                 raise ValueError(f"at-rest start frame {k} is not a hand-over state")
         else:
@@ -194,6 +201,7 @@ class PolicySource:
                       record=pub.record, record_sha256=pub.record_sha256, start_frame=k, rest=rest, life_seed=T.new_sample_seed(),
                       respawn_frontier=rf,
                       ball_order_seed=T.new_ball_order_seed(), engine=engine,
-                      assets={"starts": pub.starts_sha, "path": pub.path_sha}, chunk_steps=min(chunk, 4096),
+                      assets=dict({"starts": pub.starts_sha, "path": pub.path_sha},
+                                  **({"branch": pub.branch_sha} if pub.branch_sha else {})), chunk_steps=min(chunk, 4096),
                       max_steps=int(max_steps), max_frames=int(max_frames), deadline_s=int(deadline_s),
                       issued_at=int(now), kind=kind, greedy=kind == "eval", sample_seed=T.new_sample_seed())

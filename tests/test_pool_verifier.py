@@ -143,7 +143,7 @@ def test_rollout_replays_bit_exactly(pool, tmp_path):
         assert P.check_chain_link(a, b) is None
     # the replay in a fresh env reproduces everything (rewards bit for bit)
     m = W.read_manifest(pool.cfg.pool_dir / "weights" / f"{t.policy_sha}.json")
-    sdir, pdir = pool.verifier._assets(t)
+    sdir, pdir, _ = pool.verifier._assets(t, m)
     env = T.build_env(t, m, T.LocalGame("x87soft", "b", "r"), sdir, pdir, tmp_path / "rp",
                       launcher=fakegame.FakeLauncher(backend="headless"))
     runner = R.TaskRunner(env, t, m)

@@ -177,8 +177,16 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     env = {k: _plain(ec[k]) if k in ec else _plain(getattr(EnvConfig(), k)) for k in ENV_FIELDS if k in known_env}
     fc = dict(ec.get("features") or {})
     feats = _plain({f.name: fc.get(f.name, getattr(FeatureConfig(), f.name)) for f in fields(FeatureConfig)})
-    if feats.pop('branch_dir', None):
-        raise ValueError('pool clients do not yet implement ball-type branch assets')
+    if feats.pop("branch_dir", None):
+        # a route branch: its files come from the learner with the policy (state["branch_assets"]), never from a
+        # local directory; the manifest pins them (features.branch), the gateway ships them as the branch pack
+        ba = state.get("branch_assets")
+        if ba is None:
+            raise ValueError("the run follows a route branch (features.branch_dir) but the state carries no "
+                             "branch_assets: the learner sends the branch files with its policy")
+        from .task import branch_assets_bytes, check_branch_files
+        line, desc, drive = branch_assets_bytes(ba, int(env["level"]))
+        feats["branch"] = check_branch_files(line, desc, drive, int(env["level"]), feats.get("path_sha256"))
     feats["path_dir"] = None  # the client installs the asset itself (task assets, sha256 below)
     rc = ec.get("reward") or {}
     reward = _plain({f.name: rc.get(f.name, getattr(RewardConfig(), f.name)) for f in fields(RewardConfig)})

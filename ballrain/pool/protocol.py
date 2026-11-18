@@ -361,7 +361,9 @@ TASK = Obj({
     "issued_at": Int(0, 2 ** 40),  # unix seconds (server clock)
     "greedy": Bool(),  # eval tasks: argmax actions (behaviour log-probs still sent)
     "sample_seed": Int(0, 2 ** 53 - 1),  # sampling tasks: action draws u_t = sampling.sample_u(seed, t)
-    "assets": Obj({"starts": SHA, "path": SHA}),  # sha256 of the start-state pack and of the reference line asset
+    # sha256 of the start-state pack and of the reference line asset; branch: the route-branch pack when the
+    # policy follows one (its manifest's features.branch pins the pack's three files)
+    "assets": Obj({"starts": SHA, "path": SHA}, {"branch": SHA}),
 }, {
     # format 3 (docs/pool-prototype.md 5): an at-rest start after the hand-over at start_frame (the env's rest_starts):
     # drive to target (x, z) within max_frames, then brake; target null = brake only. Drawn by the server
