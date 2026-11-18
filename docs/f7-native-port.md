@@ -150,8 +150,9 @@ file = f"L{level_no:02d}-{hex(sha256(key.utf8))[:16]}.npz"
 - 验证（与 f6 的 `tools/native/golden.py` 同样的做法）：L1、L2 的 TAS 回放每 2 帧一个状态，加上 r8 的追踪记录（`runtime/m2-train-mac/r8/episodes-traced`），
   Python 的块作金标准。要求：连续量缩放后 |Δ| ≤ 1e-9（逐位一致时为 0）；标志量（`grounded`、`doomed`、`unknown_zone`、`air_any`、`air_near_can_stop`、
   `air_near_clear`）在全部状态上相同，若有不同，必须能指出对应的阈值量（落点接触半径、死亡高度、推力距离、`FALL_TOL` 等）离阈值在 1e-9 以内，
-  且 L2 TAS 上 `doomed` 必须为 0、L2 坑的死亡必须与 Python 一样全部提前标出（当前追踪集 75/75）。
-- 运行时：L2 TAS 上 Python（numba）块中位数 92 µs、p99 3.3 ms，风扇状态最慢（fan 1 中位 0.68 ms、p99 6.4 ms）；场每份约 58 MB，构建约 4 s。
+  且 L2 TAS 上 `doomed` 必须为 0、L2 坑的死亡必须与 Python 一样全部提前标出（当前追踪集 79/79）。
+- 运行时：L2 TAS 上 Python（numba）`perceive` 中位数 47 µs、p99 0.97 ms（reach 块含未知区和运动体 137 µs / 2.1 ms，机器有负载），风扇状态最慢
+  （fan 1 中位 0.70 ms、p99 6.3 ms）；场每份约 58 MB，构建约 4 s。
 
 ## 8. 未决问题
 
