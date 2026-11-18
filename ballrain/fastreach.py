@@ -662,6 +662,27 @@ def _fan_dist(fans, x, y, z):
 
 
 @_jit
+def _fan_col_dist(fans, x, y, z):
+    """Distance from the point to the nearest fan push column: the push box extended without limit along its local y
+    axis (world y: the boxes are turned about y only), i.e. the horizontal distance to the box footprint."""
+    best = INF
+    for f in range(fans.shape[0]):
+        dx = x - fans[f, 0]
+        dy = y - fans[f, 1]
+        dz = z - fans[f, 2]
+        s = 0.0
+        for i in (0, 2):
+            loc = dx * fans[f, 6 + 3 * i] + dy * fans[f, 7 + 3 * i] + dz * fans[f, 8 + 3 * i]
+            ex = abs(loc) - fans[f, 3 + i]
+            if ex > 0.0:
+                s += ex * ex
+        d = math.sqrt(s)
+        if d < best:
+            best = d
+    return best
+
+
+@_jit
 def _fan_touch(fans, yy, xf, zf, D, n_end, rad):
     """First PSI n <= n_end at which the reachable square (xf +- D, zf +- D) at height yy[n] comes within rad of a fan
     push box (its world AABB: conservative for the rotated ones); -1 when never. yy must be the trajectory without
@@ -1036,11 +1057,11 @@ def _contact_window(yy, yl, ya, lp, fans, cmode, xf, zf, D, na, ns, cx, cz, h, r
     cmode 0: one height profile yy (yl is yy, non-increasing on [na, ns]). cmode 1: a profile that may rise again
     (the key-free fan profile): ya holds its heights, yl their running minimum and yy their running maximum from the
     end (both non-increasing: they bound the PSI window exactly), the contact test uses ya; lp[n] is the last PSI
-    <= n the key-free flight was pushed at (-1: none yet). A point farther than FAN_R_NOM + rc from every push box
-    (a centre there is not pushed, so it does not follow the pushed profile) counts only before the first push, or
-    when the key-free flight has left the column (not pushed at n) and the point is within reach of the column since
-    the last push: its distance from the column at most the key-free travel since then plus D of the PSIs since then
-    (keys from the column edge). cmode 2: a band, every height in
+    <= n the key-free flight was pushed at (-1: none yet). A point farther than FAN_R_NOM + rc from every push
+    column (_fan_col_dist; a centre there is not pushed, so it does not follow the pushed profile) counts only before
+    the first push, or when the key-free flight has left the column (not pushed at n) and the point is within reach of
+    the column since the last push: its distance from the column at most the key-free travel since then plus D of the
+    PSIs since then (keys from the column edge). cmode 2: a band, every height in
     [yl[n], yy[n]] is possible at PSI n (yl non-increasing, yy its non-increasing upper envelope on [na, ns]): the
     centre height closest to h is used."""
     n0 = _first_le(yl, na, ns, h + rc)
@@ -1048,6 +1069,7 @@ def _contact_window(yy, yl, ya, lp, fans, cmode, xf, zf, D, na, ns, cx, cz, h, r
     first = -1
     emin = INF
     ne = -1
+    dcol = NAN
     for n in range(n0, n1 + 1):
         if cmode == 2:
             ys = max(h, yl[n])
@@ -1063,25 +1085,27 @@ def _contact_window(yy, yl, ya, lp, fans, cmode, xf, zf, D, na, ns, cx, cz, h, r
         rho2 = rc * rc - dy * dy
         if rho2 < 0.0:
             continue
+        ddx = max(abs(cx - xf[n]) - D[n] - hc, 0.0)
+        ddz = max(abs(cz - zf[n]) - D[n] - hc, 0.0)
+        if ddx * ddx + ddz * ddz > rho2:
+            continue
         if cmode == 1 and lp[n] >= 0.0:
-            m = int(lp[n])
-            dcol = _fan_dist(fans, cx, ya[n], cz) - FAN_R_NOM - rc
+            if dcol != dcol:  # once per point: its distance outside the push columns
+                dcol = _fan_col_dist(fans, cx, h, cz) - FAN_R_NOM - rc
             if dcol > 0.0:
+                m = int(lp[n])
                 if m >= n:
                     continue
                 tx = xf[n] - xf[m]
                 tz = zf[n] - zf[m]
                 if dcol > math.sqrt(tx * tx + tz * tz) + D[n - m]:
                     continue
-        ddx = max(abs(cx - xf[n]) - D[n] - hc, 0.0)
-        ddz = max(abs(cz - zf[n]) - D[n] - hc, 0.0)
-        if ddx * ddx + ddz * ddz <= rho2:
-            if first < 0:
-                first = n
-            e = max(0.0, math.sqrt((cx - xf[n]) ** 2 + (cz - zf[n]) ** 2) - math.sqrt(rho2))
-            if e < emin:
-                emin = e
-                ne = n
+        if first < 0:
+            first = n
+        e = max(0.0, math.sqrt((cx - xf[n]) ** 2 + (cz - zf[n]) ** 2) - math.sqrt(rho2))
+        if e < emin:
+            emin = e
+            ne = n
     return first, emin, ne
 
 
