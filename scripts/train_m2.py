@@ -592,7 +592,9 @@ def main(argv=None) -> int:
             raise SystemExit("--remote-listen needs --remote-key or $BALLRAIN_REMOTE_KEY")
         tcfg = _c.deepcopy(env_cfg)
         tcfg.backend, tcfg.headless, tcfg.out_root = a.remote_backend, None, None
-        template = {"env": tcfg, "seed": a.seed, "run": a.run,
+        # pool_ingest: the pool's learner link connects only to a learner that advertises pool support (older code
+        # would train pool chunks as plain remote chunks) and sends chunks only when it is true
+        template = {"env": tcfg, "seed": a.seed, "run": a.run, "pool_ingest": bool(a.pool_ingest),
                     "worker": {"chunk": a.chunk, "hidden": hidden, "activation": a.activation, "cap_mult": a.cap_mult,
                                "stall_s": a.stall_s, "respawn_stall_s": a.respawn_stall_s,
                                "stall_terminal": a.stall_terminal, "stall_extra": a.stall_extra,

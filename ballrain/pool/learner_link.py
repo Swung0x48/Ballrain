@@ -70,10 +70,17 @@ def state_from_params(template: dict, msg: dict) -> dict:
     ec = asdict(env) if is_dataclass(env) else dict(env)
     args = dict(template.get("worker") or {})
     args.setdefault("activation", "tanh")
-    return {"model": model, "rms": msg["rms"], "curriculum": msg.get("curriculum"),
-            "counters": {"update": int(msg["version"]), "steps": int(msg.get("steps", 0) or 0)},
-            "args": args, "n_obs": int(model["pi.0.weight"].shape[1]),
-            "n_act": int(model[f"pi.{2 * (n_layers - 1)}.weight"].shape[0]), "env_config": ec}
+    state = {"model": model, "rms": msg["rms"], "curriculum": msg.get("curriculum"),
+             "counters": {"update": int(msg["version"]), "steps": int(msg.get("steps", 0) or 0)},
+             "args": args, "n_obs": int(model["pi.0.weight"].shape[1]),
+             "n_act": int(model[f"pi.{2 * (n_layers - 1)}.weight"].shape[0]), "env_config": ec}
+    # the learner's route-branch bundle (level, line_npz, desc_json, drive_npz raw bytes), carried as the learner sent it:
+    # the gateway never reads branch files of its own (the export pins features.branch from these bytes). A parameter
+    # message's own copy wins over the template's (a learner that changed its branch without a restart)
+    ba = msg.get("branch_assets") if msg.get("branch_assets") is not None else template.get("branch_assets")
+    if ba is not None:
+        state["branch_assets"] = ba
+    return state
 
 
 class LearnerLink:
@@ -95,6 +102,8 @@ class LearnerLink:
         self.version = None  # newest learner update seen
         self._versions: dict = {}  # policy_sha -> learner update of its weights (manifest source.update)
         self.stop_event = threading.Event()
+        self.learner_ingests = False  # the hub's template says the learner runs with --pool-ingest
+        self._refused_logged = False
         self.counts = {"published": 0, "fed": 0, "fed_steps": 0, "other_run": 0, "errors": 0, "reconnects": 0}
         self.last_error: str | None = None
 
@@ -112,9 +121,27 @@ class LearnerLink:
         except Exception as e:  # noqa: BLE001
             self.last_error = f"connect: {type(e).__name__}: {str(e)[:200]}"
             return False
+        tpl = m["template"]
+        if "pool_ingest" not in tpl:
+            # a learner without pool support (older code) would train pool chunks as ordinary remote chunks, with no
+            # lag bound and no correction: never connect to it
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.last_error = "connect: the learner does not advertise pool support (pool_ingest); refused"
+            if not self._refused_logged:
+                self.log("learner link: the learner's hub does not advertise pool support (older train_m2); "
+                         "not connecting (retrying in the background)")
+                self._refused_logged = True
+            return False
+        self._refused_logged = False
         self.session += 1
-        self.template = m["template"]
+        self.template = tpl
         self.run = str(self.template.get("run"))
+        self.learner_ingests = bool(tpl.get("pool_ingest"))
+        # a reconnect may be a restarted / rolled-back learner: publish its parameters again from scratch
+        self._published_version, self._published_t = None, -1e18
         if getattr(self.policies, "run", self.run) != self.run:
             # the policies this link publishes carry the learner's run name (manifest source.run), which feed_once
             # compares with the template's: a differing [policy] run would mark every chunk "not for this learner"
@@ -122,7 +149,8 @@ class LearnerLink:
                      f"publishing as {self.run!r}")
             self.policies.run = self.run
         self.conn = c
-        self.log(f"learner link: connected (session {self.session}, run {self.run})")
+        self.log(f"learner link: connected (session {self.session}, run {self.run}, learner "
+                 f"{'ingests pool chunks' if self.learner_ingests else 'runs without --pool-ingest: no chunks sent'})")
         return True
 
     def _lost(self):
@@ -159,6 +187,10 @@ class LearnerLink:
             return False
         v = int(msg["version"])
         now = self.clock()
+        if self._published_version is not None and v < self._published_version:
+            # the learner went back (auto-rollback, a resume from an older checkpoint): its numbering restarted
+            self.log(f"learner link: learner update went back {self._published_version} -> {v}; republishing")
+            self._published_version, self._published_t = None, -1e18
         due = (self._published_version is None or v - self._published_version >= self.publish_every) \
             and now - self._published_t >= self.publish_min_s
         if not (force or due) or v == self._published_version:
@@ -182,7 +214,7 @@ class LearnerLink:
 
     def feed_once(self) -> int:
         """Send up to `batch` released chunks to the learner; returns the number sent."""
-        if not self.ingest or self.conn is None or self.version is None:
+        if not self.ingest or not self.learner_ingests or self.conn is None or self.version is None:
             return 0
         rows = self.store.to_ingest(self.batch)
         sent, other = [], []

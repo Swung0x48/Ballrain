@@ -148,7 +148,7 @@ def test_learner_link_publishes_live_policies_and_feeds_only_released_chunks(poo
     env = EnvConfig(**ec, features=feats, reward=RewardConfig(**rw) if rw else None)
     worker = {k: (json.loads(v) if k in ("route_probes", "gates", "split_extra", "counter_rand") else v)
               for k, v in st["args"].items()}
-    template = {"env": env, "seed": 1, "run": "test", "worker": worker}
+    template = {"env": env, "seed": 1, "run": "test", "pool_ingest": True, "worker": worker}
     data_q = queue.Queue()
     hub = RemoteHub(("127.0.0.1", 0), b"k" * 16, data_q, template, log=lambda m: None)
     addr = hub._listener.address
@@ -284,12 +284,13 @@ def test_learner_pool_flag(tmp_path, world, ingest):
 
 
 def test_reference_line_without_t_ms_is_a_valid_asset(tmp_path):
-    """benchmarks/refpaths/L02.npz (r8's line) has no t_ms: the env accepts it (ref_speed 0), so must the pool."""
-    src = REPO / "benchmarks" / "refpaths" / "L02.npz"
-    if not src.is_file():
-        pytest.skip("no L02 line")
-    with np.load(src, allow_pickle=False) as z:
-        assert "t_ms" not in z.files
+    """A line without t_ms (like the original benchmarks/refpaths/L02.npz) is accepted by the env (ref_speed 0), so it
+    must be by the pool too. A fixture line, so the test does not depend on what the repo's lines carry."""
+    n = 64
+    src = tmp_path / "L02.npz"
+    T.save_npz_deterministic(src, {"points": np.stack([np.zeros(n), np.full(n, 2.0), np.linspace(-5, -200, n)],
+                                                      1).astype("<f4"),
+                                   "sector": np.ones(n, np.uint8), "meta": np.array(json.dumps({"level": 2}))})
     sha, dst = T.export_path_asset(src, tmp_path / "assets")
     d = T.install_path_asset(dst, tmp_path / "cache", 2, sha)
     assert (d / "L02.npz").is_file()
@@ -389,3 +390,88 @@ def test_policy_consistency_tolerances_cover_float16_noise_and_catch_gross_chang
         if k == "actions":
             bad["logp"] = np.clip(lp[np.arange(T), bad["actions"].astype(int)], -60, 0).astype(np.float32)
         assert policy_consistency(SimpleNamespace(header={"steps": T}, arrays=bad), pol, task, 10) == why
+
+
+# ============================================================================================== link vs learner versions
+
+def _hub(template):
+    import queue
+    from ballrain.train.remote import RemoteHub
+    hub = RemoteHub(("127.0.0.1", 0), b"k" * 16, queue.Queue(), template, log=lambda m: None)
+    return hub, hub._listener.address
+
+
+def test_link_refuses_a_learner_without_pool_support_and_feeds_none_without_ingest(tmp_path):
+    """An older learner (no pool_ingest in its template) would train pool chunks as plain remote chunks: the link does
+    not connect. A learner advertising pool_ingest false is connected (policies) but gets no chunks."""
+    from ballrain.pool.server_store import Store
+    st = Store(tmp_path / "s.sqlite3")
+    try:
+        for tpl, connects, ingests in (({"env": {}, "run": "r", "worker": {}}, False, None),
+                                       ({"env": {}, "run": "r", "worker": {}, "pool_ingest": False}, True, False),
+                                       ({"env": {}, "run": "r", "worker": {}, "pool_ingest": True}, True, True)):
+            hub, addr = _hub(tpl)
+            logs = []
+            link = LL.LearnerLink(addr, b"k" * 16, SimpleNamespace(run="r"), st, tmp_path, log=logs.append)
+            try:
+                assert link.connect() is connects, (tpl, link.last_error)
+                if not connects:
+                    assert "pool support" in link.last_error and any("does not advertise" in m for m in logs)
+                    continue
+                assert link.learner_ingests is ingests
+                link.version = 5
+                if not ingests:  # without --pool-ingest on the learner the link never even looks for chunks
+                    link.store = SimpleNamespace(to_ingest=lambda n: (_ for _ in ()).throw(AssertionError("queried")))
+                assert link.feed_once() == 0
+            finally:
+                link.close()
+                hub.close()
+    finally:
+        st.close()
+
+
+def test_link_republishes_after_a_learner_rollback_and_on_reconnect():
+    published = []
+
+    class Pol:
+        run = "r"
+
+        def publish_state(self, state, source):
+            published.append(source)
+            return SimpleNamespace(policy_sha=f"{len(published):064x}", curriculum=None)
+    link = LL.LearnerLink(("127.0.0.1", 1), b"k", Pol(), None, ".", publish_every=10, publish_min_s=0.0)
+    link.template = {"env": {}, "run": "r", "worker": {}, "pool_ingest": True}
+    from unittest import mock
+    with mock.patch.object(LL, "state_from_params", lambda t, m: {}):
+        def at(v):
+            link._latest = {"version": v}
+            return link.maybe_publish()
+        assert at(100) and not at(105) and at(110)
+        assert at(60)  # auto-rollback / resume from an older checkpoint: published at once, not at 120
+        assert not at(65) and at(70)
+        link._published_version, link._published_t = 70, 0.0
+        hub, addr = _hub({"env": {}, "run": "r", "worker": {}, "pool_ingest": True})
+        link.addr, link.authkey = addr, b"k" * 16
+        try:
+            assert link.connect()  # a reconnect: the next parameters are published whatever their number
+            assert link._published_version is None and at(71)
+        finally:
+            link.close()
+            hub.close()
+    assert published == ["learner-u100", "learner-u110", "learner-u60", "learner-u70", "learner-u71"]
+
+
+def test_state_from_params_carries_the_learners_branch_bundle():
+    """The route-branch files come from the learner (its hub template, or a parameter message), never from the
+    gateway's disk: state_from_params passes them through to the export state unchanged."""
+    model = {"pi.0.weight": np.zeros((4, 3)), "pi.0.bias": np.zeros(4), "pi.2.weight": np.zeros((9, 4)),
+             "pi.2.bias": np.zeros(9), "v.0.weight": np.zeros((4, 3)), "v.0.bias": np.zeros(4),
+             "v.2.weight": np.zeros((1, 4)), "v.2.bias": np.zeros(1)}
+    msg = {"version": 7, "rms": {"mean": np.zeros(3), "var": np.ones(3), "count": 1.0}, "model": model}
+    tpl = {"env": {"level": 2}, "run": "r", "worker": {}, "pool_ingest": True}
+    assert "branch_assets" not in LL.state_from_params(tpl, msg)
+    ba = {"level": 2, "line_npz": b"L", "desc_json": b"{}", "drive_npz": b"D"}
+    st = LL.state_from_params(dict(tpl, branch_assets=ba), msg)
+    assert st["branch_assets"] == ba and st["n_obs"] == 3 and st["n_act"] == 9
+    ba2 = dict(ba, line_npz=b"L2")
+    assert LL.state_from_params(dict(tpl, branch_assets=ba), dict(msg, branch_assets=ba2))["branch_assets"] == ba2
