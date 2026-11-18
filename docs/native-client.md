@@ -188,4 +188,7 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - 网关响应只做了轻量的结构检查（类型和必需字段），没有照搬 `protocol.MESSAGES` 的完整 schema。
 - 上传是同步的（每段在本步结束时直接 POST）；Python 主控程序是后台线程。本机回环上没有影响，慢网络下会拖慢采样。
 - 只支持 SR 策略（与网关导出的限制相同）；`route_probes` 只是记账，没有移植。
-- `fastreach`、2002 零售版 Player.exe 版本：以后。
+- **f7 特征（`reach` 块，`ballrain/fastreach.py`）没有移植**：`FeatureConfig::from_json` 拒绝 `"reach": true` 和 `"version": "f7"`（报错指向这里），
+  `pool.weights.export_state` 也拒绝导出 f7 策略，f6 的清单里不写 `reach` 字段（清单和 policy_sha 与以前相同）。要让 f7 策略进资源池，需要把
+  fastreach 的场（读 `runtime/fastreach/L<nn>-<键>.npz` 或在客户端构建，`canonical_geometry` 的键）和 `perceive` 内核移植过来，并与 Python 逐位或在容差内一致。
+- 2002 零售版 Player.exe 版本：以后。

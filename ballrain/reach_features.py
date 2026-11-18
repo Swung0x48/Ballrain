@@ -52,7 +52,7 @@ SCALE = _scale_vector()
 # version the fields key and the unknown zones
 _FIELDS: "OrderedDict[str, FR.FastReach]" = OrderedDict()
 _FIELDS_MAX = 2
-_STATE: dict = {}  # (id(LevelData), version) -> (LevelData, fields key, zone array)
+_STATE: dict = {}  # (id(LevelData), version) -> (LevelData, fields key, zone array, canonical triangles or None)
 
 
 def require_numba() -> None:
@@ -72,26 +72,27 @@ def _zone_boxes(level) -> np.ndarray:
 
 def fields_for(tracker, cache_dir=None):
     """(FastReach with the tracker's current unknown zones, fields key)."""
-    from .features import level_geometry
     lvl = tracker.level
     vk = (id(lvl), lvl.version)
     st = _STATE.get(vk)
     if st is None or st[0] is not lvl:
-        geo = level_geometry(tracker)  # cached by the extractor already: its key is the static key
-        key = FR.FastReach.fields_key(tracker, geo.key)
+        geom = FR.FastReach.canonical_geometry(tracker)
+        key = FR.FastReach.fields_key(tracker, geom)
         if len(_STATE) > 16:
             _STATE.clear()
-        st = (lvl, key, _zone_boxes(lvl))
+        st = (lvl, key, _zone_boxes(lvl), geom)
         _STATE[vk] = st
-    _, key, zones = st
+    _, key, zones, geom = st
     fr = _FIELDS.get(key)
     if fr is None:
-        fr = FR.FastReach.fields_for_tracker(tracker, cache_dir=cache_dir, static_key=level_geometry(tracker).key)
+        fr = FR.FastReach.fields_for_tracker(tracker, cache_dir=cache_dir, geometry=geom)
         _FIELDS[key] = fr
         while len(_FIELDS) > _FIELDS_MAX:
             _FIELDS.popitem(last=False)
     else:
         _FIELDS.move_to_end(key)
+    if geom is not None:
+        _STATE[vk] = (lvl, key, zones, None)  # the triangles are only needed for a build
     if fr.uzones is not zones:
         fr.uzones = zones
     return fr, key

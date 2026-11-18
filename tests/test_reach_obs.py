@@ -208,6 +208,38 @@ def test_fields_key_ignores_moving_bodies_and_the_file_is_reused(tmp_path):
     assert fr3.info["key"] == k1 and not lock.exists()
 
 
+def test_fields_key_does_not_depend_on_ck_ids(monkeypatch):
+    """Retail and the headless SimTool give the same L2 static entities and meshes other CK ids (another id order):
+    the fields key and the build input are canonical (entity names, triangle coordinates), not in id order."""
+    from types import SimpleNamespace
+
+    from ballrain import features, geometry as G
+    tri = [np.array([[0, 0, 0], [1, 0, 0], [0, 0, 1.0]]), np.array([[5, 1, 5], [6, 1, 5], [5, 1, 6.0]]),
+           np.array([[0, 0, 0], [0, 0, 1], [1, 0, 1.0]]), np.array([[9, 0, 0], [9, 1, 0], [9, 0, 1.0]])]
+
+    def tracker(perm, ids):
+        names = {ids[0]: "A01_Floor", ids[1]: "A02_Floor", ids[2]: "Rail_01"}
+        owners = [ids[0], ids[1], ids[0], ids[2]]
+        T = [tri[i] for i in perm]
+        O = [owners[i] for i in perm]
+        ts = G.TriangleSet([t[0] for t in T], [t[1] for t in T], [t[2] for t in T], O, grid_cell=None)
+        rails = G.TriangleSet([tri[3][0]], [tri[3][1]], [tri[3][2]], [ids[2]], grid_cell=None)
+        geo = SimpleNamespace(tris=ts, rails=rails)
+        lvl = SimpleNamespace(name=lambda o: names[int(o)], depth=[])
+        return SimpleNamespace(level=lvl, level_no=2, _geo=geo)
+
+    monkeypatch.setattr(features, "level_geometry", lambda t: t._geo)
+    a, b = tracker([0, 1, 2, 3], (101, 102, 103)), tracker([3, 2, 1, 0], (77, 5, 900))
+    ga, gb = FR.FastReach.canonical_geometry(a), FR.FastReach.canonical_geometry(b)
+    for x, y in zip(ga, gb):
+        assert np.array_equal(x, y)
+    assert ga[4].sum() == 1  # the rail triangle
+    assert FR.FastReach.fields_key(a) == FR.FastReach.fields_key(b)
+    c = tracker([0, 1, 2, 3], (101, 102, 103))
+    c._geo.tris.A[1, 1] += 1e-6  # any geometry change changes it
+    assert FR.FastReach.fields_key(c) != FR.FastReach.fields_key(a)
+
+
 # ------------------------------------------------------------------------------------------------ pool gate
 
 def test_pool_refuses_f7_and_f6_manifests_have_no_reach_field(tmp_path):

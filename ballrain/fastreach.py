@@ -6,6 +6,13 @@ built once per level and closed-form flight / rolling formulas, in tens of micro
     fr = FastReach.for_tracker(tracker)                  # builds or loads runtime/fastreach/L01.npz
     vec, info = fr.perceive(pos, vel, ball_type, quarter, debug=True)
 
+For training (the f7 observation block, ballrain.reach_features): FastReach.fields_for_tracker keys the fields by the
+static geometry alone (canonical_geometry: entity names + coordinates, no CK ids, so retail and headless engines on any
+host give the same key), caches them content-addressed as runtime/fastreach/L<nn>-<sha16>.npz with one locked build per
+host and atomic writes, and the unknown zones are set from the tracker (set_unknown_boxes / zone_boxes). for_tracker
+keeps its per-level file keyed by tracker_key, which also hashes the moving-body boxes (they change at every sector
+start, transformation and respawn).
+
 Fields (all static geometry, stoppers excluded; moving bodies are not modelled):
 
 * H, layered heightfield: 0.5-unit x-z cells in 8 x 8 tiles (block-sparse: only tiles near walkable surface or
@@ -2201,26 +2208,63 @@ class FastReach:
         self.uzones = np.array([np.r_[np.asarray(lo, np.float64) - 4.0, np.asarray(hi, np.float64) + 4.0]
                                 for lo, hi in boxes], np.float64).reshape(-1, 6)
 
-    @classmethod
-    def fields_key(cls, tracker, static_key: str | None = None) -> str:
-        """Cache key of the static fields only (static geometry hash, death boxes, build parameters, physics constants,
-        BUILD_VERSION): cache_key without moving-body zones. tracker_key also hashes the moving-body boxes, which change
-        at every sector start, transformation and respawn (L2 TAS: 7 distinct tracker keys over 2 static geometries)."""
+    @staticmethod
+    def canonical_geometry(tracker):
+        """The static triangles of the tracker's current state in an order and with owner labels that do not depend
+        on CK ids: entities ranked by (name, smallest triangle), triangles by (entity rank, coordinates). CK ids
+        differ between engines (retail vs the headless SimTool: the same 40 L2 static entities, identical meshes,
+        other ids and so another id order), and a key hashed in id order would differ with identical geometry.
+        Returns (A, B, C (n, 3) float64, owner rank (n,) int64, is_rail (n,) bool)."""
+        from .features import level_geometry
+        geo = level_geometry(tracker)
         lvl = tracker.level
-        return cls.cache_key(static_key if static_key is not None else lvl.static_key(), lvl.depth, ())
+        T = geo.tris
+        X = np.c_[np.asarray(T.A, np.float64), np.asarray(T.B, np.float64), np.asarray(T.C, np.float64)]
+        own = np.asarray(T.owner, np.int64)
+        rail_own = np.unique(np.asarray(geo.rails.owner, np.int64)) if len(geo.rails) else np.zeros(0, np.int64)
+        uo = np.unique(own)
+        ekey = []
+        for o in uo:
+            rows = X[own == o]
+            first = rows[np.lexsort(tuple(rows.T[::-1]))[0]]
+            ekey.append((lvl.name(int(o)) or "", tuple(first.tolist())))
+        order = sorted(range(len(uo)), key=lambda i: ekey[i])
+        rank = np.empty(len(uo), np.int64)
+        rank[order] = np.arange(len(uo))
+        r = rank[np.searchsorted(uo, own)] if len(uo) else own
+        idx = np.lexsort(tuple(X.T[::-1]) + (r,))
+        X, r = X[idx], r[idx]
+        is_rail = np.isin(own[idx], rail_own)
+        return X[:, 0:3].copy(), X[:, 3:6].copy(), X[:, 6:9].copy(), r, is_rail
 
     @classmethod
-    def fields_for_tracker(cls, tracker, cache_dir=None, static_key: str | None = None, lock_timeout_s: float = 120.0,
-                           verbose: bool = False) -> "FastReach":
-        """Static fields of the tracker's current geometry, cached content-addressed in
-        <cache_dir>/L<nn>-<sha16 of fields_key>.npz (default <runtime>/fastreach, or $BALLRAIN_FASTREACH_DIR), with
-        no unknown zones (set them with set_unknown_boxes). Safe when many processes on one host need the same file
-        at once: one builds under a lock file (O_EXCL; a lock older than lock_timeout_s is taken over), the others
-        wait and load its result; the file is written atomically (save). Identical keys on every host: the key is a
-        hash of the level content, not of the host or the time."""
+    def fields_key(cls, tracker, geometry=None) -> str:
+        """Cache key of the static fields only: a hash of the canonical static triangles (canonical_geometry: no CK
+        ids), the death boxes the build keeps, the build parameters, the physics constants and BUILD_VERSION; no
+        moving-body zones (tracker_key also hashes those, which change at every sector start, transformation and
+        respawn: 7 distinct tracker keys over 2 static geometries on the L2 TAS)."""
         import hashlib
-        from .features import level_geometry
-        key = cls.fields_key(tracker, static_key)
+        A, B, C, r, rail = geometry if geometry is not None else cls.canonical_geometry(tracker)
+        h = hashlib.sha256()
+        for x in (A, B, C):
+            h.update(np.ascontiguousarray(x, "<f8").tobytes())
+        h.update(np.ascontiguousarray(r, "<i8").tobytes())
+        h.update(np.ascontiguousarray(rail, "u1").tobytes())
+        return cls.cache_key(f"canon-{h.hexdigest()}", tracker.level.depth, ())
+
+    @classmethod
+    def fields_for_tracker(cls, tracker, cache_dir=None, lock_timeout_s: float = 120.0, geometry=None,
+                           verbose: bool = False) -> "FastReach":
+        """Static fields of the tracker's current geometry, built from canonical_geometry (identical on every engine
+        and host for the same geometry) and cached content-addressed in <cache_dir>/L<nn>-<sha16 of fields_key>.npz
+        (default <runtime>/fastreach, or $BALLRAIN_FASTREACH_DIR), with no unknown zones (set them with
+        set_unknown_boxes). Safe when many processes on one host need the same file at once: one builds under a lock
+        file (O_EXCL; the builder refreshes its mtime every 5 s, a lock older than lock_timeout_s is taken over), the
+        others wait and load its result; the file is written atomically (save)."""
+        import hashlib
+        from . import geometry as G
+        geom = geometry if geometry is not None else cls.canonical_geometry(tracker)
+        key = cls.fields_key(tracker, geom)
         if cache_dir is None:
             env = os.environ.get("BALLRAIN_FASTREACH_DIR")
             if env:
@@ -2284,9 +2328,10 @@ class FastReach:
                 hb.start()
                 fr = try_load()  # built by another process between our check and the lock
                 if fr is None:
-                    lvl = tracker.level
-                    geo = level_geometry(tracker)
-                    fr = cls.build(geo.tris, geo.rails, lvl.depth, (), verbose=verbose)
+                    A, B, C, r, rail = geom
+                    tris = G.TriangleSet(A, B, C, r, grid_cell=None)
+                    rails = G.TriangleSet(A[rail], B[rail], C[rail], r[rail], grid_cell=None)
+                    fr = cls.build(tris, rails, tracker.level.depth, (), verbose=verbose)
                     fr.info["key"] = key
                     fr.info["wait_s"] = time.time() - t0
                     fr.info["built_by"] = os.getpid()
