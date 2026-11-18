@@ -163,6 +163,35 @@ class TasStarts:
         self.points, self.lives, self.pos, self.checkpoints = (self.points[mask], self.lives[mask], self.pos[mask],
                                                                self.checkpoints[mask])
 
+    def exclude(self, mask: np.ndarray) -> None:
+        """Like restrict (the curriculum, rehearsal starts and nearest_valid see only the frames where mask is True), but
+        the excluded frames stay hand-over states: nearest_any() can pick them and expected() knows their state (at-rest
+        starts with a drive target on a stretch no TAS start may cover, e.g. L1's re-routed 4450-6018)."""
+        if getattr(self, "_all", None) is None:
+            self._all = (self.valid, self.sector, self.sr_double, self.points, self.lives, self.pos, self.checkpoints)
+        self.restrict(mask)
+
+    def nearest_any(self, k: int) -> int:
+        """nearest_valid over the frames before exclude() (camera-filtered start states included, excluded ones too)."""
+        v = self._all[0] if getattr(self, "_all", None) is not None else self.valid
+        if k <= 0:
+            return 0
+        i = int(np.clip(np.searchsorted(v, k), 0, len(v) - 1))
+        j = max(i - 1, 0)
+        return int(v[i] if abs(v[i] - k) <= abs(v[j] - k) else v[j])
+
+    def _state_arrays(self, k: int):
+        """(index, arrays) of frame k among the kept frames, else among the excluded ones (exclude), else (None, None)."""
+        i = self.index_of(k)
+        if i is not None:
+            return i, (self.valid, self.sector, self.sr_double, self.points, self.lives, self.pos, self.checkpoints)
+        a = getattr(self, "_all", None)
+        if a is not None:
+            j = int(np.searchsorted(a[0], k))
+            if j < len(a[0]) and a[0][j] == k:
+                return j, a
+        return None, None
+
     def index_of(self, k: int) -> int | None:
         i = int(np.searchsorted(self.valid, k))
         return i if i < len(self.valid) and self.valid[i] == k else None
@@ -177,12 +206,12 @@ class TasStarts:
 
     def expected(self, k: int) -> dict | None:
         """The record's state at frame k (for hand-over checks): sector, checkpoints, points, lives, SR, ball."""
-        i = self.index_of(k)
+        i, a = self._state_arrays(k)
         if i is None:
             return None
-        return {"frame": int(k), "sector": int(self.sector[i]), "checkpoints": int(self.checkpoints[i]),
-                "points": int(self.points[i]), "lives": int(self.lives[i]), "sr_double": float(self.sr_double[i]),
-                "pos": self.pos[i].tolist()}
+        _, sector, sr, points, lives, pos, cps = a
+        return {"frame": int(k), "sector": int(sector[i]), "checkpoints": int(cps[i]), "points": int(points[i]),
+                "lives": int(lives[i]), "sr_double": float(sr[i]), "pos": pos[i].tolist()}
 
     def prefix(self, k: int) -> np.ndarray:
         return self.frames[:k]

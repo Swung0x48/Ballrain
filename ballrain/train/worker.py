@@ -441,6 +441,9 @@ class Worker:
             return
         kind, k, sec = ep.d["kind"], ep.d["start_frame"], ep.d["start_sector"]
         agent = ep.d["start_sr_ms"]
+        if kind == "tas_rest" and k > 0 and self.env.starts.index_of(k) is None:
+            ep.seg = None  # an at-rest start handed over in an excluded range (off the TAS's route): no reference time
+            return
         if kind == "tas" and k > 0:
             ref = self._tas_igt(k)
         elif kind == "tas_rest":

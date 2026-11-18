@@ -101,7 +101,9 @@ class EnvConfig:
     # velocity) until it is slower than rest_speed or rest_max_frames passed; the episode's start kind is "tas_rest"
     # (not a curriculum outcome). For skills a respawn at a checkpoint (ball at rest) needs, e.g. a run-up.
     # An entry [lo, hi, x, z, jitter] first drives the ball (world arrows) to a target drawn uniformly in
-    # [x +- jitter] x [z +- jitter] and then brakes it there (e.g. a ball at rest in a guard-rail pocket beside the line)
+    # [x +- jitter] x [z +- jitter] and then brakes it there (e.g. a ball at rest in a guard-rail pocket beside the line);
+    # its hand-over frame may lie in an exclude_starts range (TasStarts.nearest_any); a sixth element
+    # [lo, hi, x, z, jitter, max_frames] sets that entry's drive limit (default rest_max_frames)
     rest_starts: list | None = None
     p_rest: float = 0.0
     # rehearsal starts: with probability p_rehearse a new process starts at a valid frame drawn uniformly from one of
@@ -228,7 +230,8 @@ class BallanceEnv(gym.Env):
             keep = np.ones(len(v), bool)
             for lo, hi in c.exclude_starts:
                 keep &= ~((v >= int(lo)) & (v < int(hi)))
-            self.starts.restrict(keep)
+            # exclude: curriculum / rehearsal draws skip these frames; at-rest starts with a drive target may use them
+            (self.starts.exclude if hasattr(self.starts, "exclude") else self.starts.restrict)(keep)
         if self.starts is not None and self.starts.level != c.level:
             raise ValueError(f"start record {c.start_record} is level {self.starts.level}, not {c.level}")
         self.curriculum = None
@@ -270,6 +273,11 @@ class BallanceEnv(gym.Env):
                 j = float(e[4])
                 self._rest_next = (float(e[2]) + float(self._start_rng.uniform(-j, j)),
                                    float(e[3]) + float(self._start_rng.uniform(-j, j)))
+                if len(e) >= 6:  # [.., max_frames]: this entry's drive limit instead of rest_max_frames
+                    self._rest_next += (int(e[5]),)
+                # the hand-over frame may lie in an excluded range (exclude_starts): the ball is driven off it anyway
+                near = getattr(self.starts, "nearest_any", self.starts.nearest_valid)
+                return near(int(self._start_rng.integers(int(lo), int(hi) + 1)))
             return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
         if self.curriculum is not None:
             return self.curriculum.sample(self._start_rng)
@@ -367,7 +375,8 @@ class BallanceEnv(gym.Env):
         tgt = np.array([target[0], target[1]], np.float64)
         dirs = [(a, np.array([bool(a & tas.KEY_RIGHT) - bool(a & tas.KEY_LEFT), bool(a & tas.KEY_UP) - bool(a & tas.KEY_DOWN)],
                              np.float64)) for a in ARROWS9[1:]]
-        while s.frames_done - n0 < c.rest_max_frames and not s.ended:
+        max_frames = int(target[2]) if len(target) >= 3 else c.rest_max_frames
+        while s.frames_done - n0 < max_frames and not s.ended:
             o = s.tracker.obs
             if o is None or o.ball is None:
                 break

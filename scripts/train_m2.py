@@ -59,7 +59,8 @@ RUN_COLS = ["update", "t", "copy", "run_id", "end_reason", "sr_ms", "start_frame
 
 
 def parse_rest_starts(spec: str):
-    """--rest-starts: "lo-hi" or "lo-hi@x:z:jitter" entries -> [[lo, hi]] / [[lo, hi, x, z, jitter]] (None when empty)."""
+    """--rest-starts: "lo-hi", "lo-hi@x:z:jitter" or "lo-hi@x:z:jitter:max_frames" entries -> [[lo, hi]] /
+    [[lo, hi, x, z, jitter]] / [[lo, hi, x, z, jitter, max_frames]] (None when empty)."""
     out = []
     for r in spec.split(","):
         r = r.strip()
@@ -69,8 +70,10 @@ def parse_rest_starts(spec: str):
         e = [int(v) for v in rng.split("-")]
         if tgt:
             e += [float(v) for v in tgt.split(":")]
-            if len(e) != 5:
-                raise SystemExit(f"--rest-starts entry {r!r}: lo-hi@x:z:jitter")
+            if len(e) not in (5, 6):
+                raise SystemExit(f"--rest-starts entry {r!r}: lo-hi@x:z:jitter[:max_frames]")
+            if len(e) == 6:
+                e[5] = int(e[5])
         out.append(e)
     return out or None
 
@@ -201,7 +204,8 @@ def parse(argv=None):
                    help="the stall clock pauses while the ball is faster than this (units/s): run-ups are not cut")
     p.add_argument("--stall-max-s", type=float, default=15.0, help="with --stall-speed: max time without new arc progress")
     p.add_argument("--rest-starts", default="", help="at-rest starts: lo-hi record frame ranges, e.g. 11760-11900,13450-13650; "
-                   "lo-hi@x:z:jitter drives the ball to a target in [x +- jitter] x [z +- jitter] before braking")
+                   "lo-hi@x:z:jitter drives the ball to a target in [x +- jitter] x [z +- jitter] before braking "
+                   "(lo-hi@x:z:jitter:max_frames: that entry's drive limit; the hand-over may be an excluded frame)")
     p.add_argument("--counter-rand", default="",
                    help='counter randomisation on TAS / at-rest starts (WorkerSpec.counter_rand), JSON, e.g. '
                    '{"lives": {"values": [0.0, 0.1, 0.2, 0.3], "p": [0.2, 0.2, 0.2, 0.4]}, "sr_s": [0, 0.3], '
