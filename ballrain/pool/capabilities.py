@@ -18,6 +18,8 @@ CAPABILITIES = {
     "task_format3": ("0.3.0", "任务格式 3：训练器的完整开局分布（复习开局、静止开局、每条命的计数器随机化、提前重生规则）"),
     "branch_v1": ("0.4.0", "第 2 关小节 4 的石头分支：策略在这里改走另一条参考线（换成石球的路线），并多了从这条路线上出发的静止开局"),
     "branch_rules_v1": ("0.4.0", "石头分支的规则（停滞判定，静止开局的驱动和制动参数）改为随训练策略下发：客户端要按下发的规则跑任务"),
+    "multi_branch_v2": ("0.5.0", "多分线路线：第 2 关小节 2、3 有几条可选的路线（回木球、东平台、南环），策略按球种、区域和阶段换线，"
+                                 "进度和参考时间按换线规则计算，客户端要用和训练器相同的规则跟线"),
 }
 # versioned capabilities, described by prefix: "reach_" + reach_version (weights.reach_capability(), e.g.
 # reach_fastreach5_2-block1): a later fastreach / block version is a new name, so old clients are gated with this text

@@ -1144,3 +1144,41 @@ L2 是原生客户端第一次在第 2 关上通过验证（纸球、风扇）�
 - **提醒**：轮询 `runtime/pool/alerts/`，一条一个 JSON 文件。`*-suspect-*.json` 是重放不一致（第 11.4 节），里面有不一致的数值和容差，以及受影响的学习器更新范围。是否吊销（`admin revoke`）、是否解除标记（`admin unflag`）、是否回退，都由用户决定。
 - **学习器**（TensorBoard）：`pool/pool_steps`、`pool/pool_frac`、`pool/pool_lag`、`pool/pool_rho`、`pool/pool_rho_clip`、`pool/pool_dropped`、`pool/pool_refused`（开着 `--pool-ingest` 时应为 0）。
 - **这台机器第一次出现诚实的不一致**（不同 CPU、同一个引擎构建）时，最可能是跨机器的字节差异，而不是作弊。先看提醒里的 `detail` / `values`，再决定是否解除标记。
+
+
+## 15. 多分线路线（wire v2，和原生客户端会话 2026-11-18 商定）
+
+学习器的分线语义见 `docs/l2-branches.md`（`ballrain/multi_branch.py`、`ballrain/branch_assets.py`），这里只写算力池怎么传。v1（单条石头分支）的导出、分支包、任务和校验一个字节都不变，0.4.0 客户端照常跑 v1 策略。
+
+**导出**（`weights.export_state`）
+- `state["branch_assets"]` 是学习器的 v2 信封 `{version: 2, level, manifest: bytes, members: [v1 信封, …]}`，`members` 按清单顺序。
+- 用 `ballrain.branch_assets.validate` 校验；每个子路线另外过一遍 v1 的结构检查（`task._check_branch_line_and_drive`、不含本机路径）。
+- 清单保留学习器自己的固定值：`features.branch_sha256` = v2 摘要 `H(H(manifest) ‖ child[0] ‖ … ‖ child[n−1])`，其中 `child[i] = H(H(line_npz) ‖ H(desc_json) ‖ H(drive_npz))`，都是 32 字节原始摘要。不加新字段。
+- `requires` = `["multi_branch_v2"]`；有子路线的规则不是 v1 默认值（`branch_assets.uses_custom_rules`）时再加 `branch_rules_v1`。不写 `branch_v1`。v1 策略仍然只写 `branch_v1`（和 `branch_rules_v1`）。
+- 能力 `multi_branch_v2`：最早的客户端版本 0.5.0。
+
+**分支包**（任务的 `assets.branch`，还是这一个 sha 字段；`/pool/assets/<sha>.npz`）
+- v2 包是确定性的 npz，全是一维 uint8 数组，内容是学习器发来的原始字节：
+  - `manifest_json`：`branches.json` 的字节；
+  - 第 i 个子路线（从 0 开始，按清单顺序）：`m{i:02d}_line_npz`、`m{i:02d}_desc_json`、`m{i:02d}_drive_npz`。
+- 数组集合必须正好是这些；1–16 个子路线；每个文件不超过 `MAX_ASSET_BYTES`。
+- v1 包不变（`line_npz`、`desc_json`、`drive_npz`）。读的一方按有没有 `manifest_json` 区分。
+- 子路线的 id 只从清单字节里读，不从数组名里读。包的 sha 就是文件的 sha256。
+
+**客户端（原生会话负责）**
+- 装到 `<数据根>/cache/branch/<包 sha>/`：`branches.json`，每个子路线一个 `<id>/` 目录，里面是 `L<nn>.npz`、`L<nn>.json`、`drive.npz`（和 `read_bundle` 读的磁盘布局一样）。
+- 用任务之前核对：包的 sha；清单的规则（版本 2，id 匹配 `[a-z][a-z0-9-]*`，不是 Windows 设备名，phases / merge / legacy 的形状）；子路线数等于条目数；每个子路线按 v1 校验（关卡、主线固定值 = `path_sha256`、描述和驱动文件里的分支线固定值、规则）；v2 固定值等于 `features.branch_sha256`。
+- 从 0.5.0 起在 hello 里报 `multi_branch_v2`。只报这个名字而没有真的实现 v2 的客户端会算错观测和奖励，验证不会通过。
+
+**任务里的静止开局**（格式 3 的 `rest`）
+- 新增可选字段 `branch_id`：`[a-z][a-z0-9-]*`，最长 32 个字符，是清单里的子路线 id，和 `branch_s` 一起出现（`target` 为 null）。
+  - `branch_s` 加 `branch_id`：从这个子路线的驱动文件开到这个弧长（`--rest-starts lo-hi@branch:<id>:<s>`）；
+  - 只有 `branch_s`：唯一的旧式（legacy）子路线，即原来的 v1 静止开局（`rest_member(bundle, None)`）。
+- `branch_id` 只出现在 v2 策略的任务里，所以 0.4.0 客户端不会见到它。
+- 网关抽开局（`server_tasks.pick_start`）：`rest_starts` 条目 `[lo, hi, {"branch_s": s, "id": key}]` 变成 `rest = {"target": null, "branch_s": s, "branch_id": key}`，抽取顺序和 env 相同。
+
+**验证器**：`build_env` 把 v2 信封作为 `EnvConfig.branch_assets`，把任务的 `rest`（带 id）作为 `start_rest` 交给 env，由 Python 的多分线 env 重放：换线、阶段、进度账和参考时钟都由它算。原生的移植要按 `docs/l2-branches.md` 末尾的清单和它逐项一致。
+
+**数据段**：不变。当前子路线、阶段、`local_s` 和两个参考时钟是遥测，不是观测，也不进数据段。
+
+**学习器链接**：服务端这部分做完以后，链接在 hello 里报 `multi_branch_v2`。在那之前，学习器的 hub 会拒绝把 v2 分支包发给链接（`ballrain/train/remote.py`），所以 v2 学习器连不上网关。

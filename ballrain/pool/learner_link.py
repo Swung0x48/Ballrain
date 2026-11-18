@@ -123,9 +123,12 @@ class LearnerLink:
             # hub refuses a hello without it when the learner distributes one). branch_rules_version 1: the pool
             # reproduces the bundle's branch rules (stall clock, rest drive / brake): the native client 0.4.0 and the
             # verifier's replay (rollout.TaskRunner via Worker.stall_age and the env) apply them, and a policy with
-            # non-default rules requires the branch_rules_v1 capability, so only clients that apply them get its tasks
+            # non-default rules requires the branch_rules_v1 capability, so only clients that apply them get its tasks.
+            # multi_branch_v2: the link carries a multi-branch envelope too (docs/pool-prototype.md 15); its tasks go
+            # only to clients with the multi_branch_v2 capability, and the verifier replays with the Python env
             c.send({"type": "hello", "protocol": PROTOCOL, "host": HOST_LABEL, "session": self.session + 1,
-                    "backend": HOST_LABEL, "n_workers": 0, "branch_assets_version": 1, "branch_rules_version": 1})
+                    "backend": HOST_LABEL, "n_workers": 0, "branch_assets_version": 1, "branch_rules_version": 1,
+                    "multi_branch_v2": True})
             if not c.poll(timeout_s):
                 raise ConnectionError(f"no config within {timeout_s:.0f} s")
             m = c.recv()
