@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "ballrain/branch.h"
+#include "ballrain/pool_client.h"
 #include "ballrain/path.h"
 #include "ballrain/sha256.h"
 
@@ -38,6 +39,18 @@ struct Out {
 
 int main(int argc, char **argv) {
     try {
+        for (int i = 1; i + 1 < argc; ++i)  // --install-pack P --pin SHA --cache D: install_branch_pack + check_branch_dir
+            if (std::strcmp(argv[i], "--install-pack") == 0) {
+                FeatureConfig fc;
+                fc.branch_sha256 = arg(argc, argv, "--pin");
+                fc.path_sha256 = file_sha256(arg(argc, argv, "--main"));
+                std::string pack = argv[i + 1];
+                std::string d = install_branch_pack(pack, arg(argc, argv, "--cache"), std::stoi(arg(argc, argv, "--level")),
+                                                    file_sha256(pack), fc);
+                check_branch_dir(d, std::stoi(arg(argc, argv, "--level")), fc);
+                std::printf("installed %s\n", d.c_str());
+                return 0;
+            }
         std::string mp = arg(argc, argv, "--main");
         auto main_path = ReferencePath::load(mp);
         auto f = load_branch(main_path, std::stoi(arg(argc, argv, "--level")), arg(argc, argv, "--branch-dir"),
