@@ -24,20 +24,26 @@ MAX_FORUM_RESPONSE = 64 * 1024
 # /oauth/token and /api/user): every server-side forum request names the gateway with a generic agent instead
 USER_AGENT = "ballrain-pool-gateway/1.0"
 USER_FIELDS = ("id", "username", "nickname", "avatar_url", "is_email_confirmed", "joined_at", "comment_count")
+# USER_FIELDS -> the Flarum user profile's attribute (/api/users/<id>), for the fields /api/user leaves out
+PROFILE_FIELDS = {"nickname": "displayName", "avatar_url": "avatarUrl", "is_email_confirmed": "isEmailConfirmed",
+                  "joined_at": "joinTime", "comment_count": "commentCount"}
 
 
 @dataclass(frozen=True)
 class EligibilityRules:
     """Which forum-account checks the gateway applies before it hands out a pool token ([eligibility] in
     runtime/pool/config.toml, server_config.load_config), in this order: account age, email, replies. Each can be
-    switched off; unknown_join_date says what happens when the forum gives no join date (joined_at null: some forum
-    accounts, e.g. imported ones, have none): "refuse" (a clear message) or "allow" (only the age check is skipped)."""
+    switched off. The forum may give a field as null (some accounts have no join date; some OAuth clients get only
+    the basic fields): unknown_join_date / unknown_email / unknown_replies say what a switched-on check does then:
+    "refuse" (a clear message) or "allow" (that check is skipped). A switched-off check never needs its field."""
     account_age: bool = True
     min_account_days: int = 30
     unknown_join_date: str = "refuse"
     email_confirmed: bool = True
+    unknown_email: str = "refuse"
     replies: bool = True
     min_replies: int = 5
+    unknown_replies: str = "refuse"
 
     def describe(self) -> str:
         """The conditions in force, for the login page (Chinese)."""
@@ -46,9 +52,10 @@ class EligibilityRules:
             parts.append(f"论坛注册满 {int(self.min_account_days)} 天"
                          + ("（论坛没有提供注册时间的账号不受这条限制）" if self.unknown_join_date == "allow" else ""))
         if self.email_confirmed:
-            parts.append("邮箱已验证")
+            parts.append("邮箱已验证" + ("（论坛没有提供验证状态的账号不受这条限制）" if self.unknown_email == "allow" else ""))
         if self.replies and self.min_replies > 0:
-            parts.append(f"至少 {int(self.min_replies)} 条回复")
+            parts.append(f"至少 {int(self.min_replies)} 条回复"
+                         + ("（论坛没有提供回复数的账号不受这条限制）" if self.unknown_replies == "allow" else ""))
         return "、".join(parts) if parts else "任何论坛账号都可以"
 
 
@@ -71,6 +78,29 @@ class ForumConfig:
     redirect_uri: str  # <public_base_url>/pool/oauth/callback, registered exactly at the forum
     scope: str = "user.read"
     timeout_s: float = 10.0
+    debug_log: str | None = None  # [forum] debug_log = true: the forum's replies, redacted, to <pool>/forum-debug.jsonl
+
+
+SECRET_KEYS = ("access_token", "refresh_token", "id_token", "client_secret", "password")
+
+
+def redact(o):
+    """A forum reply for the debug log: tokens and secrets replaced by a marker, email addresses by their shape
+    (present, length); every other value kept as sent (the operator's own account, read on the operator's machine)."""
+    if isinstance(o, dict):
+        out = {}
+        for k, v in o.items():
+            lk = str(k).lower()
+            if lk in SECRET_KEYS or lk.endswith("_token"):
+                out[k] = f"<redacted {type(v).__name__}>"
+            elif lk == "email" or lk.endswith("_email") or lk == "email_address":
+                out[k] = None if v is None else f"<email: {type(v).__name__}, length {len(str(v))}>"
+            else:
+                out[k] = redact(v)
+        return out
+    if isinstance(o, list):
+        return [redact(v) for v in o]
+    return o
 
 
 def _clean(s, n: int) -> str:
@@ -82,6 +112,17 @@ class ForumClient:
     def __init__(self, cfg: ForumConfig, opener=None):
         self.cfg = cfg
         self.opener = opener or urllib.request.build_opener()
+
+    def _debug(self, what: str, o) -> None:
+        if not self.cfg.debug_log:
+            return
+        import time
+        try:
+            with open(self.cfg.debug_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"t": int(time.time()), "call": what, "reply": redact(o)}, ensure_ascii=False,
+                                   default=str) + "\n")
+        except OSError:
+            pass
 
     def authorize_url(self, state: str) -> str:
         q = urllib.parse.urlencode({"response_type": "code", "client_id": self.cfg.client_id,
@@ -114,6 +155,7 @@ class ForumClient:
                                      headers={"Content-Type": "application/x-www-form-urlencoded",
                                               "Accept": "application/json", "User-Agent": USER_AGENT})
         o = self._json(req)
+        self._debug("oauth/token", o)
         tok = o.get("access_token")
         if not isinstance(tok, str) or not tok or len(tok) > 4096:
             raise ForumError("no access token")
@@ -125,10 +167,46 @@ class ForumClient:
                                      headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json",
                                               "User-Agent": USER_AGENT})
         o = self._json(req)
+        self._debug("api/user", o)
         if isinstance(o.get("data"), dict):  # JSON:API wrapping ({"data": {"id", "attributes": {...}}})
             d = o["data"]
             o = dict(d.get("attributes") or {}, id=d.get("id"))
-        return {k: o.get(k) for k in USER_FIELDS}  # nothing else (email) survives this line
+        u = {k: o.get(k) for k in USER_FIELDS}  # nothing else (email) survives this line
+        if any(u.get(k) is None for k in PROFILE_FIELDS):
+            # the forum's OAuth /api/user gives some clients only id and username: the rest from the forum's own
+            # (Flarum) user profile /api/users/<id>, the same user's public record
+            self._fill_from_profile(u, access_token)
+        return u
+
+    def _fill_from_profile(self, u: dict, access_token: str) -> None:
+        """Fill the fields /api/user left out (None) from /api/users/<id> (with the token first, then without: the
+        profile is public on this forum). Silently nothing when it is unavailable: the eligibility rules then decide
+        what an unknown field means."""
+        try:
+            fid = int(u.get("id"))
+        except (TypeError, ValueError):
+            return
+        if fid <= 0:
+            return
+        o = None
+        for auth in ({"Authorization": f"Bearer {access_token}"}, {}):
+            req = urllib.request.Request(f"{self.cfg.base_url}/api/users/{fid}", method="GET",
+                                         headers={**auth, "Accept": "application/vnd.api+json", "User-Agent": USER_AGENT})
+            try:
+                o = self._json(req)
+                break
+            except ForumError:
+                o = None
+        if o is None:
+            return
+        self._debug("api/users", o)
+        d = o.get("data")
+        if not isinstance(d, dict) or str(d.get("id")) != str(fid) or not isinstance(d.get("attributes"), dict):
+            return  # not this user's record
+        a = d["attributes"]
+        for k, pk in PROFILE_FIELDS.items():
+            if u.get(k) is None and a.get(pk) is not None:
+                u[k] = a[pk]
 
 
 def parse_joined(j) -> datetime | None:
@@ -173,16 +251,16 @@ def parse_user(u: dict) -> dict:
     av = u.get("avatar_url")
     av = _clean(av, 500) if isinstance(av, str) and av.startswith(("https://", "http://")) else None
     joined = parse_joined(u.get("joined_at"))
-    confirmed = u.get("is_email_confirmed")  # a bool, or 0 / 1 (as a number or a string) from some serialisers
-    if not isinstance(confirmed, bool):
+    confirmed = u.get("is_email_confirmed")  # a bool, or 0 / 1 (as a number or a string); null: unknown
+    if confirmed is not None and not isinstance(confirmed, bool):
         if confirmed in (0, 1) or confirmed in ("0", "1"):
             confirmed = str(confirmed) == "1"
         else:
             raise ForumError(f"forum is_email_confirmed ({type(confirmed).__name__})")
-    cc = u.get("comment_count")  # an int, or a digit string
+    cc = u.get("comment_count")  # an int, or a digit string; null: unknown
     if isinstance(cc, str) and cc.strip().isdigit():
         cc = int(cc.strip())
-    if isinstance(cc, bool) or not isinstance(cc, int) or cc < 0:
+    if cc is not None and (isinstance(cc, bool) or not isinstance(cc, int) or cc < 0):
         raise ForumError(f"forum comment_count ({type(cc).__name__})")
     return {"user": {"forum_id": fid, "username": username, "nickname": nickname, "avatar_url": av},
             "joined": joined.timestamp() if joined is not None else None, "email_confirmed": confirmed,
@@ -207,8 +285,21 @@ def eligibility(rec: dict, now: float, min_days: int = 30, min_replies: int = 5,
             days = int(math.floor((now - rec["joined"]) / 86400))
             if days < r.min_account_days:
                 return payload(Reason.ACCOUNT_TOO_NEW, days=max(days, 0), min_days=int(r.min_account_days))
-    if r.email_confirmed and not rec["email_confirmed"]:
-        return payload(Reason.EMAIL_NOT_VERIFIED)
-    if r.replies and rec["comments"] < r.min_replies:
+    if r.email_confirmed:
+        if rec.get("email_confirmed") is None:
+            if r.unknown_email != "allow":
+                return {"code": Reason.EMAIL_NOT_VERIFIED.value,
+                        "message": "论坛没有提供这个账号的邮箱验证状态，无法核对“邮箱已验证”的条件，暂时不能领取算力池令牌。"
+                                   "请联系算力池管理员。",
+                        "params": {"email": "unknown"}}
+        elif not rec["email_confirmed"]:
+            return payload(Reason.EMAIL_NOT_VERIFIED)
+    if r.replies and r.min_replies > 0 and rec.get("comments") is None:
+        if r.unknown_replies != "allow":
+            return {"code": Reason.TOO_FEW_REPLIES.value,
+                    "message": f"论坛没有提供这个账号的回复数，无法核对“至少 {int(r.min_replies)} 条回复”的条件，"
+                               "暂时不能领取算力池令牌。请联系算力池管理员。",
+                    "params": {"min_replies": int(r.min_replies), "replies": "unknown"}}
+    elif r.replies and rec["comments"] < r.min_replies:
         return payload(Reason.TOO_FEW_REPLIES, replies=rec["comments"], min_replies=int(r.min_replies))
     return None

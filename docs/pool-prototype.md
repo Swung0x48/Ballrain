@@ -76,9 +76,12 @@
       min_account_days = 30
       unknown_join_date = "refuse"   # 论坛没给注册时间（joined_at 为空，例如导入的老账号）："refuse" 拒绝并说明原因，"allow" 只跳过账号年龄这一条
       email_confirmed = true
+      unknown_email = "refuse"       # 论坛没给邮箱验证状态时，同上
       replies = true
       min_replies = 5
+      unknown_replies = "refuse"     # 论坛没给回复数时，同上
       ```
+      - 有的论坛 OAuth 应用只拿得到基本字段（id、用户名、昵称、头像），其余字段为空。某条检查关掉以后就不再需要对应的字段。
       - 不写这一节就是上面的默认值；旧配置里 `[pool]` 的 `min_account_days` / `min_replies` 仍然有效。键名写错、取值不对时网关拒绝启动。
       - 注册时间未知而被拒时，原因码仍是 `account_too_new`（旧客户端只认已有的原因码），说明文字单独写明“论坛没有提供注册时间”，参数里有 `join_date: "unknown"`。
       - 登录页上的“领取条件”按生效的规则显示。

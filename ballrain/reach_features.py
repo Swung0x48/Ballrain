@@ -20,7 +20,9 @@ it and ReachBlock refuses another (tests/test_reach_obs.py pins a digest of the 
 """
 from __future__ import annotations
 
+import copy
 import hashlib
+import threading
 from collections import OrderedDict
 
 import numpy as np
@@ -58,6 +60,31 @@ SCALE = _scale_vector()
 _FIELDS: "OrderedDict[str, FR.FastReach]" = OrderedDict()
 _FIELDS_MAX = 2
 _STATE: dict = {}  # (id(LevelData), version) -> (LevelData, fields key, zone array, canonical triangles or None)
+# Thread safety: a FastReach query writes its results into the instance's own scratch arrays (and fields_for sets its
+# unknown zones), and the numba kernels run without the GIL. Several threads of one process (the pool verifier's
+# replay threads) therefore each get their own view of a cached instance: a shallow copy sharing the loaded read-only
+# field arrays (memory does not grow per thread), with private copies of the scratch arrays below. A thread's view is
+# created from the instance on first use and then reused, so single-threaded results are exactly today's.
+_SCRATCH = ("yy", "xf", "zf", "D", "fins", "yl", "ya", "stack", "stamp", "work", "out", "dbg", "pdd", "_nocollect")
+_LOCAL = threading.local()
+_LOCK = threading.Lock()  # the shared caches above (OrderedDict moves / evictions)
+
+
+def _thread_view(fr: "FR.FastReach") -> "FR.FastReach":
+    """This thread's view of the cached instance fr (see _SCRATCH)."""
+    views = getattr(_LOCAL, "views", None)
+    if views is None:
+        views = _LOCAL.views = {}
+    hit = views.get(id(fr))
+    if hit is not None and hit[0] is fr:
+        return hit[1]
+    view = copy.copy(fr)
+    for k in _SCRATCH:
+        setattr(view, k, getattr(fr, k).copy())
+    if len(views) >= 2 * _FIELDS_MAX:  # instances evicted from _FIELDS: drop their views
+        views.clear()
+    views[id(fr)] = (fr, view)
+    return view
 
 
 def reach_version() -> str:
@@ -82,6 +109,16 @@ def _zone_boxes(level) -> np.ndarray:
 
 def fields_for(tracker, cache_dir=None):
     """(FastReach with the tracker's current unknown zones, fields key)."""
+    with _LOCK:
+        fr, key, zones = _shared_fields(tracker, cache_dir)
+    view = _thread_view(fr)
+    if view.uzones is not zones:
+        view.uzones = zones
+    return view, key
+
+
+def _shared_fields(tracker, cache_dir=None):
+    """(the process-wide cached FastReach, fields key, the tracker's unknown zones); called under _LOCK."""
     lvl = tracker.level
     vk = (id(lvl), lvl.version)
     st = _STATE.get(vk)
@@ -103,9 +140,7 @@ def fields_for(tracker, cache_dir=None):
         _FIELDS.move_to_end(key)
     if geom is not None:
         _STATE[vk] = (lvl, key, zones, None)  # the triangles are only needed for a build
-    if fr.uzones is not zones:
-        fr.uzones = zones
-    return fr, key
+    return fr, key, zones
 
 
 def moving_bodies(tracker, pos, radius: float) -> np.ndarray:

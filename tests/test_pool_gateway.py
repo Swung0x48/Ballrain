@@ -818,7 +818,91 @@ def test_forum_requests_name_the_gateway_agent():
     fc = ForumClient(ForumConfig("https://forum.example", "cid", "sec", "https://x/pool/oauth/callback"), opener=_Opener())
     assert fc.exchange("code") == "t"
     fc.user("t")
-    assert [ua for _, ua in seen] == [SO.USER_AGENT, SO.USER_AGENT] and "python" not in SO.USER_AGENT.lower()
+    # token, user and the profile fallback (the fake user has only an id): every request names the gateway
+    assert len(seen) >= 2 and all(ua == SO.USER_AGENT for _, ua in seen) and "python" not in SO.USER_AGENT.lower()
+
+
+def test_forum_user_falls_back_to_the_flarum_profile():
+    """/api/user gives only id and username (the live forum with scope user.read): the rest comes from the public
+    Flarum profile /api/users/<id>; a profile of another id is ignored; an unavailable profile leaves the fields None."""
+    import io
+    import urllib.error
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    profile = {"data": {"type": "users", "id": "4", "attributes": {
+        "username": "u", "displayName": "U4", "avatarUrl": "https://forum.example/a.png",
+        "joinTime": "2025-09-30T02:52:01+00:00", "commentCount": 18, "discussionCount": 4}}}
+
+    def client(routes):
+        calls = []
+
+        class _Opener:
+            def open(self, req, timeout=None):
+                path = req.full_url.split("forum.example", 1)[1]
+                calls.append((path, req.get_header("Authorization") is not None))
+                r = routes.get((path, req.get_header("Authorization") is not None), routes.get(path))
+                if isinstance(r, int):
+                    raise urllib.error.HTTPError(req.full_url, r, "x", {}, None)
+                return _Resp(json.dumps(r).encode())
+        return ForumClient(ForumConfig("https://forum.example", "c", "s", "https://x/cb"), opener=_Opener()), calls
+    fc, calls = client({"/api/user": {"id": 4, "username": "u"}, ("/api/users/4", True): 401,
+                        ("/api/users/4", False): profile})
+    u = fc.user("t")
+    assert calls == [("/api/user", True), ("/api/users/4", True), ("/api/users/4", False)]
+    assert u["nickname"] == "U4" and u["comment_count"] == 18 and u["joined_at"].startswith("2025-09-30")
+    assert u["is_email_confirmed"] is None  # not in the public profile: the rules decide (unknown_email)
+    rec = parse_user(u)
+    assert rec["comments"] == 18 and rec["joined"] is not None and rec["user"]["avatar_url"].startswith("https://")
+    fc, _ = client({"/api/user": {"id": 4, "username": "u"}, "/api/users/4": dict(profile, data=dict(profile["data"], id="5"))})
+    assert fc.user("t")["comment_count"] is None  # another user's record: ignored
+    fc, _ = client({"/api/user": {"id": 4, "username": "u"}, "/api/users/4": 404})
+    assert fc.user("t")["joined_at"] is None
+    full = {"id": 4, "username": "u", "nickname": "n", "avatar_url": None, "is_email_confirmed": True,
+            "joined_at": "2024-01-01T00:00:00Z", "comment_count": 3}
+    fc, calls = client({"/api/user": full, "/api/users/4": profile})
+    assert fc.user("t")["comment_count"] == 3  # avatar None asks the profile, which only fills the empty fields
+    fc, calls = client({"/api/user": dict(full, avatar_url="https://forum.example/b.png")})
+    fc.user("t")
+    assert calls == [("/api/user", True)]  # everything there: no profile request
+
+
+def test_forum_debug_log_redacts_tokens_and_email(tmp_path):
+    import io
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    replies = [b'{"access_token": "SECRET-T", "refresh_token": "R", "token_type": "Bearer", "scope": "user.read"}',
+               b'{"id": 7, "username": "u", "email": "me@example.invalid", "is_email_confirmed": null, "joined_at": null}',
+               b'{"data": null}']  # the profile fallback (/api/users/7): nothing usable
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp(replies.pop(0))
+    log = tmp_path / "forum-debug.jsonl"
+    fc = ForumClient(ForumConfig("https://f", "cid", "sec", "https://x/cb", debug_log=str(log)), opener=_Opener())
+    fc.user(fc.exchange("code"))
+    text = log.read_text(encoding="utf-8")
+    assert "SECRET-T" not in text and "me@example" not in text and '"R"' not in text
+    rows = [json.loads(x) for x in text.splitlines()]
+    assert rows[0]["call"] == "oauth/token" and rows[0]["reply"]["scope"] == "user.read"
+    assert rows[1]["reply"]["email"] == "<email: str, length 18>" and rows[1]["reply"]["joined_at"] is None
+    assert rows[1]["reply"]["username"] == "u"
+    from ballrain.pool.server_config import load_config
+    cfg = tmp_path / "c.toml"
+    cfg.write_text("[forum]\ndebug_log = true\n", encoding="utf-8")
+    assert load_config(cfg, pool_dir=tmp_path, environ={}).forum.debug_log == str(tmp_path / "forum-debug.jsonl")
+    cfg.write_text("", encoding="utf-8")
+    assert load_config(cfg, pool_dir=tmp_path, environ={}).forum.debug_log is None
 
 
 def test_forum_user_fields_in_other_serialisations():
@@ -870,3 +954,22 @@ def test_eligibility_rules_from_the_config(tmp_path):
         with pytest.raises(ValueError):
             load_config(cfg, pool_dir=tmp_path)
     assert EligibilityRules(account_age=False, email_confirmed=False, replies=False).describe() == "任何论坛账号都可以"
+    # a forum that gives only the basic fields: every switched-on check refuses with its own message, or allows
+    good = {"id": 7, "username": "u", "nickname": "n", "avatar_url": None, "is_email_confirmed": None,
+            "joined_at": None, "comment_count": None}
+    bare = parse_user(good)
+    assert bare["email_confirmed"] is None and bare["comments"] is None and bare["joined"] is None
+    off_age = EligibilityRules(account_age=False)
+    r = eligibility(bare, now, rules=off_age)
+    assert r["code"] == "email_not_verified" and "没有提供" in r["message"] and r["params"]["email"] == "unknown"
+    r = eligibility(bare, now, rules=EligibilityRules(account_age=False, unknown_email="allow"))
+    assert r["code"] == "too_few_replies" and "没有提供" in r["message"] and r["params"]["replies"] == "unknown"
+    assert eligibility(bare, now, rules=EligibilityRules(account_age=False, unknown_email="allow",
+                                                         unknown_replies="allow")) is None
+    assert eligibility(bare, now, rules=EligibilityRules(account_age=False, email_confirmed=False, replies=False)) is None
+    cfg.write_text('[eligibility]\nunknown_email = "allow"\nunknown_replies = "allow"\n', encoding="utf-8")
+    c = load_config(cfg, pool_dir=tmp_path).eligibility
+    assert c.unknown_email == c.unknown_replies == "allow" and "验证状态" in c.describe()
+    cfg.write_text('[eligibility]\nunknown_replies = "sure"\n', encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_config(cfg, pool_dir=tmp_path)
