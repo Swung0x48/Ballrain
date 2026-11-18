@@ -49,6 +49,9 @@ ROLLOUT_FIELDS = ("chunk", "gamma", "cap_mult", "cap_extra_s", "stall_s", "respa
                   "gates", "split_k", "split_min_ref_s", "split_rest_allow_s", "split_extra", "counter_rand",
                   "p_early_respawn", "respawn_level_starts")
 _ROLLOUT_JSON_ARGS = ("route_probes", "gates", "split_extra", "counter_rand")  # train_m2 passes these as JSON strings
+# WorkerSpec shaping the pool's task rollout does not implement: a run that uses any of them is not exported (its
+# chunks would carry another reward than the learner's workers compute)
+UNSUPPORTED_ARGS = ("zones", "wall_push_rate", "rail_gate")
 # the ROLLOUT_FIELDS scripts/train_m2.py actually passes from its arguments to WorkerSpec; the others (cap_extra_s,
 # stall_progress, split_rest_allow_s) are WorkerSpec defaults there even if an argument of that name appears later
 _ROLLOUT_FROM_ARGS = ("chunk", "gamma", "cap_mult", "stall_s", "respawn_stall_s", "stall_terminal", "stall_extra",
@@ -155,7 +158,8 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     for k, v in sd.items():
         if not k.startswith(ARRAY_ORDER_PREFIX):
             raise ValueError(f"unexpected model tensor {k!r}")
-        arrays[k] = _c(v.detach().cpu().numpy().astype("<f4"))
+        v = v.detach().cpu().numpy() if hasattr(v, "detach") else np.asarray(v)  # torch tensors or numpy (learner link)
+        arrays[k] = _c(v.astype("<f4"))
     rms = state["rms"]
     arrays["rms_mean"] = _c(np.asarray(rms["mean"], "<f8"))
     arrays["rms_var"] = _c(np.asarray(rms["var"], "<f8"))
@@ -176,6 +180,12 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     feats["path_dir"] = None  # the client installs the asset itself (task assets, sha256 below)
     rc = ec.get("reward") or {}
     reward = _plain({f.name: rc.get(f.name, getattr(RewardConfig(), f.name)) for f in fields(RewardConfig)})
+    for k in UNSUPPORTED_ARGS:
+        v = args.get(k)
+        if isinstance(v, str):
+            v = json.loads(v) if v.strip() else {}
+        if v:
+            raise ValueError(f"the run uses {k}, which pool tasks do not implement (not exported)")
     ws = {f.name: f.default for f in fields(WorkerSpec) if f.name in ROLLOUT_FIELDS}
     ws.update({"route_probes": {}, "gates": {}, "split_extra": [], "counter_rand": {}})
     for k in _ROLLOUT_FROM_ARGS:

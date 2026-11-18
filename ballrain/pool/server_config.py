@@ -11,7 +11,8 @@
     min_account_days = 30
     min_replies = 5
     max_instances = 8
-    min_client_version = "0.3.0"     # 0.3: chunk format 3 (engine-state chain v3); older clients get client_too_old
+    min_client_version = "0.3.0"     # 0.3: chunk format 3 (engine-state chain v3), task format 3; older clients get
+                                     # client_too_old
     heartbeat_s = 30
     task_poll_s = 10
     trust_forwarded = true             # required when public_base_url is https (the tunnel): rate limits per
@@ -31,8 +32,21 @@
     deadline_s = 3600
 
     [verify]
-    probation_chunks = 200     # an account's first chunks are all replayed
-    sample_rate = 0.1          # after that, this fraction
+    probation_chunks = 200     # an account's first tasks are all replayed in full (until it has this many chunks'
+                               # steps replayed or waiting for the replay)
+    task_sample = 0.15         # after that, each task is replayed in full with this probability (drawn at issue)
+    escalate_tasks = 20        # a chunk failing the cheap policy-consistency check: its task and the account's next
+                               # this many tasks are replayed in full
+    engines = ["x87soft"]      # the engine kinds tasks are issued for = what the verifier replays with (each task is
+                               # replayed on its own engine kind; a hello with another kind gets engine_mismatch)
+    workers = 1                # replays in parallel (one engine process each; below-normal priority)
+
+    [learner]                  # the learner link (ballrain.pool.learner_link): off without hub
+    hub = "<lan host>:<port>"  # the learner's RemoteHub (scripts/train_m2.py --remote-listen); LAN only
+    key_env = "BALLRAIN_REMOTE_KEY"  # environment variable holding the hub's shared secret (never in this file)
+    publish_every = 10         # publish the learner's weights as a new task policy every N updates
+    publish_min_s = 20         # ... but at most once per this many seconds
+    ingest = true              # feed released chunks back to the learner (it drops them unless --pool-ingest)
     [engines.2002]             # what clients may run (sha256 of the engine binary) and what the verifier replays with
     sha256 = []                # default: the sha256 of binary
     binary = "runtime/hl-win/bin-x86p2002d/BallanceMMOSimTool.exe"
@@ -54,6 +68,7 @@ from pathlib import Path
 from .server_oauth import ForumConfig
 
 FORUM_URL = "https://forum.ballance.top"
+MIN_CLIENT_VERSION = "0.3.0"  # chunk format 3 / task format 3 (load_config never goes below it)
 ENV_CLIENT_ID = "BALLRAIN_POOL_FORUM_CLIENT_ID"
 ENV_CLIENT_SECRET = "BALLRAIN_POOL_FORUM_CLIENT_SECRET"
 
@@ -89,7 +104,7 @@ class PoolConfig:
     min_account_days: int = 30
     min_replies: int = 5
     max_instances: int = 8
-    min_client_version: str = "0.3.0"  # chunk format 3
+    min_client_version: str = "0.3.0"  # chunk format 3, task format 3
     heartbeat_s: int = 30
     task_poll_s: int = 10
     session_ttl_s: int = 900
@@ -103,8 +118,16 @@ class PoolConfig:
     max_frames: int = 60000
     deadline_s: int = 3600
     probation_chunks: int = 200
-    sample_rate: float = 0.1
+    task_sample: float = 0.15  # per-task full-replay probability after the probation (2026-11-18: per task, not per chunk)
+    escalate_tasks: int = 20
     engines: dict = field(default_factory=dict)  # kind -> EngineRef
+    verify_engines: tuple = ("x87soft",)  # engine kinds tasks are issued for (the verifier replays each on its kind)
+    verify_workers: int = 1
+    learner_hub: str = ""  # HOST:PORT of the learner's RemoteHub ("" = no learner link)
+    learner_key_env: str = "BALLRAIN_REMOTE_KEY"
+    learner_publish_every: int = 10
+    learner_publish_min_s: float = 20.0
+    learner_ingest: bool = True
     max_pending_bytes_per_account: int = 512 * 1024 * 1024
     max_total_bytes: int = 20 * 1024 * 1024 * 1024
     trust_forwarded: bool = False  # take the client address from CF-Connecting-IP (behind the tunnel; rate limits only)
@@ -121,7 +144,7 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
     pool_dir = Path(pool_dir) if pool_dir else base / "runtime" / "pool"
     path = Path(path) if path else pool_dir / "config.toml"
     raw = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    fo, po, pl, ta, ve = (raw.get(k, {}) for k in ("forum", "pool", "policy", "task", "verify"))
+    fo, po, pl, ta, ve, le = (raw.get(k, {}) for k in ("forum", "pool", "policy", "task", "verify", "learner"))
     public = str(po.get("public_base_url", "http://127.0.0.1:8099")).rstrip("/")
     if public.endswith("/pool"):  # the origin is wanted (paths are /pool/...)
         public = public[: -len("/pool")]
@@ -147,7 +170,9 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
     return PoolConfig(
         pool_dir=pool_dir, public_base_url=public, forum=forum,
         min_account_days=int(po.get("min_account_days", 30)), min_replies=int(po.get("min_replies", 5)),
-        max_instances=min(int(po.get("max_instances", 8)), 64), min_client_version=str(po.get("min_client_version", "0.3.0")),
+        max_instances=min(int(po.get("max_instances", 8)), 64),
+        # never below MIN_CLIENT_VERSION (a config pinning an older client would hand format-3 tasks to it)
+        min_client_version=max(str(po.get("min_client_version", MIN_CLIENT_VERSION)), MIN_CLIENT_VERSION, key=version_tuple),
         heartbeat_s=int(po.get("heartbeat_s", 30)), task_poll_s=int(po.get("task_poll_s", 10)),
         trust_forwarded=bool(po.get("trust_forwarded", False)),
         run=str(pl.get("run", "r6")),
@@ -157,8 +182,14 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
         refresh_s=int(pl.get("refresh_s", 900)),
         max_steps=int(ta.get("max_steps", 8192)), max_frames=int(ta.get("max_frames", 60000)),
         deadline_s=int(ta.get("deadline_s", 3600)),
-        probation_chunks=int(ve.get("probation_chunks", 200)), sample_rate=float(ve.get("sample_rate", 0.1)),
-        engines=engines)
+        probation_chunks=int(ve.get("probation_chunks", 200)),
+        task_sample=min(max(float(ve.get("task_sample", 0.15)), 0.0), 1.0),
+        escalate_tasks=max(0, int(ve.get("escalate_tasks", 20))),
+        engines=engines, verify_engines=tuple(str(k) for k in ve.get("engines", ["x87soft"])),
+        verify_workers=max(1, int(ve.get("workers", 1))),
+        learner_hub=str(le.get("hub", "")), learner_key_env=str(le.get("key_env", "BALLRAIN_REMOTE_KEY")),
+        learner_publish_every=max(1, int(le.get("publish_every", 10))),
+        learner_publish_min_s=float(le.get("publish_min_s", 20.0)), learner_ingest=bool(le.get("ingest", True)))
 
 
 def version_tuple(v: str) -> tuple:

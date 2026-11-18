@@ -6,6 +6,7 @@ right reason code and step, quarantining the account's unverified chunks and rev
 import json
 import sys
 import urllib.parse
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -307,7 +308,11 @@ def _forge(data: bytes, kind: str, j: int) -> bytes:
 
 
 @pytest.mark.parametrize("kind", list(FORGERIES))
-def test_forged_chunks_are_caught_and_the_account_revoked(pool, tmp_path, kind):
+def test_forged_chunks_are_caught_and_the_account_flagged(pool, tmp_path, kind):
+    """A forged chunk is caught by the replay with the right reason and step; the task's data is rejected /
+    quarantined (none of it reaches the learner); the account is flagged suspect, NOT revoked (the user decides):
+    its other tasks are then replayed in full and fed only once verified; an alert with the mismatching values goes to
+    <pool>/alerts/."""
     user = f"forger_{list(FORGERIES).index(kind)}"
     pl = Player(pool, user, tmp_path)
     t = pl.task()
@@ -330,10 +335,11 @@ def test_forged_chunks_are_caught_and_the_account_revoked(pool, tmp_path, kind):
         for x in chunks[:s] + [forged] + later:
             r = pl.send(x)
             assert r.status == 200, (kind, r.body)
-    # a second task of the same account, in flight (not closed): its chunks must end up quarantined
+    # a second task of the same account, in flight (not closed) when the mismatch is found
     t2 = pl.task()
     c2, _, _ = pl.play(t2)
     assert pl.send(c2[0]).status == 200
+    pool.store.q("UPDATE tasks SET replay=0 WHERE task_id=?", (t2.task_id,))  # as if the spot check had not drawn it
     assert pool.verifier.run_once() == 1
     rows = pool.store.chunks(t.task_id)
     bad = [r for r in rows if r["verify"] == "failed"]
@@ -350,36 +356,63 @@ def test_forged_chunks_are_caught_and_the_account_revoked(pool, tmp_path, kind):
     else:
         assert reason["code"] == want.value, (kind, reason)
     assert reason["params"] == {"task_id": t.task_id, "chunk": s, "step": step}, (kind, reason)
-    assert all(r["verify"] == "passed" for r in rows if r["seq"] < s)
-    assert [r["status"] for r in pool.store.chunks(t2.task_id)] == ["quarantined"]
-    # the player sees why, verbatim, on every request
-    r = pool.call("GET", "/pool/task", token=pl.token, session=pl.sid)
-    assert r.status == 403
-    rr = pool.js(r)["reason"]
-    assert rr["code"] == "token_revoked_replay" and rr["params"] == {"task_id": t.task_id, "chunk": s, "step": step}
-    assert f"第 {s} 段数据在第 {step} 步" in rr["message"]
+    # the task's data never reaches the learner: the replay-passed earlier chunks are quarantined too
+    assert all(r["verify"] == "passed" and r["status"] == "quarantined" for r in rows if r["seq"] < s)
+    assert all(r["status"] in ("quarantined", "rejected") for r in rows)
+    assert not [r for r in pool.store.to_ingest(1000) if r["task_id"] == t.task_id]
+    # flagged, not revoked: the player keeps working, sees the rejected chunk's reason verbatim
+    acct = pool.store.account(rows[0]["forum_id"])
+    assert acct["suspect"] == 1 and acct["revoked"] == 0
     me = pl.me()
-    assert me["token_state"] == "revoked" and me["revoke_reason"] == rr
+    assert me["token_state"] == "active"
     assert me["stats"]["chunks_rejected"] == 1 and me["stats"]["last_rejection"]["code"] == reason["code"]
-    assert pool.js(pool.call("POST", "/pool/hello", b"{}", token=pl.token))["reason"]["code"] == "token_revoked_replay"
-    lb = P.parse_message("leaderboard", pool.call("GET", "/pool/leaderboard").body)
-    assert all(e["nickname"] != FORGERS[user]["nickname"] for e in lb["entries"])
+    assert f"第 {s} 段数据在第 {step} 步" in me["stats"]["last_rejection"]["message"]
+    assert pool.call("GET", "/pool/task", token=pl.token, session=pl.sid).status == 200
+    # the coordinator's alert: account, task, the mismatching values against their tolerance, the learner updates
+    alerts = sorted((pool.cfg.pool_dir / "alerts").glob("*-suspect-*.json"))
+    assert len(alerts) == 1
+    rec = json.loads(alerts[0].read_text(encoding="utf-8"))
+    assert rec["task_id"] == t.task_id and rec["chunk"] == s and rec["step"] == step and rec["reason"] == reason["code"]
+    assert rec["pseudonym"].startswith("acct-") and "learner_updates_unreplayed" in rec
+    if kind in ("reward", "value", "logp", "observation", "flags"):
+        assert {"submitted", "replayed", "tolerance"} <= set(rec["values"]), rec
+    assert any("flagged suspect (not revoked)" in m and alerts[0].name in m for m in pool.logs)
+    # its in-flight task: replayed in full although not drawn, fed only after it passed
+    assert [r["status"] for r in pool.store.chunks(t2.task_id)] == ["held"]
+    assert not [r for r in pool.store.to_ingest(1000) if r["task_id"] == t2.task_id]
+    pool.store.q("UPDATE tasks SET deadline=0 WHERE task_id=?", (t2.task_id,))
+    assert pool.verifier.run_once() == 1
+    r2 = pool.store.chunks(t2.task_id)
+    assert [r["verify"] for r in r2] == ["passed"] and [r["status"] for r in r2] == ["released"]
+    assert [r["task_id"] for r in pool.store.to_ingest(1000)] == [t2.task_id]
+    # every new task of a suspect account is a full replay
+    t3 = pl.task()
+    assert pool.store.task(t3.task_id)["replay"] == 1
 
 
 def test_sampling_after_probation_and_verifier_faults(pool, tmp_path):
+    """Per-task spot checks: a probation task is replayed in full; after the probation (task_sample 0) a task is
+    released unreplayed, every chunk of it still passing the cheap checks."""
     pool.cfg.probation_chunks = 1
-    pool.cfg.sample_rate = 0.0
+    pool.cfg.task_sample = 0.0
     pl = Player(pool, "eligible", tmp_path)
     t = pl.task()
     chunks, _, _ = pl.play(t)
     for c in chunks:
         assert pl.send(c).status == 200
-    sel = [r["selected"] for r in pool.store.chunks(t.task_id)]
-    assert sel == [1] + [0] * (len(chunks) - 1)  # only the probation chunk is replayed
+    assert all(r["selected"] == 1 for r in pool.store.chunks(t.task_id))  # the probation task: in full
     assert pool.verifier.run_once() == 1
-    rows = pool.store.chunks(t.task_id)
-    assert rows[0]["verify"] == "passed" and all(r["verify"] == "skipped" for r in rows[1:])
-    assert pl.me()["stats"]["steps_verified"] == sum(r["steps"] for r in rows)  # sampled-out chunks count
+    assert all(r["verify"] == "passed" for r in pool.store.chunks(t.task_id))
+    t1 = pl.task()  # probation over (one chunk's steps replayed): no replay for this one
+    c1, _, _ = pl.play(t1)
+    for c in c1:
+        assert pl.send(c).status == 200
+    rows = pool.store.chunks(t1.task_id)
+    assert all(r["selected"] == 0 and r["flag"] is None for r in rows)
+    assert pool.verifier.run_once() == 1
+    rows = pool.store.chunks(t1.task_id)
+    assert all(r["verify"] == "skipped" and r["status"] == "released" for r in rows)
+    assert pl.me()["stats"]["steps_verified"] == sum(r["steps"] for r in pool.store.q("SELECT steps FROM chunks"))
     # the verifier's own engine failing is replay_failed: retried, never a revocation
     t2 = pl.task()
     c2, _, _ = pl.play(t2)
@@ -503,7 +536,7 @@ def _replay_reason(pool, task_id):
 @pytest.mark.parametrize("sampler", ["client", "rollout"])
 def test_actions_not_drawn_from_the_task_seed_are_caught(pool, tmp_path, sampler):
     """A client choosing its own actions (its own generator) while reporting the honest log-probs and values: every
-    other check passes, the action draw does not (replay_action_mismatch), and the account is revoked."""
+    other check passes, the action draw does not (replay_action_mismatch), and the account is flagged suspect."""
     pl = Player(pool, "forger_0" if sampler == "client" else "forger_1", tmp_path)
     t = pl.task()
     chunks, _, _ = pl.play(t, seed=12345, sampler=sampler)
@@ -512,7 +545,7 @@ def test_actions_not_drawn_from_the_task_seed_are_caught(pool, tmp_path, sampler
     assert pool.verifier.run_once() == 1
     reason = _replay_reason(pool, t.task_id)
     assert reason is not None and reason["code"] == Reason.REPLAY_ACTION_MISMATCH.value, reason
-    assert pl.me()["token_state"] == "revoked"
+    assert pl.me()["token_state"] == "active" and pool.store.is_suspect(pool.store.task(t.task_id)["forum_id"])
 
 
 def test_a_trajectory_resigned_onto_another_task_is_caught(pool, tmp_path, monkeypatch):
@@ -548,7 +581,7 @@ def test_a_trajectory_resigned_onto_another_task_is_caught(pool, tmp_path, monke
     pool.verifier.run_once()
     reason = _replay_reason(pool, tb.task_id)
     assert reason is not None and reason["code"] == Reason.REPLAY_ACTION_MISMATCH.value, (reason, pool.logs[-3:])
-    assert pl.me()["token_state"] == "revoked"
+    assert pl.me()["token_state"] == "active" and pool.store.is_suspect(pool.store.task(tb.task_id)["forum_id"])
 
 
 def _peergone_after(n_steps, steps_of):
@@ -815,3 +848,34 @@ def test_task_end_closes_a_task_without_a_final_chunk(pool, tmp_path):
     assert pool.verifier.run_once() == 1
     rows = pool.store.chunks(t2.task_id)
     assert [r["verify"] for r in rows] == ["passed"]
+
+
+def test_revoke_and_unflag_are_manual_admin_actions(pool, tmp_path, capsys):
+    """tools/pool/gateway.py admin: suspects lists the flagged account; unflag clears it; revoke (manual) shows the
+    player the stored replay reason and can list / mark the learner updates its data reached (nothing is undone)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gw_cli", Path(__file__).resolve().parents[1] / "tools" / "pool" / "gateway.py")
+    gw = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gw)
+    pl = Player(pool, "forger_3", tmp_path)
+    t = pl.task()
+    chunks, _, _ = pl.play(t)
+    for c in chunks[:-1] + [reseal(chunks[-1], rewards=lambda r: r + np.float32(0.25))]:
+        assert pl.send(c).status == 200
+    assert pool.verifier.run_once() == 1
+    fid = pool.store.task(t.task_id)["forum_id"]
+    pool.store.q("UPDATE chunks SET ingested=12 WHERE task_id=? AND seq=0 AND status!='rejected'", (t.task_id,))
+    base = ["--pool-dir", str(pool.cfg.pool_dir)]
+    gw.main(base + ["admin", "suspects"])
+    out = capsys.readouterr().out
+    assert str(fid) in out and "replay_reward_mismatch" in out
+    gw.main(base + ["admin", "unflag", "--forum-id", str(fid)])
+    assert not pool.store.is_suspect(fid) and pl.me()["token_state"] == "active"
+    pool.store.flag_suspect(fid, json.loads(sorted((pool.cfg.pool_dir / "alerts").glob("*.json"))[-1].read_text("utf-8")))
+    gw.main(base + ["admin", "revoke", "--forum-id", str(fid), "--list-updates", "--mark-updates"])
+    out = capsys.readouterr().out
+    assert f"revoked {fid}" in out and "learner updates" in out and "marked:" in out
+    me = pl.me()
+    assert me["token_state"] == "revoked" and me["revoke_reason"]["code"] == "token_revoked_replay"
+    assert me["revoke_reason"]["params"]["task_id"] == t.task_id
+    assert list((pool.cfg.pool_dir / "alerts").glob("*-revoked-acct-*.json"))

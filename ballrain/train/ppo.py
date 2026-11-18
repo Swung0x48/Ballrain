@@ -4,7 +4,9 @@ A chunk is T consecutive steps of one worker (ballrain.train.worker): obs (norma
 raw obs, actions, behaviour log-probs and values, rewards, terminated / truncated flags, the value of the final
 observation of a truncated step (bootstrap) and the value of the observation after the last step (bootstrap at
 the chunk end). Terminated (BallOff, LevelFinish, GameOver) bootstraps 0; truncated (frame cap, stall, crash)
-bootstraps the value of its final observation.
+bootstraps the value of its final observation. Off-policy chunks (the volunteer pool) get V-trace targets instead of
+GAE (vtrace) and are clipped around the policy at the start of the update (decoupled PPO: their "logp" in the batch is
+the proximal policy's, the behaviour policy enters through the truncated importance weights of vtrace).
 """
 from __future__ import annotations
 
@@ -110,6 +112,39 @@ def gae(chunk: dict, gamma: float, lam: float, reward_scale: float = 1.0):
         last = delta + gamma * lam * cont * last
         adv[t] = last
     return adv.astype(np.float32), (adv + v).astype(np.float32)
+
+
+def vtrace(chunk: dict, logp_cur, v_cur, v_last: float, gamma: float, lam: float, reward_scale: float = 1.0,
+           rho_bar: float = 1.0, c_bar: float = 1.0):
+    """V-trace (Espeholt et al. 2018, IMPALA) targets and policy-gradient advantages of one off-policy chunk (pool data:
+    collected by an older policy version). logp_cur: log pi(a_t | x_t) of the policy at the start of this update (the
+    proximal policy), v_cur: its values V(x_t), v_last: V of the row after the chunk. With the behaviour log-probs mu of
+    the chunk: rho_t = min(rho_bar, pi / mu), c_t = lam * min(c_bar, pi / mu) (lam as in GAE);
+        v_s = V(x_s) + delta_s + gamma c_s (v_{s+1} - V(x_{s+1})),  delta_s = rho_s (r_s + gamma V(x_{s+1}) - V(x_s));
+        adv_s = rho_s (r_s + gamma v_{s+1} - V(x_s)).
+    Terminated steps bootstrap 0, truncated ones V of the row after them (no trace across either). Returns (adv, v_s,
+    rho) as float32 arrays. On-policy (pi = mu, rho_bar = c_bar = 1) v_s is GAE(lam)'s return with the current values;
+    the advantage is IMPALA's (r_s + gamma v_{s+1} - V(x_s)), the form APPO-style learners use with PPO's clipping."""
+    r = chunk["rewards"].astype(np.float64) * reward_scale
+    v = np.asarray(v_cur, np.float64)
+    T = len(r)
+    ratio = np.exp(np.asarray(logp_cur, np.float64) - chunk["logp"].astype(np.float64))
+    rho = np.minimum(rho_bar, ratio)
+    c = lam * np.minimum(c_bar, ratio)
+    term, trunc = np.asarray(chunk["terminated"], bool), np.asarray(chunk["truncated"], bool)
+    v_next = np.r_[v[1:], float(v_last)]
+    nv = np.where(term, 0.0, v_next)
+    cont = (~term & ~trunc).astype(np.float64)
+    delta = rho * (r + gamma * nv - v)
+    acc = 0.0
+    vs_v = np.zeros(T, np.float64)
+    for t in range(T - 1, -1, -1):
+        acc = delta[t] + gamma * c[t] * cont[t] * acc
+        vs_v[t] = acc
+    vs = v + vs_v
+    vs_next = np.where(term, 0.0, np.where(trunc, v_next, np.r_[vs[1:], float(v_last)]))
+    adv = rho * (r + gamma * vs_next - v)
+    return adv.astype(np.float32), vs.astype(np.float32), rho.astype(np.float32)
 
 
 def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int, clip: float, vf_coef: float,

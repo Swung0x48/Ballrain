@@ -57,7 +57,20 @@ CREATE INDEX IF NOT EXISTS chunks_by_account ON chunks(forum_id, verify);
 # tasks.state: open | closed (final chunk received or deadline passed; waiting for the verifier) | done | failed
 # logins: user_code is shown by the controller and on the confirmation page; confirm_hash / browser_hash bind the
 #   "continue to the forum" link to the browser that rendered that page (sha256 of the link nonce / of its cookie)
-MIGRATIONS = {"logins": {"user_code": "TEXT", "confirm_hash": "TEXT", "browser_hash": "TEXT"}}
+# chunks.ingested: the learner update number when the learner link (ballrain.pool.learner_link) fed this released chunk
+#   to the learner (NULL: not fed); a later revocation of the account can then be traced to the updates it reached
+# tasks.replay: the task is replayed in full (probation, the task_sample draw at issue, or an escalation)
+# chunks.flag: why the cheap policy-consistency check flagged the chunk (escalated to a full replay), NULL if it passed
+# accounts.escalate: how many of the account's next tasks are replayed in full (after a flagged chunk)
+# accounts.suspect: a replay mismatch was found (suspect_reason: the alert record). While set, every task of the account
+#   is replayed in full and only replay-passed chunks are fed to the learner. Set by the verifier, cleared only by hand
+#   (tools/pool/gateway.py admin unflag); revocation is a separate manual action (admin revoke), never automatic
+# accounts.ingest_span: JSON {first, last, steps} of the learner updates its fed chunks reached (revocation / alert)
+MIGRATIONS = {"logins": {"user_code": "TEXT", "confirm_hash": "TEXT", "browser_hash": "TEXT"},
+              "chunks": {"ingested": "INTEGER", "ingested_at": "INTEGER", "flag": "TEXT"},
+              "tasks": {"replay": "INTEGER NOT NULL DEFAULT 0"},
+              "accounts": {"escalate": "INTEGER NOT NULL DEFAULT 0", "ingest_span": "TEXT",
+                           "suspect": "INTEGER NOT NULL DEFAULT 0", "suspect_reason": "TEXT", "suspect_at": "INTEGER"}}
 
 
 class ChunkRefused(Exception):
@@ -237,11 +250,52 @@ class Store:
                    (self.now(), 1 if running else 0, float(steps_per_s or 0.0), sid))
 
     # ------------------------------------------------------------------------------------------ tasks / chunks
-    def add_task(self, task: dict, forum_id: int, session_id: str) -> None:
-        self.q("INSERT INTO tasks(task_id, forum_id, session_id, body, policy_sha, issued_at, deadline) "
-               "VALUES(?,?,?,?,?,?,?)",
+    def add_task(self, task: dict, forum_id: int, session_id: str, replay: bool = True) -> None:
+        self.q("INSERT INTO tasks(task_id, forum_id, session_id, body, policy_sha, issued_at, deadline, replay) "
+               "VALUES(?,?,?,?,?,?,?,?)",
                (task["task_id"], int(forum_id), session_id, json.dumps(task, sort_keys=True), task["policy_sha"],
-                int(task["issued_at"]), int(task["issued_at"]) + int(task["deadline_s"])))
+                int(task["issued_at"]), int(task["issued_at"]) + int(task["deadline_s"]), 1 if replay else 0))
+
+    def set_task_replay(self, task_id: str) -> None:
+        self.q("UPDATE tasks SET replay=1 WHERE task_id=?", (task_id,))
+
+    def escalate(self, forum_id: int, n: int) -> None:
+        """The account's next n tasks are replayed in full (a flagged chunk)."""
+        self.q("UPDATE accounts SET escalate=MAX(escalate, ?) WHERE forum_id=?", (int(n), int(forum_id)))
+
+    def flag_suspect(self, forum_id: int, record: dict) -> None:
+        self.q("UPDATE accounts SET suspect=1, suspect_reason=?, suspect_at=? WHERE forum_id=?",
+               (json.dumps(record, ensure_ascii=False), self.now(), int(forum_id)))
+
+    def unflag(self, forum_id: int) -> None:
+        self.q("UPDATE accounts SET suspect=0, suspect_reason=NULL, suspect_at=NULL WHERE forum_id=?", (int(forum_id),))
+
+    def is_suspect(self, forum_id: int) -> bool:
+        r = self.one("SELECT suspect FROM accounts WHERE forum_id=?", (int(forum_id),))
+        return bool(r and r["suspect"])
+
+    def reject_task(self, task_id: str, failed_seq: int, reason: dict) -> None:
+        """A replay mismatch: the failing chunk is rejected (its reason stored, me.stats.last_rejection), every other
+        chunk of the task that has not reached the learner is quarantined (also the ones the replay passed: the task's
+        data as a whole never reaches the learner), the task is failed. The account is NOT revoked here."""
+        def fn(db):
+            db.execute("UPDATE chunks SET verify='failed', status='rejected', reason=? WHERE task_id=? AND seq=?",
+                       (json.dumps(reason, ensure_ascii=False), task_id, int(failed_seq)))
+            db.execute("UPDATE chunks SET verify=CASE WHEN seq<? THEN 'passed' ELSE verify END, status='quarantined' "
+                       "WHERE task_id=? AND seq!=? AND ingested IS NULL AND status IN ('held', 'released')",
+                       (int(failed_seq), task_id, int(failed_seq)))
+            db.execute("UPDATE tasks SET state='failed' WHERE task_id=?", (task_id,))
+        self.tx(fn)
+
+    def take_escalation(self, forum_id: int) -> bool:
+        """True (and one used up) when the account has escalated tasks left."""
+        with self.lock:
+            cur = self.db.execute("UPDATE accounts SET escalate=escalate-1 WHERE forum_id=? AND escalate>0",
+                                  (int(forum_id),))
+            return cur.rowcount > 0
+
+    def flag_chunk(self, task_id: str, seq: int, detail: str) -> None:
+        self.q("UPDATE chunks SET flag=?, selected=1 WHERE task_id=? AND seq=?", (str(detail)[:200], task_id, int(seq)))
 
     def task(self, task_id: str):
         return self.one("SELECT * FROM tasks WHERE task_id=?", (task_id,))
@@ -299,7 +353,7 @@ class Store:
         """Steps of the account that count toward its probation: chunks waiting for the replay or passed by it (all of
         them are replayed during the probation), not rejected ones. Counted in steps, not chunks, so short "stopped"
         tasks cannot run the probation down."""
-        r = self.one("SELECT COALESCE(SUM(steps), 0) AS n FROM chunks WHERE forum_id=? "
+        r = self.one("SELECT COALESCE(SUM(steps), 0) AS n FROM chunks WHERE forum_id=? AND selected=1 "
                      "AND verify IN ('pending', 'passed') AND status!='rejected'", (int(forum_id),))
         return int(r["n"])
 
@@ -396,6 +450,44 @@ class Store:
                        "AND seq<=?", (task_id, top))
             db.execute("UPDATE tasks SET state='done' WHERE task_id=?", (task_id,))
         self.tx(fn)
+
+    # ------------------------------------------------------------------------------------------ learner ingest
+    def to_ingest(self, limit: int = 64) -> list:
+        """Released chunks (passed or released by the spot-check rule) not yet fed to the learner, oldest first, with
+        their task's policy version. Held, rejected and quarantined chunks never appear."""
+        # a suspect account's data only once its own replay passed (nothing unverified of it reaches the learner)
+        return self.q("SELECT c.task_id AS task_id, c.seq AS seq, c.file AS file, c.steps AS steps, c.verify AS verify, "
+                      "c.received AS received, t.policy_sha AS policy_sha FROM chunks c JOIN tasks t ON t.task_id=c.task_id "
+                      "JOIN accounts a ON a.forum_id=c.forum_id "
+                      "WHERE c.status='released' AND c.ingested IS NULL AND (a.suspect=0 OR c.verify='passed') "
+                      "ORDER BY c.received, c.task_id, c.seq LIMIT ?", (int(limit),))
+
+    def mark_ingested(self, keys: list, update: int) -> int:
+        """Mark (task_id, seq) pairs as fed at learner update `update` (only while still released and unmarked: a chunk
+        quarantined in between is not marked). Returns the number marked."""
+        def fn(db):
+            n = 0
+            for tid, seq in keys:
+                n += db.execute("UPDATE chunks SET ingested=?, ingested_at=? WHERE task_id=? AND seq=? "
+                                "AND status='released' AND ingested IS NULL",
+                                (int(update), self.now(), tid, int(seq))).rowcount
+            return n
+        return self.tx(fn)
+
+    def record_ingest_span(self, forum_id: int, unreplayed_only: bool = False) -> dict:
+        """Store (and return) the learner updates the account's fed chunks reached."""
+        lo, hi, n = self.ingested_updates(forum_id, unreplayed_only)
+        span = {"first": lo, "last": hi, "steps": n}
+        self.q("UPDATE accounts SET ingest_span=? WHERE forum_id=?", (json.dumps(span), int(forum_id)))
+        return span
+
+    def ingested_updates(self, forum_id: int, unreplayed_only: bool = False) -> tuple:
+        """(first, last, steps) learner updates and steps this account's chunks reached (rollback tracing);
+        unreplayed_only: only chunks released by the spot-check rule without a replay (verify 'skipped')."""
+        extra = " AND verify='skipped'" if unreplayed_only else ""
+        r = self.one("SELECT MIN(ingested) AS lo, MAX(ingested) AS hi, COALESCE(SUM(steps), 0) AS n FROM chunks "
+                     "WHERE forum_id=? AND ingested IS NOT NULL AND ingested >= 0" + extra, (int(forum_id),))
+        return (r["lo"], r["hi"], int(r["n"])) if r else (None, None, 0)
 
     # ------------------------------------------------------------------------------------------ statistics
     def stats(self, forum_id: int) -> dict:

@@ -32,7 +32,7 @@ from .server_config import PoolConfig, version_tuple
 from .server_oauth import ForumClient, ForumError, eligibility, parse_user
 from .server_store import ChunkRefused, Store, sha_hex
 from .server_tasks import PolicySource
-from .server_verify import select_chunk
+from .server_verify import policy_consistency, select_task
 
 TOKEN_PREFIX = "bp1_"
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
@@ -157,6 +157,7 @@ class PoolApp:
     def __init__(self, cfg: PoolConfig, store: Store, policies: PolicySource, forum: ForumClient,
                  clock=time.time, rate_rules: dict | None = None, monotonic=time.monotonic, log=None):
         self.cfg, self.store, self.policies, self.forum = cfg, store, policies, forum
+        self._policy_cache: dict = {}  # policy_sha -> NumpyPolicy (the per-chunk consistency check)
         self.clock = clock
         self.rl = RateLimiter(rate_rules or DEFAULT_RULES, clock=monotonic)
         self.log = log or (lambda msg: None)
@@ -497,6 +498,8 @@ class PoolApp:
         ref = self.cfg.engines.get(e["kind"])
         if ref is None or e["sha256"] not in ref.sha256:
             raise _err(Reason.ENGINE_UNKNOWN, engine=e["kind"], sha=e["sha256"][:16])
+        if e["kind"] not in self.cfg.verify_engines:  # no task for an engine kind the verifier does not replay with
+            raise _err(Reason.ENGINE_MISMATCH, got=e["kind"], want=" / ".join(self.cfg.verify_engines))
         want = self.reference_files(e["kind"])
         names = P.GAME_FILE_LIST_2002 if e["kind"] == "2002" else P.GAME_FILE_LIST
         for name in names:
@@ -528,7 +531,9 @@ class PoolApp:
         t = self.policies.new_task(sess["engine_kind"], self.now(), self.cfg.max_steps, self.cfg.max_frames,
                                    self.cfg.deadline_s)
         d = t.to_dict()
-        self.store.add_task(d, acct["forum_id"], sess["session_id"])
+        replay = select_task(self.store, acct["forum_id"], self.cfg.probation_chunks * int(t.chunk_steps),
+                             self.cfg.task_sample)
+        self.store.add_task(d, acct["forum_id"], sess["session_id"], replay=replay)
         return _json("task", task=d)
 
     def task_end(self, acct, body: bytes) -> Response:
@@ -605,8 +610,8 @@ class PoolApp:
         tmp = dst.with_name(f".{dst.name}.{secrets.token_hex(4)}.tmp")
         tmp.write_bytes(body)
         tmp.replace(dst)
-        selected = select_chunk(self.store, acct["forum_id"], self.cfg.probation_chunks * int(task["chunk_steps"]),
-                                self.cfg.sample_rate)
+        flag = self._consistency(c, task)
+        selected = bool(row["replay"]) or flag is not None
         try:
             self.store.add_chunk(tid, seq, acct["forum_id"], steps, len(body), rel, selected, h["final"], h["end"])
         except ChunkRefused as e:  # re-checked inside the transaction (the verifier may have acted meanwhile)
@@ -622,8 +627,31 @@ class PoolApp:
         except BaseException:
             dst.unlink(missing_ok=True)
             raise
+        if flag is not None:  # the cheap check failed: this task in full and the account's next tasks are replayed
+            self.store.flag_chunk(tid, seq, flag)
+            self.store.set_task_replay(tid)
+            self.store.escalate(acct["forum_id"], self.cfg.escalate_tasks)
+            self.log(f"chunk {tid[:8]}/{seq}: policy-consistency check failed ({flag}); task and the account's next "
+                     f"{self.cfg.escalate_tasks} tasks go to a full replay")
         self.store.touch_session(sess["session_id"])
         return _json("chunk_result", task_id=tid, seq=seq, status="accepted", verify="pending", steps=steps)
+
+    def _consistency(self, c, task: dict):
+        """policy_consistency with the task's policy (None when the weights cannot be loaded: the replay decides)."""
+        sha = task["policy_sha"]
+        pol = self._policy_cache.get(sha)
+        if pol is None:
+            try:
+                from .weights import load_policy, read_manifest
+                wd = Path(self.cfg.pool_dir) / "weights"
+                pol = load_policy(wd / f"{sha}.npz", read_manifest(wd / f"{sha}.json"), expect_sha=sha)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"consistency check: policy {sha[:12]} unavailable ({type(e).__name__})")
+                return None
+            if len(self._policy_cache) >= 8:
+                self._policy_cache.pop(next(iter(self._policy_cache)))
+            self._policy_cache[sha] = pol
+        return policy_consistency(c, pol, task, int(c.header["step0"]))
 
     def _manifest_dims(self, sha: str):
         from .weights import read_manifest

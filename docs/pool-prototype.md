@@ -3,7 +3,7 @@
 状态：第 1 步（共享约定）已实现，见 `ballrain/pool/`；第 2b 步主控程序已实现（`tools/pool/controller.py` 和 `ballrain/pool/client_*.py`，第 9 节）；第 2a 步网关和验证器已实现（`tools/pool/gateway.py`、`tools/pool/verifier.py`、`tools/pool/mock_forum.py` 和 `ballrain/pool/server_*.py`、`rollout.py`，第 10 节）；评审修复（第 2c 步）见第 10.9 节。
 设计和与用户逐项对过的决定见 `docs/volunteer-compute.md`，尤其是第 11 节。本文是实现层面的约定：接口、消息、数据段格式、原因码、文件布局。
 
-**原型范围：** 志愿者的电脑做训练采样。网关收下的数据段只存盘、计数，**不接入正在运行的训练器**。
+**范围：** 志愿者的电脑做训练采样。网关收下、验证放行的数据段经学习器链接（第 11 节）送回训练器；训练器只有带 `--pool-ingest` 启动时才用它们，**默认不用**（丢弃并计数）。
 
 ## 1. 模块
 
@@ -15,6 +15,7 @@
 | `ballrain/pool/sampling.py` | 采样任务的确定性动作抽取：`sample_u(sample_seed, t)`、`sample_action`、重放用的 `action_consistent`（第 10.6 节，第 2c 步新增） | 主控程序、验证器 |
 | `ballrain/pool/task.py` | 任务 `Task`、本机游戏 `LocalGame`、`hash_game_files`、开局包和参考线（`export_starts_pack` / `install_starts_pack`、`export_path_asset` / `find_path_asset` / `install_path_asset`）、`build_env_config` / `build_env`、`valid_start_frames`、`save_npz_deterministic` | 网关（发任务、导出素材）、客户端、验证器 |
 | `ballrain/pool/rollout.py`、`server_*.py`、`dev.py` | 验证器的任务重放（`TaskRunner`、`replay_task`）；网关的配置、sqlite 存储、论坛 OAuth、任务来源、HTTP 应用、验证器；假游戏上的开发 / 测试环境（第 10 节） | 网关、验证器、测试 |
+| `ballrain/pool/learner_link.py` | 学习器链接：以远程主机 `pool` 的身份连学习器的 RemoteHub，用学习器的实时参数发布任务策略，把放行的段转成学习器的数据块送回（第 11 节） | 网关 |
 
 **不用 pickle。** 协议、发给客户端的文件、客户端读取的文件都不经过 pickle：
 - JSON 用标准解析器加严格检查；
@@ -817,9 +818,9 @@ python tools/pool/mock_forum.py --port 8098 --redirect-uri http://127.0.0.1:8099
 - **任务循环有两份：** `rollout.TaskRunner`（验证器）和 `client_sampler.TaskSampler`（主控程序）实现同一套规则，靠对照测试保持一致，以后应合并成一份。有一处值得注意：死亡那一步的 `arc` 记的是重生之后那一行的弧长。主控程序是这样记录的，验证器照样比较。
 - **有选择地放弃任务查不出来：** 玩家可以只交“跑得好”的任务，把其余的停掉或丢掉，这会让结果分布偏向好局。重放只能证明交上来的数据是真的。
 - **实例上限按活着的会话计算：** 一个会话超过 max(3 × 心跳间隔, 90) 秒没有动静，它名下没结束的任务就不再占用 8 个实例的名额（主控程序被强杀后重启，最多等这么久）；这些任务仍然到期限才过期，验证器再验证已到的段。
-- **`stale_policy` 没有用：** 任务固定用发出时的策略版本，数据也不进训练，所以不按新旧拒收。
-- **验证器是单线程**，2002 宿主上重放约 200 步/秒，抽查 10% 时够用。规模上来以后要多开进程，并且要顾及本机的训练。
-- **只有回环地址上的纯 HTTP。** 隧道、HTTPS、按 `CF-Connecting-IP` 限速，都要等接入隧道时再核对。
+- **`stale_policy` 没有用：** 任务固定用发出时的策略版本，新旧由训练器按更新次数判断（第 11 节 `--pool-max-lag`），网关不按新旧拒收。
+- **验证器**：`[verify] workers` 个线程并行重放；抽查按任务（第 11.4 节）。
+- **只有回环地址上的纯 HTTP。** 隧道的 `/pool` 规则见第 12 节（候选配置已验证，未上线）；按 `CF-Connecting-IP` 限速要等上线后核对。
 - **磁盘保留没做：** 放行、拒收、隔离的段一直留在 `chunks/` 下（不再占用上限，但占磁盘），接入训练器时再定保留策略。
 
 ### 10.9 评审修复（第 2c 步）
@@ -849,3 +850,178 @@ python tools/pool/mock_forum.py --port 8098 --redirect-uri http://127.0.0.1:8099
 | POSIX `preexec_fn` | 改用 `start_new_session=True`；`PR_SET_PDEATHSIG` 和父进程核对在实例自己的 `main()` 开头做（`client_lifecycle.bind_to_parent`，没有在 Linux / macOS 上跑过） |
 
 **本机配置要改一处：** `runtime/pool/config.toml` 的 `public_base_url` 是 https，按新规则网关会拒绝启动，需要在 `[pool]` 里加 `trust_forwarded = true`（这个文件不进 git，没有替你改）。
+
+## 11. 接入训练器（2026-11-18）
+
+### 11.1 结构
+
+```
+原生客户端 ──HTTPS /pool──▶ 网关 ──▶ 验证器（x87-soft，[verify] workers 个并行）
+                              │            │ 放行（passed / 抽查放行）
+                              ▼            ▼
+                         学习器链接（ballrain/pool/learner_link.py，在网关进程里）
+                              ▲ 模板 + 每次更新的参数        │ 数据块（host / backend 标签 "pool"）
+                              │                              ▼
+                     学习器的 RemoteHub（scripts/train_m2.py --remote-listen，局域网，共享密钥）
+```
+
+- 学习器链接像远程 worker 的桥一样连学习器的 RemoteHub（`multiprocessing.connection`，带 HMAC 密钥，只在局域网），主机标签 `pool`，自己不开 worker。
+  - **从学习器拿：** worker 模板（学习器**实时**的 EnvConfig、WorkerSpec 字段）和每次更新后的参数消息（权重、观测统计、课程状态）。每 `publish_every` 次更新（且至少隔 `publish_min_s` 秒）把它发布成新任务的策略（`PolicySource.publish_state`）：任务的开局分布（任务格式 3）、课程状态和学习器自己的 worker 一样。这时不再读检查点副本（`refresh_s` 不用）。
+  - **送回学习器：** 只送**已放行**的段（`passed`，或试用期后按抽查规则放行的 `skipped`；`held`、`rejected`、`quarantined` 永远不送，`server_store.to_ingest`）。`decode_chunk` 解出来后转成学习器的数据块（`chunk_message`）：float16 观测转 float32（验证器已在容差内核对过它和自己算的特征）、动作、behaviour log-prob、价值、奖励、终止 / 截断、自举价值，`version` = 这个任务的策略取自学习器的第几次更新（清单 `source.update`），另带 `pool: True` 和这一段之后的那一行观测（`raw_last`，V-trace 要用）。志愿者发来的东西没有任何一处被 unpickle；只有这个受信任的进程把转换好的数组放到已有的局域网连接上。
+  - 每段送出后在 sqlite 里记下送出时学习器的更新次数（`chunks.ingested`；不是本 run 的段记 -1，不送）。重启不会重复送；以后吊销某个账号时，`Store.ingested_updates(forum_id)` 给出它的数据可能影响到的更新范围，便于回退到更早的检查点。
+- 网关配置（`runtime/pool/config.toml`，不进 git）：
+
+  ```toml
+  [learner]
+  hub = "<学习器的局域网地址>:<端口>"   # train_m2 的 --remote-listen
+  key_env = "BALLRAIN_REMOTE_KEY"     # 存放 hub 共享密钥的环境变量名；密钥本身不写进任何文件
+  publish_every = 10
+  publish_min_s = 20
+  ingest = true
+  [verify]
+  engines = ["x87soft"]               # 只给验证器能重放的引擎类型发任务
+  workers = 2
+  ```
+  没有 `hub` 时网关照旧从检查点副本取策略（第 10.5 节）。链接连上后，策略的运行名取学习器的（`[policy] run` 不同时日志里提示并改用学习器的），否则重启后所有段都会被当成“别的 run”（`ingested = -1`，不送，日志里有记录）。`min_client_version` 读配置时不会低于 0.3.0（任务格式 3）。
+
+### 11.2 训练器：`--pool-ingest`（默认关）
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `--pool-ingest` | 关 | 用池子的数据训练。关着时池子的数据块一律丢弃，计入 `pool_refused`，日志提示一次 |
+| `--pool-max-lag N` | 300 | 策略落后超过 N 次更新的池子数据丢弃（`pool_dropped`、`pool_dropped_steps`） |
+| `--pool-correction vtrace\|none` | vtrace | 见下；`none` 和局域网远程数据一样处理（GAE、比值相对 behaviour 策略），只用来做对照实验 |
+| `--pool-rho-bar`、`--pool-c-bar` | 1、1 | V-trace 的截断 |
+
+- 池子的数据走自己的分支，不受 `--max-stale-remote` 影响；本地和局域网远程数据的处理**逐位不变**。被拒或被丢的池子数据不进任何统计（帧数、`reset_frac`、远程看门狗），所以开关关着时 updates.csv 和仪表盘不受影响。
+- 统计只写 TensorBoard（`pool/steps`、`pool/frac`、`pool/lag`、`pool/rho`、`pool/rho_clip`、`pool/refused`、`pool/dropped`），不加 updates.csv 的列（加列会让续跑的 run 另起 `updates.<i>.csv`）。被接收的池子步数记在 `counters["steps_pool"]`。
+
+### 11.3 为什么选 V-trace（加最大延迟）
+
+延迟按 r8 实测估算：r8 每次更新约 1.26 秒（8192 步，约 6500 步/秒）。池子数据的延迟 = 发布间隔（`publish_every` 10 次更新）+ 任务本身的时长（8192 步、约 200 步/秒的一个实例要 40 秒，约 30 次更新）+ 等验证（试用期内每段都重放，又是几十次更新），合计**约 100 次更新**；以前按检查点副本每 900 秒刷新一次时更是上千次。只按“落后超过 N 次就丢”，N 取几次到几十次会丢掉几乎全部数据，N 取几百次又等于不做修正。所以：
+
+- **V-trace**（IMPALA）：批次开始时用**当前**的策略和价值网络在池子数据的观测上重算 log π 和 V，ρ = min(ρ̄, π/μ)、c = λ·min(c̄, π/μ)，得到价值目标 v_s 和优势 ρ_s (r_s + γ v_{s+1} − V(x_s))（`ppo.vtrace`）。陈旧的 behaviour 价值不再进入优势。
+- **PPO 的裁剪以当前策略为中心**（decoupled PPO）：池子样本在批次里的 “old log-prob” 是当前策略的，behaviour 策略只通过 ρ 进入。否则比值 π/μ 一开始就在裁剪区间之外，梯度全被截掉。
+- **最大延迟 `--pool-max-lag` 仍然保留**作为安全上限：π/μ 落差太大时截断的重要性权重几乎全是 ρ̄，修正已无意义。
+- 同策略（π = μ）时 v_s 就是 GAE(λ) 的回报（`tests/test_pool_learner.py` 核对）。
+- 对外开放采样任务之前，仍要按 volunteer-compute.md 第 5 节做本地延迟实验：用现有机器经池子跑，比较 `--pool-correction vtrace` / `none` 和延迟 0 / 50 / 200 次更新的学习曲线。
+
+### 11.4 验证器：按任务抽查（2026-11-18，用户决定）
+
+- 只给 x87-soft 发任务（`[verify] engines`，默认 `["x87soft"]`）：验证器用自己的 x87-soft 引擎重放；2002 引擎的任务和 x87-soft 不保证逐字节相同，诚实账号也会被吊销，所以 2002 版的 hello 现在回 `engine_mismatch`。需要时可以在配置里加回 `"2002"`（要同时配好 2002 引擎）。
+- **以前按段抽查、按任务重放**：一个 32 段的任务只要抽中一段就要从头重放到那一段，实际重放量约为提交量的 90%，3 台机器的提交量（约 1500–2000 步/秒）远超一个验证线程（约 200 步/秒）。
+- **现在按任务抽查**（`server_verify.select_task`，发任务时决定，存在 `tasks.replay`，客户端不知道）：
+  - 试用期内（账号已重放或待重放的步数不到 `probation_chunks × chunk_steps`，默认 200 × 256）每个任务都整段重放；
+  - 之后每个任务以概率 `[verify] task_sample`（默认 0.15，我们自己的机器先用这个值）整段重放，其余任务结束后直接放行（`skipped`）；
+  - 重放量约为提交量的 15%：3 台机器约 250–300 步/秒，两个验证线程够用。
+- **每一段仍然做便宜的检查**（收段时，几毫秒）：
+  - 结构检查照旧（`decode_chunk` 的十步、链的衔接、段长、步数、上限，第 3.1、10.4 节）；
+  - **策略一致性检查**（`server_verify.policy_consistency`）：用任务的策略在这一段的 float16 观测上重算，提交的 log-prob（容差 0.05）、价值（2 % × max(1, |v|)）要对得上，动作必须是任务 `sample_seed` 的抽取（累积分布区间外不超过 0.01；贪心任务要是 argmax）。容差是在诚实的原生客户端数据上实测的 float16 误差的 5–25 倍（L1 6563 步、L2 5423 步：log-prob ≤ 0.011，价值 ≤ 0.3 %，区间外 ≤ 4e-4）。
+  - 不通过的段记下原因（`chunks.flag`），**这个任务改成整段重放，账号接下来的 `escalate_tasks`（默认 20）个任务也都整段重放**。标记本身不吊销任何人（float16 副本只是近似），由重放下结论；客户端看不到标记（照常回 `accepted`）。
+- **重放发现不一致时（用户的规则，2026-11-18：坏数据自动拒收，吊销和回退由用户决定）：**
+  - 这个任务的数据一概不进学习器：不一致的那一段拒收（原因存进这一段，玩家在 `me.stats.last_rejection` 里看到），这个任务的其他段（包括重放通过的前几段）全部隔离（`Store.reject_task`）；
+  - 账号**标记为可疑（suspect），不吊销**（`Store.flag_suspect`）。标记期间：这个账号的每个任务都整段重放（相当于这个账号的 `task_sample = 1`，已经发出、还没验证的任务也整段重放）；它的数据只有重放通过以后才送进学习器（`Store.to_ingest`）。所以这个账号没验证过的数据一段也进不了学习器；
+  - 给协调者写一条提醒：`runtime/pool/alerts/<UTC 时间>-suspect-<任务>.json`（一条一个文件，原子写入，可以轮询这个目录），内容是账号的论坛数字 id 和假名（`acct-<sha 前 10 位>`）、任务、段、步、原因码、**不一致的数值和容差**（`submitted` / `replayed` / `tolerance`，`rollout.Mismatch.values`）、这个账号此前**抽查放行、没有重放**的数据已经送进过的学习器更新范围（`learner_updates_unreplayed`：`chunks.ingested` 里 verify 为 `skipped` 的那些），以及它全部数据的更新范围（`learner_updates_all`）。网关日志同时打一行，带提醒文件名；
+  - **吊销和解除标记都只能手动**（`tools/pool/gateway.py admin`）：
+    - `suspects` 列出被标记的账号和原因；
+    - `unflag --forum-id N` 解除标记，回到正常抽查；
+    - `revoke --forum-id N [--list-updates] [--mark-updates]` 吊销。可疑账号默认用存下的重放原因（玩家看到 `token_revoked_replay` 和是哪个任务、哪一段、哪一步），也可以 `--note` 自己写说明。`--list-updates` 打印它的数据影响到的学习器更新范围，`--mark-updates` 再写一条 `alerts/<时间>-revoked-<假名>.json`，供训练端决定是否回退。
+  - **学习器的更新永远不会被自动撤回**：回退到哪个检查点由用户决定。提醒里的 `learner_updates_*.first` 之前的检查点不含这个账号的那部分数据。
+
+**剩下的风险（按任务抽查，p = 0.15）：**
+
+- **便宜检查查不出的伪造：** 观测、奖励、flags、可选数组都是客户端说了算，只有重放能核对。一个伪造者如果让动作、log-prob 和价值都和策略在**他自己编的观测**上一致（自己跑一遍策略），就能过便宜检查。最直接的投毒是改奖励（便宜检查完全不看奖励）。这类伪造只有在任务被抽中重放时才会被发现。
+- **发现之前能进训练多少：** 过了试用期以后，每个伪造的任务被抽中的概率是 0.15，伪造者第一次被抓之前平均能交 (1 − p)/p ≈ 5.7 个伪造任务；任务 `max_steps` 2048 时约 1.2 万步。这些段在放行后、被发现前就可能已经送进学习器；被发现时它们已经无法撤回，只能按提醒里的 `learner_updates_unreplayed` 决定是否回退（由用户决定）。被发现之后，账号被标记，它的每个任务都整段重放，之后的伪造会全部被拒收；要不要吊销由用户决定（吊销按论坛账号，换令牌绕不过去）。
+- **有选择地交任务**（只交好局）照旧查不出（第 10.8 节）。
+- **试用期能被“养号”：** 试用期按步数算，诚实地跑完 200 × 256 步之后再开始伪造，就只剩 15% 的抽查。
+- **我们自己的 3 台机器 dogfood 时**，伪造不是威胁；真正要防的是诚实的不一致（不同机器、不同引擎构建的字节差异）：它在 85% 的任务上不会被发现，会作为“正确的数据”进训练。所以第一次换新机器或新引擎构建时，先把 `task_sample` 设为 1 跑一段时间。
+- 对外开放（P2）之前要重新评估：提高 `task_sample`、对奖励做便宜的范围检查、按账号统计回报分布（volunteer-compute.md 第 4 节第 5 条，还没做）。
+
+### 11.5 测试
+
+| 文件 | 内容 |
+|---|---|
+| `tests/test_pool_learner.py` | 导出带任务格式 3 的 rollout 字段、拒绝 zones / wall_push / rail_gate；学习器链接对真的 RemoteHub：发布实时策略（EnvConfig、课程、开局分布），只送放行的段、记下 `ingested`、不重复送；`chunk_message` 的布局和自举值；V-trace 同策略时等于 GAE 回报、截断；`train_m2.py --fake` 带 / 不带 `--pool-ingest` 各跑一次（不带时 `pool_refused` > 0，带时 `steps_pool` > 0）；没有 `t_ms` 的参考线；`min_client_version` 不低于任务格式 |
+| `tests/test_pool_learner.py`（按任务抽查） | 试用期后不抽中的诚实任务直接放行、段都过便宜检查；伪造动作的段被标记、任务改成整段重放、账号升级到接下来 20 个任务整段重放、重放拒收这个任务并把账号标记为可疑（不吊销），提醒里列出它未经重放的数据送进过的学习器更新范围；便宜检查的容差放得过 float16 误差、抓得住改过的 log-prob / 价值 / 动作；`select_task` 的试用期、升级和 15% 抽样 |
+| `tests/test_pool_verifier.py`（可疑标记） | 每种伪造（奖励、观测、引擎状态、动作、log-prob、价值、flags）：原因和步号正确，这个任务的数据全部拒收 / 隔离、不进学习器，账号标记为可疑但令牌照常可用，提醒文件带不一致的数值和容差；账号在途的任务即使没抽中也整段重放、通过后才送；之后的新任务都整段重放；`admin suspects / unflag / revoke --list-updates --mark-updates` |
+| `tests/test_worker_identity.py` | 学习器自己的 worker 和 main 逐位相同（`--pool-ingest` 关）：在假游戏上用 TAS 开局记录和 r8 的开局分布（课程、在前沿之后复习含 0-0、计数器随机化、`p_early_respawn 0` + `respawn_level_starts`，再加静止开局），这个分支和与 main 的合并基础（临时 git worktree）各跑 40 段，每段的观测、动作、log-prob、价值、奖励、flags、自举值、帧数和每条回合记录都相同；两个版本的开局抽取各抽 20000 次，完全相同 |
+| `tools/native/e2e_pool_learner.py` | 真引擎端到端：一个小的 `train_m2.py`（不开 worker，`--init-from` 检查点，开局分布含全部几类）→ 学习器链接发布策略 → 网关 → 原生客户端（模拟论坛登录）跑任务 → 两个验证器线程重放 → 链接送回 → 学习器用 `--pool-ingest` 训练到 `--total-steps`；要求所有段通过并已送出、学习器计数的池子步数达到一个批次、没有被拒或被丢的池子数据 |
+
+**真引擎实测**（本机，2026-11-18，原生客户端 + x87-soft 验证器两线程 + 小学习器，`--pool-ingest`；前三行是在作者自己的任务格式 2 上测的，换成任务格式 3 之后的结果见表下）：
+
+| 关卡 / 初始权重 | 任务 | 段 | 验证 | 送回 | 学习器 |
+|---|---|---|---|---|---|
+| L1 / r7 | 10 个（LevelFinish、max_steps、一个提前重生结束的任务；含一个带推球目标的静止开局） | 20 | 20/20 通过 | 20 段 4028 步 | 6 次更新、3754 步（都是池子的数据） |
+| L1 / r7，`--p-rest 0.6`（最终代码） | 12 个：5 个只刹停的静止开局、3 个带推球目标的、3 个关卡开头、2 个 TAS | 33 | 33/33 通过 | 33 段 6563 步 | 11 次更新、6475 步 |
+| L2 / r8 第 2025 次更新 | 10 个（纸球；关卡开头和 TAS 开局） | 27 | 27/27 通过 | 27 段 5423 步 | 9 次更新、5370 步 |
+
+L2 是原生客户端第一次在第 2 关上通过验证（纸球、风扇）。端到端测试抓到过一处原生客户端的移植遗漏：只刹停的静止开局（`tas_rest`、交接帧在 TAS 路线上）的分段奖励参考时间（`Worker._split_start` 的 `tas_rest` 分支）没有移植，第一次碰到这种任务时在第 270 步 `replay_reward_mismatch`、账号被吊销（吊销流程本身正常）；补上后上表最后一行全部通过。第一次跑时并行的两个验证线程同时安装同一个开局包，Windows 拒绝替换打开的文件（`replay_failed`，之后重试成功）；已加锁。
+
+**参考线的 `t_ms` 可选。** r8 用的 `benchmarks/refpaths/L02.npz` 没有 `t_ms`（第 1 关的两条线都有）。env 和原生客户端本来就允许缺这一项（`ReferencePath.speed_at` 返回 None，`ref_speed` 特征为 0），只有池子的素材检查要求它，r8 的策略因此发布不了；现在池子（Python 和原生）也允许缺。**这同时说明 r8 的 3 个 `--ref-speed-at` 特征在第 2 关上一直是 0**，已报告给主会话，没有改训练。
+
+## 12. 公网路径 `/pool`（cloudflared）
+
+现有隧道（`~/.cloudflared/ballrain-dash.yml`，由 `runtime/ops/tunnel_watchdog.ps1` 守护）给仪表盘主机名配了两条规则：`/tensorboard` 去 TensorBoard，其余去仪表盘。接入池子要在**仪表盘那一条之前**加一条：
+
+```yaml
+  - hostname: <仪表盘的主机名>
+    path: ^/pool(/.*)?$
+    service: http://127.0.0.1:8099
+```
+
+- 候选文件已写好：`~/.cloudflared/ballrain-dash.pool-candidate.yml`（只多了这一条，其余逐字相同）。`cloudflared tunnel --config <候选文件> ingress validate` 通过；`ingress rule` 核对：`/pool`、`/pool/hello` 去 8099，`/poolx`、`/` 仍去仪表盘，`/tensorboard/...` 仍去 TensorBoard。
+- **没有替换正在用的配置，也没有重启隧道。** 上线步骤（要先告诉主会话，因为会短暂断开公开仪表盘）：网关按第 10.1 节在 8099 上 `serve`；`runtime/pool/config.toml` 里 `public_base_url` 写 https 的站点根地址、`[pool] trust_forwarded = true`（否则网关拒绝启动）；把候选文件改名覆盖 `ballrain-dash.yml`；重启 cloudflared（看门狗会按同一路径重新拉起）。
+- 网关只监听 127.0.0.1；`trust_forwarded = true` 时限速按 `CF-Connecting-IP`。本机其他进程也能伪造这个头，但它只影响限速。
+- 公开页面规则不变：网关的响应和日志里没有路径、主机名、IP、用户名。
+
+## 13. r8 上线清单（自己的 3 台机器 dogfood；按顺序）
+
+前提：这个分支已经合并进 main（它建立在原生客户端会话的任务格式 3 之上），参考线 `benchmarks/refpaths/L02.npz` 换成带 `t_ms` 的新版本（点和小节不变，sha256 `eb3ccf47…`）。新版 L02 会改变 r8 的观测：3 个 `ref_speed` 特征从恒为 0 变成真实值，续跑后会有一段过渡。
+
+**0. 所有机器的代码和 L02 先到位（再重启任何东西）**
+- 远程桥会核对参考线的 sha256（`ballrain.path.RouteError`），学习器换了 L02 以后，旧 L02 的主机会拒绝运行，所以 L02 必须先到每台机器：
+  - **Mac**（学习器 + 10 个 x87-soft worker）：Mac 上连不了 GitHub，用 `git archive` 打包、经 ssh 解到 `~/ballrain/repo`，和以前一样；
+  - **本机（runner1，同时跑网关和验证器）**：main 检出目录 `git pull` 即可；
+  - **runner2（H 255）**：仓库打包解到 `C:\ballrain`（同以前）。
+- `tests/test_worker_identity.py` 证明了合并后的 worker 在 `--pool-ingest` 关着时，同一种子下抽到的开局和打出的每一段与 main 逐位相同，所以先更新代码、后重启是安全的。
+
+**1. 学习器续跑（Mac）**
+- 停：`touch ~/ballrain/repo/runtime/m2-train/r8/STOP`，等日志里出现 “stopped at update N”（会存检查点）。
+- 起：`start_r8.sh` 的参数不变，加 `--resume --pool-ingest`（`--pool-max-lag` 默认 300、`--pool-correction` 默认 vtrace，都不用写）；`--remote-listen 0.0.0.0:29613`、`--max-stale-remote 4` 照旧。密钥照旧从 stdin 读。
+- 核对：train.log 里有 “remote hub listening”；TensorBoard 的 `pool/refused` 为 0；链接连上后有 `remote hub: pool#1 connected (0 workers, backend pool …)`。
+- 远程桥（runner1、runner2）会因为模板变了（L02 的 sha256）自动重启各自的 worker，不用手动操作。
+
+**2. 网关和验证器（本机）**
+- 原生客户端用带任务格式 3 的发布版（原生客户端会话的 Windows 测试版）。
+- `runtime/pool/config.r8-candidate.toml` 改名覆盖 `runtime/pool/config.toml`（旧文件先备份）。
+- 在启动网关的 PowerShell 里设 `BALLRAIN_REMOTE_KEY`（和 `runtime/ops/start_pc2002.ps1` 用的是同一个 hub 密钥），然后 `uv run python tools/pool/gateway.py serve --port 8099`（验证器两个线程在网关进程里，优先级低于正常）。
+- 核对网关日志：
+  - “learner link: connected (session 1, run r8)”；
+  - “learner link: policy … from update N (frontier …)”；
+  - 没有 “[policy] run … differs”。
+
+**3. 隧道切到 `/pool`（本机，先告诉主会话）**
+- 备份 `~/.cloudflared/ballrain-dash.yml`，把 `ballrain-dash.pool-candidate.yml` 复制过去。
+- 重启看门狗 `runtime/ops/tunnel_watchdog.ps1`（停掉旧的看门狗进程再启动它）。看门狗一启动就停掉正在运行的 cloudflared，按新配置重新拉起。
+- **预计中断约 10–30 秒**：停进程约 1 秒，新进程建立隧道连接通常 5–20 秒。公开仪表盘和 TensorBoard 这段时间不可用。
+- 如果只杀 cloudflared 不重启看门狗，要等看门狗连续 2 次检查失败（每次间隔约 60 秒）才拉起，**中断约 2–2.5 分钟**。
+- 核对：`https://<仪表盘主机名>/pool/leaderboard` 回 JSON；仪表盘和 `/tensorboard` 照常。
+
+**4. 登录和客户端**
+- 用一个满足门槛的论坛账号（注册满 30 天、邮箱已验证、至少 5 条回复）在每台机器的原生客户端里登录。配置里 `max_instances = 24`，一个账号就能覆盖 3 台机器。
+- 网关只监听 127.0.0.1，所以 runner2 必须走 https（隧道）；本机也可以直接用 `http://127.0.0.1:8099`。登录总要走隧道，因为论坛的回调地址是公网的。
+- 前 200 × 256 步是试用期，每个任务都整段重放（约 51 200 步，两个验证线程每秒约 400 步，2–3 分钟）。
+
+**5. 原生客户端替换哪些 Python worker**
+- **Mac：不变。** 学习器加 10 个 x87-soft worker。
+- **runner2（H 255，6 个 2002 物理 worker）→ 原生客户端 6 个实例（x87-soft），但前提是原生客户端支持停止开关文件。** 这台机器是共用的，按约定 `C:\ballrain-quiet` 出现后 1 分钟内所有 worker 必须停下（docs/volunteer-compute.md、BMMO 会话的计时窗口），而原生客户端现在没有这个功能。在它加上之前，runner2 继续跑 Python worker。
+- **runner1（本机，12 个 2002 物理 worker）：**
+  - 第一阶段：降到 10 个，空出 2 个核给验证器；另开原生客户端 2–4 个实例。只要 `runtime/pool/alerts/` 里没有新提醒、`pool/dropped` 为 0，就继续下一阶段；
+  - 第二阶段：一天之后把 Python worker 换成原生客户端，保持本机总实例数不变。
+- **注意物理来源的比例会变：** 现在 runner1 / runner2 跑的是原版 2002 物理（零售的权威），原生客户端跑的是 x87-soft，和 Mac 一样。全部替换以后，训练数据里就没有 2002 物理了。L1 上两种物理几乎逐位相同（docs/headless.md §13），L2 没有核对过。另外，main 上为 2002 SimTool 加的 `skip_respawn_from_sector`（第 2 关盘点 4 的纸球重生会崩溃）在 x87-soft 上不需要。
+
+**回退**
+- 停网关，把 `config.toml` 换回备份；隧道换回 `ballrain-dash.yml` 再重启看门狗。
+- 学习器去掉 `--pool-ingest` 续跑即可：池子的数据被丢弃，只计数。
+- 出现可疑账号的提醒时（`runtime/pool/alerts/`），由用户决定是否吊销、是否按 `learner_updates_unreplayed.first` 回退到更早的检查点；系统自己不吊销、不回退。
+

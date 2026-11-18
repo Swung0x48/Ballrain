@@ -312,9 +312,14 @@ def test_hello_checks(gw):
     assert (st, c, p["file"]) == (400, "game_files_mismatch", "Text/")
     gf = {n: GAME[n] for n in P.GAME_FILE_LIST if n != "base.cmo"}
     assert code(gw.hello(tok, game_files=gf))[2]["file"] == "base.cmo"
+    # tasks are only issued for the engine kinds the verifier replays with ([verify] engines, default x87soft)
+    st, c, p = code(gw.hello(tok, engine={"kind": "2002", "sha256": ENGINE_SHA, "version": "1"}))
+    assert (st, c, p) == (400, "engine_mismatch", {"got": "2002", "want": "x87soft"})
+    gw.cfg.verify_engines = ("2002", "x87soft")
     # the 2002 engine also reads the retail Bin/VxMath.dll and BuildingBlocks/physics_RT.dll (not in x87soft's list)
     st, c, p = code(gw.hello(tok, engine={"kind": "2002", "sha256": ENGINE_SHA, "version": "1"}))
     assert (c, p["file"]) == ("game_files_mismatch", "Bin/VxMath.dll")
+    gw.cfg.verify_engines = ("x87soft",)
     gf = dict({n: GAME[n] for n in P.GAME_FILE_LIST}, **{"Bin/VxMath.dll": GAME["Bin/VxMath.dll"]})
     assert code(gw.hello(tok, game_files=gf))[1:] == ("game_files_mismatch", {"file": "Bin/VxMath.dll", "got": "-"})
     assert code(gw.hello(tok, instances=9))[1:] == ("too_many_instances", {"max_instances": 8})
@@ -689,16 +694,22 @@ def test_http_layer_refuses_before_reading_and_bounds_connections(gw):
 
 
 def test_probation_counts_steps_not_chunks(tmp_path):
-    from ballrain.pool.server_verify import select_chunk
+    from ballrain.pool.server_verify import select_task
     st = Store(tmp_path / "s.sqlite3")
     try:
         st.upsert_account({"forum_id": 5, "username": "u", "nickname": "n"})
         for i in range(300):  # 300 one-step "stopped" tasks
             st.q("INSERT INTO chunks(task_id, seq, forum_id, steps, nbytes, file, received, selected, status, verify) "
                  "VALUES(?,0,5,1,100,'f',0,1,'held','pending')", (f"t{i}",))
-        assert select_chunk(st, 5, 200 * 256, 0.0)  # still in probation: 300 steps of 51200
+        assert select_task(st, 5, 200 * 256, 0.0)  # still in probation: 300 steps of 51200
         st.q("UPDATE chunks SET steps=256, verify='passed', status='released'")
-        assert not select_chunk(st, 5, 200 * 256, 0.0)
+        assert not select_task(st, 5, 200 * 256, 0.0)
+        assert select_task(st, 5, 200 * 256, 1.0)
+        # an escalation: the next n tasks are replayed in full, then the draw again
+        st.escalate(5, 2)
+        assert [select_task(st, 5, 200 * 256, 0.0) for _ in range(3)] == [True, True, False]
+        n = sum(select_task(st, 5, 200 * 256, 0.15) for _ in range(4000))
+        assert 0.12 < n / 4000 < 0.18
     finally:
         st.close()
 
@@ -759,19 +770,19 @@ def test_gateway_unlinks_the_file_of_a_chunk_refused_in_the_transaction(tmp_path
         h = {"task_id": t["task_id"], "seq": 0, "step0": 0, "steps": steps, "n_obs": n_obs, "n_act": 9,
              "policy_sha": t["policy_sha"], "chain_prev": P.chain_seed(t["task_id"]).hex(), "final": False, "end": None}
         data = P.encode_chunk(h, arrays)
-        real = server_app.select_chunk
+        real = g.app._consistency
 
-        def revoke_meanwhile(store, fid, probation, rate):
-            store.revoke(fid, payload(Reason.TOKEN_REVOKED_REPLAY, task_id="x", chunk=0, step=1))
-            return real(store, fid, probation, rate)
-        monkeypatch.setattr(server_app, "select_chunk", revoke_meanwhile)
+        def revoke_meanwhile(c, task):  # the verifier revokes the account while this chunk is being accepted
+            g.store.revoke(1001, payload(Reason.TOKEN_REVOKED_REPLAY, task_id="x", chunk=0, step=1))
+            return None
+        monkeypatch.setattr(g.app, "_consistency", revoke_meanwhile)
         r = g.call("POST", "/pool/chunk", data, token=tok, session=sid)
         assert r.status == 403 and g.js(r)["reason"]["code"] == "token_revoked_replay"
         assert not g.store.chunks(t["task_id"])
         assert not list((g.cfg.pool_dir / "chunks").rglob("*.brpc"))
         # per-account cap on held bytes, checked when a chunk arrives
         g.store.unrevoke(1001)
-        monkeypatch.setattr(server_app, "select_chunk", real)
+        monkeypatch.setattr(g.app, "_consistency", real)
         g.cfg.max_pending_bytes_per_account = len(data) - 1
         r = g.call("POST", "/pool/chunk", data, token=tok, session=sid)
         assert r.status == 503 and g.js(r)["reason"]["code"] == "server_busy"
