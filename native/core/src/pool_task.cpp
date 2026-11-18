@@ -117,12 +117,17 @@ TaskOutcome play_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, 
     if (task.engine != le.kind) throw Error("task engine " + task.engine + ", local engine " + le.kind);
     Policy pol;
     TasStarts starts;
-    std::string path_dir;
+    std::string path_dir, branch_dir;
     {
         std::lock_guard<std::mutex> g(cache_mu);
         pol = cache.policy(task.policy_sha);
         starts = cache.starts(task.asset_starts);
         path_dir = cache.path_dir(task.asset_path, task.level);
+        FeatureConfig pins = FeatureConfig::from_json(pol.manifest.at("features"));
+        if (pins.has_branch() != !task.asset_branch.empty())
+            throw Error(pins.has_branch() ? "the policy follows a route branch: the task has no branch pack"
+                                          : "a branch pack for a policy without a route branch");
+        if (pins.has_branch()) branch_dir = cache.branch_dir(task.asset_branch, task.level, pins);
     }
     const Json &m = pol.manifest;
     EnvConfig ec = EnvConfig::from_manifest(m.at("env"));
@@ -135,6 +140,10 @@ TaskOutcome play_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, 
     FeatureConfig fc = FeatureConfig::from_json(m.at("features"));
     if (fc.path_sha256 != task.asset_path) throw Error("the task's reference line is not the policy's");
     fc.path_dir = path_dir;
+    if (fc.has_branch()) {  // the learner's route branch, from the task's pack (never a local directory)
+        check_branch_dir(branch_dir, task.level, fc);
+        fc.branch_dir = branch_dir;
+    }
     bool drive = task.rest && task.rest->drive;  // an at-rest start with a target may hand over in an excluded range
     if (task.start_frame > 0 && !(drive ? starts.expected(task.start_frame).has_value()
                                         : starts.index_of(task.start_frame).has_value()))

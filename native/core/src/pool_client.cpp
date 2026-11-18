@@ -252,6 +252,64 @@ std::string PoolCache::path_dir(const std::string &sha, int level) {
     return d;
 }
 
+std::string PoolCache::branch_dir(const std::string &sha, int level, const FeatureConfig &fc) {
+    return install_branch_pack(asset(sha), root_, level, sha, fc);
+}
+
+static std::string level_name(int level, const char *ext) {
+    char n[24];
+    std::snprintf(n, sizeof n, "L%02d%s", level, ext);
+    return n;
+}
+
+std::string install_branch_pack(const std::string &pack, const std::string &root, int level,
+                                const std::string &expect_sha, const FeatureConfig &fc) {
+    if (!is_hex64(expect_sha) || !fc.has_branch()) throw Error("branch pack: no pins");
+    if (file_sha256(pack) != expect_sha) throw Error("branch pack: sha256 differs from " + expect_sha.substr(0, 12));
+    auto z = load_npz(pack);
+    const char *names[3] = {"line_npz", "desc_json", "drive_npz"};
+    const std::string *pins[3] = {&fc.branch_line_sha256, &fc.branch_desc_sha256, &fc.branch_drive_sha256};
+    if (z.size() != 3) throw Error("branch pack: arrays");
+    Bytes files[3];
+    for (int i = 0; i < 3; ++i) {
+        auto it = z.find(names[i]);
+        if (it == z.end() || it->second.descr != "|u1" || it->second.shape.size() != 1 || it->second.data.empty())
+            throw Error(std::string("branch pack: ") + names[i]);
+        files[i] = it->second.data;
+        if (Sha256::hex(files[i]) != *pins[i]) throw Error(std::string("branch pack: ") + names[i] + " is not the policy's");
+    }
+    // task.check_branch_files (what load_branch / the branch rest start rely on; both check again when they load)
+    Bytes jb = files[1];
+    if (jb.compare(0, 3, "\xEF\xBB\xBF") == 0) jb = jb.substr(3);
+    Json desc = Json::parse(jb, 16);
+    if (!desc.is_object() || desc.get_int("level", -1) != level) throw Error("branch description is not for this level");
+    if (desc.get_string("branch_sha256", "") != fc.branch_line_sha256)
+        throw Error("branch description names another branch line");
+    auto line = load_npz_bytes(files[0]);
+    if (!line.count("points") || !line.count("sector") || !line.count("t_ms") || !line.count("meta") || line.size() != 4)
+        throw Error("branch line: arrays");
+    Json lm = Json::parse(line.at("meta").unicode(), 12);
+    if (!lm.is_object() || lm.get_int("level", -1) != level) throw Error("branch line is not for this level");
+    auto drive = load_npz_bytes(files[2]);
+    if (!drive.count("branch_sha256") || drive.at("branch_sha256").unicode() != fc.branch_line_sha256)
+        throw Error("branch drive does not belong to the branch line");
+    std::string d = root + "/branch/" + expect_sha;
+    platform::make_dirs(d);
+    std::string out[3] = {d + "/" + level_name(level, ".npz"), d + "/" + level_name(level, ".json"), d + "/drive.npz"};
+    for (int i = 0; i < 3; ++i)
+        if (!file_exists(out[i]) || file_sha256(out[i]) != *pins[i]) put_file(out[i], files[i]);
+    return d;
+}
+
+void check_branch_dir(const std::string &dir, int level, const FeatureConfig &fc) {
+    std::string f[3] = {level_name(level, ".npz"), level_name(level, ".json"), "drive.npz"};
+    const std::string *pins[3] = {&fc.branch_line_sha256, &fc.branch_desc_sha256, &fc.branch_drive_sha256};
+    for (int i = 0; i < 3; ++i) {
+        std::string p = dir + "/" + f[i];
+        if (!file_exists(p) || file_sha256(p) != *pins[i]) throw Error("the branch directory's " + f[i] + " is not the policy's");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------- game files
 
 std::string platform_name() {

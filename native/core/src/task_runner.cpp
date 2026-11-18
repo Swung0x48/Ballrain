@@ -31,6 +31,7 @@ Task Task::from_json(const Json &t) {
     k.sample_seed = uint64_t(t.at("sample_seed").as_int());
     k.asset_starts = t.at("assets").at("starts").as_string();
     k.asset_path = t.at("assets").at("path").as_string();
+    if (const Json *b = t.at("assets").find("branch"); b && !b->is_null()) k.asset_branch = b->as_string();
     k.rest = RestStart::from_json(t.find("rest"));
     if (const Json *c = t.find("life_seed")) k.life_seed = uint64_t(c->as_int());
     if (const Json *c = t.find("respawn_frontier"); c && !c->is_null()) k.respawn_frontier = c->as_int();

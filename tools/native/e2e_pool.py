@@ -131,6 +131,9 @@ def main(argv=None) -> int:
     ap.add_argument("--heartbeat-s", type=int, default=5, help="the gateway's heartbeat interval (5: heartbeats during tasks)")
     ap.add_argument("--env-draws", default="", help="JSON over the checkpoint's env_config start draws, e.g. "
                     '{"p_rest": 0.8} (format 3: at-rest / rehearsal starts at test rates)')
+    ap.add_argument("--branch-dir", help="a route branch's files (L<nn>.npz, L<nn>.json, drive.npz): the run follows it "
+                    "and the state carries them as the learner sends them (branch_assets); the gateway pins and ships "
+                    "them (manifest features.branch, the branch pack)")
     ap.add_argument("--rollout", default="", help="JSON over the checkpoint's args (rollout fields), e.g. "
                     '{"p_early_respawn": 0.5}')
     a = ap.parse_args(argv)
@@ -182,8 +185,16 @@ def main(argv=None) -> int:
         state["env_config"] = dict(state["env_config"], **json.loads(a.env_draws))
     if a.rollout:
         state["args"] = dict(state["args"], **json.loads(a.rollout))
+    if a.branch_dir:
+        bd, lv = Path(a.branch_dir), int(state["env_config"]["level"])
+        state["branch_assets"] = {"level": lv, "line_npz": (bd / f"L{lv:02d}.npz").read_bytes(),
+                                  "desc_json": (bd / f"L{lv:02d}.json").read_bytes(),
+                                  "drive_npz": (bd / "drive.npz").read_bytes()}
+        state["env_config"] = dict(state["env_config"],
+                                   features=dict(state["env_config"]["features"], branch_dir="branch"))
     pub = policies.publish_state(state, source=Path(a.ckpt).name)
-    log(f"policy {pub.policy_sha[:12]} (record {pub.record}, {len(pub.valid)} start frames)")
+    log(f"policy {pub.policy_sha[:12]} (record {pub.record}, {len(pub.valid)} start frames"
+        f"{', branch pack ' + pub.branch_sha[:12] if pub.branch_sha else ''})")
     issued = []
     new_task = policies.new_task
 
@@ -379,9 +390,9 @@ def main(argv=None) -> int:
     arr["rewards"][10] += np.float32(0.25)
     decoded[0] = P.decode_chunk(P.encode_chunk(h, arr))
     m, pol = verifier._policy(task.policy_sha)
-    sdir, pdir = verifier._assets(task)
+    sdir, pdir, bdir = verifier._assets(task, m)
     env = T.build_env(task, m, T.LocalGame(engine="x87soft", binary=engine.binary, root=engine.root), sdir, pdir,
-                      d / "replay-forged")
+                      d / "replay-forged", branch_dir=bdir)
     runner = R.TaskRunner(env, task, m)
     try:
         mm = R.replay_task(runner, pol, decoded[:1])

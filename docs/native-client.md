@@ -313,8 +313,14 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - **对照**（主线 `benchmarks/refpaths-v2/L02.npz`，分线 `benchmarks/refpaths-alt/L02-stone`，r8 v2 清单）：`golden.py branch`（SR02 录像到 `drive.npz` 的前缀帧，再接上它的按键流，球经变球器变石球、走南环）：22402 帧、11202 行特征 C++ 与 Python
   **逐位相同**；同一条流不带分线回放时最大差 10，3204 行读到了石线的 `t_ms`，说明确实走在石线上。`task_diff.py --branch-dir`（r8 检查点，分线目录暂时在清单之外给两边）6 个场景全部通过：石球静止开局 + 策略、石球静止开局 + 随机粘滞动作、变球器上游的 TAS 开局 + 策略、小节 3–4 的 TAS 开局 + 随机粘滞动作，以及两个回退场景：目标超出按键流范围、一开始就失败的 `branch_rest_fallback`，`rest_speed` 设成 0、回放和刹车跑完才失败的 `branch_rest_late_fallback`。
   `tools/native/branch_diff.py`（`nc_branch_diff`）把跟随器单独拿出来对照：`tests/test_stone_branch.py` 的几个场景加 40 组随机游走（横向噪声、换球、换小节、倒退、跳跃、重置），每一步的输出逐位相同。
-- **还没做**（等和池 → 学习器会话商定）：清单里怎样带分线（三份文件的 sha256）、分线资源包的分发和安装、任务 `rest.branch_s`（协议里先加成了可选字段）、
-  网关按 `rest_starts` 的 `branch:` 条目抽开局。
+- **分发**（分线是学习器下发的配置，不写死在任何程序里，也没有哪个组件去读自己本地的分线文件）：学习器把三份文件的原始字节放在状态里
+  （`state["branch_assets"] = {level, line_npz, desc_json, drive_npz}`）；`weights.export_state` 检查后把它们的 sha256 钉进清单
+  `features.branch = {line_sha256, desc_sha256, drive_sha256}`（训练配置里有 `branch_dir` 却没带文件就拒绝导出）；网关 `publish_state`
+  打成分线包（`task.export_branch_pack`，三个 uint8 数组，内容相同 sha 就相同），任务带 `assets.branch`；客户端和校验端
+  `install_branch_pack` 装到缓存 `branch/<sha>/`，`build_env` / `play_task` 再核对一次三份文件。网关按 `rest_starts` 的
+  `lo-hi@branch:s` 条目抽石球静止开局（和环境同样的随机数调用顺序），发 `rest = {"target": null, "branch_s": s}`。
+- **旧客户端**：0.3.0 碰到清单里的 `features.branch` 会报“unknown feature config field”而放弃这个任务，不会不带分线悄悄跑出校验不过的数据；
+  网关那边怎么避免把这类任务发给旧客户端（版本下限还是能力声明）还在和池会话商定。
 
 ## 11. 还没有做 / 限制
 

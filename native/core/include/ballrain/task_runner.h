@@ -25,6 +25,7 @@ struct Task {  // protocol.TASK
     bool greedy = false;
     uint64_t sample_seed = 0;
     std::string asset_starts, asset_path;
+    std::string asset_branch;  // the route-branch pack ("" when the policy follows no branch)
     std::optional<RestStart> rest;  // format 3: an at-rest start after the hand-over (server-drawn)
     uint64_t life_seed = 0;          // format 3: the per-life draws (ballrain/pool/counters.py)
     std::optional<int64_t> respawn_frontier;  // format 3: the curriculum frontier of the early-respawn rule

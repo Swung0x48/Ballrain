@@ -56,6 +56,18 @@ FeatureConfig FeatureConfig::from_json(const Json &j) {
         else if (k == "path_dir") c.path_dir = v.is_null() ? "" : v.as_string();
         else if (k == "path_sha256") c.path_sha256 = v.is_null() ? "" : v.as_string();
         else if (k == "branch_dir") c.branch_dir = v.is_null() ? "" : v.as_string();
+        else if (k == "branch") {  // {line_sha256, desc_sha256, drive_sha256}
+            if (v.is_null()) continue;
+            for (auto &b : v.members()) {
+                if (b.first == "line_sha256") c.branch_line_sha256 = b.second.as_string();
+                else if (b.first == "desc_sha256") c.branch_desc_sha256 = b.second.as_string();
+                else if (b.first == "drive_sha256") c.branch_drive_sha256 = b.second.as_string();
+                else throw Error("unknown feature config field branch." + b.first);
+            }
+            if (c.branch_line_sha256.size() != 64 || c.branch_desc_sha256.size() != 64 ||
+                c.branch_drive_sha256.size() != 64)
+                throw Error("features.branch: three sha256 pins");
+        }
         else if (k == "path_lateral_scale") c.path_lateral_scale = v.as_double();
         else if (k == "path_back") c.path_back = v.as_double();
         else if (k == "path_ahead") c.path_ahead = v.as_double();

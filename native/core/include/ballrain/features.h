@@ -31,6 +31,10 @@ struct FeatureConfig {
     std::string path_source = "tas";
     std::string path_dir;  // directory of the L<nn>.npz asset ("" = none configured)
     std::string path_sha256;
+    // the route branch's files as the manifest pins them (features.branch: the learner's line, description, drive);
+    // the client installs the task's branch pack (assets.branch) and checks it against these
+    std::string branch_line_sha256, branch_desc_sha256, branch_drive_sha256;
+    bool has_branch() const { return !branch_line_sha256.empty(); }
     std::string branch_dir;  // the optional ball-type diversion (L<nn>.npz + L<nn>.json; "" = off: layout and values unchanged)
     double path_lateral_scale = 10, path_back = 10, path_ahead = 30, path_margin = 20, path_reacquire = 5;
     int waypoints = 3;
