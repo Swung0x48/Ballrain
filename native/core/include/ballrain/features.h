@@ -65,6 +65,9 @@ struct FeatureInfo {
     // the branch follower's view of this step (branch.BranchFollower: pr local_s / branch / ref_elapsed_ms / ...)
     bool has_branch = false, branch = false;
     double local_s = 0, ref_elapsed_ms = 0, ref_remaining_ms = 0;
+    bool branch_multi = false;  // wire v2: branch_id ("" on main) and phase (-1 on main) are set
+    std::string branch_id;
+    int branch_phase = -1;
     bool supported = false;
     std::optional<double> gap;
     std::string surface = "none";
@@ -93,7 +96,8 @@ public:
         if (follower_) follower_->reset();
         if (branch_) branch_->reset();
     }
-    const BranchFollower *branch() const { return branch_.get(); }
+    const RouteFollower *branch() const { return branch_.get(); }
+    RouteFollower *branch_mut() { return branch_.get(); }
     // the level's reference line for this tracker (loads it and the branch; features.reference_path)
     const ReferencePath *reference_path(const GameTracker &t);
 
@@ -120,7 +124,7 @@ private:
     bool asset_loaded_ = false;
     std::shared_ptr<const ReferencePath> path_;
     std::unique_ptr<PathFollower> follower_;
-    std::unique_ptr<BranchFollower> branch_;
+    std::unique_ptr<RouteFollower> branch_;
     std::unique_ptr<ReachBlock> reach_;
     bool have_key_ = false;
     uint64_t key_tracker_ = 0;

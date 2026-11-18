@@ -359,7 +359,27 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
   - 端到端（`e2e_pool.py`，r8 f7 + 石线检查点，网关按开局记录建场、zstd 下发）：4 个任务（含一次通关、一次石球静止开局），客户端下载安装两份场，
     校验端 28 个块全部通过，伪造的块被抓到。
 
+## 10c. 多分线路线（wire v2，0.5.0；`docs/l2-branches.md`，`ballrain/multi_branch.py` 的移植）
 
+- **`core/branch`**：`RouteFollower` 是共同的接口，`BranchFollower` 是一条 v1 分线，`MultiFollower` 是 `branches.json` 里按顺序排列的多条路线
+  （回木球、东平台、南环）。清单按 `multi_branch.manifest` 的封闭格式校验：id `[a-z][a-z0-9-]{0,31}`、不是设备名；legacy 成员；
+  阶段要在分线顶点上划分 `branch_s`；前驱列表；闸门。入口、阶段、合流按清单和阶段顺序判定，每次更新最多换一次线，合流以后这条命不再进入同一条路线；
+  非 legacy 成员只在当前阶段的弧长范围内投影（加连续窗口）。所有线共用一个按命计的进度台账和参考时钟。规则跟着当前成员走（在主线上用默认规则）。
+- **静止开局**：任务 `rest.branch_id` 指定成员（没有时是唯一的 legacy 成员）。回放这个成员的 `drive.npz`；这一站属于哪个阶段（阶段边界归新的阶段）
+  决定需要的球种和小节；交接时再核对阶段；验证过的路线游标交给这一局的特征提取器。失败时按这个成员的 `rest_fallback` 处理。
+- **分发**（`docs/pool-prototype.md` §15，和池会话商定）：清单里还是学习器的钉 `features.branch_sha256`（v2 摘要）；任务的 `assets.branch` 是 v2 分线包
+  （`manifest_json` 加 `m{i:02d}_line_npz / _desc_json / _drive_npz`，1–16 个成员）。客户端核对每个成员、清单和钉，装到 `<根目录>/cache/branch/<包 sha>/`
+  （`branches.json` 和每个成员一个目录，id 只从清单读）。能力 `multi_branch_v2`，0.5.0 起。v1 的包、钉、任务都不变。
+- **对照**：
+  - 跟随器（`branch_diff.py`，L02-multi）：`test_multi_branch.py` 的序列加 60 组随机游走，三个成员的每个阶段都走到，65/65 逐位相同；v1（L02-stone）照旧全部相同。
+  - 引擎 golden（L02-multi）：SR02 TAS 12,198 行、回木球按键流 5,523 行、东平台 8,088 行、南环 11,202 行全部特征最大差 0；同样的流只用 v1 石线回放时
+    回木球 453 行、东平台 751 行不同（确实走在新路线上）。
+  - 任务对照（`task_diff.py --branch-dir L02-multi`，经 v2 分线包）：8 个成员静止开局（`rest-starts.txt`）、legacy 静止开局、越界回退、各入口上游的 TAS 开局和粘滞动作，
+    f6 检查点 16/16、f7 检查点 16/16 通过；成员静止开局都真的成功了（一个进程），越界的那个回退（两个进程）。
+  - 端到端（`e2e_pool.py --branch-dir L02-multi`，f7）：网关发出东平台和南环的静止开局，客户端装好 v2 分线包，校验端 14 个块全部通过，伪造的块被抓到。
+  - v1 回归：石线 f6 8/8、f7 通过，L2 10/10，步数和以前一样。
+
+## 11. 还没有做 / 限制
 
 - **https 没有对真网关实测过**：Windows 的 WinHTTP https 分支、POSIX 的 libcurl 分支都只编译过（端到端都是本机 http）。Android 仍然只有 http。
 - **跨引擎构建的字节一致**只在两个 Windows x86 构建之间验证过；Mac arm64 / Linux 引擎构建之间要先核对（§4.1）。另外容差只能吸收舍入，特征里的离散判定在另一种 CPU 上翻转会被当成不一致（`pool-prototype.md` §8）。
@@ -368,8 +388,4 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - 令牌文件：POSIX 上写成 0600；Windows 上靠用户目录的权限（同 Python 主控程序）。
 - 网关响应只做了轻量的结构检查（类型和必需字段），没有照搬 `protocol.MESSAGES` 的完整 schema。
 - 只支持 SR 策略（与网关导出的限制相同）；`route_probes` 只是记账，没有移植。
-- **f7 特征（`reach` 块，`ballrain/fastreach.py`）没有移植**：`FeatureConfig::from_json` 拒绝 `"reach": true` 和 `"version": "f7"`（报错指向这里），
-  `pool.weights.export_state` 也拒绝导出 f7 策略，f6 的清单里不写 `reach` 字段（清单和 policy_sha 与以前相同）。要让 f7 策略进资源池，需要把
-  fastreach 的场（读 `runtime/fastreach/L<nn>-<键>.npz` 或在客户端构建，`canonical_geometry` 的键）和 `perceive` 内核移植过来，并与 Python 逐位或在容差内一致。
-  完整定义（场文件格式和键、perceive 语义含风扇、缩放、版本钉、容差）：`docs/f7-native-port.md`。
 - 2002 零售版 Player.exe 版本：以后。

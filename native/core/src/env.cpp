@@ -79,6 +79,10 @@ std::optional<RestStart> RestStart::from_json(const Json *r) {
         if (s.drive) throw Error("task rest: a target or branch_s, not both");
         s.branch_s = b->as_double();
     }
+    if (const Json *id = r->find("branch_id"); id && !id->is_null()) {
+        if (!s.branch_s) throw Error("task rest: branch_id needs branch_s");
+        s.branch_id = id->as_string();
+    }
     if (const Json *m = r->find("max_frames"); m && !m->is_null()) {
         s.max_frames = m->as_int();
         if (*s.max_frames < 1) throw Error("task rest.max_frames");
@@ -142,7 +146,9 @@ BallanceEnv::BallanceEnv(EnvConfig cfg, FeatureConfig features, EngineConfig eng
     repress_ = cfg_.repress_stale_keys ? *cfg_.repress_stale_keys : cfg_.world_actions;
     ms_since_turn_ = std::numeric_limits<double>::infinity();
     // env.branch_rules: the installed bundle's rules (the task is refused when they do not parse)
-    if (!fx_.config().branch_dir.empty()) branch_rules_ = load_branch_rules(fx_.config().branch_dir, cfg_.level);
+    // (wire v2: the defaults until a member is active; env._info then follows the active member's rules)
+    if (!fx_.config().branch_dir.empty() && !file_exists(fx_.config().branch_dir + "/branches.json"))
+        branch_rules_ = load_branch_rules(fx_.config().branch_dir, cfg_.level);
 }
 
 BallanceEnv::~BallanceEnv() { close(); }
@@ -245,15 +251,14 @@ void BallanceEnv::start_process() {
     if (rest_ && k > 0 && rest_->branch_s) {  // env._prepare: the stone branch's measured drive, then a closed loop
         std::string err;
         try {
-            branch_rest(*rest_->branch_s);
+            branch_rest(*rest_->branch_s, rest_->branch_id);
         } catch (const BranchRestFailed &e) {  // the drive's own checks; engine and session faults propagate
             err = e.what();
-            if (branch_rules_.rest_fallback == "error") {  // the rules ask for no relaunch
-                if (sess_) sess_->close(true), sess_.reset();
-                after_death_ = false;
-                ++branch_rest_failures_;
-                throw;
-            }
+            if (sess_) sess_->close(true), sess_.reset();
+            after_death_ = false;
+            ++branch_rest_failures_;
+            // env._rules_for_rest: an unknown / ambiguous member refuses here (RouteError: the task fails)
+            if (rest_rules(rest_->branch_id).rest_fallback == "error") throw;  // the rules ask for no relaunch
         } catch (...) {
             if (sess_) sess_->close(true), sess_.reset();
             after_death_ = false;
@@ -262,13 +267,11 @@ void BallanceEnv::start_process() {
         if (err.empty()) {
             start_.kind = "tas_rest";
             start_.branch_s = rest_->branch_s;
+            start_.branch_id = rest_branch_id_, start_.branch_phase = rest_branch_phase_;
             init_held(0);
             return;
         }
         // the failed simulation is not a valid hand-over: launch once without the drive, at the same TAS frame
-        if (sess_) sess_->close(true), sess_.reset();
-        after_death_ = false;
-        ++branch_rest_failures_;
         mismatches = launch_checked(k);
         start_.handover_mismatches = mismatches;
         start_.branch_rest_failures = branch_rest_failures_;
@@ -316,19 +319,52 @@ static bool episode_event(const GameTracker &t, size_t ev0) {
 // env._branch_rest: replay the measured drive through the trafo, then close the loop on an arc target of the branch
 // line. Never a synthesized transform or a teleport; a paper ball or an unsupported hand-over is refused. A private
 // extractor (its projection state is not the episode's)
-void BallanceEnv::branch_rest(double station) {
+const BranchRules &BallanceEnv::rest_rules(const std::string &branch_id) {
+    // env._rules_for_rest: wire v2: the addressed member's rules (from the installed manifest and its child
+    // description; an unknown / ambiguous member is a RouteError); v1: the bundle's
+    const std::string &dir = fx_.config().branch_dir;
+    Bytes raw;
+    if (dir.empty() || !read_file(dir + "/branches.json", raw)) return branch_rules_;
+    std::vector<BranchEntry> entries = parse_branch_manifest(raw);
+    int found = -1, n = 0;
+    for (size_t i = 0; i < entries.size(); ++i)
+        if (branch_id.empty() ? entries[i].legacy : entries[i].id == branch_id) found = int(i), ++n;
+    if (n != 1) throw RouteError("unknown or ambiguous rest branch '" + branch_id + "'; specify branch:<id>:<s>");
+    rest_rules_cache_ = load_branch_rules(dir + "/" + entries[size_t(found)].id, cfg_.level);
+    return rest_rules_cache_;
+}
+
+void BallanceEnv::branch_rest(double station, const std::string &branch_id) {
     const FeatureConfig &fc = fx_.config();
+    rest_branch_id_.clear(), rest_branch_phase_ = -1;
     if (fc.branch_dir.empty()) throw BranchRestFailed("branch rest start needs branch_dir");
     Session &s = *sess_;
     FeatureExtractor fx(fc);
     fx.reference_path(s.tracker());
-    const BranchFollower *br = fx.branch();
-    if (!br) throw BranchRestFailed("no matching branch at handover");
-    auto z = load_npz(fc.branch_dir + "/drive.npz");
+    const RouteFollower *rf = fx.branch();
+    if (!rf) throw BranchRestFailed("no matching branch at handover");
+    // wire v2: the addressed member (rest_member: an id, or the unique legacy member) and its child directory
+    MultiFollower *multi = dynamic_cast<MultiFollower *>(fx.branch_mut());
+    const BranchFollower *br = dynamic_cast<const BranchFollower *>(rf);
+    const BranchEntry *entry = nullptr;
+    std::string root = fc.branch_dir, key;
+    if (multi) {
+        int i;
+        try {
+            i = multi->rest_member(branch_id);
+        } catch (const RouteError &e) {
+            throw BranchRestFailed(e.what());
+        }
+        entry = &multi->entries[size_t(i)];
+        br = multi->members[size_t(i)].get();
+        key = entry->id;
+        root += "/" + key;
+    }
+    auto z = load_npz(root + "/drive.npz");
     char ln[16];
     std::snprintf(ln, sizeof ln, "/L%02d.npz", cfg_.level);
     if (z.at("record_sha256").unicode() != starts_->record_sha256 ||
-        z.at("branch_sha256").unicode() != file_sha256(fc.branch_dir + ln))
+        z.at("branch_sha256").unicode() != file_sha256(root + ln))
         throw BranchRestFailed("drive replay does not match TAS recording or branch asset");
     const NpyArray &sa = z.at("samples");
     std::vector<double> samples = sa.f64();
@@ -338,7 +374,7 @@ void BallanceEnv::branch_rest(double station) {
     double lo = samples[1], hi = samples[1];
     for (size_t i = 0; i < ns; ++i) lo = std::min(lo, samples[2 * i + 1]), hi = std::max(hi, samples[2 * i + 1]);
     if (start_frame_ != prefix || !(lo <= station && station <= hi))
-        throw BranchRestFailed("prefix frame or target outside the recorded stone drive");
+        throw BranchRestFailed("prefix frame or target outside the recorded branch drive");
     size_t best = 0;  // np.argmin(abs(samples[:, 1] - station)): the first minimum
     for (size_t i = 1; i < ns; ++i)
         if (std::abs(samples[2 * i + 1] - station) < std::abs(samples[2 * best + 1] - station)) best = i;
@@ -346,6 +382,21 @@ void BallanceEnv::branch_rest(double station) {
     const NpyArray &fr = z.at("frames");
     size_t nf = fr.data.size() / 8;
     if (offset < 0 || size_t(offset) > nf) throw BranchRestFailed("drive.npz: offset outside the frames");
+    // the material and sector the replay must produce: a phased member's phase at the station (the newer phase owns a
+    // boundary), its when.ball and when.sector (else the line's sector at the station)
+    int phase = 0, required = br->ball_type, required_sector = br->sector;
+    if (multi && !entry->legacy) {
+        int found = -1;
+        for (size_t i = 0; i < entry->phases.size(); ++i)
+            if (entry->phases[i].lo <= station && station <= entry->phases[i].hi) found = int(i);
+        if (found < 0) throw BranchRestFailed("the rest station is in no phase of the branch");
+        phase = found;
+        const BranchGate &cond = entry->phases[size_t(phase)].when;
+        required = *cond.ball;
+        int64_t i0, i1;
+        br->alt->segments(station, station, i0, i1);
+        required_sector = cond.sector ? *cond.sector : int(br->alt->seg_sector[size_t(i0)]);
+    }
     std::vector<Frame> frames(static_cast<size_t>(offset));
     for (size_t i = 0; i < frames.size(); ++i)
         std::memcpy(&frames[i].delta, fr.data.data() + 8 * i, 4), std::memcpy(&frames[i].keys, fr.data.data() + 8 * i + 4, 4);
@@ -355,7 +406,7 @@ void BallanceEnv::branch_rest(double station) {
         if (s.ended() || s.tracker().flags.ball_off) throw BranchRestFailed("ball lost during branch drive replay");
     }
     V3 target = br->alt->point_at(station);
-    if (s.tracker().ball_type() != br->ball_type || s.tracker().sector() != br->sector)
+    if (s.tracker().ball_type() != required || s.tracker().sector() != required_sector)
         throw BranchRestFailed("branch drive did not produce the required ball type and sector");
     const BranchRules &rules = br->rules;
     RestStart r;
@@ -366,6 +417,7 @@ void BallanceEnv::branch_rest(double station) {
     } catch (const BallLostBraking &e) {  // env._prepare catches it like the drive's own checks: the TAS fallback
         throw BranchRestFailed(e.what());
     }
+    if (multi) multi->restore(key, phase, station);  // the verified cursor for the hand-over check
     FeatureInfo fi;
     fx.compute(s.tracker(), &fi);
     const Observation *o = s.obs();
@@ -379,6 +431,12 @@ void BallanceEnv::branch_rest(double station) {
     if ((rules.rest_require_support && !fi.supported) || !(fi.has_branch && fi.branch) ||
         d > rules.rest_position_tolerance || vxz > stop)
         throw BranchRestFailed("branch rest target not reached at rest on the correct surface");
+    if (multi) {
+        if (s.tracker().ball_type() != required || s.tracker().sector() != required_sector || fi.branch_id != key ||
+            fi.branch_phase != phase)
+            throw BranchRestFailed("branch phase mismatch");
+        rest_branch_id_ = key, rest_branch_phase_ = phase;
+    }
 }
 
 // env._drive: push the ball with world arrows towards (x, z), aiming at a velocity proportional to the remaining
@@ -503,7 +561,13 @@ std::vector<float> BallanceEnv::features(StepInfo *info) {
         if (fi.has_branch) {
             info->has_branch = true, info->branch = fi.branch, info->local_s = fi.local_s, info->has_local_s = true;
             info->ref_elapsed_ms = fi.ref_elapsed_ms, info->ref_remaining_ms = fi.ref_remaining_ms;
-        } else if (const BranchFollower *b = fx_.branch(); b && b->timing.set) {
+            if (fi.branch_multi) {  // env._info: the active member's rules (the defaults on the main line)
+                info->branch_multi = true, info->branch_id = fi.branch_id, info->branch_phase = fi.branch_phase;
+                const auto *m = dynamic_cast<const MultiFollower *>(fx_.branch());
+                int i = m && !fi.branch_id.empty() ? m->index_of(fi.branch_id) : -1;
+                branch_rules_ = i >= 0 ? m->members[size_t(i)]->rules : BranchRules();
+            }
+        } else if (const RouteFollower *b = fx_.branch(); b && b->timing.set) {
             info->has_branch = true, info->branch = b->timing.branch;
             info->ref_elapsed_ms = b->timing.ref_elapsed_ms, info->ref_remaining_ms = b->timing.ref_remaining_ms;
         }
@@ -542,6 +606,12 @@ std::optional<std::vector<float>> BallanceEnv::reset(bool relaunch, StepInfo *in
     }
     ep_steps_ = ep_frames_ = ep_pause_frames_ = 0;
     fx_.reset_episode();
+    if (!start_.branch_id.empty()) {  // env.reset: the verified rest start's route cursor
+        fx_.reference_path(sess_->tracker());
+        auto *m = dynamic_cast<MultiFollower *>(fx_.branch_mut());
+        if (!m) throw Error("a multi-branch rest start without the multi-branch routes");
+        m->restore(start_.branch_id, start_.branch_phase, *start_.branch_s);
+    }
     if (rec_) rec_->put(K_RESET, Bytes());
     StepInfo tmp;
     StepInfo *pi = info ? info : &tmp;

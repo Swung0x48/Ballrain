@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "ballrain/branch.h"
+#include "ballrain/pool_client.h"
 #include "ballrain/path.h"
 #include "ballrain/sha256.h"
 
@@ -32,11 +33,24 @@ struct Out {
     double s, local_s, elapsed, remaining, dist, point[3], tangent[3];
     int32_t branch, active;
     int64_t seg;
+    int32_t member, phase;  // wire v2: the active member's manifest index and phase (-1 on the main line / v1)
 };
 #pragma pack(pop)
 
 int main(int argc, char **argv) {
     try {
+        for (int i = 1; i + 1 < argc; ++i)  // --install-pack P --pin SHA --cache D: install_branch_pack + check_branch_dir
+            if (std::strcmp(argv[i], "--install-pack") == 0) {
+                FeatureConfig fc;
+                fc.branch_sha256 = arg(argc, argv, "--pin");
+                fc.path_sha256 = file_sha256(arg(argc, argv, "--main"));
+                std::string pack = argv[i + 1];
+                std::string d = install_branch_pack(pack, arg(argc, argv, "--cache"), std::stoi(arg(argc, argv, "--level")),
+                                                    file_sha256(pack), fc);
+                check_branch_dir(d, std::stoi(arg(argc, argv, "--level")), fc);
+                std::printf("installed %s\n", d.c_str());
+                return 0;
+            }
         std::string mp = arg(argc, argv, "--main");
         auto main_path = ReferencePath::load(mp);
         auto f = load_branch(main_path, std::stoi(arg(argc, argv, "--level")), arg(argc, argv, "--branch-dir"),
@@ -53,7 +67,11 @@ int main(int argc, char **argv) {
             o.s = st.pr.s, o.local_s = st.local_s, o.elapsed = st.ref_elapsed_ms, o.remaining = st.ref_remaining_ms;
             o.dist = st.pr.dist;
             for (int k = 0; k < 3; ++k) o.point[k] = st.pr.point[k], o.tangent[k] = st.pr.tangent[k];
-            o.branch = st.branch, o.active = st.path == f->alt.get(), o.seg = st.pr.seg;
+            auto *multi = dynamic_cast<MultiFollower *>(f.get());
+            auto *one = dynamic_cast<BranchFollower *>(f.get());
+            o.branch = st.branch, o.active = one ? st.path == one->alt.get() : st.branch, o.seg = st.pr.seg;
+            o.member = multi && !st.branch_id.empty() ? multi->index_of(st.branch_id) : -1;
+            o.phase = st.phase;
             std::fwrite(&o, sizeof o, 1, fo);
             ++n;
         }

@@ -21,7 +21,7 @@ const char *const CLIENT_VERSION = BALLRAIN_CLIENT_VERSION;
 std::vector<std::string> client_capabilities() {
     std::string reach = "reach_" + reach_version();
     std::replace(reach.begin(), reach.end(), '.', '_');
-    return {"task_format3", "branch_v1", "branch_rules_v1", reach};
+    return {"task_format3", "branch_v1", "branch_rules_v1", "multi_branch_v2", reach};
 }
 static const size_t MAX_RESPONSE = 64 * 1024, MAX_MANIFEST = 256 * 1024, MAX_DOWNLOAD = 64 * 1024 * 1024;
 
@@ -292,11 +292,9 @@ std::string PoolCache::branch_dir(const std::string &sha, int level, const Featu
     return install_branch_pack(asset(sha), root_, level, sha, fc);
 }
 
-static void check_branch_files(const Bytes files[3], int level, const FeatureConfig &fc) {
-    // ballrain.branch_assets.validate + task.branch_bundle: the bundle digest is the policy's pin, the description is
-    // for this level, the main line and this branch line, its rules parse; the line and the drive belong together
-    if (branch_bundle_sha256(files[0], files[1], files[2]) != fc.branch_sha256)
-        throw Error("branch pack: not the policy's branch (features.branch_sha256)");
+// ballrain.branch_assets.validate for one line: the description is for this level, the main line and this branch line,
+// its rules parse; the line and the drive belong together. Returns the line's digest (child[i] of a v2 bundle)
+static std::string check_branch_line(const Bytes files[3], int level, const FeatureConfig &fc) {
     Bytes jb = files[1];
     if (jb.compare(0, 3, "\xEF\xBB\xBF") == 0) jb = jb.substr(3);
     Json desc = Json::parse(jb, 16);
@@ -313,6 +311,30 @@ static void check_branch_files(const Bytes files[3], int level, const FeatureCon
     auto drive = load_npz_bytes(files[2]);
     if (!drive.count("branch_sha256") || drive.at("branch_sha256").unicode() != line_sha)
         throw Error("branch drive does not belong to the branch line");
+    return branch_bundle_sha256(files[0], files[1], files[2]);
+}
+
+static void check_branch_files(const Bytes files[3], int level, const FeatureConfig &fc) {
+    if (check_branch_line(files, level, fc) != fc.branch_sha256)
+        throw Error("branch pack: not the policy's branch (features.branch_sha256)");
+}
+
+// wire v2 (docs/l2-branches.md): the manifest's closed schema, every child line, and the pin
+// H(H(manifest) || child[0] || ... || child[last]) over raw 32-byte digests
+static std::vector<BranchEntry> check_branch_v2(const Bytes &manifest, const std::vector<std::array<Bytes, 3>> &members,
+                                                int level, const FeatureConfig &fc) {
+    std::vector<BranchEntry> entries = parse_branch_manifest(manifest);
+    if (entries.size() != members.size()) throw Error("branch pack: manifest / member mismatch");
+    Sha256 h;
+    h.update(Sha256::hash(manifest.data(), manifest.size()));
+    for (const auto &m : members) {
+        std::string child = check_branch_line(m.data(), level, fc);
+        std::string raw;
+        for (size_t i = 0; i < 64; i += 2) raw.push_back(char(std::stoi(child.substr(i, 2), nullptr, 16)));
+        h.update(raw);
+    }
+    if (h.hexdigest() != fc.branch_sha256) throw Error("branch pack: not the policy's branches (features.branch_sha256)");
+    return entries;
 }
 
 static const char *BRANCH_ARRAYS[3] = {"line_npz", "desc_json", "drive_npz"};
@@ -331,6 +353,38 @@ std::string install_branch_pack(const std::string &pack, const std::string &root
     if (!is_hex64(expect_sha) || !fc.has_branch()) throw Error("branch pack: no pin");
     if (file_sha256(pack) != expect_sha) throw Error("branch pack: sha256 differs from " + expect_sha.substr(0, 12));
     auto z = load_npz(pack);
+    auto u8 = [&](const std::string &name) -> const Bytes & {
+        auto it = z.find(name);
+        if (it == z.end() || it->second.descr != "|u1" || it->second.shape.size() != 1 || it->second.data.empty())
+            throw Error("branch pack: " + name);
+        return it->second.data;
+    };
+    if (z.count("manifest_json")) {  // wire v2: the manifest and its members in manifest order (m00_line_npz, ...)
+        const Bytes &manifest = u8("manifest_json");
+        std::vector<std::array<Bytes, 3>> members;
+        for (size_t i = 0;; ++i) {
+            char pre[8];
+            std::snprintf(pre, sizeof pre, "m%02zu_", i);
+            if (!z.count(std::string(pre) + "line_npz")) break;
+            std::array<Bytes, 3> m;
+            for (int k = 0; k < 3; ++k) m[size_t(k)] = u8(std::string(pre) + BRANCH_ARRAYS[k]);
+            members.push_back(std::move(m));
+        }
+        if (z.size() != 1 + 3 * members.size()) throw Error("branch pack: arrays");
+        std::vector<BranchEntry> entries = check_branch_v2(manifest, members, level, fc);
+        std::string d = root + "/branch/" + expect_sha, names[3];
+        branch_names(level, names);
+        platform::make_dirs(d);
+        Bytes cur;
+        if (!read_file(d + "/branches.json", cur) || cur != manifest) put_file(d + "/branches.json", manifest);
+        for (size_t i = 0; i < entries.size(); ++i) {  // child directories named by the manifest ids (checked)
+            std::string c = d + "/" + entries[i].id;
+            platform::make_dirs(c);
+            for (int k = 0; k < 3; ++k)
+                if (!read_file(c + "/" + names[k], cur) || cur != members[i][size_t(k)]) put_file(c + "/" + names[k], members[i][size_t(k)]);
+        }
+        return d;
+    }
     if (z.size() != 3) throw Error("branch pack: arrays");
     Bytes files[3];
     for (int i = 0; i < 3; ++i) {
@@ -354,6 +408,17 @@ std::string install_branch_pack(const std::string &pack, const std::string &root
 void check_branch_dir(const std::string &dir, int level, const FeatureConfig &fc) {
     std::string names[3];
     branch_names(level, names);
+    Bytes manifest;
+    if (read_file(dir + "/branches.json", manifest)) {  // wire v2
+        std::vector<BranchEntry> entries = parse_branch_manifest(manifest);
+        std::vector<std::array<Bytes, 3>> members(entries.size());
+        for (size_t i = 0; i < entries.size(); ++i)
+            for (int k = 0; k < 3; ++k)
+                if (!read_file(dir + "/" + entries[i].id + "/" + names[k], members[i][size_t(k)]))
+                    throw Error("the branch directory has no " + entries[i].id + "/" + names[k]);
+        check_branch_v2(manifest, members, level, fc);
+        return;
+    }
     Bytes files[3];
     for (int i = 0; i < 3; ++i)
         if (!read_file(dir + "/" + names[i], files[i])) throw Error("the branch directory has no " + names[i]);

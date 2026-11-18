@@ -244,7 +244,9 @@ def run_tas(a, manifest, stream: Stream) -> dict:
     z = np.load(Path(a.record) / "raw.npz", allow_pickle=False)
     frames = z["record_frames"]
     if a.mode == "branch":  # the record up to the drive's prefix frame, then its verified key stream through the trafo
-        with np.load(Path(a.branch_dir) / "drive.npz", allow_pickle=False) as dz:
+        # wire v2 (branches.json): the member's own measured drive (--branch-member)
+        ddir = Path(a.branch_dir) / a.branch_member if a.branch_member else Path(a.branch_dir)
+        with np.load(ddir / "drive.npz", allow_pickle=False) as dz:
             k = int(dz["prefix_frame"])
             meta = json.loads((Path(a.record) / "meta.json").read_text(encoding="utf-8"))
             if str(dz["record_sha256"]) != meta.get("record_sha256"):
@@ -306,6 +308,8 @@ def main(argv=None) -> int:
     ap.add_argument("--max-steps", type=int, default=20000)
     ap.add_argument("--record", help="tas mode: dataset record directory (raw.npz)")
     ap.add_argument("--block", type=int, default=2, help="tas mode: frames per block")
+    ap.add_argument("--branch-member", help="branch mode with a multi-branch --branch-dir: the member whose drive.npz is "
+                    "replayed")
     ap.add_argument("--branch-dir", help="the ball-type diversion assets (features.branch_dir); branch mode replays "
                     "<record>[:drive.prefix_frame] + <branch-dir>/drive.npz")
     ap.add_argument("--fake", action="store_true", help="policy / random on ballrain.fakegame (the synthetic level)")
