@@ -795,3 +795,27 @@ def test_gateway_unlinks_the_file_of_a_chunk_refused_in_the_transaction(tmp_path
         assert t2["type"] == "task"
     finally:
         g.close()
+
+
+def test_forum_requests_name_the_gateway_agent():
+    """The forum's Cloudflare bans urllib's default Python-urllib agent (error 1010, HTTP 403): both server-side forum
+    calls send USER_AGENT."""
+    import io
+    from ballrain.pool import server_oauth as SO
+    seen = []
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            seen.append((req.full_url.rsplit("/", 2)[-2:], req.get_header("User-agent")))
+            return _Resp(b'{"access_token": "t", "id": 1}')
+    fc = ForumClient(ForumConfig("https://forum.example", "cid", "sec", "https://x/pool/oauth/callback"), opener=_Opener())
+    assert fc.exchange("code") == "t"
+    fc.user("t")
+    assert [ua for _, ua in seen] == [SO.USER_AGENT, SO.USER_AGENT] and "python" not in SO.USER_AGENT.lower()

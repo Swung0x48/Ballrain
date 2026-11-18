@@ -8,7 +8,7 @@ A branch describes how to navigate, not a new observation layout or a new reward
 
 | Member field | Meaning |
 |---|---|
-| `id` | Unique lower-case ASCII identifier matching `[a-z][a-z0-9-]*`; no Windows device names. No paths from the sender. |
+| `id` | Unique lower-case ASCII identifier matching `[a-z][a-z0-9-]*`, at most 32 characters; no Windows device names. No paths from the sender. |
 | `phases` | Nonempty ordered sequence of `{when, local_s:[lo,hi]}`. Spans are contiguous and positive, start/end at vertices of the branch, and partition `branch_s`. The array index is the phase. Optional `from:[?]` names earlier eligible predecessor indices and must include the immediately previous one. |
 | `when` | `ball` (wood=0, paper=1, stone=2), plus **at least one** of `sector`, `s:[lo,hi]` or `box:[[xmin,ymin,zmin],[xmax,ymax,zmax]]`. All supplied predicates are ANDed, bounds inclusive. `s` always refers to the currently active physical line **before** transition. No expressions, callbacks, host filenames or code. |
 | `merge` | Same predicates (ball optional), tested in the final phase. On match resume the main reference. Leaving an explicitly gated sector without entering the next phase also releases the branch. |
@@ -37,3 +37,5 @@ Validate all child hashes, level, main pin, branch line pin in both descriptor a
 For resume, use the original launch arguments and `--resume --path-dir benchmarks/refpaths-v2 --branch-dir benchmarks/refpaths-alt/L02-multi --branch-update` **once**. Old pin and old bytes must agree even during migration. New checkpoints contain the replacement bytes and pin. Later omit both branch flags. The change is printed and appended to `branch-updates.jsonl` in the run directory. This does not migrate a live learner or stale queued chunks.
 
 Native port checklist: implement envelope/child validation, capability gating and pin-keyed installation; match closest-segment ties, continuity and gates; per-life reset, phase-restricted projection and ordered transitions; station ledger and clocks; identical physical features and active rules; record/drive verification, rest/fallback and restored cursor; update policy/task/cache identity and reject old or mixed samples. Use `tests/test_multi_branch.py`, `test_branch_distribution.py`, `test_stone_branch.py` and the two-build capture logs as parity fixtures. Native pool export remains closed until that port exists.
+
+Pool transport (export, the v2 branch pack, the capability gate, rest branch_id): docs/pool-prototype.md section 15.
