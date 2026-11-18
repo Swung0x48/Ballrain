@@ -345,6 +345,9 @@ class RemoteBridge:
     def _lost(self, c):
         if self.conn is c:
             self.conn = None
+            # a worker started before the next learner has sent anything must not get the old learner's last
+            # parameters (after the r8 NaN they were non-finite); it waits for the first parameters of the new session
+            self._last_params = None
             try:
                 c.close()
             except Exception:  # noqa: BLE001
