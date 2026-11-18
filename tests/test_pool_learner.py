@@ -461,6 +461,40 @@ def test_link_republishes_after_a_learner_rollback_and_on_reconnect():
     assert published == ["learner-u100", "learner-u110", "learner-u60", "learner-u70", "learner-u71"]
 
 
+def test_reconnect_never_publishes_the_previous_sessions_parameters():
+    """The r8 NaN stop (2026-11-18): the old learner's last (non-finite) parameters were still cached at the reconnect
+    and published before the resumed learner sent anything. A drop and a new session both forget them."""
+    published = []
+
+    class Pol:
+        run = "r"
+
+        def publish_state(self, state, source):
+            published.append(source)
+            return SimpleNamespace(policy_sha=f"{len(published):064x}", curriculum=None)
+    link = LL.LearnerLink(("127.0.0.1", 1), b"k", Pol(), None, ".", publish_every=10, publish_min_s=0.0)
+    link.template = {"env": {}, "run": "r", "worker": {}, "pool_ingest": True}
+    from unittest import mock
+    with mock.patch.object(LL, "state_from_params", lambda t, m: {}):
+        link._latest, link.version = {"version": 16870}, 16870  # the old session's last send
+        link.conn = SimpleNamespace(close=lambda: None)
+        link._lost()
+        assert link._latest is None and link.version is None and not link.maybe_publish()
+        link._latest, link.version = {"version": 16870}, 16870  # cached again (a race), then a new session
+        hub, addr = _hub({"env": {}, "run": "r", "worker": {}, "pool_ingest": True})
+        link.addr, link.authkey = addr, b"k" * 16
+        try:
+            assert link.connect()
+            assert link._latest is None and link.version is None and not link.maybe_publish()
+            assert link.feed_once() == 0  # no learner version yet: nothing fed either
+            link._latest = {"version": 16877}  # the new learner's own first parameters
+            assert link.maybe_publish()
+        finally:
+            link.close()
+            hub.close()
+    assert published == ["learner-u16877"]
+
+
 def test_state_from_params_carries_the_learners_branch_bundle():
     """The route-branch files come from the learner (its hub template, or a parameter message), never from the
     gateway's disk: state_from_params passes them through to the export state unchanged."""

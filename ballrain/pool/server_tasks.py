@@ -56,6 +56,29 @@ class Published:
         return int(self.manifest["arch"]["n_act"])
 
 
+PROBE_ROWS = 64
+PROBE_MIN_ENTROPY = 1e-4  # nats, mean over the probe batch: below this the policy is a constant argmax
+
+
+def probe_policy(weights_dir, manifest: dict) -> None:
+    """Run an exported policy on a fixed probe batch (seeded raw observations within the feature clip, normalised as
+    the client does) and refuse it (ValueError, nothing published) when its log-probs or values are non-finite, its
+    mean entropy is ~0, or its outputs do not depend on the input at all (a collapsed network)."""
+    sha = manifest["policy_sha"]
+    pol = W.load_policy(Path(weights_dir) / f"{sha}.npz", Path(weights_dir) / f"{sha}.json", expect_sha=sha)
+    clip = float((manifest.get("features") or {}).get("clip") or 10.0)
+    raw = np.clip(np.random.default_rng(20261118).normal(0.0, 1.0, (PROBE_ROWS, pol.n_obs)), -clip, clip)
+    lp = np.stack([np.asarray(pol.log_probs(pol.normalize(r.astype(np.float32))), np.float64) for r in raw])
+    v = np.array([float(pol.value(pol.normalize(r.astype(np.float32)))) for r in raw])
+    if not (np.isfinite(lp).all() and np.isfinite(v).all()):
+        raise ValueError("probe: non-finite log-probs or values")
+    ent = float(-(np.exp(lp) * lp).sum(1).mean())
+    if ent < PROBE_MIN_ENTROPY:
+        raise ValueError(f"probe: mean entropy {ent:.2e} (a collapsed policy)")
+    if float(np.ptp(v)) == 0.0 and float(np.ptp(lp, axis=0).max()) == 0.0:
+        raise ValueError("probe: outputs do not depend on the input")
+
+
 class PolicySource:
     def __init__(self, pool_dir, run: str, datasets_dir, path_dirs, ckpt_dir=None, ckpt_glob: str = "ckpt_*.pt",
                  clock=time.time):
@@ -85,6 +108,7 @@ class PolicySource:
         """Export a checkpoint dict and its assets; make it the version new tasks name."""
         from ballrain.curriculum import CurriculumConfig, ReverseCurriculum, TasStarts
         m = W.export_state(state, self.weights_dir, self.run)
+        probe_policy(self.weights_dir, m)  # guard: never hand out a policy that computes nonsense
         record = m["env"]["start_record"]
         if not record or "/" in record or "\\" in record:
             raise ValueError(f"the policy's start record {record!r} is not a dataset record name")
