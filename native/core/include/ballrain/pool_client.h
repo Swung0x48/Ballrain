@@ -14,6 +14,7 @@
 namespace ballrain {
 
 extern const char *const CLIENT_VERSION;
+extern const std::vector<const char *> CLIENT_CAPABILITIES;  // hello.capabilities
 
 struct GatewayUnavailable : Error {  // no usable answer: network, timeout, not the protocol
     explicit GatewayUnavailable(const std::string &m) : Error(m) {}

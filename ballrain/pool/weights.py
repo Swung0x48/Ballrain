@@ -225,6 +225,11 @@ def export_state(state: dict, out_dir, run: str) -> dict:
         "env": env, "engine_options": engine_options, "features": feats, "reward": reward, "rollout": rollout,
         "arrays": {k: {"dtype": a.dtype.str, "shape": list(a.shape)} for k, a in sorted(arrays.items())},
     }
+    # the client capabilities its tasks need (ballrain.pool.capabilities; the gateway gates by them). Absent when
+    # nothing new is needed, so every client keeps getting the policy's tasks; not an identity field (policy_sha)
+    requires = ["branch_v1"] if feats.get("branch") else []
+    if requires:
+        m["requires"] = requires
     assert_public(m)
     dumps(m)  # JSON-safe (raises on NaN / non-JSON values)
     sha = policy_sha(m, arrays)

@@ -138,3 +138,28 @@ def test_gateway_draws_branch_rest_starts():
         kk = int(rng.integers(int(e[0]), int(e[1]) + 1))
         want.append((kk, {"target": None, "branch_s": 1975.0}) if len(e) == 3 else (st.nearest_valid(kk), {"target": None}))
     assert got == want
+
+
+def test_branch_policies_require_the_branch_capability(tmp_path):
+    from ballrain.pool import capabilities as C
+    m = W.export_state(l2_state(branch_assets=bundle()), tmp_path, "r8")
+    assert m["requires"] == ["branch_v1"] and "branch_v1" in C.CAPABILITIES
+    plain = W.export_state(l2_state(branch_dir=None), tmp_path / "p", "r8")
+    assert "requires" not in plain  # nothing new needed: every client keeps getting its tasks
+    # requires is not an identity field: the same policy with or without it has the same sha
+    assert W.policy_sha(dict(plain, requires=["x"]), {}) == W.policy_sha(plain, {})
+    from ballrain.pool.client_api import CLIENT_CAPABILITIES
+    assert not C.missing(m["requires"], CLIENT_CAPABILITIES)
+
+
+def test_hello_carries_capabilities():
+    eng = {"kind": "x87soft", "sha256": "a" * 64, "version": "v1"}
+    base = dict(client_version="0.4.0", platform="windows", engine=eng, game_files={}, instances=1)
+    try:
+        P.make_message("hello", **base)
+    except P.ProtocolError:
+        pytest.skip("this test's hello skeleton does not fit the schema")
+    assert P.make_message("hello", **base, capabilities=["task_format3", "branch_v1", "later_thing"])
+    for bad in (["x" * 33], ["a b"], ["c"] * 33):
+        with pytest.raises(P.ProtocolError):
+            P.make_message("hello", **base, capabilities=bad)

@@ -402,8 +402,11 @@ MESSAGES: dict[str, Obj] = {
     "login_status": _msg("login_status", {"status": Str(16, enum=("pending", "ok", "refused", "expired"))},
                          {"token": Str(128, ID_RE, min_len=32), "user": USER, "reason": REASON}),
     # ---- session
+    # capabilities: what the client can run (ballrain.pool.capabilities; absent = none); the gateway hands a policy's
+    # tasks only to clients that have its manifest's "requires". Unknown names are allowed (and ignored)
     "hello": _msg("hello", {"client_version": Str(32, VERSION_RE, min_len=1), "platform": Str(16, enum=PLATFORMS),
-                            "engine": ENGINE, "game_files": GAME_FILES, "instances": Int(1, 64)}),
+                            "engine": ENGINE, "game_files": GAME_FILES, "instances": Int(1, 64)},
+                  {"capabilities": List(Str(32, ID_RE, min_len=1), 32)}),
     "hello_ok": _msg("hello_ok", {"session_id": Str(64, ID_RE, min_len=16), "max_instances": Int(1, 64),
                                   "heartbeat_s": Int(5, 3600), "task_poll_s": Int(1, 3600), "user": USER,
                                   "leaderboard": Bool(), "server_time": Int(0, 2 ** 40)},

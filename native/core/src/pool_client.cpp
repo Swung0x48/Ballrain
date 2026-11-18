@@ -15,6 +15,7 @@ namespace ballrain {
 #endif
 // native/CMakeLists.txt project(VERSION): 0.3 = chunk format 3 (engine-state chain v3, task format 3)
 const char *const CLIENT_VERSION = BALLRAIN_CLIENT_VERSION;
+const std::vector<const char *> CLIENT_CAPABILITIES = {"task_format3", "branch_v1"};
 static const size_t MAX_RESPONSE = 64 * 1024, MAX_MANIFEST = 256 * 1024, MAX_DOWNLOAD = 64 * 1024 * 1024;
 
 GatewayRefusal::GatewayRefusal(Json r, int st)
@@ -109,6 +110,9 @@ Json GatewayClient::hello(const std::string &plat, const Json &engine, const Jso
     f.set("engine", engine);
     f.set("game_files", game_files);
     f.set("instances", Json::integer(instances));
+    Json caps = Json::array();  // what this client can run (ballrain.pool.capabilities; the gateway gates tasks by them)
+    for (const char *c : CLIENT_CAPABILITIES) caps.push(Json::string(c));
+    f.set("capabilities", caps);
     Json r = call("POST", "/pool/hello", {"hello_ok"}, json_body(make_message("hello", f)), JSON_CT, true, false);
     session_id = r.at("session_id").as_string();
     return r;
