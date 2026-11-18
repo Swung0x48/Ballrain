@@ -10,7 +10,11 @@
 
 namespace ballrain {
 
-const char *const CLIENT_VERSION = "0.3.0";  // 0.3: chunk format 3 (engine-state chain v3)
+#ifndef BALLRAIN_CLIENT_VERSION
+#define BALLRAIN_CLIENT_VERSION "0.0.0-dev"
+#endif
+// native/CMakeLists.txt project(VERSION): 0.3 = chunk format 3 (engine-state chain v3, task format 3)
+const char *const CLIENT_VERSION = BALLRAIN_CLIENT_VERSION;
 static const size_t MAX_RESPONSE = 64 * 1024, MAX_MANIFEST = 256 * 1024, MAX_DOWNLOAD = 64 * 1024 * 1024;
 
 GatewayRefusal::GatewayRefusal(Json r, int st)

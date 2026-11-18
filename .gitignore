@@ -17,5 +17,6 @@ __pycache__/
 # dedicated game copies (proprietary game files, never committed)
 /runtime/
 
-# native client build trees (native/build_win.cmd, cmake -B build/...)
+# native client build trees (native/build_win.cmd, cmake -B build/...) and release zips (tools/native/package_win.py)
 /build/
+/dist/

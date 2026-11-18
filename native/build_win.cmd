@@ -11,5 +11,7 @@ if "%VCVARS%"=="" if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\Bui
 if "%VCVARS%"=="" (echo vcvars64.bat not found; set VCVARS & exit /b 1)
 call "%VCVARS%" >nul || exit /b 1
 set HERE=%~dp0
-cmake -S "%HERE%." -B "%HERE%..\build\native-%CFG%" -G Ninja -DCMAKE_BUILD_TYPE=%CFG% || exit /b 1
-cmake --build "%HERE%..\build\native-%CFG%" || exit /b 1
+rem BALLRAIN_BUILD_DIR: another build directory (default build\native-<cfg>); BALLRAIN_CMAKE_ARGS: extra -D options
+if "%BALLRAIN_BUILD_DIR%"=="" set "BALLRAIN_BUILD_DIR=%HERE%..\build\native-%CFG%"
+cmake -S "%HERE%." -B "%BALLRAIN_BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=%CFG% %BALLRAIN_CMAKE_ARGS% || exit /b 1
+cmake --build "%BALLRAIN_BUILD_DIR%" || exit /b 1

@@ -54,9 +54,10 @@ bool process_running(const std::string &image_name);
 bool on_battery();
 int cpu_count();
 
-// One HTTP(S) request. Windows: WinHTTP (http and https, the system's TLS and proxy settings). POSIX: http only for
-// now (a loopback test gateway); https on macOS / Linux / Android is not implemented yet. Throws ballrain::Error on a
-// connection failure, a timeout or a body larger than max_body.
+// One HTTP(S) request. Windows: WinHTTP (http and https, the system's TLS and proxy settings). POSIX: https through
+// libcurl when the build found it (macOS always; Linux the distro's libcurl), plain http by the built-in client
+// (a loopback test gateway); Android: http only so far. Throws ballrain::Error on a connection failure, a timeout or a
+// body larger than max_body.
 struct HttpResponse {
     int status = 0;
     std::string body;

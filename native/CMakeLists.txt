@@ -7,7 +7,8 @@
 # Windows (from a VS developer prompt, x64):  cmake -S native -B build/native -G Ninja -DCMAKE_BUILD_TYPE=Release
 # Android: -DCMAKE_TOOLCHAIN_FILE=<ndk>/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=28
 cmake_minimum_required(VERSION 3.16)
-project(ballrain_native C CXX)
+# the client version (hello.client_version, the release zip name): the one place to change it
+project(ballrain_native VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -79,6 +80,7 @@ add_library(ballrain_engine STATIC core/src/session.cpp core/src/env.cpp core/sr
     core/src/pool_task.cpp core/src/controller.cpp core/src/update.cpp core/src/diagnostics.cpp
     ${BALLRAIN_PLATFORM_SRC})
 target_include_directories(ballrain_engine PUBLIC platform)
+target_compile_definitions(ballrain_engine PRIVATE BALLRAIN_CLIENT_VERSION="${PROJECT_VERSION}")
 target_link_libraries(ballrain_engine PUBLIC ballrain_core ballrain_ed25519 ballrain_miniz)
 if(WIN32)
     target_link_libraries(ballrain_engine PUBLIC ws2_32 winhttp shell32 ole32)
@@ -86,6 +88,13 @@ if(WIN32)
 elseif(NOT ANDROID)
     find_package(Threads REQUIRED)
     target_link_libraries(ballrain_engine PUBLIC Threads::Threads)
+    find_package(CURL)  # https on macOS / Linux (without it: http to a loopback gateway only)
+    if(CURL_FOUND)
+        target_link_libraries(ballrain_engine PUBLIC CURL::libcurl)
+        target_compile_definitions(ballrain_engine PRIVATE BALLRAIN_HAVE_CURL=1)
+    else()
+        message(WARNING "libcurl not found: this build cannot reach an https gateway")
+    endif()
 endif()
 
 if(BALLRAIN_APPS)
