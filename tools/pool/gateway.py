@@ -8,6 +8,7 @@
 
     # accounts (the verifier never revokes: a replay mismatch flags the account suspect and writes <pool>/alerts/)
     python tools/pool/gateway.py admin list
+    python tools/pool/gateway.py admin stats
     python tools/pool/gateway.py admin suspects
     python tools/pool/gateway.py admin unflag --forum-id 123
     python tools/pool/gateway.py admin revoke --forum-id 123 [--note "说明"] [--list-updates] [--mark-updates]
@@ -163,6 +164,30 @@ def cmd_admin(a):
             rr = json.loads(r["revoke_reason"])["code"] if r["revoke_reason"] else ""
             print(f"{r['forum_id']:>8} {r['username']:<24} {r['nickname']:<16} board={r['leaderboard']} "
                   f"revoked={r['revoked']} {rr} verified={st['steps_verified']} pending={st['steps_pending']}")
+    elif a.action == "stats":  # one screen for the coordinator: tasks, chunks, verification, flags, alerts
+        q = store.q
+        print("tasks by state / end:", {f"{r['state']}/{r['end_reason']}": r["n"] for r in
+                                        q("SELECT state, end_reason, COUNT(*) AS n FROM tasks GROUP BY state, end_reason")})
+        print("tasks replayed in full (drawn / probation / escalated):",
+              q("SELECT COUNT(*) AS n FROM tasks WHERE replay=1")[0]["n"], "of", q("SELECT COUNT(*) AS n FROM tasks")[0]["n"])
+        print("chunks by verify / status:", {f"{r['verify']}/{r['status']}": f"{r['n']} ({r['steps']} steps)" for r in
+                                            q("SELECT verify, status, COUNT(*) AS n, SUM(steps) AS steps FROM chunks "
+                                              "GROUP BY verify, status")})
+        print("chunks flagged by the cheap check:", {r["flag"]: r["n"] for r in
+                                                     q("SELECT flag, COUNT(*) AS n FROM chunks WHERE flag IS NOT NULL GROUP BY flag")})
+        print("chunks fed to a learner:", q("SELECT COUNT(*) AS n FROM chunks WHERE ingested >= 0")[0]["n"])
+        now = store.now()
+        for h in (1, 24):
+            r = q("SELECT COUNT(*) AS n, COALESCE(SUM(steps), 0) AS steps FROM chunks WHERE received >= ?", (now - 3600 * h,))[0]
+            print(f"received in the last {h} h: {r['n']} chunks, {r['steps']} steps ({r['steps'] / (3600 * h):.1f} steps/s)")
+        print("sessions active in the last 5 min:", {f"{r['engine_kind']} {r['client_version']} {r['platform']}": r["n"] for r in
+                                                     q("SELECT engine_kind, client_version, platform, COUNT(*) AS n FROM sessions "
+                                                       "WHERE last_seen >= ? GROUP BY engine_kind, client_version, platform",
+                                                       (now - 300,))})
+        print("suspect accounts:", q("SELECT COUNT(*) AS n FROM accounts WHERE suspect=1")[0]["n"],
+              "revoked:", q("SELECT COUNT(*) AS n FROM accounts WHERE revoked=1")[0]["n"])
+        al = sorted((Path(cfg.pool_dir) / "alerts").glob("*.json"))
+        print(f"alerts: {len(al)}" + (f", newest {al[-1].name}" if al else ""))
     elif a.action == "suspects":  # accounts the verifier flagged (a replay mismatch); nothing was revoked
         for r in store.q("SELECT forum_id, suspect_reason, suspect_at FROM accounts WHERE suspect=1 ORDER BY suspect_at"):
             rec = json.loads(r["suspect_reason"] or "{}")
@@ -222,7 +247,7 @@ def main(argv=None):
     f.add_argument("--forum-port", type=int, default=8098)
     f.set_defaults(fn=cmd_dev_fake)
     m = sub.add_parser("admin")
-    m.add_argument("action", choices=("list", "suspects", "unflag", "revoke", "unrevoke"))
+    m.add_argument("action", choices=("list", "stats", "suspects", "unflag", "revoke", "unrevoke"))
     m.add_argument("--forum-id", type=int)
     m.add_argument("--note", default="")
     m.add_argument("--no-quarantine", dest="quarantine", action="store_false")
