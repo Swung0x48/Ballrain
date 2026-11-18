@@ -459,3 +459,19 @@ def test_link_republishes_after_a_learner_rollback_and_on_reconnect():
             link.close()
             hub.close()
     assert published == ["learner-u100", "learner-u110", "learner-u60", "learner-u70", "learner-u71"]
+
+
+def test_state_from_params_carries_the_learners_branch_bundle():
+    """The route-branch files come from the learner (its hub template, or a parameter message), never from the
+    gateway's disk: state_from_params passes them through to the export state unchanged."""
+    model = {"pi.0.weight": np.zeros((4, 3)), "pi.0.bias": np.zeros(4), "pi.2.weight": np.zeros((9, 4)),
+             "pi.2.bias": np.zeros(9), "v.0.weight": np.zeros((4, 3)), "v.0.bias": np.zeros(4),
+             "v.2.weight": np.zeros((1, 4)), "v.2.bias": np.zeros(1)}
+    msg = {"version": 7, "rms": {"mean": np.zeros(3), "var": np.ones(3), "count": 1.0}, "model": model}
+    tpl = {"env": {"level": 2}, "run": "r", "worker": {}, "pool_ingest": True}
+    assert "branch_assets" not in LL.state_from_params(tpl, msg)
+    ba = {"level": 2, "line_npz": b"L", "desc_json": b"{}", "drive_npz": b"D"}
+    st = LL.state_from_params(dict(tpl, branch_assets=ba), msg)
+    assert st["branch_assets"] == ba and st["n_obs"] == 3 and st["n_act"] == 9
+    ba2 = dict(ba, line_npz=b"L2")
+    assert LL.state_from_params(dict(tpl, branch_assets=ba), dict(msg, branch_assets=ba2))["branch_assets"] == ba2

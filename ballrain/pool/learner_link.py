@@ -70,10 +70,17 @@ def state_from_params(template: dict, msg: dict) -> dict:
     ec = asdict(env) if is_dataclass(env) else dict(env)
     args = dict(template.get("worker") or {})
     args.setdefault("activation", "tanh")
-    return {"model": model, "rms": msg["rms"], "curriculum": msg.get("curriculum"),
-            "counters": {"update": int(msg["version"]), "steps": int(msg.get("steps", 0) or 0)},
-            "args": args, "n_obs": int(model["pi.0.weight"].shape[1]),
-            "n_act": int(model[f"pi.{2 * (n_layers - 1)}.weight"].shape[0]), "env_config": ec}
+    state = {"model": model, "rms": msg["rms"], "curriculum": msg.get("curriculum"),
+             "counters": {"update": int(msg["version"]), "steps": int(msg.get("steps", 0) or 0)},
+             "args": args, "n_obs": int(model["pi.0.weight"].shape[1]),
+             "n_act": int(model[f"pi.{2 * (n_layers - 1)}.weight"].shape[0]), "env_config": ec}
+    # the learner's route-branch bundle (level, line_npz, desc_json, drive_npz raw bytes), carried as the learner sent it:
+    # the gateway never reads branch files of its own (the export pins features.branch from these bytes). A parameter
+    # message's own copy wins over the template's (a learner that changed its branch without a restart)
+    ba = msg.get("branch_assets") if msg.get("branch_assets") is not None else template.get("branch_assets")
+    if ba is not None:
+        state["branch_assets"] = ba
+    return state
 
 
 class LearnerLink:
