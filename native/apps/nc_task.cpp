@@ -42,6 +42,7 @@ int main(int argc, char **argv) {
         FeatureConfig fc = FeatureConfig::from_json(m.at("features"));
         fc.path_dir = arg(argc, argv, "--path-dir");
         fc.branch_dir = arg(argc, argv, "--branch-dir", "");  // the ball-type diversion assets (tests: out of band)
+        fc.reach_dir = arg(argc, argv, "--reach-dir", "");  // the f7 fields (tests; the client: the task's assets.reach)
         std::string bpack = arg(argc, argv, "--branch-pack", "");  // as the client: the task's branch pack
         if (fc.has_branch() != !bpack.empty())
             throw Error(fc.has_branch() ? "the policy follows a route branch: give --branch-pack"

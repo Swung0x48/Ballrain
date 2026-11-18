@@ -5,6 +5,8 @@
 #include <cmath>
 
 #include "ballrain/branch.h"
+#include "ballrain/reach_block.h"
+#include "ballrain/chunk.h"
 #include "ballrain/npz.h"
 #include "ballrain/sha256.h"
 #include "platform.h"
@@ -16,7 +18,11 @@ namespace ballrain {
 #endif
 // native/CMakeLists.txt project(VERSION): 0.3 = chunk format 3 (engine-state chain v3, task format 3)
 const char *const CLIENT_VERSION = BALLRAIN_CLIENT_VERSION;
-const std::vector<const char *> CLIENT_CAPABILITIES = {"task_format3", "branch_v1", "branch_rules_v1"};
+std::vector<std::string> client_capabilities() {
+    std::string reach = "reach_" + reach_version();
+    std::replace(reach.begin(), reach.end(), '.', '_');
+    return {"task_format3", "branch_v1", "branch_rules_v1", reach};
+}
 static const size_t MAX_RESPONSE = 64 * 1024, MAX_MANIFEST = 256 * 1024, MAX_DOWNLOAD = 64 * 1024 * 1024;
 
 GatewayRefusal::GatewayRefusal(Json r, int st)
@@ -112,7 +118,7 @@ Json GatewayClient::hello(const std::string &plat, const Json &engine, const Jso
     f.set("game_files", game_files);
     f.set("instances", Json::integer(instances));
     Json caps = Json::array();  // what this client can run (ballrain.pool.capabilities; the gateway gates tasks by them)
-    for (const char *c : CLIENT_CAPABILITIES) caps.push(Json::string(c));
+    for (const std::string &c : client_capabilities()) caps.push(Json::string(c));
     f.set("capabilities", caps);
     Json r = call("POST", "/pool/hello", {"hello_ok"}, json_body(make_message("hello", f)), JSON_CT, true, false);
     session_id = r.at("session_id").as_string();
@@ -253,6 +259,31 @@ std::string PoolCache::path_dir(const std::string &sha, int level) {
         Bytes b;
         read_file(src, b);
         put_file(dst, b);
+    }
+    return d;
+}
+
+static const int64_t MAX_REACH_Z = 32ll << 20, MAX_REACH = 128ll << 20;  // docs/f7-native-port.md 8
+
+std::string PoolCache::reach_dir(const std::vector<Task::ReachAsset> &assets, int level) {
+    std::string d = root_ + "/fastreach";
+    platform::make_dirs(d);
+    if (assets.size() > 8) throw Error("assets.reach: too many entries");
+    for (const Task::ReachAsset &a : assets) {
+        if (a.level != level) continue;
+        if (!is_hex64(a.key_sha256) || !is_hex64(a.sha256) || !is_hex64(a.zsha256) || a.size <= 0 || a.size > MAX_REACH ||
+            a.zsize <= 0 || a.zsize > MAX_REACH_Z)
+            throw Error("assets.reach: a bad entry");
+        char n[16];
+        std::snprintf(n, sizeof n, "L%02d-", level);
+        std::string p = d + "/" + n + a.key_sha256.substr(0, 16) + ".npz";
+        if (file_exists(p) && platform::file_size(p) == a.size && file_sha256(p) == a.sha256) continue;
+        Bytes z = api_.download("/pool/assets/" + a.zsha256 + ".zst", size_t(a.zsize), a.zsha256);
+        if (int64_t(z.size()) != a.zsize) throw Error("reach fields: the download has another size");
+        Bytes raw = zstd_decompress_capped(z, size_t(a.size));
+        if (int64_t(raw.size()) != a.size || Sha256::hex(raw) != a.sha256)
+            throw Error("reach fields: the decompressed file is not the announced one");
+        put_file(p, raw);
     }
     return d;
 }

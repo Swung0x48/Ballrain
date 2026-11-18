@@ -26,6 +26,13 @@ struct Task {  // protocol.TASK
     uint64_t sample_seed = 0;
     std::string asset_starts, asset_path;
     std::string asset_branch;  // the route-branch pack ("" when the policy follows no branch)
+    // assets.reach (f7): one entry per fields file the level can need (docs/f7-native-port.md 8)
+    struct ReachAsset {
+        int level = 0;
+        std::string key_sha256, sha256, zsha256;  // sha256(fields_key), the .npz, the .zst
+        int64_t size = 0, zsize = 0;
+    };
+    std::vector<ReachAsset> asset_reach;
     std::optional<RestStart> rest;  // format 3: an at-rest start after the hand-over (server-drawn)
     uint64_t life_seed = 0;          // format 3: the per-life draws (ballrain/pool/counters.py)
     std::optional<int64_t> respawn_frontier;  // format 3: the curriculum frontier of the early-respawn rule

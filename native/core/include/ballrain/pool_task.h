@@ -30,7 +30,7 @@ struct TaskOutcome {
 };
 
 // Where the engine's copies and run directories go when the client's own paths are not plain ASCII (the engine
-// resolves its files with narrow code-page paths): BALLRAIN_WORK_DIR if set, else <data_dir>/engine-work, in its 8.3
+// resolves its files with narrow code-page paths): <data_dir>/engine-work (the data dir is BALLRAIN_WORK_DIR when set), in its 8.3
 // form when that path is not plain ASCII itself (a Chinese user name). Throws a message for the player when no
 // plain-ASCII form exists.
 std::string engine_work_dir(const std::string &data_dir);

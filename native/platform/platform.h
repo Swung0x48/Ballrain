@@ -17,7 +17,6 @@ std::vector<std::pair<std::string, std::string>> environment();  // the current 
 bool make_dirs(const std::string &path);
 bool remove_file(const std::string &path);
 std::string absolute_path(const std::string &path);
-std::string temp_dir();
 
 // Directory listing for game-file hashing: regular files under dir (recursively), paths relative to dir with '/'.
 // link = a symbolic link / reparse point (not followed; the hash counts it as a mismatch). false: dir unreadable.
@@ -32,8 +31,9 @@ bool rename_file(const std::string &from, const std::string &to);  // replaces a
 int64_t file_size(const std::string &path);                       // -1 when missing
 int64_t unix_time();                                              // wall-clock seconds
 
-// The client's data directory: %USERPROFILE%\.ballrain on Windows, ~/.ballrain elsewhere (everything the client
-// writes that does not belong next to the program: config, token, logs, cache, upload queue, run and work directories)
+// The client's one root: BALLRAIN_WORK_DIR when set, else %USERPROFILE%\.ballrain on Windows, ~/.ballrain elsewhere.
+// Everything the client writes is a subdirectory of it (config, token, logs, cache, upload queue, run directories,
+// engine-work copies); nothing goes to temp, LOCALAPPDATA, ProgramData or other guessed places
 std::string data_dir();
 std::string home_dir();
 std::string executable_path();  // this program (absolute)

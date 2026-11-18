@@ -198,7 +198,9 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 
 ### 7.1 控制器（`native/core/src/controller.cpp`）
 `ballrain/pool/client_core.py` 的移植，和界面无关（以后的 Android 应用直接用它）：
-- **数据目录** `%USERPROFILE%\.ballrain`（macOS / Linux `~/.ballrain`）：客户端写的、不放在程序目录里的东西全在这里（程序目录可以是只读的）。
+- **数据目录**（唯一的根）：设了环境变量 `BALLRAIN_WORK_DIR` 就是它，否则 `%USERPROFILE%\.ballrain`（macOS / Linux `~/.ballrain`）。客户端写的所有东西都在它的子目录里
+  （程序目录可以是只读的），不往临时目录、`LOCALAPPDATA`、`ProgramData` 或其他猜出来的地方写，也没有别的路径环境变量。根目录写不进去时客户端启动就报中文提示
+  （让玩家把 `BALLRAIN_WORK_DIR` 指向一个有写权限的文件夹）。
   `config.json`、`token`（POSIX 0600）、`user.json`（论坛账号，诊断导出时用来替换）、`cache/`（按 sha 存的策略、开局包、参考线）、`queue/`（上传队列）、
   `logs/`（`client.log` 超过 2 MB 轮转，保留 3 份；出错实例最近一次的引擎日志 `engine-NN.log`）、`runs/`、`engine-work/`（见下面的非 ASCII 路径）。同一个数据目录只能开一个客户端（Windows 命名互斥体，POSIX 文件锁）。
 - **实例**：最多 8 个线程（默认 min(8, 核数 / 2)，网关的 `max_instances` 优先），每个线程一个引擎子进程，按任务取、跑、切段。
@@ -219,7 +221,7 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - **非 ASCII 路径**：无头引擎用代码页路径找文件，Ballance 目录或引擎路径里有中文时（中文用户名、桌面上的游戏）它会找不到 base.cmo。
   这时客户端先试 8.3 短名，没有短名就把引擎目录、以及 x87-soft 版要读的四项游戏文件复制到数据目录下的 `engine-work/`（按引擎 sha256 /
   游戏文件哈希命名，只复制一次），运行目录也放在那里。用户名是中文时数据目录本身也不是纯 ASCII，这时用 `engine-work` 的 8.3 短名（系统盘通常有）；
-  连短名都没有时给出中文提示，玩家可以设环境变量 `BALLRAIN_WORK_DIR` 指向一个纯英文的文件夹。
+  连短名都没有时给出中文提示：玩家设环境变量 `BALLRAIN_WORK_DIR` 指向一个纯英文的文件夹，整个数据目录（`engine-work/` 也在其中）就搬到那里。
   实测：数据目录、引擎、游戏目录都放在中文路径下，端到端 12/12 段通过。
 
 ### 7.2 终端界面（`native/apps/ballrain_pool.cpp`，FTXUI）
@@ -334,7 +336,28 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
   “unknown feature config field branch_sha256”放弃任务，不会悄悄跑出校验不过的数据。
   端到端（门控生效）：4 个石球静止开局任务，20 个块全部通过。
 
-## 11. 还没有做 / 限制
+## 10b. f7 可达性块（`docs/f7-native-port.md`，`ballrain/fastreach.py` / `reach_features.py` 的移植）
+
+- **`core/fastreach`**：`_perceive` 和它调用的全部辅助函数（空中扫描、地面行进、支撑场、SDF、轨道管、风扇剖面与高度带、死亡盒），
+  依赖数学库的表（三种球的 S1/S2、4 个象限的按键方向、探针方向）直接嵌入 Python 生成的数值（`tools/native/reach_diff.py tables`）。
+  场文件 `L<nn>-<sha16>.npz` 原样读入（float32 / int8 / int16 在读的地方按 Python 的公式转 double）；`Fields` 只读可共享，`Workspace` 每个调用方一份。
+  没有 JIT：随程序提前编译，第一步就是正常速度。
+- **`core/reach_block`**：`ReachBlock` 和 `FastReach.perceive` 的包装：规范三角形顺序（`canonical_geometry`，与 CK id 无关）、场键 `fields_key`
+  （静态三角形、保留的死亡盒、风扇推力盒、常数、`BUILD_VERSION`）、未知区（物理化的非固定实体的网格盒外扩 4）、运动体（8 单位内 = 未知区）、
+  未知区优先于 doomed、缩放到 [-1, 1]；版本钉 `reach_version()` = `fastreach5.2-block1`，清单里的版本不同就拒绝任务。
+  当前几何的场在场目录里找不到时任务失败（不会算出一块 0）。特征：`FeatureConfig.reach` / `reach_version`，布局末尾 59 维，象限同 `action_quarter`。
+- **场的分发**（`docs/f7-native-port.md` §8，和池会话商定）：网关用 Python 构建场，zstd 压缩后作为任务素材 `assets.reach` 下发
+  （每项 level、key_sha256、sha256、size、zsha256、zsize；地址由 zsha256 推出 `/pool/assets/<zsha256>.zst`）。客户端核对压缩包的大小和 sha，
+  解压时输出上限是 size，再核对 sha，存到 `<根目录>/cache/fastreach/L<nn>-<key_sha256 前 16 位>.npz`，每份只下载一次。L2 每份 58.5 MB，压缩后 4.0 MB，两份。
+- **能力**：0.4.0 声明 `reach_fastreach5_2-block1`（`"reach_" + reach_version`，`.` 换成 `_`）；f7 清单的 `requires` 写同一个名字，
+  以后 fastreach 或块的版本提升会重新按能力挡住旧客户端。
+- **容差**（用户决定，2026-11-18）：reach 块不要求逐位一致，校验端对它放宽（池会话实现）；实测仍是逐位一致的：
+  - 内核对照（`reach_diff.py`，55,745 个状态：L2 四份 TAS 每 3 帧的真实状态 30,000 个，合成状态 25,745 个，覆盖风扇代码 0–9 和 doom_reason 0–6）：
+    用系统的 `ucrtbase.dll` 时全部逐位相同；用客户端静态链接的运行库时 31 个状态在 `1e-16` 量级上不同（`pow` 差 1 ulp），没有标志翻转、没有跳变。
+  - 整块对照（`golden.py`，r8 f7 检查点，267 维）：SR02 TAS 12,198 行、石线 11,202 行全部特征最大差 0。
+  - 速度：C++ 每次 `perceive` 中位数 13.8 µs、p99 577 µs（真实状态），Python（numba）40.3 µs / 813 µs。
+
+
 
 - **https 没有对真网关实测过**：Windows 的 WinHTTP https 分支、POSIX 的 libcurl 分支都只编译过（端到端都是本机 http）。Android 仍然只有 http。
 - **跨引擎构建的字节一致**只在两个 Windows x86 构建之间验证过；Mac arm64 / Linux 引擎构建之间要先核对（§4.1）。另外容差只能吸收舍入，特征里的离散判定在另一种 CPU 上翻转会被当成不一致（`pool-prototype.md` §8）。

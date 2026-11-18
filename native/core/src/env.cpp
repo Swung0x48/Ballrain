@@ -134,6 +134,11 @@ BallanceEnv::BallanceEnv(EnvConfig cfg, FeatureConfig features, EngineConfig eng
     if (rest_ && start_frame_ <= 0) throw Error("an at-rest start needs a TAS start frame");
     for (auto k : ARROWS9) actions_.push_back(k);
     if (cfg_.esc_frames < 3) throw Error("esc_frames must be >= 3");
+    // env.BallanceEnv: the reach block's 8 directions are the action keys (world actions need camera "world",
+    // camera-relative keys a camera frame)
+    if (fx_.config().reach && (fx_.config().camera == "world") != cfg_.world_actions)
+        throw Error("FeatureConfig.reach with camera " + fx_.config().camera + " and world_actions=" +
+                    (cfg_.world_actions ? "true" : "false") + ": the reach directions would not be the action directions");
     repress_ = cfg_.repress_stale_keys ? *cfg_.repress_stale_keys : cfg_.world_actions;
     ms_since_turn_ = std::numeric_limits<double>::infinity();
     // env.branch_rules: the installed bundle's rules (the task is refused when they do not parse)

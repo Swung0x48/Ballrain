@@ -108,10 +108,15 @@ std::string home_dir() {
     const char *h = std::getenv("HOME");
     if (h && *h) return h;
     passwd *pw = getpwuid(getuid());
-    return pw && pw->pw_dir ? pw->pw_dir : "/tmp";
+    return pw && pw->pw_dir ? pw->pw_dir : "";
 }
 
-std::string data_dir() { return home_dir() + "/.ballrain"; }
+std::string data_dir() {
+    const char *w = std::getenv("BALLRAIN_WORK_DIR");
+    if (w && *w) return w;
+    std::string h = home_dir();
+    return h.empty() ? std::string() : h + "/.ballrain";
+}
 
 std::string executable_path() {
 #ifdef __APPLE__
@@ -194,13 +199,6 @@ bool on_battery() {
 int cpu_count() {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? int(n) : 1;
-}
-
-std::string temp_dir() {
-    const char *t = std::getenv("TMPDIR");
-    std::string s = t && *t ? t : "/tmp";
-    while (s.size() > 1 && s.back() == '/') s.pop_back();
-    return s;
 }
 
 // ---------------------------------------------------------------------------------------------- sockets

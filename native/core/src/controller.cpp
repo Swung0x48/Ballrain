@@ -231,6 +231,21 @@ struct Controller::Slot {
 
 Controller::Controller(std::string data_dir, EventFn on_event)
     : dir_(std::move(data_dir)), on_event_(std::move(on_event)), log_(dir_ + "/logs") {
+    // the one root everything goes under: refuse clearly when it cannot be written (restricted accounts)
+    bool ok = !dir_.empty() && platform::make_dirs(dir_);
+    if (ok) {
+        std::string probe = dir_ + "/.write-test";
+        try {
+            write_file(probe, "ok");
+            platform::remove_file(probe);
+        } catch (...) {
+            ok = false;
+        }
+    }
+    if (!ok)
+        throw Error("客户端的数据目录 " + (dir_.empty() ? std::string("（找不到用户目录）") : dir_) +
+                    " 无法写入。请设置环境变量 BALLRAIN_WORK_DIR，指向一个你有写权限的文件夹（例如 D:\\ballrain），"
+                    "客户端的所有文件都会放在那里。");
     platform::make_dirs(dir_ + "/queue");
     for (auto &t : platform::list_dir(dir_ + "/queue"))  // a crash right at queue_open: nothing to upload there
         if (!file_exists(dir_ + "/queue/" + t + "/meta.json")) remove_tree(dir_ + "/queue/" + t);
@@ -1287,7 +1302,6 @@ DiagFiles Controller::diagnostics() const {
     std::string home = platform::home_dir(), user = platform::user_name();
     if (!home.empty()) rep.push_back({home, "~"});
     if (user.size() >= 2) rep.push_back({user, "<用户>"});
-    if (const char *w = std::getenv("BALLRAIN_WORK_DIR"); w && *w) rep.push_back({w, "<引擎工作目录>"});
     info.set("queued_chunks", Json::integer(view().queued_chunks));
     DiagFiles out;
     out.push_back({"info.json", scrub_text(info.dump(true), rep)});

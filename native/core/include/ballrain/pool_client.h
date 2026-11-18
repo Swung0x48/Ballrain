@@ -10,11 +10,14 @@
 #include "ballrain/json.h"
 #include "ballrain/policy.h"
 #include "ballrain/starts.h"
+#include "ballrain/task_runner.h"
 
 namespace ballrain {
 
 extern const char *const CLIENT_VERSION;
-extern const std::vector<const char *> CLIENT_CAPABILITIES;  // hello.capabilities
+// hello.capabilities (ballrain.pool.capabilities): task format 3, the route branch and its rules, the f7 reach block
+// of this client's version (weights.reach_capability: "reach_" + reach_version with "_" for ".")
+std::vector<std::string> client_capabilities();
 
 struct GatewayUnavailable : Error {  // no usable answer: network, timeout, not the protocol
     explicit GatewayUnavailable(const std::string &m) : Error(m) {}
@@ -65,6 +68,9 @@ public:
     std::string path_dir(const std::string &sha, int level);  // the reference line installed as L<nn>.npz
     // the route-branch pack installed as the FeatureConfig.branch_dir (install_branch_pack)
     std::string branch_dir(const std::string &sha, int level, const FeatureConfig &fc);
+    // f7: the task's reach fields (assets.reach) installed as <root>/fastreach/L<nn>-<key_sha256[:16]>.npz (the
+    // ReachBlock's fields directory); each file is downloaded once (zstd, size-capped, sha-checked) and kept
+    std::string reach_dir(const std::vector<Task::ReachAsset> &assets, int level);
 
 private:
     std::string root_;
