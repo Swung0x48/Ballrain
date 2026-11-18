@@ -5,7 +5,8 @@
 Serves static/index.html, /api/status (small JSON, polled by the page every 60 s) and
 /api/data/<name>.json (map / curve payloads, gzip). A background thread recomputes the payloads every
 --interval seconds (default 10 min; the page's "立即刷新" asks for an earlier pass, rate-limited) into
-runtime/dashboard/ (untracked). The level outlines are built once and cached. The process lowers its
+runtime/dashboard/ (untracked). Each run's level and TAS record come from its config (level 1 before r8); the maps
+of a level (geometry_l<N>, frontier_l<N>, history_l<N>) are built from that level's TAS record, once, and cached. The process lowers its
 own CPU priority, only reads the training outputs, and never starts or touches the game or the trainer.
 See tools/dashboard/README.md for what the page publishes and what it leaves out.
 """
@@ -178,7 +179,7 @@ def highlight_public() -> dict | None:
            "tz": s("tz", 10), "sr_ms": i("sr_ms"), "k": i("k"), "tas_ms": i("tas_ms"), "backend": s("backend", 32),
            "matched": j.get("matched") is True,
            "duration_s": j.get("duration_s") if isinstance(j.get("duration_s"), (int, float)) else None,
-           "v": i("v"),
+           "v": i("v"), "level": i("level"),
            "recorded_ts": D.ts_from_label(j.get("recorded_at"), j.get("tz")),
            "episode_ts": D.ts_from_label(j.get("episode_at"), j.get("tz")),
            # file names of this recording's set, as its json lists them (never a leftover file)
@@ -230,7 +231,7 @@ class Dashboard:
         self.game_assets = not a.no_game_assets
         self.lock = threading.Lock()
         self.wake = threading.Event()
-        self.level = None
+        self.levels: dict = {}  # TAS record -> geometry.Level (built in the generation thread only)
         self.traces = D.Traces(CACHE / "traces.pkl")
         self.sigs: dict = {}
         self.summary: dict = {}
@@ -271,8 +272,17 @@ class Dashboard:
             errors[name] = type(e).__name__  # details stay in the server log only
             log(f"section {name} failed:\n" + traceback.format_exc())
 
+    def level_of(self, run, build: bool = False):
+        """The run's Level (its TAS record); build=False (request threads): only one that is already loaded."""
+        rec = D.run_level(run)["record"]
+        if rec is None:
+            return None
+        if rec not in self.levels and build:
+            from geometry import Level
+            self.levels[rec] = Level(CACHE, log=log, record=rec)
+        return self.levels.get(rec)
+
     def generate(self):
-        from geometry import Level
         with self.lock:
             self.gen["running"] = True
             self.gen["last_start"] = time.time()
@@ -289,56 +299,94 @@ class Dashboard:
             self.sigs[name] = sig
 
         try:
-            if self.level is None:
-                self.level = Level(CACHE, log=log)
-            L = self.level
             runs = D.discover_runs()
             mac = D.mac_runs(runs)
             off = D.mac_offset_hours(runs)
             self.off = off
             sel = D.default_run(runs)
+            # one map set per level the Mac runs train; a level's maps follow its latest run (the default run when it
+            # is that level's) and its TAS record
+            by_level: dict = {}
+            for r in mac:
+                lv = D.run_level(r)
+                if lv["record"] is not None:
+                    by_level.setdefault(lv["level"], []).append(r)
+            if not by_level:
+                by_level = {1: []}
+            levels = {}
+            for lv, rs in sorted(by_level.items()):
+                act = [r for r in rs if D.is_active(r)]
+                cur_run = next((r for r in rs if r.name == sel), None) or (act or rs or [None])[-1]
+                rec = D.run_level(cur_run)["record"] if cur_run is not None else D.LEVEL_RECORDS[1]
+                try:
+                    if rec not in self.levels:
+                        from geometry import Level
+                        self.levels[rec] = Level(CACHE, log=log, record=rec)
+                    levels[lv] = (self.levels[rec], cur_run)
+                except Exception as e:
+                    errors[f"level{lv}"] = type(e).__name__
+                    log(f"level {lv} failed:\n" + traceback.format_exc())
+            summary["levels"] = sorted(levels)
+            # payloads of levels no run trains any more are dropped from the listing
+            # (and the level-1 names of the single-level version)
+            for k in list(vers):
+                m = re.match(r"^(?:geometry|frontier|history)(?:_l(\d+))?$", k)
+                if m and (m.group(1) is None or int(m.group(1)) not in levels):
+                    del vers[k]
 
-            put("geometry", 1, lambda: L.outlines)
+            for lv, (L, _) in levels.items():
+                put(f"geometry_l{lv}", L.record, lambda L=L: L.outlines)
 
             def frontier():
-                cur_st = D.run_status(next(r for r in mac if r.name == sel), off, L.n, {**self.machines, "sources": self.sources}) if sel else {}
-                cur = int(cur_st.get("frontier") or 19086)
-                self.map_frontier = (sel, cur)  # what the charts were built for (status() compares)
-                sig = (tuple(D._sig(r.path / "train.log") for r in runs), cur, sel, self.show_alt)
-                put("frontier", sig, lambda: D.frontier_payload(L, runs, off, sel, cur, self.show_alt))
+                for lv, (L, cur_run) in levels.items():
+                    name = cur_run.name if cur_run is not None else None
+                    cur_st = D.run_status(cur_run, off, L, {**self.machines, "sources": self.sources}) if cur_run else {}
+                    cur = int(cur_st.get("frontier") or L.default_frontier)
+                    if name == sel:
+                        self.map_frontier = (sel, cur)  # what the charts were built for (status() compares)
+                    sig = (tuple(D._sig(r.path / "train.log") for r in runs), tuple(D._sig(r.path / "config.json") for r in runs),
+                           cur, name, L.record, self.show_alt)
+                    put(f"frontier_l{lv}", sig, lambda L=L, name=name, cur=cur: D.frontier_payload(L, runs, off, name, cur, self.show_alt))
             self._section("frontier", errors, frontier)
 
             def curves():
-                sig = tuple((r.name, tuple(D._sig(Path(f)) for f in r.files("updates*.csv"))) for r in runs)
+                sig = tuple((r.name, D._sig(r.path / "config.json"), tuple(D._sig(Path(f)) for f in r.files("updates*.csv")))
+                            for r in runs)
                 put("curves", sig, lambda: D.curves_payload(runs, self.machines))
             self._section("curves", errors, curves)
 
             def traces():
                 keep = set()
-                allidx = []
+                allidx: dict = {}  # level -> traced episodes of the runs on that level's map record
                 counts = {}
                 for r in mac:
                     idx = self.traces.index(r)
                     counts[r.name] = len(idx)
-                    allidx += idx
+                    lv = D.run_level(r)
+                    if lv["level"] in levels and levels[lv["level"]][0].record == lv["record"]:
+                        allidx.setdefault(lv["level"], []).extend(idx)
                     if not idx:
                         continue
                     latest = idx[-ATTEMPTS_N:]
                     keep.update(i["key"] for i in latest)
 
-                    def build(latest=latest, n=len(idx), run=r.name):
+                    def build(latest=latest, n=len(idx), run=r.name, level=lv["level"]):
                         trs = [D.traj_payload(i, t) for i in latest if (t := self.traces.get(i)) is not None]
-                        return {"run": run, "total": n, "traj": trs}
-                    put(f"attempts_{r.name}", (len(idx), idx[-1]["key"]), build)
-                allidx.sort(key=lambda i: i["t"])
-                sub, thin = D.nested_sample(allidx, HISTORY_N)
-                keep.update(i["key"] for i in sub)
-                if allidx:
-                    def build_h():
-                        trs = [D.traj_payload(i, t) for i in thin if (t := self.traces.get(i)) is not None]
-                        return {"runs": [r.name for r in mac if counts.get(r.name)], "total": len(allidx),
-                                "traj": trs}
-                    put("history", tuple(sorted(counts.items())), build_h)
+                        return {"run": run, "level": level, "total": n, "traj": trs}
+                    put(f"attempts_{r.name}", (len(idx), idx[-1]["key"], lv["record"]), build)
+                for lv, ai in allidx.items():
+                    ai.sort(key=lambda i: i["t"])
+                    sub, thin = D.nested_sample(ai, HISTORY_N)
+                    keep.update(i["key"] for i in sub)
+                    if ai:
+                        runs_lv = {i["run"] for i in ai}
+
+                        def build_h(thin=thin, n=len(ai), runs_lv=runs_lv, lv=lv):
+                            trs = [D.traj_payload(i, t) for i in thin if (t := self.traces.get(i)) is not None]
+                            return {"runs": [r.name for r in mac if counts.get(r.name) and r.name in runs_lv],
+                                    "level": lv, "total": n, "traj": trs}
+                        put(f"history_l{lv}", (tuple(sorted((k, v) for k, v in counts.items() if k in runs_lv)),
+                                               levels[lv][0].record), build_h)
                 self.traces.save(keep)
                 summary["traced_counts"] = counts
             self._section("traces", errors, traces)
@@ -374,11 +422,10 @@ class Dashboard:
         off = getattr(self, "off", None)
         if off is None:
             off = D.mac_offset_hours(runs)
-        n = self.level.n if self.level is not None else 20588
         st = {}
         for r in mac:
             try:
-                st[r.name] = D.run_status(r, off, n, {**self.machines, "sources": self.sources})
+                st[r.name] = D.run_status(r, off, self.level_of(r), {**self.machines, "sources": self.sources})
             except Exception as e:
                 st[r.name] = {"run": r.name, "error": type(e).__name__}
                 log(f"status {r.name} failed:\n" + traceback.format_exc())
@@ -399,12 +446,13 @@ class Dashboard:
             compute = D.discarded_steps(runs, D.default_run(runs))
         except Exception:
             compute = None
-        res = {"now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "now_ts": int(time.time()), "tz": D.tz_label(), "milestone": "M2",
+        res = {"now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "now_ts": int(time.time()), "tz": D.tz_label(), "milestone": "M3",
                "runs": [r.name for r in mac], "default_run": D.default_run(runs), "status": st, "gen": gen,
                "interval_s": self.interval, "min_refresh_s": self.min_refresh, "machines": self.machines,
                "tensorboard_url": self.tensorboard_url, "data": summ.get("data") or {},
                "sr": summ.get("sr") or {}, "k0": summ.get("k0") or [],
                "traced_counts": summ.get("traced_counts") or {}, "assets": self.assets, "compute": compute,
+               "levels": summ.get("levels") or [],
                "reports": R.public(R.load()), "highlight": highlight_public()}
         self._status = (time.time(), res)
         return res

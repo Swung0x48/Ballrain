@@ -16,10 +16,10 @@ from ballrain.train.worker import Worker, WorkerSpec
 D = np.float32(1000 / 132)
 
 
-def _decider(p, frontier, after_death=True, with_curriculum=True, with_starts=True, seed=0):
+def _decider(p, frontier, after_death=True, with_curriculum=True, with_starts=True, seed=0, **spec):
     """A Worker with only what _skip_respawn reads: sectors 1-4 entered at record frames 936 / 7817 / 11756 / 14232."""
     w = object.__new__(Worker)
-    w.spec = SimpleNamespace(p_early_respawn=p)
+    w.spec = SimpleNamespace(p_early_respawn=p, **spec)
     valid = np.arange(936, 20587)
     sector = np.select([valid < 7817, valid < 11756, valid < 14232], [1, 2, 3], 4)
     w.env = SimpleNamespace(_after_death=after_death,
@@ -52,6 +52,38 @@ def test_skip_probability_and_default_draws_nothing():
     skips = np.mean([w._skip_respawn("BallOff", {"sector": 1}) for _ in range(20000)])
     assert 0.88 < skips < 0.92
     assert WorkerSpec(wid=0, copy="x", env=None, seed=0).p_early_respawn == 1.0
+
+
+def test_skip_respawn_from_sector():
+    # bridge override for engines that crash on late respawns: every BallOff in that sector or later, no draw
+    w = _decider(1.0, 4100, skip_respawn_from_sector=4)
+    state = w._respawn_rng.bit_generator.state
+    assert w._skip_respawn("BallOff", {"sector": 4}) and w._skip_respawn("BallOff", {"sector": 5})
+    assert not w._skip_respawn("BallOff", {"sector": 3})  # earlier sectors: the p_early_respawn rule (p = 1: played)
+    assert w._respawn_rng.bit_generator.state == state
+    assert not w._skip_respawn("stall", {"sector": 4}) and not w._skip_respawn("LevelFinish", {"sector": 5})
+    assert not _decider(1.0, 4100, after_death=False, skip_respawn_from_sector=4)._skip_respawn("BallOff", {"sector": 4})
+    lvl = _decider(0.0, 4100, skip_respawn_from_sector=4, respawn_level_starts=True)
+    lvl.env._start = {"process_start_frame": 0}
+    assert lvl._skip_respawn("BallOff", {"sector": 4})  # level starts too (the engine crashes either way)
+    assert not lvl._skip_respawn("BallOff", {"sector": 2})  # ... their earlier respawns are still played
+    assert not _decider(1.0, 4100, skip_respawn_from_sector=0)._skip_respawn("BallOff", {"sector": 5})  # 0 = off
+    assert not _decider(1.0, 4100)._skip_respawn("BallOff", {"sector": 5})  # older spec without the field
+    assert WorkerSpec(wid=0, copy="x", env=None, seed=0).skip_respawn_from_sector == 0
+
+
+def test_bridge_local_overrides(tmp_path):
+    sys.path.insert(0, str(__import__("ballrain.instances", fromlist=["REPO_ROOT"]).REPO_ROOT / "scripts"))
+    import remote_worker_m2 as rw
+    logs = []
+    a = SimpleNamespace(skip_respawn_from_sector=None)
+    assert rw.local_overrides(tmp_path, a, logs.append) == {} and not logs
+    (tmp_path / "worker_overrides.json").write_text('{"skip_respawn_from_sector": 5}', encoding="utf-8")
+    assert rw.local_overrides(tmp_path, a, logs.append) == {"skip_respawn_from_sector": 5} and logs
+    assert rw.local_overrides(tmp_path, SimpleNamespace(skip_respawn_from_sector=4), logs.append) ==         {"skip_respawn_from_sector": 4}  # the flag wins over the file
+    (tmp_path / "worker_overrides.json").write_text('{"p_early_respawn": 1.0}', encoding="utf-8")
+    with pytest.raises(SystemExit):
+        rw.local_overrides(tmp_path, a, logs.append)  # only the listed fields may be overridden locally
 
 
 def test_train_m2_option_reaches_spec_and_remote_template():

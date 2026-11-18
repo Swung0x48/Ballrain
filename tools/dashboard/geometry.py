@@ -1,13 +1,15 @@
-"""Level-1 top-view geometry for the dashboard maps, built once and cached on disk.
+"""Top-view geometry and TAS line of a level for the dashboard maps, built once per TAS record and cached on disk.
 
-Rebuilding the level needs the TAS record replayed through a GameTracker, so the result is saved to
-runtime/dashboard/cache/ and reused by every later regeneration and restart. The triangles are merged
-into outlines (boundary-edge loops per object, x-z plane), so the browser draws a few hundred polygons
-instead of ~18k triangles. Adapted from runtime/viz/viz_features.py (OfflineSession, replay_to).
+Rebuilding a level needs its TAS record (runtime/datasets/tas-v1/<record>) replayed through a GameTracker, so the
+result is saved to runtime/dashboard/cache/ and reused by every later regeneration and restart. One pass gives both
+the outlines (triangles merged into boundary-edge loops per object, x-z plane, so the browser draws a few hundred
+polygons instead of ~18k triangles) and the TAS line (ball position, sector and ball_nav per frame). Level 1 can
+still read the older runtime/viz feature cache for its line (same values). Adapted from runtime/viz/viz_features.py.
 """
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -18,10 +20,26 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-RECORD = "SR01_1_14_457_264"
-REC_DIR = ROOT / "runtime" / "datasets" / "tas-v1" / RECORD
-TAS_CACHE = ROOT / "runtime" / "viz" / f"cache_{RECORD}_f3.npz"
+# default start record per level: mirrors scripts/train_m2.py RECORDS (a run's --record overrides; test_dashboard_levels)
+LEVEL_RECORDS = {1: "SR01_1_14_457_264", 2: "SR02_1_28_992_264"}
+RECORD = LEVEL_RECORDS[1]
+DATASET = ROOT / "runtime" / "datasets" / "tas-v1"
+RECORD_RE = re.compile(r"^SR(\d\d)_\d+_\d\d_\d{3}_\d{3}$")
 GEOM_VERSION = 2
+LINE_VERSION = 1
+START_BACK = 1500  # ballrain.curriculum.CurriculumConfig.start_back: the first frontier, before any log line
+
+
+def record_ok(record, level: int | None = None) -> bool:
+    """A TAS record name as the dataset spells it (SR<level>_...), of `level` when given, present on this machine."""
+    m = RECORD_RE.match(str(record or ""))
+    if not m or (level is not None and int(m.group(1)) != int(level)):
+        return False
+    return (DATASET / str(record) / "raw.npz").is_file()
+
+
+def viz_cache(record: str) -> Path:
+    return ROOT / "runtime" / "viz" / f"cache_{record}_f3.npz"
 
 
 class OfflineSession:
@@ -114,12 +132,7 @@ def _outlines(A, B, C, owner) -> list[list[float]]:
     return rings
 
 
-def _build(n_frames: int) -> dict:
-    from ballrain.features import level_geometry
-    s = OfflineSession(REC_DIR, 1)
-    for i in range(min(n_frames, s.n)):
-        s.ingest(s.obs(i))
-    geo = level_geometry(s.tracker)
+def _split(geo) -> dict:
     T = geo.tris
     rail = np.isin(T.owner, np.unique(geo.rails.owner)) if len(geo.rails) else np.zeros(len(T), bool)
     ny = T.N[:, 1]
@@ -130,26 +143,79 @@ def _build(n_frames: int) -> dict:
     return out
 
 
-class Level:
-    """TAS line (pos / sector / ball_nav per frame) + level outlines, held in memory."""
+def replay_record(record: str, outlines: bool = True) -> tuple[dict, dict | None]:
+    """One pass over the record's observations: the TAS line per observation (index = frames_done; pos is NaN where
+    the ball is not found, sector 0 before the level is loaded, ball_nav as the tracker flags it) and, when asked,
+    the level outlines as the tracker knows them 5 observations before the end (as built for level 1 before)."""
+    from ballrain.features import level_geometry
+    level = int(record[2:4])
+    s = OfflineSession(DATASET / record, level)
+    pos, sec, nav = np.full((s.n, 3), np.nan), np.zeros(s.n), np.zeros(s.n)
+    geo = None
+    for i in range(s.n):
+        o = s.obs(i)
+        s.ingest(o)
+        t, b = s.tracker, o.ball
+        if s.loaded and b is not None and bool(b["found"]) and int(b["type"]) in (0, 1, 2):
+            pos[i] = np.asarray(b["pos"], np.float64)
+        sec[i] = t.sector if s.loaded else 0
+        nav[i] = float(t.flags.ball_nav)
+        if outlines and i == s.n - 6:
+            geo = _split(level_geometry(t))
+    if outlines and geo is None:
+        geo = _split(level_geometry(s.tracker))
+    return {"pos": pos, "sector": sec, "ball_nav": nav}, geo
 
-    def __init__(self, cache_dir: Path, log=print):
-        c = np.load(TAS_CACHE, allow_pickle=True)
-        self.pos = np.asarray(c["pos"], dtype=np.float64)
-        self.sector = np.asarray(c["sector"])
-        self.nav = np.asarray(c["ball_nav"])
-        self.n = len(self.pos)
-        gp = cache_dir / f"geom_{RECORD}_v{GEOM_VERSION}.json"
+
+def _write_json(p: Path, obj) -> None:
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj), encoding="utf-8")
+    tmp.replace(p)
+
+
+class Level:
+    """One level as its TAS record shows it: the TAS line (pos / sector / ball_nav per frame), the outlines, the
+    checkpoint frames, the record's own SR clock and the benchmark thresholds; held in memory, cached on disk."""
+
+    def __init__(self, cache_dir: Path, log=print, record: str = RECORD):
+        import data as D
+        if not record_ok(record):
+            raise ValueError("unknown TAS record")
+        self.record = record
+        self.level = int(record[2:4])
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        gp = cache_dir / f"geom_{record}_v{GEOM_VERSION}.json"
+        lp = cache_dir / f"line_{record}_v{LINE_VERSION}.npz"
+        line = geo = None
+        if viz_cache(record).is_file():
+            c = np.load(viz_cache(record), allow_pickle=False)
+            line = {k: c[k] for k in ("pos", "sector", "ball_nav")}
+        elif lp.is_file():
+            c = np.load(lp, allow_pickle=False)
+            line = {k: c[k] for k in ("pos", "sector", "ball_nav")}
         if gp.exists():
-            self.outlines = json.loads(gp.read_text(encoding="utf-8"))
-        else:
-            log("geometry: replaying the TAS record once ...")
-            self.outlines = _build(self.n - 5)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp = gp.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.outlines), encoding="utf-8")
-            tmp.replace(gp)
-            log(f"geometry: cached {gp.name} ({sum(len(v) for v in self.outlines.values())} outlines)")
-        ch = np.flatnonzero(np.diff(self.sector) > 0) + 1
-        self.checkpoints = [int(i) for i in ch[ch > 936]]
+            geo = json.loads(gp.read_text(encoding="utf-8"))
+        if line is None or geo is None:
+            log(f"geometry: replaying the level {self.level} TAS record once ...")
+            line2, geo2 = replay_record(record, outlines=geo is None)
+            if line is None:
+                line = line2
+                tmp = lp.with_name(lp.stem + ".tmp.npz")
+                np.savez_compressed(tmp, **line)
+                tmp.replace(lp)
+            if geo is None:
+                geo = geo2
+                _write_json(gp, geo)
+                log(f"geometry: cached level {self.level} ({sum(len(v) for v in geo.values())} outlines)")
+        self.outlines = geo
+        self.pos = np.asarray(line["pos"], dtype=np.float64)
+        self.sector = np.asarray(line["sector"])
+        self.nav = np.asarray(line["ball_nav"])
+        self.n = len(self.pos)
         self.ok = np.flatnonzero(self.nav > 0)
+        self.first = int(self.ok[0])  # spawn: the first frame the ball can be steered (L1 936)
+        ch = np.flatnonzero(np.diff(self.sector) > 0) + 1
+        self.checkpoints = [int(i) for i in ch[ch > self.first]]
+        self.clock = D.tas_clock(record)
+        self.default_frontier = int(self.ok[-1]) - START_BACK  # the curriculum's first frontier (L1 19086)
+        self.trace = DATASET / record / "trace.txt"

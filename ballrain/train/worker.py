@@ -17,6 +17,7 @@ A forced truncation ends the game process (env.reset() in the middle of a life s
 Early respawns (WorkerSpec.p_early_respawn < 1): after a BallOff whose respawn sector the start record enters before
 the curriculum frontier, the respawn life is skipped with probability 1 - p_early_respawn: the game process ends and the
 next episode is a new curriculum start; the dead episode's record carries respawn_skipped = True.
+WorkerSpec.skip_respawn_from_sector > 0 skips every respawn life in that sector or later the same way (no draw).
 
 Run directories: after a process ends its meta (.json) is read for the run statistics; with prune="finish"
 non-finishing runs are deleted and finishing runs keep only the .json, .tas and events.txt (disk: a run
@@ -124,6 +125,12 @@ class WorkerSpec:
     # respawn_level_starts: in a process started from level load (k = 0) every respawn life is played, whatever
     # p_early_respawn says (from-spawn training: the agent's own approach, deaths and respawns included); getattr-read
     respawn_level_starts: bool = False
+    # skip_respawn_from_sector (0 = off): a BallOff whose respawn sector (the sector at death) is >= this value never
+    # plays its respawn life, in any process (level starts included): the process ends and a new curriculum start
+    # follows (respawn_skipped). Set by a bridge for engines that crash on such respawns (remote_worker_m2.py
+    # --skip-respawn-from-sector; L2 r8: the 2002-physics SimTool crashes on the 盘点-4 paper-ball respawn, see
+    # runtime/m2-train/r8-prep/simtool-2002-respawn-crash.md); getattr-read
+    skip_respawn_from_sector: int = 0
     # counter randomisation (off when empty): in a game process not started from level load (TAS / at-rest starts and
     # their respawns) every life draws one set of counter-feature values and the observations of that life carry them
     # instead of the true ones: {"lives": {"values": [...], "p": [...]} (replaced), "sr_s": [lo, hi], "points": [lo, hi]
@@ -408,6 +415,9 @@ class Worker:
         record enters before the curriculum frontier, and a draw >= p_early_respawn. No draw at p >= 1."""
         p = self.spec.p_early_respawn
         env = self.env
+        k = int(getattr(self.spec, "skip_respawn_from_sector", 0) or 0)
+        if k > 0 and end == "BallOff" and getattr(env, "_after_death", False) and int(info.get("sector") or 0) >= k:
+            return True  # an engine that cannot play this respawn (bridge override): no draw
         if (p >= 1.0 or end != "BallOff" or not getattr(env, "_after_death", False) or env.curriculum is None
                 or env.starts is None):
             return False
