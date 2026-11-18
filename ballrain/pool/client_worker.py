@@ -193,8 +193,9 @@ class Worker:
         policy, manifest = self.cache.policy(task.policy_sha)
         sdir = self.cache.starts(task.assets["starts"])
         pdir = self.cache.path(task.assets["path"], task.level)
-        br, bsha = manifest["features"].get("branch"), task.assets.get("branch")
-        bdir = self.cache.branch(bsha, task.level, br) if br and bsha else None
+        f, bsha = manifest["features"], task.assets.get("branch")
+        bdir = self.cache.branch(bsha, task.level, f["branch_sha256"], f.get("path_sha256")) \
+            if f.get("branch_sha256") and bsha else None
         slot = int(self.cfg.get("slot", 0))
         copy = f"pool-{slot:02d}"
         out = Path(self.cfg["data_dir"]) / "runs"

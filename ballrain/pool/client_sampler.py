@@ -397,17 +397,18 @@ class TaskSampler(_worker_base()):
                 ef = env._ep_frames
                 s = env.reward.s
                 branch = bool(info2.get("branch"))  # as Worker.run: stall_age on the active line's metres
-                odometer = info2.get("local_s") if branch else s
+                rules = env.branch_rules
+                odometer = info2.get("local_s") if branch and rules.stall_odometer == "local_s" else s
                 speed = None
                 if sp.stall_speed is not None:
                     o = env.session.tracker.obs if env.session is not None else None
                     if o is not None and o.ball is not None:
                         velocity = o.ball["speed"]
-                        if branch:
+                        if branch and rules.stall_speed_source == "speed+speed_change":
                             velocity = np.asarray(velocity) + o.ball["speed_change"]
                         speed = float(np.linalg.norm(velocity))
                 win = stall_rsp if ep.d["kind"] == "respawn" else stall_all
-                since = stall_age(ep, ef, odometer, branch, speed, sp.stall_progress, sp.stall_speed, stall_max, win)
+                since = stall_age(ep, ef, odometer, branch, speed, sp.stall_progress, sp.stall_speed, stall_max, win, rules)
                 if ep.d["cap_frames"] is not None and ef >= ep.d["cap_frames"]:
                     trunc, end = True, "cap"
                 elif s is not None and since >= win:

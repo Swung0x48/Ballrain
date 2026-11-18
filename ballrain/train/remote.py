@@ -29,6 +29,9 @@ import time
 import traceback
 from multiprocessing.connection import Client, Listener
 
+from ..branch_assets import bundle_rules
+from ..branch_rules import DEFAULT_RULES
+
 PROTOCOL = 1
 
 
@@ -94,6 +97,13 @@ class RemoteHub:
             hello = conn.recv()
             if hello.get("type") != "hello" or hello.get("protocol") != PROTOCOL:
                 conn.send({"type": "error", "error": f"bad hello {hello!r}"})
+                return
+            assets = getattr(self.template.get("env"), "branch_assets", None)
+            if assets is not None and hello.get("branch_assets_version") != 1:
+                conn.send({"type": "error", "error": "distributed branch requires branch_assets_version=1"})
+                return
+            if assets and hello.get("branch_rules_version") != 1 and bundle_rules(assets) != DEFAULT_RULES:
+                conn.send({"type": "error", "error": "non-default branch rules require branch_rules_version=1"})
                 return
             host = f"{hello.get('host', '?')}#{hello.get('session', 0)}"
             known = self.conns.get(hello.get("host"))
@@ -230,7 +240,7 @@ class RemoteBridge:
                     try:
                         cc = Client(self.addr, authkey=self.authkey)
                         cc.send({"type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session + 1,
-                                 "backend": self.label, "n_workers": len(self.copies)})
+                                 "branch_assets_version": 1, "branch_rules_version": 1, "backend": self.label, "n_workers": len(self.copies)})
                         if not cc.poll(30):
                             raise ConnectionError("no config within 30 s")
                         box["conn"], box["msg"] = cc, cc.recv()

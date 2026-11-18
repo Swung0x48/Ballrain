@@ -86,9 +86,11 @@ class Verifier:
         with self._plock:  # parallel workers: one installs a pack at a time (Windows refuses a replace of an open file)
             sdir = T.install_starts_pack(ad / f"{task.assets['starts']}.npz", cache, task.assets["starts"])
             pdir = T.install_path_asset(ad / f"{task.assets['path']}.npz", cache, task.level, task.assets["path"])
-            br, bsha = manifest["features"].get("branch"), task.assets.get("branch")
-            if br and bsha:  # the route branch: the pack the gateway exported from the learner's files
-                bdir = T.install_branch_pack(ad / f"{bsha}.npz", cache, task.level, bsha, br)
+            f = manifest["features"]
+            bsha = task.assets.get("branch")
+            if f.get("branch_sha256") and bsha:  # the route branch: the pack the gateway exported from the learner's files
+                bdir = T.install_branch_pack(ad / f"{bsha}.npz", cache, task.level, bsha, f["branch_sha256"],
+                                             f.get("path_sha256"))
         return sdir, pdir, bdir
 
     def _decoded(self, task_id: str, rows: list, upto: int, n_obs: int, n_act: int) -> list:

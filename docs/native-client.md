@@ -337,4 +337,8 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - 令牌文件：POSIX 上写成 0600；Windows 上靠用户目录的权限（同 Python 主控程序）。
 - 网关响应只做了轻量的结构检查（类型和必需字段），没有照搬 `protocol.MESSAGES` 的完整 schema。
 - 只支持 SR 策略（与网关导出的限制相同）；`route_probes` 只是记账，没有移植。
-- `fastreach`、2002 零售版 Player.exe 版本：以后。
+- **f7 特征（`reach` 块，`ballrain/fastreach.py`）没有移植**：`FeatureConfig::from_json` 拒绝 `"reach": true` 和 `"version": "f7"`（报错指向这里），
+  `pool.weights.export_state` 也拒绝导出 f7 策略，f6 的清单里不写 `reach` 字段（清单和 policy_sha 与以前相同）。要让 f7 策略进资源池，需要把
+  fastreach 的场（读 `runtime/fastreach/L<nn>-<键>.npz` 或在客户端构建，`canonical_geometry` 的键）和 `perceive` 内核移植过来，并与 Python 逐位或在容差内一致。
+  完整定义（场文件格式和键、perceive 语义含风扇、缩放、版本钉、容差）：`docs/f7-native-port.md`。
+- 2002 零售版 Player.exe 版本：以后。

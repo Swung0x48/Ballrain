@@ -16,7 +16,10 @@ import train_m2  # noqa: E402
 
 def test_level_and_record_options():
     a = train_m2.parse(["--run", "x"])
-    assert a.level == 1 and train_m2.start_record(a) == "SR01_1_14_457_264" and not a.rehearse_behind_frontier
+    # --level defaults to None at parse time and resolves to the checkpoint's level (else 1) in main()
+    assert a.level is None and not a.rehearse_behind_frontier
+    a.level = 1
+    assert train_m2.start_record(a) == "SR01_1_14_457_264"
     a = train_m2.parse(["--run", "x", "--level", "2", "--rehearse-behind-frontier"])
     assert train_m2.start_record(a) == "SR02_1_28_992_264" and a.rehearse_behind_frontier
     a = train_m2.parse(["--run", "x", "--level", "2", "--record", "SR02_1_33_070_240"])

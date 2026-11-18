@@ -33,6 +33,8 @@ import gymnasium as gym
 import numpy as np
 
 from . import instances, protocol as P, tas
+from .branch_assets import bundle_rules
+from .branch_rules import DEFAULT_RULES
 from .client import AgentSession, SessionConfig
 from .curriculum import CurriculumConfig, ReverseCurriculum, TasStarts
 from .features import FeatureConfig, FeatureExtractor
@@ -149,8 +151,26 @@ class EnvConfig:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     reward: RewardConfig | None = None
 
+    branch_assets: dict | None = None
+
+    def __reduce_ex__(self, protocol):
+        if self.branch_assets is not None:
+            # An older spawned worker must not silently drop an unfamiliar dataclass field.
+            if bundle_rules(self.branch_assets) != DEFAULT_RULES:
+                return _restore_branch_env_rules_v1, (vars(self),)
+            return _restore_branch_env_v1, (vars(self),)
+        return super().__reduce_ex__(protocol)
+
     def reward_config(self) -> RewardConfig:
         return self.reward if self.reward is not None else RewardConfig(mode=self.mode)
+
+
+def _restore_branch_env_v1(fields):
+    return EnvConfig(**fields)
+
+
+def _restore_branch_env_rules_v1(fields):
+    return EnvConfig(**fields)
 
 
 def key_push_dirs(cam_matrix) -> dict:
@@ -209,7 +229,17 @@ class BallanceEnv(gym.Env):
             raise ValueError(f"launcher backend {getattr(launcher, 'backend', 'retail')!r} != EnvConfig.backend "
                              f"{self.cfg.backend!r}")
         self.launcher = launcher
-        self.fx = FeatureExtractor(self.cfg.features)
+        from .branch_assets import install
+        fc = self.cfg.features
+        if fc.reach and (fc.camera == "world") != bool(self.cfg.world_actions):
+            # the reach block's 8 directions are the arrow keys under FeatureExtractor.action_quarter: world actions
+            # need the world frame (quarter 0), camera-relative keys a camera frame (the Cam_OrientRef quarter)
+            raise ValueError(f"FeatureConfig.reach with camera {fc.camera!r} and world_actions={self.cfg.world_actions}: "
+                             "the reach directions would not be the action directions (world actions need "
+                             "camera='world', camera-relative actions a camera frame)")
+        self._branch_temp = install(self.cfg.branch_assets, self.cfg.level, fc.path_sha256, fc.branch_sha256)
+        self.branch_rules = bundle_rules(self.cfg.branch_assets) if self._branch_temp else DEFAULT_RULES
+        self.fx = FeatureExtractor(fc, branch_root=self._branch_temp.name if self._branch_temp else None)
         self.reward = Reward(self.cfg.reward_config())
         if self.cfg.esc_frames < 3:
             raise ValueError("esc_frames must be >= 3 (Esc must be released, the toggle lands 2 frames later)")
@@ -334,17 +364,17 @@ class BallanceEnv(gym.Env):
                "pos": np.asarray(o.ball["pos"], np.float64).tolist()}
         return None if got == exp else {"got": got, "expected": exp}
 
-    def _brake(self, p: dict) -> None:
+    def _brake(self, p: dict, rules=DEFAULT_RULES) -> None:
         """At-rest start: push against the ball's horizontal velocity until it is slower than rest_speed."""
         from .features import yaw_basis  # noqa: F401  (world_to_camera_keys uses it)
         s, c = p["session"], self.cfg
         n0 = s.frames_done
-        while s.frames_done - n0 < c.rest_max_frames and not s.ended:
+        while s.frames_done - n0 < (rules.rest_max_brake_frames or c.rest_max_frames) and not s.ended:
             o = s.tracker.obs
             v = (np.asarray(o.ball["speed"], np.float64) + np.asarray(o.ball["speed_change"], np.float64)
                  if o is not None and o.ball is not None else np.zeros(3))  # the velocity as in the features
             vh = np.array([v[0], 0.0, v[2]])
-            if np.linalg.norm(vh) < c.rest_speed:
+            if np.linalg.norm(vh) < (rules.rest_stop_speed or c.rest_speed):
                 break
             w = -vh / np.linalg.norm(vh)
             best = max(ARROWS9[1:], key=lambda a: np.dot(w, np.array([bool(a & tas.KEY_RIGHT) - bool(a & tas.KEY_LEFT), 0.0,
@@ -353,7 +383,7 @@ class BallanceEnv(gym.Env):
                                                                        bool(a & tas.KEY_UP) - bool(a & tas.KEY_DOWN)])))
             keys = world_to_camera_keys(best, o.cams["cams"][0]["matrix"]) if o.cams is not None else best
             ev0 = len(s.tracker.events)
-            s.act(tas.make_frames([self.delta], [keys]), repeat=2, stop=EPISODE_STOP)
+            s.act(tas.make_frames([self.delta], [keys]), repeat=rules.rest_control_repeat, stop=EPISODE_STOP)
             if any(c_ in (Ev.BallOff, Ev.LevelFinish, Ev.GameOver) for _, c_, _ in s.tracker.events[ev0:]):
                 break
         s.act(tas.make_frames([self.delta], [0]), repeat=1, stop=EPISODE_STOP)  # release the arrows
@@ -401,6 +431,8 @@ class BallanceEnv(gym.Env):
                     # the drive, preserving the requested TAS frame (and curriculum band).
                     p["session"].close(kill=True)
                     self.branch_rest_failures += 1
+                    if self.branch_rules.rest_fallback == "error":
+                        raise
                     p = self._prepare(copy, k, rest=False)
                     failure = dict(branch_rest_failures=self.branch_rest_failures,
                                    branch_rest_target=rest["branch_s"], branch_rest_error=str(exc))
@@ -420,19 +452,20 @@ class BallanceEnv(gym.Env):
         Never synthesize a transform, teleport, or accept a paper / unsupported handover.
         Use a private extractor: warm-preparation can run concurrently with training.
         """
-        from .path import asset_path, file_sha256, resolve_path_dir
+        from .path import asset_path, file_sha256
         cfg = self.cfg.features
-        if not cfg.branch_dir:
-            raise ValueError('branch rest start needs branch_dir')
+        if self._branch_temp is None:
+            raise ValueError('branch rest start needs distributed assets')
+        root = Path(self._branch_temp.name)
         s = p['session']
-        fx = FeatureExtractor(cfg)
+        fx = FeatureExtractor(cfg, branch_root=root)
         fx.reference_path(s.tracker)
         branch = fx.branch
         if branch is None:
             raise ValueError('no matching branch at handover')
-        with np.load(resolve_path_dir(cfg.branch_dir) / 'drive.npz', allow_pickle=False) as drive:
+        with np.load(root / 'drive.npz', allow_pickle=False) as drive:
             if (str(drive['record_sha256']) != p['start'].get('record_sha256') or
-                    str(drive['branch_sha256']) != file_sha256(asset_path(self.cfg.level, resolve_path_dir(cfg.branch_dir)))):
+                    str(drive['branch_sha256']) != file_sha256(asset_path(self.cfg.level, root))):
                 raise ValueError('drive replay does not match TAS recording or branch asset')
             samples = drive['samples']
             if k != int(drive['prefix_frame']) or not samples[:, 1].min() <= station <= samples[:, 1].max():
@@ -446,17 +479,19 @@ class BallanceEnv(gym.Env):
         target = branch.alt.point_at(station)
         if s.tracker.ball_type() != branch.ball_type or s.tracker.sector != branch.sector:
             raise RuntimeError('branch drive did not produce the required ball type and sector')
-        self._drive(p, target[[0, 2]])
-        self._brake(p)
+        rules = branch.rules
+        self._drive(p, target[[0, 2]], rules)
+        self._brake(p, rules)
         _, fi = fx.compute(s.tracker)
         o = s.tracker.obs.ball
-        if (not fi.get('supported') or not fi.get('path', {}).get('branch') or
-                np.linalg.norm(o['pos'] - target) > 2 or np.linalg.norm(fi['vel'][[0, 2]]) > self.cfg.rest_speed):
+        if ((rules.rest_require_support and not fi.get('supported')) or not fi.get('path', {}).get('branch') or
+                np.linalg.norm(o['pos'] - target) > rules.rest_position_tolerance or
+                np.linalg.norm(fi['vel'][[0, 2]]) > (rules.rest_stop_speed or self.cfg.rest_speed)):
             raise RuntimeError('branch rest target not reached at rest on the correct surface')
         p['start']['branch_s'] = station
         p['recorder'].meta.start_state.update(branch_s=station)
 
-    def _drive(self, p: dict, target) -> None:
+    def _drive(self, p: dict, target, rules=DEFAULT_RULES) -> None:
         """At-rest start with a target (rest_starts entry [lo, hi, x, z, jitter]): push the ball with world arrows towards
         (x, z), aiming at a velocity proportional to the remaining distance (capped), until it is within 1 unit and
         slower than rest_speed or rest_max_frames passed; _brake then stops it there."""
@@ -465,7 +500,7 @@ class BallanceEnv(gym.Env):
         tgt = np.array([target[0], target[1]], np.float64)
         dirs = [(a, np.array([bool(a & tas.KEY_RIGHT) - bool(a & tas.KEY_LEFT), bool(a & tas.KEY_UP) - bool(a & tas.KEY_DOWN)],
                              np.float64)) for a in ARROWS9[1:]]
-        max_frames = int(target[2]) if len(target) >= 3 else c.rest_max_frames
+        max_frames = int(target[2]) if len(target) >= 3 else (rules.rest_max_drive_frames or c.rest_max_frames)
         while s.frames_done - n0 < max_frames and not s.ended:
             o = s.tracker.obs
             if o is None or o.ball is None:
@@ -473,18 +508,18 @@ class BallanceEnv(gym.Env):
             pos = np.asarray(o.ball["pos"], np.float64)[[0, 2]]
             v = (np.asarray(o.ball["speed"], np.float64) + np.asarray(o.ball["speed_change"], np.float64))[[0, 2]]
             d = tgt - pos
-            if np.linalg.norm(d) < 1.0 and np.linalg.norm(v) < c.rest_speed:
+            if np.linalg.norm(d) < rules.drive_arrival_radius and np.linalg.norm(v) < (rules.rest_stop_speed or c.rest_speed):
                 break
-            want = d * 0.8
-            if np.linalg.norm(want) > 6.0:
-                want *= 6.0 / np.linalg.norm(want)
+            want = d * rules.drive_gain
+            if np.linalg.norm(want) > rules.drive_speed_cap:
+                want *= rules.drive_speed_cap / np.linalg.norm(want)
             w = want - v
             keys = 0
-            if np.linalg.norm(w) > 0.3:
+            if np.linalg.norm(w) > rules.drive_deadband:
                 best = max(dirs, key=lambda kd: float(np.dot(w, kd[1])) / np.linalg.norm(kd[1]))[0]
                 keys = world_to_camera_keys(best, o.cams["cams"][0]["matrix"]) if o.cams is not None else best
             ev0 = len(s.tracker.events)
-            s.act(tas.make_frames([self.delta], [keys]), repeat=2, stop=EPISODE_STOP)
+            s.act(tas.make_frames([self.delta], [keys]), repeat=rules.rest_control_repeat, stop=EPISODE_STOP)
             if any(c_ in (Ev.BallOff, Ev.LevelFinish, Ev.GameOver) for _, c_, _ in s.tracker.events[ev0:]):
                 break
         p["start"]["rest_target"] = [float(tgt[0]), float(tgt[1])]

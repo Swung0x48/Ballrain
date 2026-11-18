@@ -9,6 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ballrain.env import BallanceEnv, EnvConfig
 from ballrain.features import FeatureConfig
 
+from ballrain.branch_assets import read_bundle, validate
+
+bundle = read_bundle(2, sys.argv[4])
+main_sha = json.loads(bundle["desc_json"])["main_sha256"]
+
 live = Path(sys.argv[1])
 hl = live / "hl-win"
 build, copy = sys.argv[2:4]
@@ -17,7 +22,8 @@ for target in (1525, 1700, 1850, 1975, 2100):
     cfg = EnvConfig(level=2, backend="headless", copy=copy, out_root=str(live / "viz/l2s4/stone"),
                     headless=dict(binary=str(hl / build / "BallanceMMOSimTool.exe"),
                                   root=str(hl / "game"), socket="tcp"),
-                    features=FeatureConfig(branch_dir="benchmarks/refpaths-alt/L02-stone"),
+                    features=FeatureConfig(path_dir=sys.argv[5], path_sha256=main_sha,
+                                           branch_sha256=validate(bundle, 2, main_sha)), branch_assets=bundle,
                     start_record=str(live / "datasets/tas-v1/SR02_1_28_992_264"), p_rest=1,
                     rest_starts=[[14730, 14730, dict(branch_s=float(target))]])
     env = BallanceEnv(cfg)

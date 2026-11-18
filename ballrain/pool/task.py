@@ -17,8 +17,8 @@ Start-state assets (served sha-addressed and immutable, GET /pool/assets/<sha256
 - the reference line L<nn>.npz (install_path_asset), checked against FeatureConfig.path_sha256;
 - a route branch (ballrain/branch.py, docs/l2-stone-branch.md), when the policy follows one: the branch pack
   (export_branch_pack / install_branch_pack) holds the learner's three files as sent (state["branch_assets"]: the
-  branch line L<nn>.npz, its station description L<nn>.json, the verified drive.npz), pinned by the manifest's
-  features.branch = {line_sha256, desc_sha256, drive_sha256} and installed as the FeatureConfig.branch_dir. No
+  branch line L<nn>.npz, its station description and rules L<nn>.json, the verified drive.npz), pinned by the
+  learner's own features.branch_sha256 (ballrain.branch_assets) and handed to the env as EnvConfig.branch_assets. No
   component reads branch files of its own: the route is the learner's configuration.
 Both are plain npz (np.load(allow_pickle=False), dtypes checked); the dataset's own meta.json (local paths) is not
 shipped.
@@ -55,8 +55,9 @@ PATH_OPTIONAL = {"t_ms": (np.dtype("<f8"), 1)}
 MAX_ASSET_BYTES = 64 * 1024 * 1024
 
 
-# the branch pack: the learner's files as raw bytes (uint8, 1-d), each pinned by the manifest's features.branch
-BRANCH_PACK_ARRAYS = {"line_npz": "line_sha256", "desc_json": "desc_sha256", "drive_npz": "drive_sha256"}
+# the branch pack: the learner's files as raw bytes (uint8, 1-d); the manifest pins them by features.branch_sha256
+# (ballrain.branch_assets: the sha256 of the three raw 32-byte digests in this order)
+BRANCH_PACK_ARRAYS = ("line_npz", "desc_json", "drive_npz")
 DRIVE_ARRAYS = {"branch_sha256": (np.dtype("<U64"), 0), "record_sha256": (np.dtype("<U64"), 0),
                 "prefix_frame": (np.dtype("<i8"), 0), "frames": (RECORD_FRAME_DTYPE, 1),
                 "samples": (np.dtype("<f8"), 2)}
@@ -390,27 +391,10 @@ def _npz_arrays(b: bytes, what: str) -> dict:
     return out
 
 
-def check_branch_files(line: bytes, desc: bytes, drive: bytes, level: int, main_sha256: str | None = None) -> dict:
-    """The checks of a route branch's three files (what ballrain.branch.load_branch and env._branch_rest rely on):
-    the description names the level, the main line (when main_sha256 is given) and the branch line's sha256; the
-    line is a reference line of the level with t_ms (the branch clock); the drive belongs to that line. Returns
-    features.branch = {line_sha256, desc_sha256, drive_sha256}."""
+def _check_branch_line_and_drive(line: bytes, drive: bytes, level: int) -> None:
+    """The structure the native client relies on beyond ballrain.branch_assets.validate (array names, dtypes, shapes,
+    finite values, no local paths in the line's meta)."""
     from .weights import assert_public
-    line_sha = hashlib.sha256(line).hexdigest()
-    try:
-        d = json.loads(desc.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise ValueError(f"branch description: {e}") from None
-    if not isinstance(d, dict) or d.get("level") != int(level):
-        raise ValueError(f"branch description is not for level {level}")
-    if main_sha256 is not None and d.get("main_sha256") != main_sha256:
-        raise ValueError("branch description pairs with another main reference line")
-    if d.get("branch_sha256") != line_sha:
-        raise ValueError("branch description names another branch line")
-    for k in ("sector", "ball_type", "main_s", "branch_s", "stations"):
-        if k not in d:
-            raise ValueError(f"branch description: no {k}")
-    assert_public(d)
     a = _npz_arrays(line, "branch line")
     spec = dict(PATH_ARRAYS, **PATH_OPTIONAL)
     if set(a) != set(spec) | {"meta"}:
@@ -432,30 +416,43 @@ def check_branch_files(line: bytes, desc: bytes, drive: bytes, level: int, main_
     for k, (dt, nd) in DRIVE_ARRAYS.items():
         if z[k].dtype != dt or z[k].ndim != nd:
             raise ValueError(f"branch drive: {k} is {z[k].dtype} / {z[k].ndim}-d")
-    if str(z["branch_sha256"]) != line_sha or int(z["prefix_frame"]) <= 0:
-        raise ValueError("branch drive does not belong to the branch line")
     sm = z["samples"]
-    if sm.shape[1:] != (2,) or not len(sm) or not np.isfinite(sm).all() or \
+    if int(z["prefix_frame"]) <= 0 or sm.shape[1:] != (2,) or not len(sm) or not np.isfinite(sm).all() or \
             not ((sm[:, 0] >= 0) & (sm[:, 0] <= len(z["frames"]))).all():
-        raise ValueError("branch drive: samples")
-    return {"line_sha256": line_sha, "desc_sha256": hashlib.sha256(desc).hexdigest(),
-            "drive_sha256": hashlib.sha256(drive).hexdigest()}
+        raise ValueError("branch drive: prefix frame / samples")
 
 
-def branch_assets_bytes(ba: dict, level: int) -> tuple[bytes, bytes, bytes]:
-    """The learner's state["branch_assets"] ({level, line_npz, desc_json, drive_npz}) -> (line, desc, drive) bytes."""
-    if not isinstance(ba, dict) or int(ba.get("level", -1)) != int(level):
+def branch_bundle(ba: dict, level: int, main_sha256: str | None) -> tuple[dict, str, bool]:
+    """The learner's state["branch_assets"] ({level, line_npz, desc_json, drive_npz} raw bytes, sha256 optional: it is
+    recomputed and, when given, must agree) checked as the learner's workers check it (ballrain.branch_assets.validate:
+    level, digests, the main line pairing, the rules) plus the native client's structure checks. Returns (bundle with
+    sha256, features.branch_sha256, whether the rules differ from the v1 defaults)."""
+    from ballrain.branch_assets import filenames, validate, bundle_rules
+    from ballrain.branch_rules import DEFAULT_RULES
+    from ballrain.path import RouteError
+    from .weights import assert_public
+    if not isinstance(ba, dict) or ba.get("level") != int(level):
         raise ValueError(f"the learner's branch assets are not for level {level}")
-    return tuple(_raw(ba.get(k), k) for k in ("line_npz", "desc_json", "drive_npz"))
+    blobs = {k: _raw(ba.get(k), k) for k in filenames(level)}
+    digests = {k: hashlib.sha256(v).hexdigest() for k, v in blobs.items()}
+    if ba.get("sha256") not in (None, digests):
+        raise ValueError("the learner's branch assets: sha256 differs from the bytes")
+    bundle = dict(level=int(level), **blobs, sha256=digests)
+    try:
+        key = validate(bundle, int(level), main_sha256)
+        rules = bundle_rules(bundle)
+    except (RouteError, ValueError, KeyError) as e:
+        raise ValueError(f"branch assets: {e}") from None
+    assert_public(json.loads(blobs["desc_json"]))
+    _check_branch_line_and_drive(blobs["line_npz"], blobs["drive_npz"], level)
+    return bundle, key, rules != DEFAULT_RULES
 
 
-def export_branch_pack(ba: dict, level: int, out_dir, main_sha256: str | None = None) -> tuple[str, Path]:
+def export_branch_pack(ba: dict, level: int, out_dir, main_sha256: str | None) -> tuple[str, Path]:
     """Server side: the learner's branch bundle -> <out_dir>/<sha>.npz (sha = the file's sha256), the three files'
     bytes as uint8 arrays (deterministic npz: the same bundle gives the same sha)."""
-    line, desc, drive = branch_assets_bytes(ba, level)
-    check_branch_files(line, desc, drive, level, main_sha256)
-    arrays = {k: np.frombuffer(b, np.uint8).copy() for k, b in zip(("line_npz", "desc_json", "drive_npz"),
-                                                                   (line, desc, drive))}
+    bundle, _, _ = branch_bundle(ba, level, main_sha256)
+    arrays = {k: np.frombuffer(bundle[k], np.uint8).copy() for k in BRANCH_PACK_ARRAYS}
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = out_dir / f".branch.{os.getpid()}.npz"
@@ -466,38 +463,42 @@ def export_branch_pack(ba: dict, level: int, out_dir, main_sha256: str | None = 
     return sha, dst
 
 
-def install_branch_pack(pack, cache_dir, level: int, expect_sha: str, branch: dict) -> Path:
-    """Client side: check a downloaded branch pack (its sha256, the three files against the manifest's
-    features.branch pins, check_branch_files) and lay it out as <cache_dir>/branch/<sha>/ with L<nn>.npz, L<nn>.json
-    and drive.npz (the FeatureConfig.branch_dir); returns the directory. Idempotent."""
+def install_branch_pack(pack, cache_dir, level: int, expect_sha: str, branch_sha256: str,
+                        main_sha256: str | None) -> Path:
+    """Client side: check a downloaded branch pack (its sha256; branch_bundle; the bundle digest is the manifest's
+    features.branch_sha256) and lay it out as <cache_dir>/branch/<sha>/ with L<nn>.npz, L<nn>.json and drive.npz;
+    returns the directory. Idempotent."""
+    from ballrain.branch_assets import filenames
     a = _load_checked(Path(pack), {k: (np.dtype("|u1"), 1) for k in BRANCH_PACK_ARRAYS}, expect_sha)
-    files = {k: a[k].tobytes() for k in BRANCH_PACK_ARRAYS}
-    for k, pin in BRANCH_PACK_ARRAYS.items():
-        if hashlib.sha256(files[k]).hexdigest() != branch.get(pin):
-            raise ValueError(f"branch pack: {k} is not the policy's ({pin})")
-    check_branch_files(files["line_npz"], files["desc_json"], files["drive_npz"], level)
+    bundle, key, _ = branch_bundle(dict(level=int(level), **{k: a[k].tobytes() for k in BRANCH_PACK_ARRAYS}), level,
+                                   main_sha256)
+    if key != branch_sha256:
+        raise ValueError("branch pack: not the policy's branch (features.branch_sha256)")
     d = Path(cache_dir) / "branch" / expect_sha
     if (d / ".complete").is_file():
         return d
     d.mkdir(parents=True, exist_ok=True)
-    for k, name in (("line_npz", f"L{int(level):02d}.npz"), ("desc_json", f"L{int(level):02d}.json"),
-                    ("drive_npz", "drive.npz")):
+    for k, name in filenames(level).items():
         tmp = d / f".{name}.{os.getpid()}.tmp"
-        tmp.write_bytes(files[k])
+        tmp.write_bytes(bundle[k])
         os.replace(tmp, d / name)
     (d / ".complete").write_text(expect_sha, encoding="utf-8")
     return d
 
 
-def check_branch_dir(branch_dir, level: int, branch: dict) -> Path:
-    """The installed branch directory holds exactly the files the manifest pins (TaskMismatch otherwise)."""
+def read_branch_dir(branch_dir, level: int, branch_sha256: str, main_sha256: str | None) -> dict:
+    """The installed branch directory as the env's EnvConfig.branch_assets bundle, checked against the manifest's pin
+    (TaskMismatch otherwise)."""
+    from ballrain.branch_assets import filenames
     d = Path(branch_dir)
-    for name, pin in ((f"L{int(level):02d}.npz", "line_sha256"), (f"L{int(level):02d}.json", "desc_sha256"),
-                      ("drive.npz", "drive_sha256")):
-        p = d / name
-        if not p.is_file() or file_sha256(p) != branch.get(pin):
-            raise TaskMismatch(f"the branch directory's {name} is not the policy's")
-    return d
+    try:
+        ba = dict(level=int(level), **{k: (d / name).read_bytes() for k, name in filenames(level).items()})
+        bundle, key, _ = branch_bundle(ba, level, main_sha256)
+    except (OSError, ValueError) as e:
+        raise TaskMismatch(f"the branch directory: {e}") from None
+    if key != branch_sha256:
+        raise TaskMismatch("the branch directory is not the policy's branch (features.branch_sha256)")
+    return bundle
 
 
 # ============================================================================================== env
@@ -531,11 +532,11 @@ def build_env_config(task: Task, manifest: dict, local: LocalGame, starts_dir, p
     if feats.get("path_sha256") != task.assets["path"]:
         raise TaskMismatch("the task's reference line is not the policy's")
     feats["path_dir"] = str(Path(path_dir).resolve())
-    br = feats.pop("branch", None)  # the route branch the policy follows (features.branch pins its three files)
-    if br is not None:
+    bundle = None  # the route branch the policy follows (features.branch_sha256): the env installs it itself
+    if feats.get("branch_sha256"):
         if not task.assets.get("branch") or branch_dir is None:
             raise TaskMismatch("the policy follows a route branch: the task needs its branch pack")
-        feats["branch_dir"] = str(check_branch_dir(branch_dir, task.level, br).resolve())
+        bundle = read_branch_dir(branch_dir, task.level, feats["branch_sha256"], feats.get("path_sha256"))
     elif task.assets.get("branch") or branch_dir is not None:
         raise TaskMismatch("a branch pack for a policy without a route branch")
     for k in ("far_waypoints", "ref_speed_at"):
@@ -545,7 +546,7 @@ def build_env_config(task: Task, manifest: dict, local: LocalGame, starts_dir, p
                      start_rest=dict(task.rest) if task.rest is not None else None,
                      curriculum=None, rest_starts=None, p_rest=0.0, rehearse_starts=None, p_rehearse=0.0,
                      warm_pool=False, warm_copy=None, trace=False, prefix=None, seed=int(task.ball_order_seed),
-                     copy=copy, out_root=str(out_root), backend="headless",
+                     copy=copy, out_root=str(out_root), backend="headless", branch_assets=bundle,
                      headless=local.headless(task.ball_order, manifest.get("engine_options")),
                      features=FeatureConfig(**feats), reward=RewardConfig(**manifest["reward"]))
 

@@ -96,7 +96,7 @@ class PolicySource:
         line = T.find_path_asset(int(m["env"]["level"]), psha_want, self.path_dirs)
         psha, _ = T.export_path_asset(line, self.assets_dir)
         bsha = None
-        if m["features"].get("branch"):  # the learner's branch files, as export_state pinned them
+        if m["features"].get("branch_sha256"):  # the learner's branch files, as export_state pinned them
             bsha, _ = T.export_branch_pack(state["branch_assets"], int(m["env"]["level"]), self.assets_dir, psha)
         excl = m["env"].get("exclude_starts")
         st = TasStarts(str(rd))

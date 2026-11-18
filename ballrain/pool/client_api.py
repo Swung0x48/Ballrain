@@ -21,7 +21,7 @@ from .reasons import TOKEN_FATAL, Reason
 
 CLIENT_VERSION = "0.3.0"  # 0.2: chunk format 2 (the engine-state chain); 0.3: format 3 (chain v3)
 # what this client can run (hello.capabilities; ballrain.pool.capabilities): format 3 tasks, the route branch
-CLIENT_CAPABILITIES = ("task_format3", "branch_v1")
+CLIENT_CAPABILITIES = ("task_format3", "branch_v1", "branch_rules_v1")
 MAX_RESPONSE = P.MAX_JSON_BYTES
 MAX_MANIFEST = 256 * 1024
 MAX_DOWNLOAD = 64 * 1024 * 1024
@@ -244,6 +244,6 @@ class Cache:
         from . import task as T
         return T.install_path_asset(self.asset(sha), self.root, level, sha)
 
-    def branch(self, sha: str, level: int, pins: dict) -> Path:
+    def branch(self, sha: str, level: int, branch_sha256: str, main_sha256: str | None) -> Path:
         from . import task as T
-        return T.install_branch_pack(self.asset(sha), self.root, level, sha, pins)
+        return T.install_branch_pack(self.asset(sha), self.root, level, sha, branch_sha256, main_sha256)
