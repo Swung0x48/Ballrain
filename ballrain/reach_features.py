@@ -129,8 +129,10 @@ class ReachBlock:
 
     def compute(self, tracker, pos, vel, quarter: int, ball_type: int):
         """(scaled block (N_REACH,), raw perceive vector (N_REACH,), fields key)."""
-        fr, key = fields_for(tracker, self.cache_dir)
         p = np.asarray(pos, np.float64)
+        if not (np.isfinite(p).all() and np.isfinite(np.asarray(vel, np.float64)).all()):
+            return np.zeros(N_REACH), np.full(N_REACH, np.nan), None  # perceive refuses it; the f6 entries nan_to_num
+        fr, key = fields_for(tracker, self.cache_dir)
         bodies = moving_bodies(tracker, p, self.body_radius)
         raw, _ = fr.perceive(p, vel, int(ball_type), int(quarter), bodies=bodies)
         return scale(raw), raw, key

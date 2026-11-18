@@ -47,6 +47,12 @@ def test_reach_refused_without_numba(monkeypatch):
     FeatureExtractor(FeatureConfig())  # f6 does not need it
 
 
+@needs_numba
+def test_non_finite_state_gives_a_zero_block_not_an_error():
+    blk, raw, key = RF.ReachBlock().compute(None, [np.nan, 0, 0], [0, 0, 0], 0, 0)  # the tracker is never touched
+    assert key is None and not blk.any() and blk.shape == (FR.N_FEATURES,)
+
+
 def test_scaling_is_finite_and_within_one():
     raw = np.array([1, 1, 1, 1, 3.0, -90, 40, -40, -90, 3.0, 1, 1, 1, 0.3, 0.9, -0.3, -1, 0, 1]
                    + [20, -20, 20, 20, -20] * 8, np.float64)
