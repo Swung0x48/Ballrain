@@ -112,12 +112,27 @@ int main(int argc, char **argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
     SetConsoleTitleW(L"Ballrain 算力池");
-    {  // QuickEdit would freeze the output when the player clicks into the window
-        HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
-        DWORD mode = 0;
-        if (GetConsoleMode(in, &mode)) SetConsoleMode(in, (mode | ENABLE_EXTENDED_FLAGS) & ~DWORD(ENABLE_QUICK_EDIT_MODE));
-    }
+    // the console as it was: restored on exit (restore_console)
+    HANDLE con_in = GetStdHandle(STD_INPUT_HANDLE), con_out = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD in_mode0 = 0, out_mode0 = 0;
+    bool have_in = GetConsoleMode(con_in, &in_mode0) != 0, have_out = GetConsoleMode(con_out, &out_mode0) != 0;
+    // QuickEdit would freeze the output when the player clicks into the window
+    if (have_in) SetConsoleMode(con_in, (in_mode0 | ENABLE_EXTENDED_FLAGS) & ~DWORD(ENABLE_QUICK_EDIT_MODE));
 #endif
+    // After the UI: mouse tracking off, cursor on, pending input (mouse reports the shell would otherwise read as
+    // typed text) dropped, the console modes of the start. FTXUI restores the console mode before it sends its own
+    // reset sequences, which then may not take effect on Windows.
+    auto restore_console = [&] {
+#ifdef _WIN32
+        if (have_out) SetConsoleMode(con_out, out_mode0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
+        std::fputs("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?25h\x1b[?7h", stdout);
+        std::fflush(stdout);
+#ifdef _WIN32
+        if (have_in) FlushConsoleInputBuffer(con_in), SetConsoleMode(con_in, in_mode0);
+        if (have_out) SetConsoleMode(con_out, out_mode0);
+#endif
+    };
     std::string data_dir = platform::data_dir();
     for (int i = 1; i + 1 < argc; ++i)
         if (std::strcmp(argv[i], "--data-dir") == 0) data_dir = platform::absolute_path(argv[i + 1]);
@@ -451,6 +466,7 @@ int main(int argc, char **argv) {
     app.Loop(root);
     quitting = true;
     ticker.join();
+    restore_console();
     std::printf("正在停止所有实例并上传剩下的数据……\n");
     std::fflush(stdout);
     if (login_thread.joinable()) login_thread.join();

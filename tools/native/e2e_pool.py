@@ -119,6 +119,9 @@ def main(argv=None) -> int:
                     "--auto-pause on and must pause, then resume)")
     ap.add_argument("--quiet", default="", help="AT:FOR seconds: the client's stop-switch file exists (it must pause, "
                     "then resume)")
+    ap.add_argument("--hold", type=float, default=0.0,
+                    help="demo: after the login keep the gateway up this many seconds (or until <dir>/stop exists) "
+                         "with the verifier running, for the TUI started by hand on <dir>/client; no client run")
     ap.add_argument("--tui", help="also run the terminal UI (ballrain_pool --snapshot live:25) on the client's data")
     ap.add_argument("--kill-after", type=float, default=0.0,
                     help="first hard-kill the client this many seconds into a run (its engines must die with it: the job "
@@ -203,6 +206,25 @@ def main(argv=None) -> int:
     out, err = p.communicate(timeout=120)
     assert p.returncode == 0, (out, err)
     log(f"login ok: {json.loads(out.splitlines()[-1])['user']['username']}")
+    if a.hold > 0:  # a demo for a person at the TUI: the configuration filled in, the gateway and verifier kept up
+        cfgp = client_dir / "config.json"
+        c = json.loads(cfgp.read_text(encoding="utf-8")) if cfgp.is_file() else {}
+        c.update(gateway_url=gateway, ballance_dir=a.client_game, engine_binary=a.client_engine, instances=a.instances,
+                 setup_done=True, auto_pause_player=False, auto_pause_battery=False)
+        cfgp.write_text(json.dumps(c, ensure_ascii=False, indent=1), encoding="utf-8")
+        log(f"DEMO READY: ballrain_pool --data-dir {client_dir} (stop: create {d / 'stop'})")
+        end = time.time() + a.hold
+        while time.time() < end and not (d / "stop").exists():
+            try:
+                verifier.run_once()
+            except Exception as e:  # noqa: BLE001
+                log(f"verifier: {e}")
+            time.sleep(5)
+        servers[0].shutdown()
+        forum.shutdown()
+        store.close()
+        log("demo gateway stopped")
+        return 0
 
     # ---- the native client plays tasks
     killed_tasks = []
