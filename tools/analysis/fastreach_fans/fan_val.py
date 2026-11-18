@@ -89,13 +89,13 @@ for i, p, v, bt in tas:
         fan_codes[int(fc)] = fan_codes.get(int(fc), 0) + 1
     if vec[F["unknown_zone"]] > 0.5:
         unk += 1
-        if 19000 <= i <= 22400:
+        if 18900 <= i <= 22400:  # the fan stretch, as the latency window (19000 missed the fan states 18992-18997)
             unk_fan.append((i, reason(info), int(fc) if fc == fc else -1, int(vec[F["grounded"]]),
                             [round(float(x), 2) for x in p], [round(float(x), 2) for x in v]))
 R["tas"] = {"states": len(tas), "doomed": doom, "n_doomed": len(doom), "unknown": unk,
-            "unknown_19000_22400": unk_fan, "fan_codes": fan_codes}
+            "unknown_18900_22400": unk_fan, "fan_codes": fan_codes}
 print(f"TAS: {len(tas)} states, doomed {len(doom)} (frames {sorted(set(d[0] // 100 * 100 for d in doom))}); "
-      f"unknown_zone {unk}, in 19000-22400: {len(unk_fan)} {unk_fan[:40]}; fan dbg codes {fan_codes}")
+      f"unknown_zone {unk}, in 18900-22400: {len(unk_fan)} {unk_fan[:40]}; fan dbg codes {fan_codes}")
 TASD = {i: (p, v, bt) for i, p, v, bt in tas}
 
 

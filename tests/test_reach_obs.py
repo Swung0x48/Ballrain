@@ -231,7 +231,7 @@ def test_fields_key_does_not_depend_on_ck_ids(monkeypatch):
         ts = G.TriangleSet([t[0] for t in T], [t[1] for t in T], [t[2] for t in T], O, grid_cell=None)
         rails = G.TriangleSet([tri[3][0]], [tri[3][1]], [tri[3][2]], [ids[2]], grid_cell=None)
         geo = SimpleNamespace(tris=ts, rails=rails)
-        lvl = SimpleNamespace(name=lambda o: names[int(o)], depth=[])
+        lvl = SimpleNamespace(name=lambda o: names[int(o)], depth=[], by_name={}, entities={})  # no fans
         return SimpleNamespace(level=lvl, level_no=2, _geo=geo)
 
     monkeypatch.setattr(features, "level_geometry", lambda t: t._geo)
@@ -244,6 +244,27 @@ def test_fields_key_does_not_depend_on_ck_ids(monkeypatch):
     c = tracker([0, 1, 2, 3], (101, 102, 103))
     c._geo.tris.A[1, 1] += 1e-6  # any geometry change changes it
     assert FR.FastReach.fields_key(c) != FR.FastReach.fields_key(a)
+
+
+@needs_numba
+def test_l2_fields_carry_the_fans(tmp_path):
+    """The f7 fields of L2 (fields_for_tracker, the observation block's cache) hold the 9 fan push boxes, and the
+    fields key covers them (a key without the fans differs)."""
+    from ballrain import dataset, instances, protocol as P
+    rec = instances.runtime_dir() / "datasets" / f"tas-v{dataset.DATASET_VERSION}" / "SR02_1_28_992_264"
+    if not (rec / "level.msg").is_file():
+        pytest.skip("tas-v1 dataset not built")
+    tr = GameTracker(2)
+    tr.merge_level(P.parse_level_message((rec / "level.msg").read_bytes())[0])
+    tr.level_no = 2
+    fr = FR.FastReach.fields_for_tracker(tr, cache_dir=tmp_path)
+    assert fr.fans.shape == (9, FR.FAN_COLS) and len(fr.info["fans"]) == 9
+    assert np.array_equal(fr.fans, FR.fan_obbs(FR.fan_boxes(tr.level)))
+    key = FR.FastReach.fields_key(tr)
+    assert fr.info["key"] == key
+    from types import SimpleNamespace
+    bare = SimpleNamespace(level=SimpleNamespace(depth=tr.level.depth, by_name={}, entities={}))
+    assert FR.FastReach.fields_key(bare, FR.FastReach.canonical_geometry(tr)) != key
 
 
 # ------------------------------------------------------------------------------------------------ pool gate

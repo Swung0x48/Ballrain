@@ -76,21 +76,31 @@ Query (perceive): no key enumeration, no trajectory search.
   (not on rails): the full brake path (closed form, sampled
   on R) leaves the support and neither the brake departure nor a full-push takeoff along the velocity has a
   reachable landing. On rails a grounded ball is never doomed (a straight brake path leaves a curved rail: unknown).
+  unknown_zone wins: perceive clears doomed whenever unknown_zone is set (a moving-body zone, a moving body within
+  UNKNOWN_R, the horizon, a fan), so the two flags are never both 1 (the reason stays in dbg doom_reason).
 * Fans in the query. The push makes the height depend on the keys (they move the ball in or out of a narrow box), so
   the closed form holds only until a push can happen. Each air scan first finds the first PSI at which any reachable
   centre (the key square at the fan-free height, which is exact up to then) comes within FAN_R_OUT of a push box
   (_fan_touch, world AABB of the box: conservative). No such PSI before the landing / death: unchanged, exact. Else
   the key-free flight with the pushes (_fan_profile: v' = lam v - g + dv while the centre is within FAN_R_NOM, the
-  closed form piecewise, per PSI) is scanned, with its height replaced after the first apex by its non-increasing
-  upper envelope (a hover at the box top counts as staying at the top); its landing gives the air features (dbg fan
-  1), else the fan-free landing is kept (fan 2; also when both fan-free landings come before the key-free flight's
-  first push), else unknown_zone (fan 3, doom_reason 5): such a flight is never
-  doomed. That is the documented conservative choice: entering / leaving a box within the horizon is not solved
-  exactly over all key plans, so a ball that could still reach a push box before it dies is unknown, not doomed (also
-  wood, which a fan only slows). Takeoff scans of the grounded test (brake departure, jump) that can reach a push box
-  count as safe (fan 5, 6). Grounded within FAN_R_OUT of a push box: never doomed (fan 4), and unknown_zone when a
-  ball the push lifts (paper) is within FAN_R_IN (it leaves the ground). The ground features (gap / step deficits)
-  do not know fans: a gap a fan carries the ball over reads as impossible.
+  closed form piecewise, per PSI) is scanned: contacts on its actual heights (a hover at the box top: exit, fall
+  back, pushed again), PSI windows from its running minimum / running maximum from the end, and from the first to
+  the last push of that flight only landings within FAN_R_NOM + contact of a push box count (a centre steered out
+  of the column is not pushed: it falls from there instead of hovering, so a far landing at the hover height is not
+  reachable; an upper envelope of the hover pushed such landings to the horizon end); its landing gives the air
+  features (dbg fan 1), else the
+  fan-free landing is kept (fan 2, with its landings in collect; also when both fan-free landings come before the
+  key-free flight's first push). Else the band test over all key plans: every plan's height lies between the flight
+  formula (no push) and _fan_upper (pushed at every PSI from the first touch: the height is linear in the push
+  indicators with non-negative coefficients); a surface point the band reaches within the key square is a possible
+  landing (_contact_window cmode 2). A possible landing, or an upper bound that stays above the death height over the
+  horizon (paper: a push lifts it), = unknown_zone (fan 3, doom_reason 5); no possible landing and the upper bound
+  dies = doomed (fan 7, doom_reason 6: wood, which a fan only slows, falling past a fan over the void). The takeoff
+  scans of the grounded test (brake departure, jump) that find no landing and can reach a push box run the same band
+  test: a possible landing or no death = safe (fan 5, 6), else not (fan 8, 9). Grounded within FAN_R_OUT of a push
+  box: never doomed (fan 4), and unknown_zone when a ball the push lifts (paper) is within FAN_R_IN (it leaves the
+  ground). The ground features (gap / step deficits) do not know fans: a gap a fan carries the ball over reads as
+  impossible.
 
 Numerics: the kernels are scalar functions compiled by numba when it is installed (optional dependency group
 `fastreach`); with BALLRAIN_NO_NUMBA=1 or without numba the same functions run as plain Python on the same numpy
@@ -111,7 +121,10 @@ import numpy as np
 from . import reach, tas
 from .reach import BALLS, KEY_COMBOS
 
-BUILD_VERSION = 5
+BUILD_VERSION = 5  # the fields (build output, cache key): bump when the build or the arrays change
+# perceive semantics (the vector a state gives on given fields): bump with any change of the query. 2: unknown_zone
+# clears doomed, the fan band test (fan codes 7-9), the column rule for envelope landings, collect per reported scan
+QUERY_VERSION = 2
 
 # Physics constants of reach.py, as literals HERE on purpose: numba (cache=True) freezes globals into the compiled
 # kernels and invalidates its on-disk cache only when this file changes, so a constant imported from reach.py would
@@ -717,6 +730,25 @@ def _fan_profile(fans, xf, zf, y0, vy, lam, dv, rnom, n_max, yy, ins):
 
 
 @_jit
+def _fan_upper(y0, vy, lam, dv, n_from, n_max, yy):
+    """Upper bound of the height under any key plan when no push can act before PSI n_from (_fan_touch: the
+    reachable set comes within FAN_R_OUT of a push box first there): pushed at every PSI from n_from on (the same
+    indexing as _fan_profile). The height is linear in the push indicators with non-negative coefficients, so a plan
+    pushed at a subset of these PSIs is never higher. yy[0..n_max]."""
+    y = y0
+    v = vy
+    yy[0] = y0
+    for n in range(1, n_max + 1):
+        y += v / PSI_HZ
+        yy[n] = y
+        a = -GPSI
+        if n >= n_from:
+            a += dv
+        v = lam * v + a
+    return 0
+
+
+@_jit
 def _first_le(y, a, b, v):
     """First n in [a, b] with y[n] <= v (y non-increasing on [a, b]); b + 1 when none."""
     if a > b or y[b] > v:
@@ -993,23 +1025,53 @@ def _pyr_node(Hh, P1, P2, Pd, Poff, Pdim, tiles, lev, a, b):
 
 
 @_jit
-def _contact_window(yy, xf, zf, D, na, ns, cx, cz, h, rc, hc):
+def _contact_window(yy, yl, ya, lp, fans, cmode, xf, zf, D, na, ns, cx, cz, h, rc, hc):
     """Landing on a surface point (cx, h, cz) (hc: half cell, inflates it to a square for the reachability test):
     over the PSIs in [na, ns] at which the centre falls from h + rc to h and the reachable square can bring the sphere
     of contact radius rc onto the point: (first such PSI, least effort, the PSI of that least effort). Effort at PSI n
     = max(0, horizontal distance of the point from the key-free centre - contact radius at that height), i.e. how far
     the keys must move the centre (0 = the key-free flight lands on it); ties go to the earlier PSI.
-    (-1, inf, -1) when never."""
-    n0 = _first_le(yy, na, ns, h + rc)
+    (-1, inf, -1) when never.
+    cmode 0: one height profile yy (yl is yy, non-increasing on [na, ns]). cmode 1: a profile that may rise again
+    (the key-free fan profile): ya holds its heights, yl their running minimum and yy their running maximum from the
+    end (both non-increasing: they bound the PSI window exactly), the contact test uses ya; lp[n] is the last PSI
+    <= n the key-free flight was pushed at (-1: none yet). A point farther than FAN_R_NOM + rc from every push box
+    (a centre there is not pushed, so it does not follow the pushed profile) counts only before the first push, or
+    when the key-free flight has left the column (not pushed at n) and the point is within reach of the column since
+    the last push: its distance from the column at most the key-free travel since then plus D of the PSIs since then
+    (keys from the column edge). cmode 2: a band, every height in
+    [yl[n], yy[n]] is possible at PSI n (yl non-increasing, yy its non-increasing upper envelope on [na, ns]): the
+    centre height closest to h is used."""
+    n0 = _first_le(yl, na, ns, h + rc)
     n1 = _last_ge(yy, na, ns, h)
     first = -1
     emin = INF
     ne = -1
     for n in range(n0, n1 + 1):
-        dy = yy[n] - h
+        if cmode == 2:
+            ys = max(h, yl[n])
+            if ys > yy[n] or ys > h + rc:
+                continue
+            dy = ys - h
+        elif cmode == 1:
+            dy = ya[n] - h
+            if dy < 0.0:
+                continue
+        else:
+            dy = yy[n] - h
         rho2 = rc * rc - dy * dy
         if rho2 < 0.0:
             continue
+        if cmode == 1 and lp[n] >= 0.0:
+            m = int(lp[n])
+            dcol = _fan_dist(fans, cx, ya[n], cz) - FAN_R_NOM - rc
+            if dcol > 0.0:
+                if m >= n:
+                    continue
+                tx = xf[n] - xf[m]
+                tz = zf[n] - zf[m]
+                if dcol > math.sqrt(tx * tx + tz * tz) + D[n - m]:
+                    continue
         ddx = max(abs(cx - xf[n]) - D[n] - hc, 0.0)
         ddz = max(abs(cz - zf[n]) - D[n] - hc, 0.0)
         if ddx * ddx + ddz * ddz <= rho2:
@@ -1025,15 +1087,21 @@ def _contact_window(yy, xf, zf, D, na, ns, cx, cz, h, rc, hc):
 @_jit
 def _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, oz, boxes, void_y,
               S1, S2, x0, y0, z0, vx, vy, vz, a_air, r, filt, excl, mode, yy, xf, zf, D, stack, stamp, stamp_id,
-              collect, res, given):
+              collect, res, given, yl, ya, fins, fans):
     """Reachable landings from an airborne state. filt (4,): x0, x1, z0, z1 of the only surface points that count
     (filt[0] > filt[1]: no filter); excl (3,): x, z, radius of a disc whose surface points do not count (radius 0:
     none); mode 0 = full (earliest and least-effort landing), 1 = stop at the first landing found. collect (M, 5):
     reachable landing cells (x, h, z, n, effort) are written while there is room (len 0: none).
-    given 0: the height profile is the flight formula (filled into yy); 1: yy holds a profile already (the fan
-    profile, which may rise again after its first apex): from its first apex to the death floor it is replaced (in
-    yy) by its non-increasing upper envelope, which the scan needs (an approximation above the true height by the
-    depth of any later dip).
+    given 0: the height profile is the flight formula (filled into yy); 1: yy holds a profile already (the key-free
+    fan profile, which may rise again after its first apex: a hover at a push box top, exit, fall back, pushed again)
+    and fins its pushed PSIs (overwritten with the last pushed PSI <= n): the heights are kept in ya, yy becomes
+    their running maximum from the death-floor PSI back to the first apex and yl their running minimum from that
+    apex (the non-increasing bounds of the PSI windows), the contacts are tested on ya, and after the first push a
+    landing outside the push column counts only when reachable from the column since the last push
+    (_contact_window cmode 1: a centre steered out of the column loses the push). 2: a band: yy holds an upper
+    bound of the height at every PSI (_fan_upper), yl a lower bound (the flight formula: pushes only add height);
+    the descent starts at the lower bound's apex, the death floor is the upper bound's crossing (every key plan is
+    below it), a landing is a surface point the band reaches (cmode 2). fans: push boxes (given 1).
     res (float64, >= 16): found, n_first, first x, h, z, n_near (the PSI of the least effort), near x, h, z, effort,
     n_apex, n_stop, visited nodes, the near landing's contact radius and contact centre height (surface height for a
     cell, the tube axis for a rail), death floor crossed within the horizon (0: the horizon ran out first).
@@ -1045,9 +1113,21 @@ def _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, o
         xf[n] = x0 + vx * S1[n]
         zf[n] = z0 + vz * S1[n]
         D[n] = a_air * S2[n]
+    if given == 1:
+        last = -1.0
+        for n in range(N + 1):
+            ya[n] = yy[n]
+            if fins[n] > 0.5:
+                last = float(n)
+            fins[n] = last  # now: the last pushed PSI <= n (-1: none)
     if given == 0:
         na = 0
         while na < N and yy[na + 1] >= yy[na]:
+            na += 1
+        na = max(na, 1)
+    elif given == 2:
+        na = 0
+        while na < N and yl[na + 1] >= yl[na]:
             na += 1
         na = max(na, 1)
     else:
@@ -1061,12 +1141,18 @@ def _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, o
             crossed = True
             break
     if given != 0:
-        # from the first apex on, the profile is replaced by its non-increasing upper envelope (the highest height
-        # still ahead): a hover at a push box top (exit, fall back, pushed again) counts as staying at its top
-        na = 0
-        while na < ns and yy[na + 1] >= yy[na]:
-            na += 1
-        na = max(na, 1)
+        # from the first apex on (given 2: the lower bound's), yy is replaced by its non-increasing upper envelope (the
+        # highest height still ahead); given 1: yl by the running minimum (the lowest height so far)
+        if given == 1:
+            na = 0
+            while na < ns and yy[na + 1] >= yy[na]:
+                na += 1
+            na = max(na, 1)
+            m = INF
+            for n in range(na, ns + 1):
+                if ya[n] < m:
+                    m = ya[n]
+                yl[n] = m
         m = -INF
         for n in range(ns, na - 1, -1):
             if yy[n] > m:
@@ -1090,6 +1176,7 @@ def _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, o
     use_f = filt[0] <= filt[1]
     use_x = excl[2] > 0.0
     done = False
+    ylw = yy if given == 0 else yl  # the profile that bounds the first contact PSI from below
     if ns >= na:
         # ---- pyramid walk
         top = Pdim.shape[0] - 1 + 3
@@ -1116,7 +1203,7 @@ def _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, o
             bz1 = oz + ((b + 1) * span - 0.5) * RES
             if use_f and (bx1 < filt[0] or bx0 > filt[1] or bz1 < filt[2] or bz0 > filt[3]):
                 continue
-            n_lo = _first_le(yy, na, ns, hmax + rc)
+            n_lo = _first_le(ylw, na, ns, hmax + rc)
             n_hi = _last_ge(yy, na, ns, hmin)
             if n_lo > n_hi:
                 continue
@@ -1153,7 +1240,8 @@ def _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, o
                 h = float(Hh[t, a % TL, b % TL, k])
                 if h != h:
                     break
-                n1, e1, ne1 = _contact_window(yy, xf, zf, D, na, ns, cx, cz, h, rc, hc)
+                n1, e1, ne1 = _contact_window(yy, ylw, ya, fins, fans, given, xf, zf, D, na, ns, cx, cz,
+                                              h, rc, hc)
                 if n1 < 0:
                     continue
                 if yy[n1] < _death_y(boxes, void_y, cx, cz):
@@ -1223,7 +1311,8 @@ def _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, o
                                 continue
                             if use_x and (px - excl[0]) ** 2 + (pz - excl[1]) ** 2 <= excl[2] * excl[2]:
                                 continue
-                            n1, e1, ne1 = _contact_window(yy, xf, zf, D, na, ns, px, pz, py, rcr, 0.0)
+                            n1, e1, ne1 = _contact_window(yy, ylw, ya, fins, fans, given, xf, zf, D, na,
+                                                          ns, px, pz, py, rcr, 0.0)
                             if n1 < 0:
                                 continue
                             if yy[n1] < _death_y(boxes, void_y, px, pz):
@@ -1280,10 +1369,10 @@ def _perceive(tiles, Hh, P1, P2, Pd, Poff, Pdim, Rr, Rl, Rn, Rf, bidx, bricks, s
               ox, oz, sx0, sy0, sz0, boxes, void_y, uzones, fans,
               S1, S2, lam_a, a_air, lam_g, a_g, r, fdv,
               px, py, pz, vx, vy, vz, dirs, rightv, fwdv,
-              yy, xf, zf, D, fins, stack, stamp, stamp_id, collect, work, out, dbg, pdd):
+              yy, xf, zf, D, fins, yl, ya, stack, stamp, stamp_id, collect, work, out, dbg, pdd):
     """One state -> out (N_FEATURES), dbg (N_DBG), pdd (8, N_PDD). dirs (8, 3): world x, z of each key direction
     (unit) and the push magnitude along it (1 or sqrt 2); rightv, fwdv: camera right / forward (world x, z).
-    fans (k, FAN_COLS), fdv: the fan push per PSI on this ball (0: fans ignored)."""
+    fans (k, FAN_COLS), fdv: the fan push per PSI on this ball (0: fans ignored). yl, ya: work arrays (N + 1)."""
     N = S1.shape[0] - 1
     fan_on = fdv > 0.0 and fans.shape[0] > 0
     for i in range(out.shape[0]):
@@ -1363,7 +1452,7 @@ def _perceive(tiles, Hh, P1, P2, Pd, Poff, Pdim, Rr, Rl, Rn, Rf, bidx, bricks, s
         stamp_id += 1
         _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, oz, boxes, void_y,
                   S1, S2, px, py, pz, vx, vy, vz, a_air, r, nofilt, noex, 0, yy, xf, zf, D, stack, stamp, stamp_id,
-                  collect, res, 0)
+                  collect, res, 0, yl, ya, fins, fans)
         fan_unk = False
         if fan_on:
             # can any reachable centre be pushed before the flight lands or dies? (before that PSI the flight
@@ -1376,6 +1465,10 @@ def _perceive(tiles, Hh, P1, P2, Pd, Poff, Pdim, Rr, Rl, Rn, Rf, bidx, bricks, s
                 # it or on the fan-free flight = unknown, never doomed
                 found0 = res[0] > 0.0
                 res0 = res.copy()
+                col0 = collect.copy()  # the fan-free scan's landings (restored with its features, fan 2)
+                for i in range(collect.shape[0]):
+                    for j in range(collect.shape[1]):
+                        collect[i, j] = 0.0
                 pushed = _fan_profile(fans, xf, zf, py, vy, lam_a, fdv, FAN_R_NOM, N, yy, fins)
                 n_push = N + 1
                 for n in range(N + 1):
@@ -1388,18 +1481,39 @@ def _perceive(tiles, Hh, P1, P2, Pd, Poff, Pdim, Rr, Rl, Rn, Rf, bidx, bricks, s
                     stamp_id += 1
                     _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, oz, boxes, void_y,
                               S1, S2, px, py, pz, vx, vy, vz, a_air, r, nofilt, noex, 0, yy, xf, zf, D, stack, stamp,
-                              stamp_id, collect, res, 1)
+                              stamp_id, collect, res, 1, yl, ya, fins, fans)
                 if pushed > 0 and res[0] > 0.0:
                     dbg[DBG_FAN] = 1.0  # landing on the key-free fan profile
                 elif found0:
                     dbg[DBG_FAN] = 2.0  # none on it: the fan-free flight's landing (approximate)
                     for i in range(res.shape[0]):
                         res[i] = res0[i]
+                    for i in range(collect.shape[0]):
+                        for j in range(collect.shape[1]):
+                            collect[i, j] = col0[i, j]
                     for n in range(N + 1):  # (xf, zf, D are the same for both profiles)
                         yy[n] = py + vy * S1[n] - GPSI * S2[n]
                 else:
-                    dbg[DBG_FAN] = 3.0
-                    fan_unk = True
+                    # no landing on either profile: can any key plan land before every plan is below the death
+                    # height? The band between the flight formula (no push) and the push at every PSI from ft on
+                    # (_fan_upper) holds every plan's height; no surface in reach of it and the upper bound dies:
+                    # doomed (fan 7: wood, which a push only slows, over the void), else unknown (fan 3)
+                    _fan_upper(py, vy, lam_a, fdv, ft, N, yy)
+                    for n in range(N + 1):
+                        yl[n] = py + vy * S1[n] - GPSI * S2[n]
+                    stamp_id += 1
+                    _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, oz, boxes, void_y,
+                              S1, S2, px, py, pz, vx, vy, vz, a_air, r, nofilt, noex, 1, yy, xf, zf, D, stack, stamp,
+                              stamp_id, collect[:0], res, 2, yl, ya, fins, fans)
+                    for i in range(collect.shape[0]):
+                        for j in range(collect.shape[1]):
+                            collect[i, j] = 0.0
+                    if res[0] > 0.0 or res[15] == 0.0:
+                        dbg[DBG_FAN] = 3.0
+                        fan_unk = True
+                    else:
+                        dbg[DBG_FAN] = 7.0
+                    res[0] = 0.0  # (the band's landing is not a feature)
         dbg[DBG_AIR_ANY] = res[0]
         dbg[DBG_N_APEX] = res[10]
         dbg[DBG_N_STOP] = res[11]
@@ -1483,7 +1597,8 @@ def _perceive(tiles, Hh, P1, P2, Pd, Poff, Pdim, Rr, Rl, Rn, Rf, bidx, bricks, s
             out[12] = 1.0 if cmin >= r - 0.15 else 0.0
         elif res[15] > 0.0 and not fan_unk:
             out[1] = 1.0
-            dbg[DBG_DOOM_REASON] = 1.0  # airborne, no landing before the death height
+            # airborne, no landing before the death height (6: for every key plan, under the fan pushes too)
+            dbg[DBG_DOOM_REASON] = 6.0 if dbg[DBG_FAN] == 7.0 else 1.0
         else:
             out[2] = 1.0  # no landing within the horizon, but the death height is not reached in it either: unknown
             dbg[DBG_DOOM_REASON] = 5.0 if fan_unk else 4.0  # 5: a fan can push it before it lands or dies
@@ -1613,13 +1728,24 @@ def _perceive(tiles, Hh, P1, P2, Pd, Poff, Pdim, Rr, Rl, Rn, Rf, bidx, bricks, s
                     empty = collect[:0]
                     _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, oz, boxes, void_y,
                               S1, S2, lx, yb, lz, lvx_, 0.0, lvz_, a_air, r, nofilt, excl, 1, yy, xf, zf, D, stack,
-                              stamp, stamp_id, empty, res, 0)
+                              stamp, stamp_id, empty, res, 0, yl, ya, fins, fans)
                     dbg[DBG_BRAKE_TAKEOFF] = res[0]
                     if res[0] > 0.0 or res[15] == 0.0 or sp_ < 0.05:
                         safe = True
-                    elif fan_on and _fan_touch(fans, yy, xf, zf, D, int(res[11]) + 1, FAN_R_OUT) >= 0:
-                        safe = True  # a fan can push the departing ball
-                        dbg[DBG_FAN] = 5.0
+                    elif fan_on:
+                        # a fan can push the departing ball: the band scan (as in the air) decides; safe = fan 5,
+                        # still no landing for any key plan = fan 8
+                        ftk = _fan_touch(fans, yy, xf, zf, D, int(res[11]) + 1, FAN_R_OUT)
+                        if ftk >= 0:
+                            for n in range(N + 1):
+                                yl[n] = yy[n]
+                            _fan_upper(yb, 0.0, lam_a, fdv, ftk, N, yy)
+                            stamp_id += 1
+                            _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, oz, boxes,
+                                      void_y, S1, S2, lx, yb, lz, lvx_, 0.0, lvz_, a_air, r, nofilt, excl, 1, yy, xf,
+                                      zf, D, stack, stamp, stamp_id, empty, res, 2, yl, ya, fins, fans)
+                            safe = res[0] > 0.0 or res[15] == 0.0
+                            dbg[DBG_FAN] = 5.0 if safe else 8.0
             if not safe:
                 # full push along the velocity to the edge, then the flight from there
                 ux = vx / speed
@@ -1644,13 +1770,23 @@ def _perceive(tiles, Hh, P1, P2, Pd, Poff, Pdim, Rr, Rl, Rn, Rf, bidx, bricks, s
                     empty = collect[:0]
                     _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, oz, boxes, void_y,
                               S1, S2, excl[0], mres[1], excl[1], vc * ux, vc * mres[2], vc * uz, a_air, r, nofilt,
-                              excl, 1, yy, xf, zf, D, stack, stamp, stamp_id, empty, res, 0)
+                              excl, 1, yy, xf, zf, D, stack, stamp, stamp_id, empty, res, 0, yl, ya, fins, fans)
                     dbg[DBG_JUMP_TAKEOFF] = res[0]
                     if res[0] > 0.0 or res[15] == 0.0:
                         safe = True
-                    elif fan_on and _fan_touch(fans, yy, xf, zf, D, int(res[11]) + 1, FAN_R_OUT) >= 0:
-                        safe = True
-                        dbg[DBG_FAN] = 6.0
+                    elif fan_on:
+                        ftk = _fan_touch(fans, yy, xf, zf, D, int(res[11]) + 1, FAN_R_OUT)
+                        if ftk >= 0:  # as for the brake departure: safe = fan 6, no landing for any plan = fan 9
+                            for n in range(N + 1):
+                                yl[n] = yy[n]
+                            _fan_upper(mres[1], vc * mres[2], lam_a, fdv, ftk, N, yy)
+                            stamp_id += 1
+                            _air_scan(tiles, Hh, P1, P2, Pd, Poff, Pdim, seg, rstart, ritems, ntz, ox, oz, boxes,
+                                      void_y, S1, S2, excl[0], mres[1], excl[1], vc * ux, vc * mres[2], vc * uz, a_air,
+                                      r, nofilt, excl, 1, yy, xf, zf, D, stack, stamp, stamp_id, empty, res, 2, yl,
+                                      ya, fins, fans)
+                            safe = res[0] > 0.0 or res[15] == 0.0
+                            dbg[DBG_FAN] = 6.0 if safe else 9.0
             if not safe:
                 out[1] = 1.0
                 dbg[DBG_DOOM_REASON] = 2.0 if tko else 3.0
@@ -2149,6 +2285,8 @@ class FastReach:
         self.zf = np.empty(N_PSI + 1)
         self.D = np.empty(N_PSI + 1)
         self.fins = np.zeros(N_PSI + 1)
+        self.yl = np.zeros(N_PSI + 1)
+        self.ya = np.zeros(N_PSI + 1)
         self.stack = np.zeros((512, 3), np.int64)
         self.stamp = np.zeros(max(len(self.seg), 1), np.int64)
         self.stamp_id = 0
@@ -2507,9 +2645,10 @@ class FastReach:
     @classmethod
     def fields_key(cls, tracker, geometry=None) -> str:
         """Cache key of the static fields only: a hash of the canonical static triangles (canonical_geometry: no CK
-        ids), the death boxes the build keeps, the build parameters, the physics constants and BUILD_VERSION; no
-        moving-body zones (tracker_key also hashes those, which change at every sector start, transformation and
-        respawn: 7 distinct tracker keys over 2 static geometries on the L2 TAS)."""
+        ids), the death boxes the build keeps, the fan push boxes (fan_boxes: sorted by entity name, so no CK ids
+        either), the build parameters, the physics and fan constants and BUILD_VERSION; no moving-body zones
+        (tracker_key also hashes those, which change at every sector start, transformation and respawn: 7 distinct
+        tracker keys over 2 static geometries on the L2 TAS)."""
         import hashlib
         A, B, C, r, rail = geometry if geometry is not None else cls.canonical_geometry(tracker)
         h = hashlib.sha256()
@@ -2517,7 +2656,7 @@ class FastReach:
             h.update(np.ascontiguousarray(x, "<f8").tobytes())
         h.update(np.ascontiguousarray(r, "<i8").tobytes())
         h.update(np.ascontiguousarray(rail, "u1").tobytes())
-        return cls.cache_key(f"canon-{h.hexdigest()}", tracker.level.depth, ())
+        return cls.cache_key(f"canon-{h.hexdigest()}", tracker.level.depth, (), fans=fan_boxes(tracker.level))
 
     @classmethod
     def fields_for_tracker(cls, tracker, cache_dir=None, lock_timeout_s: float = 120.0, geometry=None,
@@ -2598,7 +2737,7 @@ class FastReach:
                     A, B, C, r, rail = geom
                     tris = G.TriangleSet(A, B, C, r, grid_cell=None)
                     rails = G.TriangleSet(A[rail], B[rail], C[rail], r[rail], grid_cell=None)
-                    fr = cls.build(tris, rails, tracker.level.depth, (), verbose=verbose)
+                    fr = cls.build(tris, rails, tracker.level.depth, (), verbose=verbose, fans=fan_boxes(tracker.level))
                     fr.info["key"] = key
                     fr.info["wait_s"] = time.time() - t0
                     fr.info["built_by"] = os.getpid()
@@ -2667,12 +2806,15 @@ class FastReach:
         self.stamp_id = _perceive(*self._args(), S1, S2, b.air_lambda, b.air_accel, b.ground_lambda, b.ground_accel,
                                   b.radius, fan_dv(b), float(p[0]), float(p[1]), float(p[2]), float(v[0]),
                                   float(v[1]), float(v[2]), dirs, rv, fv, self.yy, self.xf, self.zf, self.D, self.fins,
-                                  self.stack, self.stamp, self.stamp_id, col, self.work, self.out, self.dbg, self.pdd)
+                                  self.yl, self.ya, self.stack, self.stamp, self.stamp_id, col, self.work, self.out,
+                                  self.dbg, self.pdd)
         vec = self.out.copy()
         if bodies is not None and len(bodies):
             bp = np.asarray(bodies, np.float64).reshape(-1, 3)
             if (np.linalg.norm(bp - p, axis=1) < UNKNOWN_R).any():
                 vec[2] = 1.0
+        if vec[2] > 0.5:
+            vec[1] = 0.0  # unknown_zone wins over doomed (module docstring "Doomed"; dbg doom_reason keeps the reason)
         if not debug:
             return vec, None
         info = {"named": dict(zip(FEATURE_NAMES, vec.tolist())), "dbg": dict(zip(DBG_NAMES, self.dbg.tolist())),
@@ -2695,7 +2837,7 @@ class FastReach:
                   self.ritems, self.ntz, self.ox, self.oz, self.boxes, self.void_y, S1, S2, float(pos[0]),
                   float(pos[1]), float(pos[2]), float(vel[0]), float(vel[1]), float(vel[2]), b.air_accel, b.radius,
                   filt, np.zeros(3), 0, self.yy, self.xf, self.zf, self.D, self.stack, self.stamp, self.stamp_id,
-                  self._nocollect, res, 0)
+                  self._nocollect, res, 0, self.yl, self.ya, self.fins, self.fans)
         return bool(res[0] > 0), int(res[1])
 
     def fan_profile(self, pos, vel, ball_type: int = 0, path=None, rnom: float = FAN_R_NOM):
