@@ -135,6 +135,9 @@ int main(int argc, char **argv) {
 
     // ---------------------------------------------------------------------------------------- setup page
     std::string in_gateway = cfg.gateway_url, in_dir = cfg.ballance_dir, in_engine = cfg.engine_binary;
+    std::string in_quiet = cfg.quiet_file;
+    bool in_ap_player = cfg.auto_pause_player, in_ap_battery = cfg.auto_pause_battery;
+    bool first_run = !cfg.setup_done;
     bool bundled = !bundled_engine(cfg.engine_kind).empty();  // the release zip ships the engine: no field then
     std::vector<GameProblem> probs;
     std::string found_note;
@@ -155,6 +158,9 @@ int main(int argc, char **argv) {
     auto i_gateway = Input(&in_gateway, "https://…（网关地址）", one_line);
     auto i_dir = Input(&in_dir, "例如 D:\\Games\\Ballance", one_line);
     auto i_engine = Input(&in_engine, "BallanceMMOSimTool.exe 的完整路径", one_line);
+    auto i_quiet = Input(&in_quiet, "留空 = 不用；例如 C:\\ballrain-quiet", one_line);
+    auto cb_player = Checkbox("玩 Ballance（Player.exe 运行）时自动暂停", &in_ap_player);
+    auto cb_battery = Checkbox("笔记本用电池时自动暂停", &in_ap_battery);
     auto b_find = Button("查找常见位置", [&] {
         auto d = find_ballance_dirs();
         if (d.empty()) {
@@ -171,20 +177,22 @@ int main(int argc, char **argv) {
         if (!probs.empty()) return;
         ClientConfig c = ctl.config();
         c.gateway_url = in_gateway, c.ballance_dir = in_dir, c.engine_binary = in_engine, c.setup_done = true;
+        c.quiet_file = in_quiet, c.auto_pause_player = in_ap_player, c.auto_pause_battery = in_ap_battery;
+        first_run = false;
         ctl.set_config(c);
         cfg = c;
         page = ctl.has_token() ? MAIN : LOGIN;
         if (page == MAIN) jobs.run("连接网关", [&] { return ctl.connect() ? "已连接网关" : std::string("连接失败"); });
     });
     auto b_quit0 = Button("退出", [&] { quitting = true; });
-    auto setup_c = Container::Vertical({i_gateway, i_dir, Maybe(i_engine, [&] { return !bundled; }),
-                                        Container::Horizontal({b_find, b_check, b_save, b_quit0})});
+    auto setup_c = Container::Vertical({i_gateway, i_dir, Maybe(i_engine, [&] { return !bundled; }), cb_player, cb_battery,
+                                        i_quiet, Container::Horizontal({b_find, b_check, b_save, b_quit0})});
     auto setup_r = Renderer(setup_c, [&] {
         Elements pl;
         if (checked && probs.empty()) pl.push_back(text("游戏文件检查通过。") | color(Color::Green));
         for (auto &p : probs) pl.push_back(paragraph("• " + p.message) | color(Color::Red));
         return vbox({
-                   text(" Ballrain 算力池 · 首次设置 ") | bold | center,
+                   text(first_run ? " Ballrain 算力池 · 首次设置 " : " Ballrain 算力池 · 设置 ") | bold | center,
                    separator(),
                    paragraph("用你自己电脑上的 Ballance 帮忙采集训练数据。客户端只读取游戏目录里的 base.cmo、Database.tdb、"
                              "3D Entities 和 Text，不会改动任何游戏文件。"),
@@ -192,6 +200,10 @@ int main(int argc, char **argv) {
                    hbox({text("网关地址：    "), i_gateway->Render() | flex}) | border,
                    hbox({text("Ballance 目录："), i_dir->Render() | flex}) | border,
                    bundled ? text("") : hbox({text("引擎文件：    "), i_engine->Render() | flex}) | border,
+                   window(text(" 自动暂停 "), vbox({cb_player->Render(), cb_battery->Render(),
+                                                hbox({text("暂停开关文件："), i_quiet->Render() | flex}),
+                                                paragraph("（这个文件或文件夹存在时所有实例暂停，删掉后自动继续；共用的电脑可以用它）") | dim})),
+                   paragraph("改了网关地址后会自动重新连接；换到另一个网关需要重新登录。") | dim,
                    found_note.empty() ? text("") : paragraph(found_note),
                    vbox(std::move(pl)),
                    text(""),
@@ -301,6 +313,7 @@ int main(int argc, char **argv) {
     auto b_setup = Button("设置", [&] {
         ClientConfig c = ctl.config();
         in_gateway = c.gateway_url, in_dir = c.ballance_dir, in_engine = c.engine_binary, checked = false, probs.clear();
+        in_quiet = c.quiet_file, in_ap_player = c.auto_pause_player, in_ap_battery = c.auto_pause_battery;
         page = SETUP;
     });
     auto b_logout = Button("退出登录", [&] {
