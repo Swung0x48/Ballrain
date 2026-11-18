@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "ballrain/branch.h"
 #include "ballrain/geometry.h"
 #include "ballrain/json.h"
 #include "ballrain/path.h"
@@ -30,6 +31,12 @@ struct FeatureConfig {
     std::string path_source = "tas";
     std::string path_dir;  // directory of the L<nn>.npz asset ("" = none configured)
     std::string path_sha256;
+    // the learner's pin of its route branch (features.branch_sha256: ballrain.branch_assets' digest of the line, the
+    // description with its rules and the drive); the client installs the task's branch pack (assets.branch) and
+    // checks it against this
+    std::string branch_sha256;
+    bool has_branch() const { return !branch_sha256.empty(); }
+    std::string branch_dir;  // the optional ball-type diversion (L<nn>.npz + L<nn>.json; "" = off: layout and values unchanged)
     double path_lateral_scale = 10, path_back = 10, path_ahead = 30, path_margin = 20, path_reacquire = 5;
     int waypoints = 3;
     double waypoint_spacing = 5;
@@ -47,8 +54,11 @@ struct FeatureConfig {
 struct FeatureInfo {
     bool have_ball = false;
     V3 pos{}, vel{};
-    std::optional<Projection> path;
+    std::optional<Projection> path;  // with a branch: path->s = the earned main-line progress
     std::string path_source;
+    // the branch follower's view of this step (branch.BranchFollower: pr local_s / branch / ref_elapsed_ms / ...)
+    bool has_branch = false, branch = false;
+    double local_s = 0, ref_elapsed_ms = 0, ref_remaining_ms = 0;
     bool supported = false;
     std::optional<double> gap;
     std::string surface = "none";
@@ -75,11 +85,14 @@ public:
     std::vector<float> compute(const GameTracker &t, FeatureInfo *info = nullptr);
     void reset_episode() {
         if (follower_) follower_->reset();
+        if (branch_) branch_->reset();
     }
+    const BranchFollower *branch() const { return branch_.get(); }
+    // the level's reference line for this tracker (loads it and the branch; features.reference_path)
+    const ReferencePath *reference_path(const GameTracker &t);
 
 private:
     struct Slices;
-    const ReferencePath *reference_path(const GameTracker &t);
     bool needs_asset(const GameTracker &t) const;
     void check_route(const GameTracker &t) const;
     LevelGeometry &geometry(const GameTracker &t);
@@ -101,6 +114,7 @@ private:
     bool asset_loaded_ = false;
     std::shared_ptr<const ReferencePath> path_;
     std::unique_ptr<PathFollower> follower_;
+    std::unique_ptr<BranchFollower> branch_;
     bool have_key_ = false;
     uint64_t key_tracker_ = 0;
     int key_version_ = -1, key_rows_ = -1;

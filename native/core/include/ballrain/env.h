@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "ballrain/engine_chain.h"
+#include "ballrain/branch.h"
 #include "ballrain/features.h"
 #include "ballrain/json.h"
 #include "ballrain/reward.h"
@@ -56,6 +57,9 @@ struct RestStart {
     bool drive = false;
     double x = 0.0, z = 0.0;
     std::optional<int64_t> max_frames;
+    // the stone branch's at-rest start (env._branch_rest): replay <branch_dir>/drive.npz's verified key stream from the
+    // prefix frame through the trafo to this arc length of the branch line, drive onto it and brake
+    std::optional<double> branch_s;
     static std::optional<RestStart> from_json(const Json *rest);  // nullptr / null: no at-rest start
 };
 
@@ -66,6 +70,11 @@ struct StartInfo {
     bool new_process = true;
     int handover_mismatches = 0;
     int64_t drive_frames = 0, rest_frames = 0;
+    std::optional<double> branch_s;
+    // env._prepare: a failed branch drive relaunches a normal TAS start at the same frame (kind "tas")
+    int branch_rest_failures = 0;  // the env's running count (env.branch_rest_failures), set on a fallback start
+    std::optional<double> branch_rest_target;
+    std::string branch_rest_error;
 };
 
 struct StepInfo {
@@ -76,6 +85,10 @@ struct StepInfo {
     std::string episode_end;  // "" while the episode goes on
     bool camera_off_quarter = false;
     bool process_ended = false;
+    // env._info with a branch: the route's branch / local_s / reference clock, else the branch's last timing
+    bool has_branch = false, branch = false;
+    bool has_local_s = false;  // local_s comes with a projection only (not with the branch's last timing)
+    double local_s = 0, ref_elapsed_ms = 0, ref_remaining_ms = 0;
     std::optional<std::string> error;
     FeatureInfo feat;
 };
@@ -92,6 +105,7 @@ public:
 
     const std::vector<uint32_t> &actions() const { return actions_; }
     FeatureExtractor &features() { return fx_; }
+    const BranchRules &branch_rules() const { return branch_rules_; }
     Session *session() { return sess_.get(); }
     bool after_death() const { return after_death_; }
     const StartInfo &start_info() const { return start_; }
@@ -112,11 +126,15 @@ public:
 
 private:
     void start_process();
+    int launch_checked(int64_t k);  // launch with the hand-over check and its retries; the mismatch count
+    int branch_rest_failures_ = 0;
     bool launch(int64_t k);  // one process brought to control; false: the hand-over differs from the record
     bool handover_ok(int64_t k) const;
     void init_held(int64_t k);
-    void drive(const RestStart &r);
-    void brake();
+    void drive(const RestStart &r, const BranchRules &rules = BranchRules());
+    void brake(const BranchRules &rules = BranchRules());
+    BranchRules branch_rules_;  // the installed branch's rules (env.branch_rules), the defaults without a branch
+    void branch_rest(double station);
     void intro();
     void finish_process();
     std::vector<float> features(StepInfo *info);

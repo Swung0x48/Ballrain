@@ -3,7 +3,9 @@
 #include <cmath>
 #include <limits>
 
+#include "ballrain/npz.h"
 #include "ballrain/policy.h"
+#include "ballrain/sha256.h"
 #include "platform.h"
 
 namespace ballrain {
@@ -73,6 +75,10 @@ std::optional<RestStart> RestStart::from_json(const Json *r) {
         if (t.items().size() != 2) throw Error("task rest.target must be [x, z]");
         s.drive = true, s.x = t.at(size_t(0)).as_double(), s.z = t.at(size_t(1)).as_double();
     }
+    if (const Json *b = r->find("branch_s"); b && !b->is_null()) {
+        if (s.drive) throw Error("task rest: a target or branch_s, not both");
+        s.branch_s = b->as_double();
+    }
     if (const Json *m = r->find("max_frames"); m && !m->is_null()) {
         s.max_frames = m->as_int();
         if (*s.max_frames < 1) throw Error("task rest.max_frames");
@@ -121,7 +127,7 @@ BallanceEnv::BallanceEnv(EnvConfig cfg, FeatureConfig features, EngineConfig eng
     : cfg_(std::move(cfg)), eng_(std::move(engine)), run_root_(std::move(run_root)), rec_(rec), fx_(std::move(features)),
       starts_(starts), start_frame_(start_frame), rest_(rest), reward_(reward) {
     // an at-rest start with a drive target may hand over in an excluded range (TasStarts.expected knows it)
-    bool any = rest_ && rest_->drive;
+    bool any = rest_ && (rest_->drive || rest_->branch_s);
     if (start_frame_ > 0 && (!starts_ || !(any ? starts_->expected(start_frame_).has_value()
                                                 : starts_->index_of(start_frame_).has_value())))
         throw Error("start frame " + std::to_string(start_frame_) + " is not a valid start frame of the record");
@@ -130,6 +136,8 @@ BallanceEnv::BallanceEnv(EnvConfig cfg, FeatureConfig features, EngineConfig eng
     if (cfg_.esc_frames < 3) throw Error("esc_frames must be >= 3");
     repress_ = cfg_.repress_stale_keys ? *cfg_.repress_stale_keys : cfg_.world_actions;
     ms_since_turn_ = std::numeric_limits<double>::infinity();
+    // env.branch_rules: the installed bundle's rules (the task is refused when they do not parse)
+    if (!fx_.config().branch_dir.empty()) branch_rules_ = load_branch_rules(fx_.config().branch_dir, cfg_.level);
 }
 
 BallanceEnv::~BallanceEnv() { close(); }
@@ -198,8 +206,17 @@ bool BallanceEnv::handover_ok(int64_t k) const {
            o->ball->pos[0] == exp->pos[0] && o->ball->pos[1] == exp->pos[1] && o->ball->pos[2] == exp->pos[2];
 }
 
-void BallanceEnv::start_process() {
-    int64_t k = start_frame_;
+// a failed stone rest start (its own checks: assets, range, ball lost, ball type / sector, not at rest on the line):
+// start_process falls back to the TAS start; engine and session faults are not caught
+struct BranchRestFailed : Error {
+    explicit BranchRestFailed(const std::string &m) : Error(m) {}
+};
+// the brake lost the ball (env._brake's RuntimeError; the process is already stopped): a game outcome, not a fault
+struct BallLostBraking : Error {
+    explicit BallLostBraking(const std::string &m) : Error(m) {}
+};
+
+int BallanceEnv::launch_checked(int64_t k) {
     int mismatches = 0;
     for (int attempt = 0;; ++attempt) {
         if (launch(k)) break;
@@ -209,11 +226,52 @@ void BallanceEnv::start_process() {
             throw Error("hand-over at frame " + std::to_string(k) + " differs from the record " +
                         std::to_string(mismatches) + " times");
     }
+    return mismatches;
+}
+
+void BallanceEnv::start_process() {
+    int64_t k = start_frame_;
+    int mismatches = launch_checked(k);
     start_ = StartInfo();
     start_.kind = "tas";
     start_.frame = k;
     start_.new_process = true;
     start_.handover_mismatches = mismatches;
+    if (rest_ && k > 0 && rest_->branch_s) {  // env._prepare: the stone branch's measured drive, then a closed loop
+        std::string err;
+        try {
+            branch_rest(*rest_->branch_s);
+        } catch (const BranchRestFailed &e) {  // the drive's own checks; engine and session faults propagate
+            err = e.what();
+            if (branch_rules_.rest_fallback == "error") {  // the rules ask for no relaunch
+                if (sess_) sess_->close(true), sess_.reset();
+                after_death_ = false;
+                ++branch_rest_failures_;
+                throw;
+            }
+        } catch (...) {
+            if (sess_) sess_->close(true), sess_.reset();
+            after_death_ = false;
+            throw;
+        }
+        if (err.empty()) {
+            start_.kind = "tas_rest";
+            start_.branch_s = rest_->branch_s;
+            init_held(0);
+            return;
+        }
+        // the failed simulation is not a valid hand-over: launch once without the drive, at the same TAS frame
+        if (sess_) sess_->close(true), sess_.reset();
+        after_death_ = false;
+        ++branch_rest_failures_;
+        mismatches = launch_checked(k);
+        start_.handover_mismatches = mismatches;
+        start_.branch_rest_failures = branch_rest_failures_;
+        start_.branch_rest_target = rest_->branch_s;
+        start_.branch_rest_error = err;
+        init_held(k);
+        return;
+    }
     if (rest_ && k > 0) {  // env._prepare: drive (with a target), then brake; _init_held then holds nothing
         uint32_t f0 = sess_->frames_done();
         if (rest_->drive) drive(*rest_);
@@ -250,12 +308,82 @@ static bool episode_event(const GameTracker &t, size_t ev0) {
     return false;
 }
 
+// env._branch_rest: replay the measured drive through the trafo, then close the loop on an arc target of the branch
+// line. Never a synthesized transform or a teleport; a paper ball or an unsupported hand-over is refused. A private
+// extractor (its projection state is not the episode's)
+void BallanceEnv::branch_rest(double station) {
+    const FeatureConfig &fc = fx_.config();
+    if (fc.branch_dir.empty()) throw BranchRestFailed("branch rest start needs branch_dir");
+    Session &s = *sess_;
+    FeatureExtractor fx(fc);
+    fx.reference_path(s.tracker());
+    const BranchFollower *br = fx.branch();
+    if (!br) throw BranchRestFailed("no matching branch at handover");
+    auto z = load_npz(fc.branch_dir + "/drive.npz");
+    char ln[16];
+    std::snprintf(ln, sizeof ln, "/L%02d.npz", cfg_.level);
+    if (z.at("record_sha256").unicode() != starts_->record_sha256 ||
+        z.at("branch_sha256").unicode() != file_sha256(fc.branch_dir + ln))
+        throw BranchRestFailed("drive replay does not match TAS recording or branch asset");
+    const NpyArray &sa = z.at("samples");
+    std::vector<double> samples = sa.f64();
+    int64_t prefix = z.at("prefix_frame").ints().at(0);
+    size_t ns = samples.size() / 2;
+    if (sa.shape.size() != 2 || sa.shape[1] != 2 || ns == 0) throw BranchRestFailed("drive.npz: samples");
+    double lo = samples[1], hi = samples[1];
+    for (size_t i = 0; i < ns; ++i) lo = std::min(lo, samples[2 * i + 1]), hi = std::max(hi, samples[2 * i + 1]);
+    if (start_frame_ != prefix || !(lo <= station && station <= hi))
+        throw BranchRestFailed("prefix frame or target outside the recorded stone drive");
+    size_t best = 0;  // np.argmin(abs(samples[:, 1] - station)): the first minimum
+    for (size_t i = 1; i < ns; ++i)
+        if (std::abs(samples[2 * i + 1] - station) < std::abs(samples[2 * best + 1] - station)) best = i;
+    int64_t offset = int64_t(samples[2 * best]);
+    const NpyArray &fr = z.at("frames");
+    size_t nf = fr.data.size() / 8;
+    if (offset < 0 || size_t(offset) > nf) throw BranchRestFailed("drive.npz: offset outside the frames");
+    std::vector<Frame> frames(static_cast<size_t>(offset));
+    for (size_t i = 0; i < frames.size(); ++i)
+        std::memcpy(&frames[i].delta, fr.data.data() + 8 * i, 4), std::memcpy(&frames[i].keys, fr.data.data() + 8 * i + 4, 4);
+    for (size_t b = 0; b < frames.size(); b += 512) {
+        std::vector<Frame> blk(frames.begin() + std::ptrdiff_t(b), frames.begin() + std::ptrdiff_t(std::min(frames.size(), b + 512)));
+        s.act(blk, 1, episode_stop());
+        if (s.ended() || s.tracker().flags.ball_off) throw BranchRestFailed("ball lost during branch drive replay");
+    }
+    V3 target = br->alt->point_at(station);
+    if (s.tracker().ball_type() != br->ball_type || s.tracker().sector() != br->sector)
+        throw BranchRestFailed("branch drive did not produce the required ball type and sector");
+    const BranchRules &rules = br->rules;
+    RestStart r;
+    r.drive = true, r.x = target[0], r.z = target[2];
+    drive(r, rules);
+    try {
+        brake(rules);
+    } catch (const BallLostBraking &e) {  // env._prepare catches it like the drive's own checks: the TAS fallback
+        throw BranchRestFailed(e.what());
+    }
+    FeatureInfo fi;
+    fx.compute(s.tracker(), &fi);
+    const Observation *o = s.obs();
+    double d = 1e9;
+    if (o && o->ball)
+        d = std::sqrt((o->ball->pos[0] - target[0]) * (o->ball->pos[0] - target[0]) +
+                      (o->ball->pos[1] - target[1]) * (o->ball->pos[1] - target[1]) +
+                      (o->ball->pos[2] - target[2]) * (o->ball->pos[2] - target[2]));
+    double vxz = std::sqrt(fi.vel[0] * fi.vel[0] + fi.vel[2] * fi.vel[2]);
+    double stop = rules.rest_stop_speed ? *rules.rest_stop_speed : cfg_.rest_speed;
+    if ((rules.rest_require_support && !fi.supported) || !(fi.has_branch && fi.branch) ||
+        d > rules.rest_position_tolerance || vxz > stop)
+        throw BranchRestFailed("branch rest target not reached at rest on the correct surface");
+}
+
 // env._drive: push the ball with world arrows towards (x, z), aiming at a velocity proportional to the remaining
 // distance (capped), until it is within 1 unit and slower than rest_speed or max_frames passed
-void BallanceEnv::drive(const RestStart &r) {
+void BallanceEnv::drive(const RestStart &r, const BranchRules &rules) {
     Session &s = *sess_;
     uint32_t n0 = s.frames_done();
-    int64_t max_frames = r.max_frames ? *r.max_frames : cfg_.rest_max_frames;
+    int64_t max_frames = r.max_frames ? *r.max_frames
+                                      : (rules.rest_max_drive_frames ? *rules.rest_max_drive_frames : cfg_.rest_max_frames);
+    double stop = rules.rest_stop_speed ? *rules.rest_stop_speed : cfg_.rest_speed;
     while (int64_t(s.frames_done() - n0) < max_frames && !s.ended()) {
         const Observation *o = s.obs();
         if (!o || !o->ball) break;
@@ -263,30 +391,32 @@ void BallanceEnv::drive(const RestStart &r) {
         double vx = double(o->ball->speed[0]) + double(o->ball->speed_change[0]);
         double vz = double(o->ball->speed[2]) + double(o->ball->speed_change[2]);
         double dx = r.x - px, dz = r.z - pz;
-        if (std::sqrt(dx * dx + dz * dz) < 1.0 && std::sqrt(vx * vx + vz * vz) < cfg_.rest_speed) break;
-        double wx = dx * 0.8, wz = dz * 0.8;
+        if (std::sqrt(dx * dx + dz * dz) < rules.drive_arrival_radius && std::sqrt(vx * vx + vz * vz) < stop) break;
+        double wx = dx * rules.drive_gain, wz = dz * rules.drive_gain;
         double wn = std::sqrt(wx * wx + wz * wz);
-        if (wn > 6.0) {
-            double f = 6.0 / wn;
+        if (wn > rules.drive_speed_cap) {  // want *= cap / |want|
+            double f = rules.drive_speed_cap / wn;
             wx *= f, wz *= f;
         }
         wx -= vx, wz -= vz;
         uint32_t keys = 0;
-        if (std::sqrt(wx * wx + wz * wz) > 0.3) {
+        if (std::sqrt(wx * wx + wz * wz) > rules.drive_deadband) {
             keys = best_arrows(wx, wz);
             if (o->cams) keys = world_to_camera_keys(keys, o->cams->cams[0].matrix);
         }
         size_t ev0 = s.tracker().events.size();
-        s.act({{cfg_.delta, keys}}, 2, episode_stop());
+        s.act({{cfg_.delta, keys}}, uint32_t(rules.rest_control_repeat), episode_stop());
         if (episode_event(s.tracker(), ev0)) break;
     }
 }
 
 // env._brake: push against the ball's horizontal velocity until it is slower than rest_speed, release the arrows
-void BallanceEnv::brake() {
+void BallanceEnv::brake(const BranchRules &rules) {
     Session &s = *sess_;
     uint32_t n0 = s.frames_done();
-    while (int64_t(s.frames_done() - n0) < cfg_.rest_max_frames && !s.ended()) {
+    int64_t max_frames = rules.rest_max_brake_frames ? *rules.rest_max_brake_frames : cfg_.rest_max_frames;
+    double stop = rules.rest_stop_speed ? *rules.rest_stop_speed : cfg_.rest_speed;
+    while (int64_t(s.frames_done() - n0) < max_frames && !s.ended()) {
         const Observation *o = s.obs();
         double vx = 0.0, vz = 0.0;
         if (o && o->ball) {
@@ -294,18 +424,18 @@ void BallanceEnv::brake() {
             vz = double(o->ball->speed[2]) + double(o->ball->speed_change[2]);
         }
         double n = std::sqrt(vx * vx + 0.0 + vz * vz);
-        if (n < cfg_.rest_speed) break;
+        if (n < stop) break;
         uint32_t keys = best_arrows(-vx / n, -vz / n);
         if (o && o->cams) keys = world_to_camera_keys(keys, o->cams->cams[0].matrix);
         size_t ev0 = s.tracker().events.size();
-        s.act({{cfg_.delta, keys}}, 2, episode_stop());
+        s.act({{cfg_.delta, keys}}, uint32_t(rules.rest_control_repeat), episode_stop());
         if (episode_event(s.tracker(), ev0)) break;
     }
     s.act({{cfg_.delta, 0u}}, 1, episode_stop());  // release the arrows
     const GameTracker &t = s.tracker();
     if (s.ended() || t.flags.ball_off || !t.flags.ball_nav) {
         finish_process();
-        throw Error("at-rest start at frame " + std::to_string(start_frame_) + ": the ball was lost while braking");
+        throw BallLostBraking("at-rest start at frame " + std::to_string(start_frame_) + ": the ball was lost while braking");
     }
 }
 
@@ -362,7 +492,18 @@ std::vector<float> BallanceEnv::features(StepInfo *info) {
     FeatureInfo fi;
     std::vector<float> v = fx_.compute(sess_->tracker(), &fi);
     if (rec_) rec_->put(K_FEAT, v.data(), v.size() * 4);
-    if (info) info->feat = std::move(fi);
+    if (info) {
+        // env._info: the route's branch fields, else (no IVP ball: transforms, finish) the branch's last timing, so
+        // the route clock is never compared with the absolute TAS IGT
+        if (fi.has_branch) {
+            info->has_branch = true, info->branch = fi.branch, info->local_s = fi.local_s, info->has_local_s = true;
+            info->ref_elapsed_ms = fi.ref_elapsed_ms, info->ref_remaining_ms = fi.ref_remaining_ms;
+        } else if (const BranchFollower *b = fx_.branch(); b && b->timing.set) {
+            info->has_branch = true, info->branch = b->timing.branch;
+            info->ref_elapsed_ms = b->timing.ref_elapsed_ms, info->ref_remaining_ms = b->timing.ref_remaining_ms;
+        }
+        info->feat = std::move(fi);
+    }
     return v;
 }
 

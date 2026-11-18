@@ -25,6 +25,7 @@ struct Task {  // protocol.TASK
     bool greedy = false;
     uint64_t sample_seed = 0;
     std::string asset_starts, asset_path;
+    std::string asset_branch;  // the route-branch pack ("" when the policy follows no branch)
     std::optional<RestStart> rest;  // format 3: an at-rest start after the hand-over (server-drawn)
     uint64_t life_seed = 0;          // format 3: the per-life draws (ballrain/pool/counters.py)
     std::optional<int64_t> respawn_frontier;  // format 3: the curriculum frontier of the early-respawn rule
@@ -115,13 +116,15 @@ private:
         double seg_agent = 0, seg_ref = 0;
         std::optional<int64_t> seg_k0;
         std::set<std::string> gates_hit;
+        std::optional<bool> cap_branch;  // the branch flag the cap was last computed for (worker ep.d["cap_branch"])
+        bool stall_branch = false;       // the route the stall odometer (mark_s) is measured on (worker ep.stall_branch)
     };
     void new_episode(const StepInfo &info);
     std::optional<int64_t> cap_frames(const StepInfo &info) const;
     double tas_igt(int64_t k) const;
     std::optional<double> tas_cross(int sector) const;
     std::optional<int64_t> tas_cross_frame(int sector) const;
-    void split_start(Episode &ep);
+    void split_start(Episode &ep, const StepInfo &info);
     std::vector<float> new_life(std::vector<float> obs);
     bool skip_respawn(int sector) const;
     double split_bonus(Episode &ep, const StepInfo &info, bool finished);

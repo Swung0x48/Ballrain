@@ -31,6 +31,7 @@ Task Task::from_json(const Json &t) {
     k.sample_seed = uint64_t(t.at("sample_seed").as_int());
     k.asset_starts = t.at("assets").at("starts").as_string();
     k.asset_path = t.at("assets").at("path").as_string();
+    if (const Json *b = t.at("assets").find("branch"); b && !b->is_null()) k.asset_branch = b->as_string();
     k.rest = RestStart::from_json(t.find("rest"));
     if (const Json *c = t.find("life_seed")) k.life_seed = uint64_t(c->as_int());
     if (const Json *c = t.find("respawn_frontier"); c && !c->is_null()) k.respawn_frontier = c->as_int();
@@ -163,6 +164,10 @@ std::optional<int64_t> TaskRunner::tas_cross_frame(int sector) const {
 }
 
 std::optional<int64_t> TaskRunner::cap_frames(const StepInfo &info) const {
+    if (info.has_branch) {  // Worker._cap_frames with a route clock: the active line's budget
+        double budget = (info.ref_elapsed_ms + info.ref_remaining_ms) * sp_.cap_mult;
+        return int64_t((budget + 1000 * sp_.cap_extra_s) / delta_ms_);
+    }
     if (!st_) return std::nullopt;
     const StartInfo &s = env_.start_info();
     int64_t k;
@@ -176,8 +181,12 @@ std::optional<int64_t> TaskRunner::cap_frames(const StepInfo &info) const {
     return int64_t((sp_.cap_mult * rem_ms + 1000 * sp_.cap_extra_s) / delta_ms_);
 }
 
-void TaskRunner::split_start(Episode &ep) {
+void TaskRunner::split_start(Episode &ep, const StepInfo &info) {
     if (!sp_.split_k || !st_) return;
+    if (info.has_branch) {  // Worker._split_start: the route clock replaces the TAS IGT reference
+        ep.has_seg = true, ep.seg_agent = ep.start_sr_ms, ep.seg_ref = info.ref_elapsed_ms, ep.seg_k0.reset();
+        return;
+    }
     std::optional<double> ref;
     if (ep.kind == "tas_rest" && ep.start_frame > 0 && !st_->index_of(ep.start_frame)) {
         ep.has_seg = false;  // handed over in an excluded range (off the TAS's route): no reference time
@@ -199,7 +208,7 @@ void TaskRunner::split_start(Episode &ep) {
 double TaskRunner::split_bonus(Episode &ep, const StepInfo &info, bool finished) {
     if (!ep.has_seg || !sp_.split_k) return 0.0;
     int sec = finished ? 0 : info.sector;
-    auto end_ref = tas_cross(sec);
+    auto end_ref = info.has_branch ? std::optional<double>(info.ref_elapsed_ms) : tas_cross(sec);
     if (!end_ref || !info.sr_ms) return 0.0;
     double sr = *info.sr_ms;
     double t_agent = (sr - ep.seg_agent) / 1000.0;
@@ -259,8 +268,10 @@ void TaskRunner::new_episode(const StepInfo &info) {
     ep.cap_frames = cap_frames(info);
     auto rs = env_.reward().s;
     ep.mark_s = rs ? *rs : -std::numeric_limits<double>::infinity();
+    ep.stall_branch = info.has_branch && info.branch;  // worker _Episode: on the branch the odometer is local metres
+    if (ep.stall_branch && env_.branch_rules().stall_odometer == "local_s" && info.has_local_s) ep.mark_s = info.local_s;
     ep.max_sector_seen = ep.start_sector;
-    split_start(ep);
+    split_start(ep, info);
     ep_ = std::move(ep);
     ++episodes;
 }
@@ -337,19 +348,36 @@ StepResult TaskRunner::step(int a, const std::function<std::string()> &stop) {
         }
     }
     std::string wend = (term || trunc) ? info2.episode_end : "";
+    if (info2.has_branch && ep.cap_branch != info2.branch) {  // Worker.run: a switch re-budgets the frame cap
+        ep.cap_frames = cap_frames(info2);
+        ep.cap_branch = info2.branch;
+    }
     if (!(term || trunc)) {
         int64_t ef = env_.ep_frames();
         auto s = env_.reward().s;
-        if (s && *s > ep.mark_s + sp_.stall_progress) ep.mark_s = *s, ep.mark_frame = ef;
-        int64_t win = ep.kind == "respawn" ? stall_rsp_ : stall_all_;
-        int64_t since = ef - ep.mark_frame;
+        // worker.stall_age: the odometer is the active line's metres on the branch (never compared across a route
+        // switch: a switch restarts it), the earned main-line progress otherwise
+        bool branch = info2.has_branch && info2.branch;
+        const BranchRules &rules = env_.branch_rules();  // the distributed rules (L<nn>.json), defaults without a branch
+        bool local = branch && rules.stall_odometer == "local_s";
+        std::optional<double> odo = local ? (info2.has_local_s ? std::optional<double>(info2.local_s) : std::nullopt) : s;
+        bool add_change = branch && rules.stall_speed_source == "speed+speed_change";
+        std::optional<double> speed;
         if (sp_.stall_speed) {
             const Observation *o = sess ? sess->obs() : nullptr;
             if (o && o->ball) {
-                const float *v = o->ball->speed;
-                float n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);  // np.linalg.norm of float32
-                if (double(n) > *sp_.stall_speed) ep.move_frame = ef;
+                float v[3];  // float32 like the ball record; on the branch speed + speed_change
+                for (int k = 0; k < 3; ++k) v[k] = add_change ? o->ball->speed[k] + o->ball->speed_change[k] : o->ball->speed[k];
+                speed = double(std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]));  // np.linalg.norm of float32
             }
+        }
+        int64_t win = ep.kind == "respawn" ? stall_rsp_ : stall_all_;
+        if (odo && (branch != ep.stall_branch || *odo > ep.mark_s + sp_.stall_progress))
+            ep.mark_s = *odo, ep.mark_frame = ef, ep.stall_branch = branch;
+        int64_t since = ef - ep.mark_frame;
+        if (sp_.stall_speed) {
+            double threshold = branch ? std::min(rules.stall_pause_speed, *sp_.stall_speed) : *sp_.stall_speed;
+            if (speed && *speed > threshold) ep.move_frame = ef;
             since = std::min(since, ef - ep.move_frame);
             if (ef - ep.mark_frame >= stall_max_) since = win;
         }

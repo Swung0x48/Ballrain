@@ -41,6 +41,15 @@ int main(int argc, char **argv) {
         starts.exclude(ec.exclude_starts);
         FeatureConfig fc = FeatureConfig::from_json(m.at("features"));
         fc.path_dir = arg(argc, argv, "--path-dir");
+        fc.branch_dir = arg(argc, argv, "--branch-dir", "");  // the ball-type diversion assets (tests: out of band)
+        std::string bpack = arg(argc, argv, "--branch-pack", "");  // as the client: the task's branch pack
+        if (fc.has_branch() != !bpack.empty())
+            throw Error(fc.has_branch() ? "the policy follows a route branch: give --branch-pack"
+                                        : "--branch-pack for a policy without a route branch");
+        if (!bpack.empty()) {
+            fc.branch_dir = install_branch_pack(bpack, arg(argc, argv, "--out") + "/cache", task.level, file_sha256(bpack), fc);
+            check_branch_dir(fc.branch_dir, task.level, fc);
+        }
         EngineConfig eng;
         eng.binary = platform::absolute_path(arg(argc, argv, "--engine"));
         eng.root = platform::absolute_path(arg(argc, argv, "--root"));

@@ -177,8 +177,26 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     env = {k: _plain(ec[k]) if k in ec else _plain(getattr(EnvConfig(), k)) for k in ENV_FIELDS if k in known_env}
     fc = dict(ec.get("features") or {})
     feats = _plain({f.name: fc.get(f.name, getattr(FeatureConfig(), f.name)) for f in fields(FeatureConfig)})
-    if feats.pop('branch_dir', None) or feats.pop('branch_sha256', None) or state.get('branch_assets') is not None:
-        raise ValueError('pool clients do not yet implement ball-type branch assets')
+    legacy_dir = feats.pop("branch_dir", None)  # (old checkpoints: a directory marker, never opened)
+    requires = []
+    if feats.get("branch_sha256") or legacy_dir:
+        # a route branch: its files come from the learner with the policy (state["branch_assets"], ballrain.branch_assets),
+        # never from a local directory; the manifest keeps the learner's pin (features.branch_sha256: the digest of the
+        # three files), the gateway ships them as the branch pack (task.export_branch_pack)
+        ba = state.get("branch_assets")
+        if ba is None:
+            raise ValueError("the run follows a route branch but the state carries no branch_assets: the learner "
+                             "sends the branch files with its policy")
+        from .task import branch_bundle
+        bundle, key, rules_changed = branch_bundle(ba, int(env["level"]), feats.get("path_sha256"))
+        if feats.get("branch_sha256") not in (None, key):
+            raise ValueError("the learner's branch_assets are not the files its features pin (branch_sha256)")
+        feats["branch_sha256"] = key
+        requires.append("branch_v1")
+        if rules_changed:  # rules other than the v1 defaults: only clients that read L<nn>.json rules
+            requires.append("branch_rules_v1")
+    else:
+        feats.pop("branch_sha256", None)
     feats["path_dir"] = None  # the client installs the asset itself (task assets, sha256 below)
     # feature version gate: the native client (native/core/src/features.cpp) and the verifier compute f6 only; the f7
     # reach block (FeatureConfig.reach, ballrain/fastreach.py) has no native port yet (docs/native-client.md)
@@ -223,6 +241,10 @@ def export_state(state: dict, out_dir, run: str) -> dict:
         "env": env, "engine_options": engine_options, "features": feats, "reward": reward, "rollout": rollout,
         "arrays": {k: {"dtype": a.dtype.str, "shape": list(a.shape)} for k, a in sorted(arrays.items())},
     }
+    # the client capabilities its tasks need (ballrain.pool.capabilities; the gateway gates by them). Absent when
+    # nothing new is needed, so every client keeps getting the policy's tasks; not an identity field (policy_sha)
+    if requires:
+        m["requires"] = requires
     assert_public(m)
     dumps(m)  # JSON-safe (raises on NaN / non-JSON values)
     sha = policy_sha(m, arrays)

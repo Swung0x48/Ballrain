@@ -14,7 +14,12 @@ Start-state assets (served sha-addressed and immutable, GET /pool/assets/<sha256
 - the starts pack (export_starts_pack / install_starts_pack): the record's frames (the prefix source), its valid start
   frames and expected hand-over states (starts.npz), the camera cache (camera.npz) and a minimal meta.json -- what
   ballrain.curriculum.TasStarts reads -- installed as a record directory the env's start_record points to;
-- the reference line L<nn>.npz (install_path_asset), checked against FeatureConfig.path_sha256.
+- the reference line L<nn>.npz (install_path_asset), checked against FeatureConfig.path_sha256;
+- a route branch (ballrain/branch.py, docs/l2-stone-branch.md), when the policy follows one: the branch pack
+  (export_branch_pack / install_branch_pack) holds the learner's three files as sent (state["branch_assets"]: the
+  branch line L<nn>.npz, its station description and rules L<nn>.json, the verified drive.npz), pinned by the
+  learner's own features.branch_sha256 (ballrain.branch_assets) and handed to the env as EnvConfig.branch_assets. No
+  component reads branch files of its own: the route is the learner's configuration.
 Both are plain npz (np.load(allow_pickle=False), dtypes checked); the dataset's own meta.json (local paths) is not
 shipped.
 """
@@ -48,6 +53,14 @@ PATH_ARRAYS = {"points": (np.dtype("<f4"), 2), "sector": (np.dtype("|u1"), 1)}
 # optional: the line's TAS times (ReferencePath.t_ms; without them the ref_speed features are zero, e.g. L02.npz)
 PATH_OPTIONAL = {"t_ms": (np.dtype("<f8"), 1)}
 MAX_ASSET_BYTES = 64 * 1024 * 1024
+
+
+# the branch pack: the learner's files as raw bytes (uint8, 1-d); the manifest pins them by features.branch_sha256
+# (ballrain.branch_assets: the sha256 of the three raw 32-byte digests in this order)
+BRANCH_PACK_ARRAYS = ("line_npz", "desc_json", "drive_npz")
+DRIVE_ARRAYS = {"branch_sha256": (np.dtype("<U64"), 0), "record_sha256": (np.dtype("<U64"), 0),
+                "prefix_frame": (np.dtype("<i8"), 0), "frames": (RECORD_FRAME_DTYPE, 1),
+                "samples": (np.dtype("<f8"), 2)}
 
 
 def _c(a) -> np.ndarray:
@@ -355,6 +368,139 @@ def install_path_asset(asset, cache_dir, level: int, expect_sha: str) -> Path:
     return d
 
 
+def _raw(v, name: str) -> bytes:
+    """A branch file as bytes: bytes / bytearray / memoryview, or a 1-d uint8 array (an npz round trip)."""
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        b = bytes(v)
+    elif isinstance(v, np.ndarray) and v.dtype == np.uint8 and v.ndim == 1:
+        b = v.tobytes()
+    else:
+        raise ValueError(f"branch asset {name}: not bytes")
+    if not b or len(b) > MAX_ASSET_BYTES:
+        raise ValueError(f"branch asset {name}: empty or larger than {MAX_ASSET_BYTES} bytes")
+    return b
+
+
+def _npz_arrays(b: bytes, what: str) -> dict:
+    import io
+    with np.load(io.BytesIO(b), allow_pickle=False) as z:
+        out = {k: z[k] for k in z.files}
+    for k, a in out.items():
+        if a.dtype.hasobject:
+            raise ValueError(f"{what}: {k} has an object dtype")
+    return out
+
+
+def _check_branch_line_and_drive(line: bytes, drive: bytes, level: int) -> None:
+    """The structure the native client relies on beyond ballrain.branch_assets.validate (array names, dtypes, shapes,
+    finite values, no local paths in the line's meta)."""
+    from .weights import assert_public
+    a = _npz_arrays(line, "branch line")
+    spec = dict(PATH_ARRAYS, **PATH_OPTIONAL)
+    if set(a) != set(spec) | {"meta"}:
+        raise ValueError(f"branch line: arrays {sorted(set(a) ^ (set(spec) | {'meta'}))} unexpected / missing")
+    for k, (dt, nd) in spec.items():
+        if a[k].dtype != dt or a[k].ndim != nd or (a[k].dtype.kind == "f" and not np.isfinite(a[k]).all()):
+            raise ValueError(f"branch line: {k}")
+    n = len(a["points"])
+    if a["points"].shape != (n, 3) or len(a["sector"]) != n or len(a["t_ms"]) != n or a["meta"].dtype.kind != "U" \
+            or a["meta"].ndim != 0:
+        raise ValueError("branch line: shapes")
+    m = P.loads_strict(str(a["meta"]).encode("utf-8"), 16384)
+    if not isinstance(m, dict) or m.get("level") != int(level):
+        raise ValueError(f"branch line is not level {level}")
+    assert_public(m)
+    z = _npz_arrays(drive, "branch drive")
+    if set(z) != set(DRIVE_ARRAYS):
+        raise ValueError(f"branch drive: arrays {sorted(set(z) ^ set(DRIVE_ARRAYS))} unexpected / missing")
+    for k, (dt, nd) in DRIVE_ARRAYS.items():
+        if z[k].dtype != dt or z[k].ndim != nd:
+            raise ValueError(f"branch drive: {k} is {z[k].dtype} / {z[k].ndim}-d")
+    sm = z["samples"]
+    if int(z["prefix_frame"]) <= 0 or sm.shape[1:] != (2,) or not len(sm) or not np.isfinite(sm).all() or \
+            not ((sm[:, 0] >= 0) & (sm[:, 0] <= len(z["frames"]))).all():
+        raise ValueError("branch drive: prefix frame / samples")
+
+
+def branch_bundle(ba: dict, level: int, main_sha256: str | None) -> tuple[dict, str, bool]:
+    """The learner's state["branch_assets"] ({level, line_npz, desc_json, drive_npz} raw bytes, sha256 optional: it is
+    recomputed and, when given, must agree) checked as the learner's workers check it (ballrain.branch_assets.validate:
+    level, digests, the main line pairing, the rules) plus the native client's structure checks. Returns (bundle with
+    sha256, features.branch_sha256, whether the rules differ from the v1 defaults)."""
+    from ballrain.branch_assets import filenames, validate, bundle_rules
+    from ballrain.branch_rules import DEFAULT_RULES
+    from ballrain.path import RouteError
+    from .weights import assert_public
+    if not isinstance(ba, dict) or ba.get("level") != int(level):
+        raise ValueError(f"the learner's branch assets are not for level {level}")
+    blobs = {k: _raw(ba.get(k), k) for k in filenames(level)}
+    digests = {k: hashlib.sha256(v).hexdigest() for k, v in blobs.items()}
+    if ba.get("sha256") not in (None, digests):
+        raise ValueError("the learner's branch assets: sha256 differs from the bytes")
+    bundle = dict(level=int(level), **blobs, sha256=digests)
+    try:
+        key = validate(bundle, int(level), main_sha256)
+        rules = bundle_rules(bundle)
+    except (RouteError, ValueError, KeyError) as e:
+        raise ValueError(f"branch assets: {e}") from None
+    assert_public(json.loads(blobs["desc_json"]))
+    _check_branch_line_and_drive(blobs["line_npz"], blobs["drive_npz"], level)
+    return bundle, key, rules != DEFAULT_RULES
+
+
+def export_branch_pack(ba: dict, level: int, out_dir, main_sha256: str | None) -> tuple[str, Path]:
+    """Server side: the learner's branch bundle -> <out_dir>/<sha>.npz (sha = the file's sha256), the three files'
+    bytes as uint8 arrays (deterministic npz: the same bundle gives the same sha)."""
+    bundle, _, _ = branch_bundle(ba, level, main_sha256)
+    arrays = {k: np.frombuffer(bundle[k], np.uint8).copy() for k in BRANCH_PACK_ARRAYS}
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp = out_dir / f".branch.{os.getpid()}.npz"
+    _write_npz(tmp, arrays)
+    sha = file_sha256(tmp)
+    dst = out_dir / f"{sha}.npz"
+    os.replace(tmp, dst)
+    return sha, dst
+
+
+def install_branch_pack(pack, cache_dir, level: int, expect_sha: str, branch_sha256: str,
+                        main_sha256: str | None) -> Path:
+    """Client side: check a downloaded branch pack (its sha256; branch_bundle; the bundle digest is the manifest's
+    features.branch_sha256) and lay it out as <cache_dir>/branch/<sha>/ with L<nn>.npz, L<nn>.json and drive.npz;
+    returns the directory. Idempotent."""
+    from ballrain.branch_assets import filenames
+    a = _load_checked(Path(pack), {k: (np.dtype("|u1"), 1) for k in BRANCH_PACK_ARRAYS}, expect_sha)
+    bundle, key, _ = branch_bundle(dict(level=int(level), **{k: a[k].tobytes() for k in BRANCH_PACK_ARRAYS}), level,
+                                   main_sha256)
+    if key != branch_sha256:
+        raise ValueError("branch pack: not the policy's branch (features.branch_sha256)")
+    d = Path(cache_dir) / "branch" / expect_sha
+    if (d / ".complete").is_file():
+        return d
+    d.mkdir(parents=True, exist_ok=True)
+    for k, name in filenames(level).items():
+        tmp = d / f".{name}.{os.getpid()}.tmp"
+        tmp.write_bytes(bundle[k])
+        os.replace(tmp, d / name)
+    (d / ".complete").write_text(expect_sha, encoding="utf-8")
+    return d
+
+
+def read_branch_dir(branch_dir, level: int, branch_sha256: str, main_sha256: str | None) -> dict:
+    """The installed branch directory as the env's EnvConfig.branch_assets bundle, checked against the manifest's pin
+    (TaskMismatch otherwise)."""
+    from ballrain.branch_assets import filenames
+    d = Path(branch_dir)
+    try:
+        ba = dict(level=int(level), **{k: (d / name).read_bytes() for k, name in filenames(level).items()})
+        bundle, key, _ = branch_bundle(ba, level, main_sha256)
+    except (OSError, ValueError) as e:
+        raise TaskMismatch(f"the branch directory: {e}") from None
+    if key != branch_sha256:
+        raise TaskMismatch("the branch directory is not the policy's branch (features.branch_sha256)")
+    return bundle
+
+
 # ============================================================================================== env
 
 class TaskMismatch(ValueError):
@@ -362,7 +508,7 @@ class TaskMismatch(ValueError):
 
 
 def build_env_config(task: Task, manifest: dict, local: LocalGame, starts_dir, path_dir, out_root,
-                     copy: str = "pool-00"):
+                     copy: str = "pool-00", branch_dir=None):
     """The EnvConfig a client runs a task with: the manifest's env / feature / reward configuration, the task's
     start (start_record = the installed record directory, start_frame = k) and ball order, the local engine; every
     random draw of the env off. Raises TaskMismatch when the pieces do not belong together."""
@@ -386,6 +532,13 @@ def build_env_config(task: Task, manifest: dict, local: LocalGame, starts_dir, p
     if feats.get("path_sha256") != task.assets["path"]:
         raise TaskMismatch("the task's reference line is not the policy's")
     feats["path_dir"] = str(Path(path_dir).resolve())
+    bundle = None  # the route branch the policy follows (features.branch_sha256): the env installs it itself
+    if feats.get("branch_sha256"):
+        if not task.assets.get("branch") or branch_dir is None:
+            raise TaskMismatch("the policy follows a route branch: the task needs its branch pack")
+        bundle = read_branch_dir(branch_dir, task.level, feats["branch_sha256"], feats.get("path_sha256"))
+    elif task.assets.get("branch") or branch_dir is not None:
+        raise TaskMismatch("a branch pack for a policy without a route branch")
     for k in ("far_waypoints", "ref_speed_at"):
         feats[k] = tuple(feats.get(k) or ())
     env.pop("start_record")
@@ -393,17 +546,17 @@ def build_env_config(task: Task, manifest: dict, local: LocalGame, starts_dir, p
                      start_rest=dict(task.rest) if task.rest is not None else None,
                      curriculum=None, rest_starts=None, p_rest=0.0, rehearse_starts=None, p_rehearse=0.0,
                      warm_pool=False, warm_copy=None, trace=False, prefix=None, seed=int(task.ball_order_seed),
-                     copy=copy, out_root=str(out_root), backend="headless",
+                     copy=copy, out_root=str(out_root), backend="headless", branch_assets=bundle,
                      headless=local.headless(task.ball_order, manifest.get("engine_options")),
                      features=FeatureConfig(**feats), reward=RewardConfig(**manifest["reward"]))
 
 
 def build_env(task: Task, manifest: dict, local: LocalGame, starts_dir, path_dir, out_root, copy: str = "pool-00",
-              launcher=None):
+              launcher=None, branch_dir=None):
     """BallanceEnv for a task (build_env_config), checked: its action keys and observation size are the manifest's,
     and k is one of the record's valid start frames (after exclude_starts), so the env does not snap it."""
     from ballrain.env import BallanceEnv
-    cfg = build_env_config(task, manifest, local, starts_dir, path_dir, out_root, copy)
+    cfg = build_env_config(task, manifest, local, starts_dir, path_dir, out_root, copy, branch_dir)
     e = BallanceEnv(cfg, launcher=launcher)
     try:
         if [int(a) for a in e.actions] != [int(k) for k in manifest["actions"]["keys"]]:
@@ -412,7 +565,7 @@ def build_env(task: Task, manifest: dict, local: LocalGame, starts_dir, path_dir
             raise TaskMismatch("the env's observation size differs from the policy's")
         k = int(task.start_frame)
         # an at-rest start with a drive target may hand over in an excluded range (TasStarts.expected knows it)
-        drive = task.rest is not None and task.rest.get("target") is not None
+        drive = task.rest is not None and (task.rest.get("target") is not None or task.rest.get("branch_s") is not None)
         if k and (e.starts is None or (e.starts.expected(k) is None if drive else e.starts.index_of(k) is None)):
             raise TaskMismatch(f"start frame {k} is not a valid start frame of {task.record}")
         if task.rest is not None and not k:

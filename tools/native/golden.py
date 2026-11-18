@@ -237,11 +237,31 @@ def run_tas(a, manifest, stream: Stream) -> dict:
     from ballrain.headless import HeadlessConfig, HeadlessLauncher
     z = np.load(Path(a.record) / "raw.npz", allow_pickle=False)
     frames = z["record_frames"]
+    if a.mode == "branch":  # the record up to the drive's prefix frame, then its verified key stream through the trafo
+        with np.load(Path(a.branch_dir) / "drive.npz", allow_pickle=False) as dz:
+            k = int(dz["prefix_frame"])
+            meta = json.loads((Path(a.record) / "meta.json").read_text(encoding="utf-8"))
+            if str(dz["record_sha256"]) != meta.get("record_sha256"):
+                raise SystemExit("drive.npz is not for this record")
+            drive = dz["frames"]
+        frames = np.concatenate([frames[:k].astype(drive.dtype), drive])
     feats = dict(manifest["features"])
     feats["path_dir"] = a.path_dir
+    root = None
+    if a.branch_dir:  # as the learner's workers: the pinned bundle (ballrain.branch_assets), never the directory itself
+        from ballrain.branch_assets import install, read_bundle, validate
+        from ballrain.path import asset_path, file_sha256
+        lv = int(manifest["env"]["level"])
+        bundle = read_bundle(lv, a.branch_dir)
+        main_sha = file_sha256(asset_path(lv, Path(a.path_dir)))
+        feats["branch_sha256"] = validate(bundle, lv, main_sha)
+        feats["path_sha256"] = main_sha
+        feats.pop("branch_dir", None)
+        tmp = install(bundle, lv, main_sha, feats["branch_sha256"])
+        root = tmp.name
     for k in ("far_waypoints", "ref_speed_at"):
         feats[k] = tuple(feats.get(k) or ())
-    fx = FeatureExtractor(FeatureConfig(**feats))
+    fx = FeatureExtractor(FeatureConfig(**feats), branch_root=root)
     out = Path(a.out).resolve() / "runs" / "tas"
     sc = C.SessionConfig(level=int(manifest["env"]["level"]), out_dir=out, copy="nc-py", max_frames=len(frames) + 10,
                          body_radius=60.0, sr_tail=32)
@@ -269,7 +289,7 @@ def run_tas(a, manifest, stream: Stream) -> dict:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=("policy", "random", "tas"))
+    ap.add_argument("mode", choices=("policy", "random", "tas", "branch"))
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--engine", default=str(REPO / "runtime/nc/engine/BallanceMMOSimTool.exe"))
@@ -280,6 +300,8 @@ def main(argv=None) -> int:
     ap.add_argument("--max-steps", type=int, default=20000)
     ap.add_argument("--record", help="tas mode: dataset record directory (raw.npz)")
     ap.add_argument("--block", type=int, default=2, help="tas mode: frames per block")
+    ap.add_argument("--branch-dir", help="the ball-type diversion assets (features.branch_dir); branch mode replays "
+                    "<record>[:drive.prefix_frame] + <branch-dir>/drive.npz")
     ap.add_argument("--fake", action="store_true", help="policy / random on ballrain.fakegame (the synthetic level)")
     a = ap.parse_args(argv)
     from ballrain.pool.weights import read_manifest
@@ -289,7 +311,7 @@ def main(argv=None) -> int:
     stream = Stream(out / "stream.bin")
     install_taps(stream)
     try:
-        res = run_tas(a, manifest, stream) if a.mode == "tas" else run_env(a, manifest, stream)
+        res = run_tas(a, manifest, stream) if a.mode in ("tas", "branch") else run_env(a, manifest, stream)
     finally:
         stream.close()
     meta = {"mode": a.mode, "seed": a.seed, "ball_seed": a.ball_seed, "ball_order": f"retail:{a.ball_seed}",

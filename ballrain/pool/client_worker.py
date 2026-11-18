@@ -193,6 +193,9 @@ class Worker:
         policy, manifest = self.cache.policy(task.policy_sha)
         sdir = self.cache.starts(task.assets["starts"])
         pdir = self.cache.path(task.assets["path"], task.level)
+        f, bsha = manifest["features"], task.assets.get("branch")
+        bdir = self.cache.branch(bsha, task.level, f["branch_sha256"], f.get("path_sha256")) \
+            if f.get("branch_sha256") and bsha else None
         slot = int(self.cfg.get("slot", 0))
         copy = f"pool-{slot:02d}"
         out = Path(self.cfg["data_dir"]) / "runs"
@@ -201,7 +204,7 @@ class Worker:
         if self.cfg.get("fake_game"):  # tests: the in-process fake game (ballrain.fakegame)
             from ballrain.fakegame import FakeLauncher
             launcher = FakeLauncher(backend="headless")
-        env = build_env(task, manifest, local, sdir, pdir, out, copy=copy, launcher=launcher)
+        env = build_env(task, manifest, local, sdir, pdir, out, copy=copy, launcher=launcher, branch_dir=bdir)
         last = [time.monotonic(), 0]
 
         def on_result(res, header):

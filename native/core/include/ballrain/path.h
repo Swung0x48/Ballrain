@@ -82,6 +82,9 @@ bool anchors_match(const Json &meta, const Anchors &a, double tol = 1.0);
 bool anchors_ready(const Json &meta, const Anchors &a);
 
 // A reference-line asset (L<nn>.npz) loaded once, with its file sha256.
+// numpy.interp for one x (the end values outside xp), the same arithmetic as numpy (path.cpp)
+double np_interp(double x, const std::vector<double> &xp, const std::vector<double> &fp);
+
 struct PathAsset {
     std::string path;
     std::string sha256;

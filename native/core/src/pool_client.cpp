@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cmath>
 
+#include "ballrain/branch.h"
 #include "ballrain/npz.h"
 #include "ballrain/sha256.h"
 #include "platform.h"
@@ -15,6 +16,7 @@ namespace ballrain {
 #endif
 // native/CMakeLists.txt project(VERSION): 0.3 = chunk format 3 (engine-state chain v3, task format 3)
 const char *const CLIENT_VERSION = BALLRAIN_CLIENT_VERSION;
+const std::vector<const char *> CLIENT_CAPABILITIES = {"task_format3", "branch_v1", "branch_rules_v1"};
 static const size_t MAX_RESPONSE = 64 * 1024, MAX_MANIFEST = 256 * 1024, MAX_DOWNLOAD = 64 * 1024 * 1024;
 
 GatewayRefusal::GatewayRefusal(Json r, int st)
@@ -109,6 +111,9 @@ Json GatewayClient::hello(const std::string &plat, const Json &engine, const Jso
     f.set("engine", engine);
     f.set("game_files", game_files);
     f.set("instances", Json::integer(instances));
+    Json caps = Json::array();  // what this client can run (ballrain.pool.capabilities; the gateway gates tasks by them)
+    for (const char *c : CLIENT_CAPABILITIES) caps.push(Json::string(c));
+    f.set("capabilities", caps);
     Json r = call("POST", "/pool/hello", {"hello_ok"}, json_body(make_message("hello", f)), JSON_CT, true, false);
     session_id = r.at("session_id").as_string();
     return r;
@@ -250,6 +255,78 @@ std::string PoolCache::path_dir(const std::string &sha, int level) {
         put_file(dst, b);
     }
     return d;
+}
+
+std::string PoolCache::branch_dir(const std::string &sha, int level, const FeatureConfig &fc) {
+    return install_branch_pack(asset(sha), root_, level, sha, fc);
+}
+
+static void check_branch_files(const Bytes files[3], int level, const FeatureConfig &fc) {
+    // ballrain.branch_assets.validate + task.branch_bundle: the bundle digest is the policy's pin, the description is
+    // for this level, the main line and this branch line, its rules parse; the line and the drive belong together
+    if (branch_bundle_sha256(files[0], files[1], files[2]) != fc.branch_sha256)
+        throw Error("branch pack: not the policy's branch (features.branch_sha256)");
+    Bytes jb = files[1];
+    if (jb.compare(0, 3, "\xEF\xBB\xBF") == 0) jb = jb.substr(3);
+    Json desc = Json::parse(jb, 16);
+    std::string line_sha = Sha256::hex(files[0]);
+    if (!desc.is_object() || desc.get_int("level", -1) != level || desc.get_string("branch_sha256", "") != line_sha ||
+        (!fc.path_sha256.empty() && desc.get_string("main_sha256", "") != fc.path_sha256))
+        throw Error("branch description does not match level, main or branch line");
+    BranchRules::from_desc(desc);  // an unknown rule or an invalid value refuses the task
+    auto line = load_npz_bytes(files[0]);
+    if (!line.count("points") || !line.count("sector") || !line.count("t_ms") || !line.count("meta") || line.size() != 4)
+        throw Error("branch line: arrays");
+    Json lm = Json::parse(line.at("meta").unicode(), 12);
+    if (!lm.is_object() || lm.get_int("level", -1) != level) throw Error("branch line is not for this level");
+    auto drive = load_npz_bytes(files[2]);
+    if (!drive.count("branch_sha256") || drive.at("branch_sha256").unicode() != line_sha)
+        throw Error("branch drive does not belong to the branch line");
+}
+
+static const char *BRANCH_ARRAYS[3] = {"line_npz", "desc_json", "drive_npz"};
+
+static void branch_names(int level, std::string out[3]) {
+    char n[24];
+    std::snprintf(n, sizeof n, "L%02d.npz", level);
+    out[0] = n;
+    std::snprintf(n, sizeof n, "L%02d.json", level);
+    out[1] = n;
+    out[2] = "drive.npz";
+}
+
+std::string install_branch_pack(const std::string &pack, const std::string &root, int level,
+                                const std::string &expect_sha, const FeatureConfig &fc) {
+    if (!is_hex64(expect_sha) || !fc.has_branch()) throw Error("branch pack: no pin");
+    if (file_sha256(pack) != expect_sha) throw Error("branch pack: sha256 differs from " + expect_sha.substr(0, 12));
+    auto z = load_npz(pack);
+    if (z.size() != 3) throw Error("branch pack: arrays");
+    Bytes files[3];
+    for (int i = 0; i < 3; ++i) {
+        auto it = z.find(BRANCH_ARRAYS[i]);
+        if (it == z.end() || it->second.descr != "|u1" || it->second.shape.size() != 1 || it->second.data.empty())
+            throw Error(std::string("branch pack: ") + BRANCH_ARRAYS[i]);
+        files[i] = it->second.data;
+    }
+    check_branch_files(files, level, fc);
+    std::string d = root + "/branch/" + expect_sha, names[3];
+    branch_names(level, names);
+    platform::make_dirs(d);
+    for (int i = 0; i < 3; ++i) {
+        std::string p = d + "/" + names[i];
+        Bytes cur;
+        if (!read_file(p, cur) || cur != files[i]) put_file(p, files[i]);
+    }
+    return d;
+}
+
+void check_branch_dir(const std::string &dir, int level, const FeatureConfig &fc) {
+    std::string names[3];
+    branch_names(level, names);
+    Bytes files[3];
+    for (int i = 0; i < 3; ++i)
+        if (!read_file(dir + "/" + names[i], files[i])) throw Error("the branch directory has no " + names[i]);
+    check_branch_files(files, level, fc);
 }
 
 // ---------------------------------------------------------------------------------------------- game files

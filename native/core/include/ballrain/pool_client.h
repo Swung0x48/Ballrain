@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "ballrain/features.h"
 #include "ballrain/json.h"
 #include "ballrain/policy.h"
 #include "ballrain/starts.h"
@@ -13,6 +14,7 @@
 namespace ballrain {
 
 extern const char *const CLIENT_VERSION;
+extern const std::vector<const char *> CLIENT_CAPABILITIES;  // hello.capabilities
 
 struct GatewayUnavailable : Error {  // no usable answer: network, timeout, not the protocol
     explicit GatewayUnavailable(const std::string &m) : Error(m) {}
@@ -61,11 +63,20 @@ public:
     std::string asset(const std::string &sha);     // the asset file, downloaded and sha-checked
     TasStarts starts(const std::string &sha);      // the starts pack, checked (install_starts_pack's checks)
     std::string path_dir(const std::string &sha, int level);  // the reference line installed as L<nn>.npz
+    // the route-branch pack installed as the FeatureConfig.branch_dir (install_branch_pack)
+    std::string branch_dir(const std::string &sha, int level, const FeatureConfig &fc);
 
 private:
     std::string root_;
     GatewayClient &api_;
 };
+
+// task.install_branch_pack: a branch pack (uint8 arrays line_npz, desc_json, drive_npz) whose file sha256 is
+// expect_sha and whose files are the manifest's pins, laid out as <root>/branch/<sha>/ L<nn>.npz, L<nn>.json,
+// drive.npz; returns that directory. task.check_branch_dir: the directory holds exactly the pinned files.
+std::string install_branch_pack(const std::string &pack, const std::string &root, int level,
+                                const std::string &expect_sha, const FeatureConfig &fc);
+void check_branch_dir(const std::string &dir, int level, const FeatureConfig &fc);
 
 // hello.game_files (task.hash_game_files): GAME_FILE_LIST (+ BuildingBlocks/physics_RT.dll for the 2002 engine);
 // a directory entry is the tree digest of its files; a missing entry is 64 zeros
