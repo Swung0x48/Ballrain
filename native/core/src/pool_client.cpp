@@ -359,18 +359,19 @@ std::string install_branch_pack(const std::string &pack, const std::string &root
             throw Error("branch pack: " + name);
         return it->second.data;
     };
-    if (z.count("manifest_json")) {  // wire v2: the manifest and its members in manifest order (m00_line_npz, ...)
-        const Bytes &manifest = u8("manifest_json");
+    if (z.count("manifest")) {  // wire v2: the manifest and its members in manifest order (m0_line_npz, ...)
+        const Bytes &manifest = u8("manifest");
         std::vector<std::array<Bytes, 3>> members;
         for (size_t i = 0;; ++i) {
-            char pre[8];
-            std::snprintf(pre, sizeof pre, "m%02zu_", i);
+            char pre[16];
+            std::snprintf(pre, sizeof pre, "m%zu_", i);
             if (!z.count(std::string(pre) + "line_npz")) break;
             std::array<Bytes, 3> m;
             for (int k = 0; k < 3; ++k) m[size_t(k)] = u8(std::string(pre) + BRANCH_ARRAYS[k]);
             members.push_back(std::move(m));
         }
-        if (z.size() != 1 + 3 * members.size()) throw Error("branch pack: arrays");
+        if (members.empty() || members.size() > 16 || z.size() != 1 + 3 * members.size())
+            throw Error("branch pack: arrays");
         std::vector<BranchEntry> entries = check_branch_v2(manifest, members, level, fc);
         std::string d = root + "/branch/" + expect_sha, names[3];
         branch_names(level, names);
