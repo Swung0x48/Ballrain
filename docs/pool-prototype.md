@@ -893,6 +893,8 @@ python tools/pool/mock_forum.py --port 8098 --redirect-uri http://127.0.0.1:8099
 | `--pool-correction vtrace\|none` | vtrace | 见下；`none` 和局域网远程数据一样处理（GAE、比值相对 behaviour 策略），只用来做对照实验 |
 | `--pool-rho-bar`、`--pool-c-bar` | 1、1 | V-trace 的截断 |
 
+- 学习器在 hub 的 worker 模板里声明 `pool_ingest: true/false`。学习器链接**只连声明了这一项的学习器**：更早的 train_m2 没有池子分支，会把池子的数据当成普通远程数据训练，没有延迟上限，也没有修正。声明为 false 时链接照常连上、照常发布策略，但不送数据。
+- 学习器的更新次数变小时（自动回退、从更早的检查点续跑），以及每次重新连上时，链接都会立刻重新发布策略，不用等再过 `publish_every` 次更新。
 - 池子的数据走自己的分支，不受 `--max-stale-remote` 影响；本地和局域网远程数据的处理**逐位不变**。被拒或被丢的池子数据不进任何统计（帧数、`reset_frac`、远程看门狗），所以开关关着时 updates.csv 和仪表盘不受影响。
 - 统计只写 TensorBoard（`pool/steps`、`pool/frac`、`pool/lag`、`pool/rho`、`pool/rho_clip`、`pool/refused`、`pool/dropped`），不加 updates.csv 的列（加列会让续跑的 run 另起 `updates.<i>.csv`）。被接收的池子步数记在 `counters["steps_pool"]`。
 
