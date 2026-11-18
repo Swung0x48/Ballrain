@@ -42,18 +42,30 @@ struct EnvConfig {
     bool start_check = true;  // compare the hand-over state of a TAS start with the record; relaunch on a mismatch
     int start_retries = 3;
     std::vector<std::pair<int64_t, int64_t>> exclude_starts;  // record frames [lo, hi) never used as start states
+    double rest_speed = 0.5;       // at-rest starts: braked until the horizontal speed is below this
+    int64_t rest_max_frames = 600;  // the brake's (and by default the drive's) frame limit
 
     // The manifest's "env" block (ballrain/pool/weights.py ENV_FIELDS). Refuses what this port does not support
     // (camera / Esc / collect actions, HS mode).
     static EnvConfig from_manifest(const Json &env);
 };
 
+// An at-rest start after the hand-over at the start frame (protocol TASK "rest"; env.py _drive / _brake): with a target,
+// drive the ball to (x, z) within max_frames (default rest_max_frames), then brake it below rest_speed
+struct RestStart {
+    bool drive = false;
+    double x = 0.0, z = 0.0;
+    std::optional<int64_t> max_frames;
+    static std::optional<RestStart> from_json(const Json *rest);  // nullptr / null: no at-rest start
+};
+
 // info["start"]: how the current episode started
 struct StartInfo {
-    std::string kind = "tas";  // "tas" (a new process: TAS start k, k = 0 from level load) | "respawn"
+    std::string kind = "tas";  // "tas" (a new process: TAS start k, k = 0 from level load) | "tas_rest" | "respawn"
     int64_t frame = 0;
     bool new_process = true;
     int handover_mismatches = 0;
+    int64_t drive_frames = 0, rest_frames = 0;
 };
 
 struct StepInfo {
@@ -71,10 +83,11 @@ struct StepInfo {
 class BallanceEnv {
 public:
     // starts: the task's start record (nullptr: starts from level load without a record); start_frame: k (0 = from
-    // level load), one of starts->valid when > 0. reward: the manifest's reward (env.step's reward).
+    // level load), one of starts->valid when > 0 (an at-rest start with a drive target: any hand-over state, excluded
+    // ranges too). reward: the manifest's reward (env.step's reward). rest: every process starts at rest after k.
     BallanceEnv(EnvConfig cfg, FeatureConfig features, EngineConfig engine, std::string run_root,
                 StreamWriter *rec = nullptr, const TasStarts *starts = nullptr, int64_t start_frame = 0,
-                RewardConfig reward = RewardConfig());
+                RewardConfig reward = RewardConfig(), std::optional<RestStart> rest = std::nullopt);
     ~BallanceEnv();
 
     const std::vector<uint32_t> &actions() const { return actions_; }
@@ -102,6 +115,8 @@ private:
     bool launch(int64_t k);  // one process brought to control; false: the hand-over differs from the record
     bool handover_ok(int64_t k) const;
     void init_held(int64_t k);
+    void drive(const RestStart &r);
+    void brake();
     void intro();
     void finish_process();
     std::vector<float> features(StepInfo *info);
@@ -130,6 +145,7 @@ private:
     double ms_since_turn_;
     const TasStarts *starts_;
     int64_t start_frame_;
+    std::optional<RestStart> rest_;
     Reward reward_;
     StartInfo start_;
     EngineDigest *digest_ = nullptr;

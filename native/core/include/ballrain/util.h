@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -88,6 +89,7 @@ inline size_t align4(size_t n) { return (n + 3) & ~size_t(3); }
 bool read_file(const std::string &path, Bytes &out);
 bool read_file_from(const std::string &path, uint64_t offset, Bytes &out, uint64_t *file_size);
 bool file_exists(const std::string &path);
+std::filesystem::path u8_path(const std::string &utf8);  // a UTF-8 path for the standard library's file streams
 void write_file(const std::string &path, const Bytes &data);
 
 std::string hex(const void *p, size_t n);

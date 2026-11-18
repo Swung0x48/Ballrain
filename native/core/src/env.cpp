@@ -60,7 +60,24 @@ EnvConfig EnvConfig::from_manifest(const Json &e) {
     c.start_retries = int(e.get_int("start_retries", 3));
     if (const Json *x = e.find("exclude_starts"); x && x->is_array())
         for (auto &r : x->items()) c.exclude_starts.push_back({r.at(size_t(0)).as_int(), r.at(size_t(1)).as_int()});
+    c.rest_speed = e.get_double("rest_speed", c.rest_speed);
+    c.rest_max_frames = e.get_int("rest_max_frames", c.rest_max_frames);
     return c;
+}
+
+std::optional<RestStart> RestStart::from_json(const Json *r) {
+    if (!r || r->is_null()) return std::nullopt;
+    RestStart s;
+    const Json &t = r->at("target");
+    if (!t.is_null()) {
+        if (t.items().size() != 2) throw Error("task rest.target must be [x, z]");
+        s.drive = true, s.x = t.at(size_t(0)).as_double(), s.z = t.at(size_t(1)).as_double();
+    }
+    if (const Json *m = r->find("max_frames"); m && !m->is_null()) {
+        s.max_frames = m->as_int();
+        if (*s.max_frames < 1) throw Error("task rest.max_frames");
+    }
+    return s;
 }
 
 // ---------------------------------------------------------------------------------------------- world actions
@@ -99,11 +116,16 @@ uint32_t world_to_camera_keys(uint32_t keys, const float m[12]) {
 // ---------------------------------------------------------------------------------------------- env
 
 BallanceEnv::BallanceEnv(EnvConfig cfg, FeatureConfig features, EngineConfig engine, std::string run_root,
-                         StreamWriter *rec, const TasStarts *starts, int64_t start_frame, RewardConfig reward)
+                         StreamWriter *rec, const TasStarts *starts, int64_t start_frame, RewardConfig reward,
+                         std::optional<RestStart> rest)
     : cfg_(std::move(cfg)), eng_(std::move(engine)), run_root_(std::move(run_root)), rec_(rec), fx_(std::move(features)),
-      starts_(starts), start_frame_(start_frame), reward_(reward) {
-    if (start_frame_ > 0 && (!starts_ || !starts_->index_of(start_frame_)))
+      starts_(starts), start_frame_(start_frame), rest_(rest), reward_(reward) {
+    // an at-rest start with a drive target may hand over in an excluded range (TasStarts.expected knows it)
+    bool any = rest_ && rest_->drive;
+    if (start_frame_ > 0 && (!starts_ || !(any ? starts_->expected(start_frame_).has_value()
+                                                : starts_->index_of(start_frame_).has_value())))
         throw Error("start frame " + std::to_string(start_frame_) + " is not a valid start frame of the record");
+    if (rest_ && start_frame_ <= 0) throw Error("an at-rest start needs a TAS start frame");
     for (auto k : ARROWS9) actions_.push_back(k);
     if (cfg_.esc_frames < 3) throw Error("esc_frames must be >= 3");
     repress_ = cfg_.repress_stale_keys ? *cfg_.repress_stale_keys : cfg_.world_actions;
@@ -192,7 +214,99 @@ void BallanceEnv::start_process() {
     start_.frame = k;
     start_.new_process = true;
     start_.handover_mismatches = mismatches;
+    if (rest_ && k > 0) {  // env._prepare: drive (with a target), then brake; _init_held then holds nothing
+        uint32_t f0 = sess_->frames_done();
+        if (rest_->drive) drive(*rest_);
+        start_.drive_frames = int64_t(sess_->frames_done()) - int64_t(f0);
+        uint32_t f1 = sess_->frames_done();
+        brake();
+        start_.rest_frames = int64_t(sess_->frames_done()) - int64_t(f1);
+        start_.kind = "tas_rest";
+        init_held(0);
+        return;
+    }
     init_held(k);
+}
+
+// The arrow combination whose world direction (x = right - left, z = up - down, normalised) has the largest dot product
+// with w (Python max(): the first of equal ones, in ARROWS9 order)
+static uint32_t best_arrows(double wx, double wz) {
+    uint32_t best = 0;
+    double bc = -std::numeric_limits<double>::infinity();
+    for (int a = 1; a < 9; ++a) {
+        uint32_t k = ARROWS9[a];
+        double kx = double(bool(k & KEY_RIGHT)) - double(bool(k & KEY_LEFT));
+        double kz = double(bool(k & KEY_UP)) - double(bool(k & KEY_DOWN));
+        double c = (wx * kx + wz * kz) / std::sqrt(kx * kx + kz * kz);
+        if (c > bc) bc = c, best = k;
+    }
+    return best;
+}
+
+static bool episode_event(const GameTracker &t, size_t ev0) {
+    for (size_t i = ev0; i < t.events.size(); ++i)
+        if (t.events[i].code == Ev::BallOff || t.events[i].code == Ev::LevelFinish || t.events[i].code == Ev::GameOver)
+            return true;
+    return false;
+}
+
+// env._drive: push the ball with world arrows towards (x, z), aiming at a velocity proportional to the remaining
+// distance (capped), until it is within 1 unit and slower than rest_speed or max_frames passed
+void BallanceEnv::drive(const RestStart &r) {
+    Session &s = *sess_;
+    uint32_t n0 = s.frames_done();
+    int64_t max_frames = r.max_frames ? *r.max_frames : cfg_.rest_max_frames;
+    while (int64_t(s.frames_done() - n0) < max_frames && !s.ended()) {
+        const Observation *o = s.obs();
+        if (!o || !o->ball) break;
+        double px = o->ball->pos[0], pz = o->ball->pos[2];
+        double vx = double(o->ball->speed[0]) + double(o->ball->speed_change[0]);
+        double vz = double(o->ball->speed[2]) + double(o->ball->speed_change[2]);
+        double dx = r.x - px, dz = r.z - pz;
+        if (std::sqrt(dx * dx + dz * dz) < 1.0 && std::sqrt(vx * vx + vz * vz) < cfg_.rest_speed) break;
+        double wx = dx * 0.8, wz = dz * 0.8;
+        double wn = std::sqrt(wx * wx + wz * wz);
+        if (wn > 6.0) {
+            double f = 6.0 / wn;
+            wx *= f, wz *= f;
+        }
+        wx -= vx, wz -= vz;
+        uint32_t keys = 0;
+        if (std::sqrt(wx * wx + wz * wz) > 0.3) {
+            keys = best_arrows(wx, wz);
+            if (o->cams) keys = world_to_camera_keys(keys, o->cams->cams[0].matrix);
+        }
+        size_t ev0 = s.tracker().events.size();
+        s.act({{cfg_.delta, keys}}, 2, episode_stop());
+        if (episode_event(s.tracker(), ev0)) break;
+    }
+}
+
+// env._brake: push against the ball's horizontal velocity until it is slower than rest_speed, release the arrows
+void BallanceEnv::brake() {
+    Session &s = *sess_;
+    uint32_t n0 = s.frames_done();
+    while (int64_t(s.frames_done() - n0) < cfg_.rest_max_frames && !s.ended()) {
+        const Observation *o = s.obs();
+        double vx = 0.0, vz = 0.0;
+        if (o && o->ball) {
+            vx = double(o->ball->speed[0]) + double(o->ball->speed_change[0]);
+            vz = double(o->ball->speed[2]) + double(o->ball->speed_change[2]);
+        }
+        double n = std::sqrt(vx * vx + 0.0 + vz * vz);
+        if (n < cfg_.rest_speed) break;
+        uint32_t keys = best_arrows(-vx / n, -vz / n);
+        if (o && o->cams) keys = world_to_camera_keys(keys, o->cams->cams[0].matrix);
+        size_t ev0 = s.tracker().events.size();
+        s.act({{cfg_.delta, keys}}, 2, episode_stop());
+        if (episode_event(s.tracker(), ev0)) break;
+    }
+    s.act({{cfg_.delta, 0u}}, 1, episode_stop());  // release the arrows
+    const GameTracker &t = s.tracker();
+    if (s.ended() || t.flags.ball_off || !t.flags.ball_nav) {
+        finish_process();
+        throw Error("at-rest start at frame " + std::to_string(start_frame_) + ": the ball was lost while braking");
+    }
 }
 
 // env._init_held: none from level load; after a TAS prefix the keys of its last frame, each with the record's camera

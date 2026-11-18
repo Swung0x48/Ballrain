@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -89,7 +90,8 @@ public:
     ~SocketChannel();
     std::string name() const;  // "tcp:127.0.0.1:<port>" (BALLRAIN_SOCK)
     const ChanHeader &header() const { return hdr_; }
-    ChanHeader wait_hello(double timeout_s);
+    // alive(): false once the engine process has exited (the wait ends at once instead of after timeout_s)
+    ChanHeader wait_hello(double timeout_s, const std::function<bool()> &alive = nullptr);
     std::optional<Bytes> wait_obs(double timeout_s);  // the OBS payload (24-byte header + OBS1); nullopt = ended
     Bytes send_action(const Action &a);              // returns the ACT1 bytes sent
     void close();
@@ -113,6 +115,7 @@ struct EngineConfig {
     std::optional<int64_t> boot_ticks, hidden_ticks, reset_nmc, reset_seed, reset_frame;
     bool legacy_edit = true, reset_precision = false, orig_random = false;
     bool log = true;
+    bool background = false;  // the volunteer client: below-normal priority, the client's job object
     std::vector<std::pair<std::string, std::string>> extra_env;
 };
 

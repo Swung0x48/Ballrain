@@ -13,6 +13,7 @@
 #include <string>
 
 #include "ballrain/sha256.h"
+#include "ballrain/pool_task.h"
 #include "ballrain/task_runner.h"
 #include "platform.h"
 
@@ -43,6 +44,14 @@ int main(int argc, char **argv) {
         EngineConfig eng;
         eng.binary = platform::absolute_path(arg(argc, argv, "--engine"));
         eng.root = platform::absolute_path(arg(argc, argv, "--root"));
+        {  // as the client: non-ASCII paths through the engine work directory
+            LocalEngine le;
+            le.binary = eng.binary, le.root = eng.root, le.kind = task.engine;
+            std::string note;
+            le = engine_view(le, hash_game_files(eng.root, task.engine), arg(argc, argv, "--out"), &note);
+            if (!note.empty()) std::fprintf(stderr, "%s\n", note.c_str());
+            eng.binary = le.binary, eng.root = le.root;
+        }
         eng.ball_order = "retail:" + std::to_string(task.ball_order_seed);
         for (int i = 1; i + 1 < argc; ++i)
             if (std::strcmp(argv[i], "--engine-env") == 0) {
@@ -51,7 +60,8 @@ int main(int argc, char **argv) {
             }
         std::string out = arg(argc, argv, "--out");
         platform::make_dirs(out + "/runs");
-        BallanceEnv env(ec, fc, eng, out + "/runs", nullptr, &starts, task.start_frame, RewardConfig::from_json(m.at("reward")));
+        BallanceEnv env(ec, fc, eng, out + "/runs", nullptr, &starts, task.start_frame, RewardConfig::from_json(m.at("reward")),
+                        task.rest);
         TaskRunner runner(env, &starts, task, RolloutSpec::from_json(m.at("rollout")), m.at("env").at("delta_ms").as_double());
         std::string mode = arg(argc, argv, "--actions", "policy");
         int64_t stop_after = std::atoll(arg(argc, argv, "--stop-after", "0").c_str());
@@ -74,7 +84,7 @@ int main(int argc, char **argv) {
         int64_t seq = 0;
         std::string end = sample_task(
             runner, pol, task,
-            [&](const Bytes &data) {
+            [&](const Bytes &data, bool) {
                 char n[32];
                 std::snprintf(n, sizeof n, "/%06lld.brpc", (long long)seq++);
                 write_file(out + n, data);

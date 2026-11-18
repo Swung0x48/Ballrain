@@ -39,6 +39,8 @@ public:
     Json hello(const std::string &platform, const Json &engine, const Json &game_files, int instances);
     Json task();  // a "task" or "no_task" message
     Json chunk(const Bytes &data);  // chunk_result (a "rejected" result is returned, an error message raised)
+    // task_end: close a task that ended without a final chunk once its `chunks` chunks were all posted
+    Json task_end(const std::string &task_id, int64_t chunks, const std::string &reason);
     Json heartbeat(bool running, const Json &instances, double steps_per_s);
     Json me();
     Json set_leaderboard(bool on);

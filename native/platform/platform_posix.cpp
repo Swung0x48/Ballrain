@@ -10,19 +10,33 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <dirent.h>
+#include <pwd.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 #include <chrono>
 #include <climits>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <fstream>
 #include <thread>
 
 #include "ballrain/util.h"
 #include "platform.h"
+
+#ifdef BALLRAIN_HAVE_CURL
+#include <curl/curl.h>
+#endif
+#include <algorithm>
 
 extern char **environ;
 
@@ -67,6 +81,119 @@ std::string absolute_path(const std::string &path) {
     char buf[PATH_MAX];
     if (!getcwd(buf, sizeof buf)) return path;
     return std::string(buf) + "/" + path;
+}
+
+std::vector<std::string> list_dir(const std::string &dir) {
+    std::vector<std::string> out;
+    DIR *d = opendir(dir.c_str());
+    if (!d) return out;
+    while (dirent *e = readdir(d)) {
+        std::string n = e->d_name;
+        if (n != "." && n != "..") out.push_back(n);
+    }
+    closedir(d);
+    return out;
+}
+
+bool rename_file(const std::string &from, const std::string &to) { return std::rename(from.c_str(), to.c_str()) == 0; }
+
+int64_t file_size(const std::string &path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 ? int64_t(st.st_size) : -1;
+}
+
+int64_t unix_time() { return int64_t(std::time(nullptr)); }
+
+std::string home_dir() {
+    const char *h = std::getenv("HOME");
+    if (h && *h) return h;
+    passwd *pw = getpwuid(getuid());
+    return pw && pw->pw_dir ? pw->pw_dir : "/tmp";
+}
+
+std::string data_dir() { return home_dir() + "/.ballrain"; }
+
+std::string executable_path() {
+#ifdef __APPLE__
+    char buf[PATH_MAX];
+    uint32_t n = sizeof buf;
+    if (_NSGetExecutablePath(buf, &n) == 0) {
+        char real[PATH_MAX];
+        if (realpath(buf, real)) return real;
+        return buf;
+    }
+    return "";
+#else
+    char buf[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    return n > 0 ? std::string(buf, size_t(n)) : std::string();
+#endif
+}
+
+std::string short_path(const std::string &path) { return path; }
+
+std::string user_name() {
+    passwd *pw = getpwuid(getuid());
+    return pw && pw->pw_name ? pw->pw_name : "";
+}
+
+bool open_url(const std::string &url) {
+    if (url.rfind("https://", 0) != 0 && url.rfind("http://", 0) != 0) return false;
+#ifdef __APPLE__
+    const char *tool = "/usr/bin/open";
+#else
+    const char *tool = "xdg-open";
+#endif
+    pid_t pid;
+    char *argv[] = {const_cast<char *>(tool), const_cast<char *>(url.c_str()), nullptr};
+    int rc = posix_spawnp(&pid, tool, nullptr, nullptr, argv, environ);
+    if (rc != 0) return false;
+    int st;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+bool single_instance(const std::string &data_dir) {
+    make_dirs(data_dir);
+    int fd = open((data_dir + "/.lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);  // kept open until exit
+    if (fd < 0) return true;
+    struct flock fl {};
+    fl.l_type = F_WRLCK, fl.l_whence = SEEK_SET;
+    return fcntl(fd, F_SETLK, &fl) == 0;
+}
+
+bool process_running(const std::string &image_name) {
+#ifdef __linux__
+    std::string want;
+    for (char c : image_name) want += char(std::tolower(static_cast<unsigned char>(c)));
+    for (auto &d : list_dir("/proc")) {
+        if (d.empty() || !std::isdigit(static_cast<unsigned char>(d[0]))) continue;
+        std::ifstream f("/proc/" + d + "/cmdline", std::ios::binary);
+        std::string cmd((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        for (auto &c : cmd) c = char(std::tolower(static_cast<unsigned char>(c)));
+        if (cmd.find(want) != std::string::npos) return true;
+    }
+#else
+    (void)image_name;  // macOS: not probed yet (Ballance does not run there natively)
+#endif
+    return false;
+}
+
+bool on_battery() {
+#ifdef __linux__
+    for (auto &d : list_dir("/sys/class/power_supply")) {
+        std::ifstream t("/sys/class/power_supply/" + d + "/type"), s("/sys/class/power_supply/" + d + "/status");
+        std::string type, status;
+        std::getline(t, type), std::getline(s, status);
+        if (type == "Battery" && status == "Discharging") return true;
+    }
+#endif
+    return false;
+}
+
+int cpu_count() {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? int(n) : 1;
 }
 
 std::string temp_dir() {
@@ -219,6 +346,7 @@ public:
         int rc = posix_spawn(&pid_, spec.argv[0].c_str(), &fa, nullptr, argv.data(), envp.data());
         posix_spawn_file_actions_destroy(&fa);
         if (rc != 0) throw Error("posix_spawn failed (" + std::to_string(rc) + ") for " + spec.argv[0]);
+        if (spec.background) setpriority(PRIO_PROCESS, pid_, 10);  // below normal (best effort)
     }
     ~PosixProcess() override {
         if (running()) kill();
@@ -311,10 +439,72 @@ bool list_files(const std::string &dir, std::vector<DirEntry> &out, size_t max_f
     return walk(dir, "", out, max_files);
 }
 
+#ifdef BALLRAIN_HAVE_CURL
+// https (and http) through libcurl: the system's TLS and CA store (macOS: always present; Linux: the distro's)
+struct CurlBody {
+    std::string data;
+    size_t max = 0;
+    bool over = false;
+};
+static size_t curl_write(char *p, size_t sz, size_t n, void *ud) {
+    auto *b = static_cast<CurlBody *>(ud);
+    if (b->data.size() + sz * n > b->max) {
+        b->over = true;
+        return 0;
+    }
+    b->data.append(p, sz * n);
+    return sz * n;
+}
+
+static HttpResponse curl_request(const std::string &method, const std::string &url,
+                                 const std::vector<std::pair<std::string, std::string>> &headers,
+                                 const std::string &body, double timeout_s, size_t max_body) {
+    static const bool inited = [] { return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK; }();
+    if (!inited) throw Error("https: libcurl did not initialise");
+    CURL *c = curl_easy_init();
+    if (!c) throw Error("https: no curl handle");
+    curl_slist *hl = nullptr;
+    for (auto &h : headers) hl = curl_slist_append(hl, (h.first + ": " + h.second).c_str());
+    hl = curl_slist_append(hl, "Expect:");
+    CurlBody out;
+    out.max = max_body;
+    curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method.c_str());
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, hl);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, curl_write);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(c, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, long(timeout_s * 1000));
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, long(std::min(timeout_s, 20.0) * 1000));
+    if (!body.empty() || method == "POST") {
+        curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.data());
+        curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, curl_off_t(body.size()));
+    }
+    CURLcode rc = curl_easy_perform(c);
+    long status = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    curl_slist_free_all(hl);
+    curl_easy_cleanup(c);
+    if (out.over) throw Error("http: response larger than " + std::to_string(max_body) + " bytes");
+    if (rc != CURLE_OK) throw Error(std::string("https: ") + curl_easy_strerror(rc));
+    HttpResponse r;
+    r.status = int(status);
+    r.body = std::move(out.data);
+    return r;
+}
+#endif
+
 HttpResponse http_request(const std::string &method, const std::string &url,
                           const std::vector<std::pair<std::string, std::string>> &headers, const std::string &body,
                           double timeout_s, size_t max_body) {
-    if (url.compare(0, 7, "http://") != 0) throw Error("http: only http:// is implemented on this platform yet");
+#ifdef BALLRAIN_HAVE_CURL
+    if (url.compare(0, 8, "https://") == 0) return curl_request(method, url, headers, body, timeout_s, max_body);
+#endif
+    if (url.compare(0, 7, "http://") != 0)
+        throw Error("http: https needs libcurl on this platform (this build has none)");
     std::string rest = url.substr(7);
     size_t slash = rest.find('/');
     std::string hostport = rest.substr(0, slash), path = slash == std::string::npos ? "/" : rest.substr(slash);

@@ -315,6 +315,29 @@ class Store:
                          (int(forum_id),))
         return int(r["n"])
 
+    def close_task(self, task_id: str, forum_id: int, chunks: int, reason: str) -> str | None:
+        """The client's task_end: an open task of the account with exactly `chunks` chunks received becomes closed (as
+        at its deadline). Returns the task's state afterwards, None when the task is unknown / not the account's,
+        "order" when the chunk count differs (chunks still on their way)."""
+        out: list = []
+
+        def fn(db):
+            t = db.execute("SELECT state, final, next_seq, forum_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if t is None or int(t["forum_id"]) != int(forum_id):
+                out.append(None)
+                return
+            if t["state"] != "open":
+                out.append(str(t["state"]))
+                return
+            if int(t["next_seq"]) != int(chunks):
+                out.append("order")
+                return
+            db.execute("UPDATE tasks SET state='closed', end_reason=? WHERE task_id=? AND state='open'",
+                       (f"client: {reason}"[:300], task_id))
+            out.append("closed")
+        self.tx(fn)
+        return out[0]
+
     def close_expired(self) -> int:
         """Open tasks past their deadline become closed (the verifier takes what arrived)."""
         with self.lock:

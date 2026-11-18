@@ -229,6 +229,24 @@ static std::wstring quote_arg(const std::wstring &a) {
     return out + L"\"";
 }
 
+// One Job Object per client process: every background engine is assigned to it; KILL_ON_JOB_CLOSE ends them when
+// the last handle (this process's) closes, also on a crash or a TerminateProcess of the client.
+static HANDLE client_job() {
+    static HANDLE job = [] {
+        HANDLE j = CreateJobObjectW(nullptr, nullptr);
+        if (j) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+            li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li)) {
+                CloseHandle(j);
+                j = nullptr;
+            }
+        }
+        return j;
+    }();
+    return job;
+}
+
 class WinProcess : public Process {
 public:
     explicit WinProcess(const Spec &spec) {
@@ -270,15 +288,27 @@ public:
                                                  n_inherit * sizeof(HANDLE), nullptr, nullptr);
         PROCESS_INFORMATION pi{};
         std::wstring cwd = widen(spec.cwd);
-        BOOL ok = attr_ok && CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE,
-                                            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-                                            &blk[0], cwd.empty() ? nullptr : cwd.c_str(), &si.StartupInfo, &pi);
+        DWORD flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+        if (spec.background) flags |= CREATE_SUSPENDED | BELOW_NORMAL_PRIORITY_CLASS;
+        BOOL ok = attr_ok && CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, TRUE, flags, &blk[0],
+                                            cwd.empty() ? nullptr : cwd.c_str(), &si.StartupInfo, &pi);
         DWORD e = GetLastError();
         if (attr_ok) DeleteProcThreadAttributeList(si.lpAttributeList);
         if (nul_in != INVALID_HANDLE_VALUE) CloseHandle(nul_in);
         if (err != nul_out && err != INVALID_HANDLE_VALUE) CloseHandle(err);
         if (nul_out != INVALID_HANDLE_VALUE) CloseHandle(nul_out);
         if (!ok) throw Error("CreateProcess failed (" + std::to_string(e) + ") for " + spec.argv[0]);
+        if (spec.background) {  // created suspended: in the job before it runs a single instruction
+            HANDLE job = client_job();
+            if (!job || !AssignProcessToJobObject(job, pi.hProcess)) {
+                DWORD je = GetLastError();
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                throw Error("cannot put the engine into the client's job object (" + std::to_string(je) + ")");
+            }
+            ResumeThread(pi.hThread);
+        }
         CloseHandle(pi.hThread);
         h_ = pi.hProcess;
         pid_ = int(pi.dwProcessId);
@@ -321,6 +351,12 @@ std::unique_ptr<Process> Process::spawn(const Spec &spec) { return std::make_uni
 // ---------------------------------------------------------------------------------------------- files, HTTP (Windows)
 #ifdef _WIN32
 #include <winhttp.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <tlhelp32.h>
+#include <cctype>
+#include <cwctype>
+#include <ctime>
 
 namespace ballrain {
 namespace platform {
@@ -328,6 +364,114 @@ namespace platform {
 bool is_dir(const std::string &path) {
     DWORD a = GetFileAttributesW(widen(path).c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+std::vector<std::string> list_dir(const std::string &dir) {
+    std::vector<std::string> out;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(widen(dir + "\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        std::wstring n = fd.cFileName;
+        if (n != L"." && n != L"..") out.push_back(narrow(n));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return out;
+}
+
+bool rename_file(const std::string &from, const std::string &to) {
+    // a file just written is often held for a moment by a virus scanner / the indexer (sharing violation, access
+    // denied): retry for up to ~2 s before giving up
+    std::wstring f = widen(from), t = widen(to);
+    for (int i = 0; i < 100; ++i) {
+        if (MoveFileExW(f.c_str(), t.c_str(), MOVEFILE_REPLACE_EXISTING)) return true;
+        DWORD e = GetLastError();
+        if (e != ERROR_SHARING_VIOLATION && e != ERROR_ACCESS_DENIED && e != ERROR_LOCK_VIOLATION) return false;
+        Sleep(20);
+    }
+    return false;
+}
+
+int64_t file_size(const std::string &path) {
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(widen(path).c_str(), GetFileExInfoStandard, &d)) return -1;
+    return (int64_t(d.nFileSizeHigh) << 32) | int64_t(d.nFileSizeLow);
+}
+
+int64_t unix_time() { return int64_t(std::time(nullptr)); }
+
+static std::string known_folder(REFKNOWNFOLDERID id) {
+    PWSTR p = nullptr;
+    std::string out;
+    if (SHGetKnownFolderPath(id, 0, nullptr, &p) == S_OK) out = narrow(p);
+    if (p) CoTaskMemFree(p);
+    return out;
+}
+
+std::string data_dir() { return home_dir() + "\\.ballrain"; }
+
+std::string home_dir() { return known_folder(FOLDERID_Profile); }
+
+std::string short_path(const std::string &path) {
+    std::wstring w = widen(path);
+    DWORD n = GetShortPathNameW(w.c_str(), nullptr, 0);
+    if (!n) return path;
+    std::wstring out(n, L'\0');
+    n = GetShortPathNameW(w.c_str(), &out[0], n);
+    out.resize(n);
+    return n ? narrow(out) : path;
+}
+
+std::string executable_path() {
+    std::wstring buf(32768, L'\0');
+    DWORD n = GetModuleFileNameW(nullptr, &buf[0], DWORD(buf.size()));
+    buf.resize(n);
+    return narrow(buf);
+}
+
+std::string user_name() {
+    wchar_t buf[256];
+    DWORD n = 256;
+    return GetUserNameW(buf, &n) ? narrow(std::wstring(buf, n ? n - 1 : 0)) : std::string();
+}
+
+bool open_url(const std::string &url) {
+    if (url.rfind("https://", 0) != 0 && url.rfind("http://", 0) != 0) return false;  // never a file or a program
+    return reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", widen(url).c_str(), nullptr, nullptr,
+                                                   SW_SHOWNORMAL)) > 32;
+}
+
+bool single_instance(const std::string &data_dir) {
+    std::wstring name = L"Local\\BallrainPool-";
+    uint32_t h = 2166136261u;  // FNV-1a of the folded path: one mutex per data directory
+    for (char c : data_dir) h = (h ^ uint32_t(std::tolower(static_cast<unsigned char>(c == '\\' ? '/' : c)))) * 16777619u;
+    name += std::to_wstring(h);
+    HANDLE m = CreateMutexW(nullptr, TRUE, name.c_str());  // never closed: held until the process exits
+    return m && GetLastError() != ERROR_ALREADY_EXISTS;
+}
+
+bool process_running(const std::string &image_name) {
+    std::wstring want = widen(image_name);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof pe;
+    bool found = false;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok && !found; ok = Process32NextW(snap, &pe))
+        found = _wcsicmp(pe.szExeFile, want.c_str()) == 0;
+    CloseHandle(snap);
+    return found;
+}
+
+bool on_battery() {
+    SYSTEM_POWER_STATUS s;
+    if (!GetSystemPowerStatus(&s)) return false;
+    return s.ACLineStatus == 0 && s.BatteryFlag != 128;  // 128: no system battery
+}
+
+int cpu_count() {
+    DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    return n ? int(n) : 1;
 }
 
 static bool walk(const std::wstring &root, const std::wstring &rel, std::vector<DirEntry> &out, size_t max_files) {

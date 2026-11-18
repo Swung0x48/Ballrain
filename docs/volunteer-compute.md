@@ -6,7 +6,7 @@
 
 - **游戏文件由玩家自己提供。** 每个玩家都有自己的 Ballance 拷贝。客户端只读取玩家本机的安装目录，校验文件的 sha256，项目不分发任何游戏文件。要校验的文件：
   - 2002 年的 `physics_RT.dll`（sha256 `e72e4afc…`）；
-  - `base.cmo`、`Database.tdb`、`3D Entities/`、`Text/`、`Bin/VxMath.dll`，这几项就是 docs/headless.md 里第二台 Windows 主机的最小清单。
+  - `base.cmo`、`Database.tdb`、`3D Entities/`、`Text/`（x87-soft 引擎只读这四项；2002 引擎另要 `Bin/VxMath.dll` 和 `BuildingBlocks/physics_RT.dll`）。
 - **志愿者只做采样，训练只在中心做。** 志愿者的电脑只跑无头游戏和策略前向：
   - Windows 跑 2002 headless，直接加载玩家本机的原版物理 DLL；
   - macOS / Linux 跑 x87-soft headless。

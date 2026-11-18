@@ -46,13 +46,15 @@ ENV_FIELDS = ("level", "mode", "delta_ms", "action_repeat", "camera_actions", "w
 # the chunk's "rewards" are the worker's training reward under these
 ROLLOUT_FIELDS = ("chunk", "gamma", "cap_mult", "cap_extra_s", "stall_s", "respawn_stall_s", "stall_progress",
                   "stall_terminal", "stall_extra", "stall_compensate", "stall_speed", "stall_max_s", "route_probes",
-                  "gates", "split_k", "split_min_ref_s", "split_rest_allow_s", "split_extra")
-_ROLLOUT_JSON_ARGS = ("route_probes", "gates", "split_extra")  # train_m2 passes these as JSON strings
+                  "gates", "split_k", "split_min_ref_s", "split_rest_allow_s", "split_extra", "counter_rand",
+                  "p_early_respawn", "respawn_level_starts")
+_ROLLOUT_JSON_ARGS = ("route_probes", "gates", "split_extra", "counter_rand")  # train_m2 passes these as JSON strings
 # the ROLLOUT_FIELDS scripts/train_m2.py actually passes from its arguments to WorkerSpec; the others (cap_extra_s,
 # stall_progress, split_rest_allow_s) are WorkerSpec defaults there even if an argument of that name appears later
 _ROLLOUT_FROM_ARGS = ("chunk", "gamma", "cap_mult", "stall_s", "respawn_stall_s", "stall_terminal", "stall_extra",
                       "stall_compensate", "stall_speed", "stall_max_s", "route_probes", "gates", "split_k",
-                      "split_min_ref_s", "split_extra")
+                      "split_min_ref_s", "split_extra", "counter_rand", "p_early_respawn",
+                      "respawn_level_starts")
 ACTION_NAMES = {0: "none", 1: "up", 2: "down", 4: "left", 8: "right"}
 # HeadlessConfig fields that change the simulation (SimTool's --tas recipe), taken from the run's env_config.headless;
 # binary / root / socket / host / port / log / extra_env are the client's own, ball_order is the task's
@@ -175,7 +177,7 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     rc = ec.get("reward") or {}
     reward = _plain({f.name: rc.get(f.name, getattr(RewardConfig(), f.name)) for f in fields(RewardConfig)})
     ws = {f.name: f.default for f in fields(WorkerSpec) if f.name in ROLLOUT_FIELDS}
-    ws.update({"route_probes": {}, "gates": {}, "split_extra": []})
+    ws.update({"route_probes": {}, "gates": {}, "split_extra": [], "counter_rand": {}})
     for k in _ROLLOUT_FROM_ARGS:
         if k not in args:
             continue

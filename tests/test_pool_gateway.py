@@ -312,8 +312,11 @@ def test_hello_checks(gw):
     assert (st, c, p["file"]) == (400, "game_files_mismatch", "Text/")
     gf = {n: GAME[n] for n in P.GAME_FILE_LIST if n != "base.cmo"}
     assert code(gw.hello(tok, game_files=gf))[2]["file"] == "base.cmo"
-    st, c, p = code(gw.hello(tok, engine={"kind": "2002", "sha256": ENGINE_SHA, "version": "1"}))  # no physics_RT.dll
-    assert (c, p["file"]) == ("game_files_mismatch", "BuildingBlocks/physics_RT.dll")
+    # the 2002 engine also reads the retail Bin/VxMath.dll and BuildingBlocks/physics_RT.dll (not in x87soft's list)
+    st, c, p = code(gw.hello(tok, engine={"kind": "2002", "sha256": ENGINE_SHA, "version": "1"}))
+    assert (c, p["file"]) == ("game_files_mismatch", "Bin/VxMath.dll")
+    gf = dict({n: GAME[n] for n in P.GAME_FILE_LIST}, **{"Bin/VxMath.dll": GAME["Bin/VxMath.dll"]})
+    assert code(gw.hello(tok, game_files=gf))[1:] == ("game_files_mismatch", {"file": "Bin/VxMath.dll", "got": "-"})
     assert code(gw.hello(tok, instances=9))[1:] == ("too_many_instances", {"max_instances": 8})
     assert code(gw.hello(tok, client_version="0.0.9"))[1] == "client_too_old"
     assert code(gw.hello(tok, client_version="0.1.0"))[1] == "client_too_old"  # chunk format 1 (the float32 chain)
@@ -474,7 +477,9 @@ def test_policy_source_publishes_r6_and_draws_curriculum_starts(tmp_path):
     assert pub.record == pub.manifest["env"]["start_record"] and pub.curriculum is not None
     assert ps.refresh() is pub  # the same checkpoint is not exported again
     cu = pub.curriculum
-    ks = [ps.pick_start(pub) for _ in range(400)]
+    draws, pub.draws = pub.draws, None  # the curriculum draw alone (the rehearsal / at-rest draws: below)
+    ks = [k for k, rest in (ps.pick_start(pub) for _ in range(400))]
+    pub.draws = draws
     excl = pub.manifest["env"]["exclude_starts"] or []
     valid = set(pub.valid.tolist())
     assert all(k in valid for k in ks)
@@ -486,6 +491,8 @@ def test_policy_source_publishes_r6_and_draws_curriculum_starts(tmp_path):
     d = P.check(P.TASK, t.to_dict())
     assert d["engine"] == "2002" and d["chunk_steps"] == pub.manifest["rollout"]["chunk"]
     assert d["assets"] == {"starts": pub.starts_sha, "path": pub.path_sha}
+    for _ in range(200):  # with the run's own rehearsal / at-rest draws: every task passes the schema
+        P.check(P.TASK, ps.new_task("2002", 1000, 8192, 60000, 3600).to_dict())
 
 
 # ============================================================================================== review fixes

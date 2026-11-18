@@ -31,6 +31,9 @@ Task Task::from_json(const Json &t) {
     k.sample_seed = uint64_t(t.at("sample_seed").as_int());
     k.asset_starts = t.at("assets").at("starts").as_string();
     k.asset_path = t.at("assets").at("path").as_string();
+    k.rest = RestStart::from_json(t.find("rest"));
+    if (const Json *c = t.find("life_seed")) k.life_seed = uint64_t(c->as_int());
+    if (const Json *c = t.find("respawn_frontier"); c && !c->is_null()) k.respawn_frontier = c->as_int();
     if (k.chunk_steps < 1 || k.max_steps < 1 || k.max_frames < 1) throw Error("task limits");
     return k;
 }
@@ -59,16 +62,74 @@ RolloutSpec RolloutSpec::from_json(const Json &r) {
         else if (k == "split_rest_allow_s") s.split_rest_allow_s = v.as_double();
         else if (k == "split_extra")
             for (auto &e : v.items()) s.split_extra.push_back({e.at(size_t(0)).as_double(), e.at(size_t(1)).as_double(), e.at(size_t(2)).as_double()});
+        else if (k == "counter_rand") s.counter_rand = v.is_null() ? Json::object() : v;
+        else if (k == "p_early_respawn") s.p_early_respawn = v.as_double();
+        else if (k == "respawn_level_starts") s.respawn_level_starts = v.as_bool();
         else throw Error("rollout field " + k + " unknown to this client");
     }
     return s;
+}
+
+// ---------------------------------------------------------------------------------------------- counters
+
+CounterRand::CounterRand(const Json &spec, const FeatureExtractor &fx) {
+    int at = 0;
+    for (auto &l : fx.layout()) {
+        if (l.first == "lives") i_lives_ = at;
+        else if (l.first == "sr_s") i_sr_ = at;
+        else if (l.first == "points") i_points_ = at;
+        at += l.second;
+    }
+    if (!spec.is_object()) return;
+    if (const Json *l = spec.find("lives"); l && i_lives_ >= 0) {
+        for (auto &v : l->at("values").items()) values_.push_back(v.as_double());
+        if (values_.empty()) throw Error("counter_rand.lives.values is empty");
+        std::vector<double> p;
+        const Json *pj = l->find("p");
+        if (!pj || pj->is_null()) {
+            p.assign(values_.size(), 1.0 / double(values_.size()));
+        } else {
+            for (auto &v : pj->items()) p.push_back(v.as_double());
+            if (p.size() != values_.size()) throw Error("counter_rand.lives.p");
+            double sum = numpy_sum(p.data(), p.size());
+            for (auto &x : p) x /= sum;
+        }
+        double c = 0.0;
+        for (double x : p) c += x, cdf_.push_back(c);  // np.cumsum
+        has_lives_ = true;
+    }
+    if (const Json *r = spec.find("sr_s"); r && i_sr_ >= 0)
+        sr_lo_ = r->at(size_t(0)).as_double(), sr_hi_ = r->at(size_t(1)).as_double(), has_sr_ = true;
+    if (const Json *r = spec.find("points"); r && i_points_ >= 0)
+        pt_lo_ = r->at(size_t(0)).as_double(), pt_hi_ = r->at(size_t(1)).as_double(), has_pt_ = true;
+    any_ = !spec.members().empty();
+}
+
+void CounterRand::draw(uint64_t seed, int64_t life) {
+    ops_.clear();
+    uint64_t b = 4 * uint64_t(life);
+    if (has_lives_) {
+        double u = sample_u(seed, b);
+        size_t i = size_t(std::upper_bound(cdf_.begin(), cdf_.end(), u) - cdf_.begin());  // searchsorted side=right
+        i = std::min(i, values_.size() - 1);
+        ops_.push_back({i_lives_, true, values_[i]});
+    }
+    if (has_sr_) ops_.push_back({i_sr_, false, sr_lo_ + (sr_hi_ - sr_lo_) * sample_u(seed, b + 1)});
+    if (has_pt_) ops_.push_back({i_points_, false, pt_lo_ + (pt_hi_ - pt_lo_) * sample_u(seed, b + 2)});
+}
+
+void CounterRand::apply(std::vector<float> &o) const {
+    for (auto &op : ops_) {  // numpy: float32 array element with a Python float (NEP 50: float32 arithmetic)
+        float &x = o[size_t(op.index)];
+        x = op.set ? float(op.value) : x + float(op.value);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------- runner
 
 TaskRunner::TaskRunner(BallanceEnv &env, const TasStarts *starts, const Task &task, const RolloutSpec &spec,
                        double delta_ms)
-    : env_(env), st_(starts), task_(task), sp_(spec), delta_ms_(delta_ms) {
+    : env_(env), st_(starts), task_(task), sp_(spec), delta_ms_(delta_ms), cr_(spec.counter_rand, env.features()) {
     env_.set_digest(&dg_);
     if (st_ && !st_->valid.empty()) {  // rollout._Shaping
         lf_ = st_->levelfinish_frame && *st_->levelfinish_frame ? *st_->levelfinish_frame : st_->valid.back();
@@ -118,7 +179,12 @@ std::optional<int64_t> TaskRunner::cap_frames(const StepInfo &info) const {
 void TaskRunner::split_start(Episode &ep) {
     if (!sp_.split_k || !st_) return;
     std::optional<double> ref;
+    if (ep.kind == "tas_rest" && ep.start_frame > 0 && !st_->index_of(ep.start_frame)) {
+        ep.has_seg = false;  // handed over in an excluded range (off the TAS's route): no reference time
+        return;
+    }
     if (ep.kind == "tas" && ep.start_frame > 0) ref = tas_igt(ep.start_frame);
+    else if (ep.kind == "tas_rest") ref = tas_igt(ep.start_frame) - 1000 * sp_.split_rest_allow_s;
     else if (ep.kind == "respawn") {
         auto c = tas_cross(ep.start_sector);
         if (c) ref = *c - 1000 * sp_.split_rest_allow_s;
@@ -199,6 +265,25 @@ void TaskRunner::new_episode(const StepInfo &info) {
     ++episodes;
 }
 
+std::vector<float> TaskRunner::new_life(std::vector<float> obs) {
+    // as Worker._reset / rollout.TaskRunner._new_life_counters: the reset observation was computed with the true
+    // counters, the new life's set applies from it on
+    cr_.clear();
+    if (cr_.active(task_.start_frame)) cr_.draw(task_.life_seed, lives_);
+    ++lives_;
+    cr_.apply(obs);
+    return obs;
+}
+
+// counters.skip_respawn (Worker._skip_respawn): the respawn after the current life's death in `sector` is not played
+bool TaskRunner::skip_respawn(int sector) const {
+    if (sp_.p_early_respawn >= 1.0 || !task_.respawn_frontier || !st_) return false;
+    if (sp_.respawn_level_starts && task_.start_frame == 0) return false;
+    auto cross = tas_cross_frame(sector);
+    if (!cross || *cross >= *task_.respawn_frontier) return false;
+    return sample_u(task_.life_seed, 4 * uint64_t(lives_ - 1) + 3) >= sp_.p_early_respawn;
+}
+
 std::vector<float> TaskRunner::start() {
     std::optional<std::vector<float>> o;
     try {
@@ -209,7 +294,7 @@ std::vector<float> TaskRunner::start() {
     digest = dg_.take();
     f_hand_ = info_.frames_done;
     new_episode(info_);
-    return *o;
+    return new_life(std::move(*o));
 }
 
 static std::string end_name(const StepInfo &info, const std::string &worker_end) {
@@ -231,6 +316,7 @@ StepResult TaskRunner::step(int a, const std::function<std::string()> &stop) {
     std::vector<float> obs2;
     try {
         obs2 = env_.step(a, term, trunc, info2, &r);
+        cr_.apply(obs2);
     } catch (const std::exception &e) {
         throw EngineFailure(std::string("step: ") + e.what());
     }
@@ -284,7 +370,9 @@ StepResult TaskRunner::step(int a, const std::function<std::string()> &stop) {
     bool respawn = term && wend != "stall" && env_.after_death();
     uint8_t flags = term ? FLAG_TERMINATED : (trunc ? FLAG_TRUNCATED : 0);
     std::string task_end;
-    if (trunc || (term && !respawn)) {
+    if (respawn && wend == "BallOff" && skip_respawn(info2.sector)) {
+        task_end = "respawn_skipped";  // the learner's early-respawn rule: its process would end here
+    } else if (trunc || (term && !respawn)) {
         task_end = end_name(info2, wend);
     } else {
         if (steps >= task_.max_steps) task_end = "max_steps";
@@ -298,6 +386,7 @@ StepResult TaskRunner::step(int a, const std::function<std::string()> &stop) {
     if (task_end.empty() && term) {  // a respawn in the same process (or the process ends during it)
         std::optional<std::vector<float>> on;
         StepInfo in;
+        cr_.clear();
         try {
             on = env_.reset(false, &in);
         } catch (const std::exception &e) {
@@ -306,7 +395,7 @@ StepResult TaskRunner::step(int a, const std::function<std::string()> &stop) {
         if (!on) {
             task_end = "GameOver";
         } else {
-            nxt = *on;
+            nxt = new_life(std::move(*on));
             last_feat = in.feat;
             new_episode(in);
         }
@@ -378,7 +467,7 @@ Bytes ChunkAssembler::cut(const std::string &end) {
 }
 
 std::string sample_task(TaskRunner &runner, const Policy &policy, const Task &task,
-                        const std::function<void(const Bytes &)> &on_chunk, const std::function<std::string()> &stop,
+                        const std::function<void(const Bytes &, bool)> &on_chunk, const std::function<std::string()> &stop,
                         const std::function<int(int64_t, const std::vector<float> &)> &choose) {
     ChunkAssembler asm_(task, policy.n_obs, policy.n_act, policy.sha);
     std::vector<float> obs = runner.start();
@@ -401,9 +490,9 @@ std::string sample_task(TaskRunner &runner, const Policy &policy, const Task &ta
         x = policy.normalize(st.next_obs);
         asm_.add(lp[size_t(a)], st, policy.value(x));
         end = st.end;
-        if (end.empty() && asm_.ready()) on_chunk(asm_.cut());
+        if (end.empty() && asm_.ready()) on_chunk(asm_.cut(), false);
     }
-    if (asm_.pending()) on_chunk(asm_.cut(end));
+    if (asm_.pending()) on_chunk(asm_.cut(end), true);
     return end;
 }
 

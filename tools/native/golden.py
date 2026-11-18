@@ -185,7 +185,11 @@ def run_env(a, manifest, stream: Stream) -> dict:
     from ballrain.pool.sampling import sample_action, sample_u
     from ballrain.pool.weights import load_policy
     pol = load_policy(Path(a.manifest).with_suffix(".npz"), manifest)
-    env = BallanceEnv(env_config(a, manifest))
+    launcher = None
+    if a.fake:  # ballrain.fakegame's synthetic level over the headless socket transport (CI: no game, no engine)
+        from ballrain.fakegame import FakeLauncher
+        launcher = FakeLauncher(transport="socket")
+    env = BallanceEnv(env_config(a, manifest), launcher=launcher)
     rng = np.random.default_rng(a.seed)
     t0 = time.perf_counter()
     steps, deaths, ends = 0, 0, []
@@ -239,7 +243,8 @@ def run_tas(a, manifest, stream: Stream) -> dict:
         feats[k] = tuple(feats.get(k) or ())
     fx = FeatureExtractor(FeatureConfig(**feats))
     out = Path(a.out).resolve() / "runs" / "tas"
-    sc = C.SessionConfig(level=1, out_dir=out, copy="nc-py", max_frames=len(frames) + 10, body_radius=60.0, sr_tail=32)
+    sc = C.SessionConfig(level=int(manifest["env"]["level"]), out_dir=out, copy="nc-py", max_frames=len(frames) + 10,
+                         body_radius=60.0, sr_tail=32)
     s = C.AgentSession(sc, HeadlessLauncher(HeadlessConfig(**headless_cfg(a, manifest))))
     t0 = time.perf_counter()
     s.start()
@@ -275,6 +280,7 @@ def main(argv=None) -> int:
     ap.add_argument("--max-steps", type=int, default=20000)
     ap.add_argument("--record", help="tas mode: dataset record directory (raw.npz)")
     ap.add_argument("--block", type=int, default=2, help="tas mode: frames per block")
+    ap.add_argument("--fake", action="store_true", help="policy / random on ballrain.fakegame (the synthetic level)")
     a = ap.parse_args(argv)
     from ballrain.pool.weights import read_manifest
     manifest = read_manifest(a.manifest)

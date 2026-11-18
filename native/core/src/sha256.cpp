@@ -103,7 +103,7 @@ std::string Sha256::hex(const void *data, size_t n) {
 }
 
 std::string file_sha256(const std::string &path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(u8_path(path), std::ios::binary);
     if (!f) throw Error("cannot read " + path);
     Sha256 s;
     std::vector<char> buf(1 << 20);

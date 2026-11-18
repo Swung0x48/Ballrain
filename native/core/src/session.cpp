@@ -118,11 +118,13 @@ void SocketChannel::apply_state(const Bytes &p) {
     hdr_.mod_state = r.u32(), hdr_.end_reason = r.u32(), hdr_.frames_done = r.u32(), hdr_.last_error = r.u32();
 }
 
-ChanHeader SocketChannel::wait_hello(double timeout_s) {
+ChanHeader SocketChannel::wait_hello(double timeout_s, const std::function<bool()> &alive) {
     double deadline = platform::monotonic_s() + timeout_s;
-    if (!conn_) {
-        conn_ = listener_->accept(timeout_s);
-        if (!conn_) throw Timeout("the game did not connect");
+    while (!conn_) {
+        double left = deadline - platform::monotonic_s();
+        if (left <= 0) throw Timeout("the game did not connect");
+        conn_ = listener_->accept(alive ? std::min(left, 0.25) : left);
+        if (!conn_ && alive && !alive()) throw PeerGone("the game process exited before it connected");
     }
     send(BR_PING, Bytes());
     for (;;) {
@@ -267,10 +269,11 @@ const Observation &Session::start() {
     spec.argv = engine_argv(eng_);
     spec.env = engine_env(cfg_, eng_, chan_->name());
     if (eng_.log) spec.stderr_path = d + "/headless.log";
+    spec.background = eng_.background;
     try {
         timing.launch = platform::monotonic_s();
         proc_ = platform::Process::spawn(spec);
-        hello_ = chan_->wait_hello(cfg_.hello_timeout_s);
+        hello_ = chan_->wait_hello(cfg_.hello_timeout_s, [this] { return proc_->running(); });
         timing.hello = platform::monotonic_s();
         if (rec_) rec_->put(K_HELLO, hello_.mod_version);
         if (hello_.mod_version.find("headless") == std::string::npos)

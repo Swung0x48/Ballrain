@@ -119,6 +119,9 @@ class EnvConfig:
     # follow: L1 shortcut 2 while the reference line takes shortcut 1); applied to TasStarts, so curriculum draws,
     # rehearsal and at-rest starts all skip them
     exclude_starts: list | None = None
+    # an at-rest start given by the caller instead of drawn (pool tasks: the server draws it): {"target": [x, z] |
+    # None, "max_frames": n} applied to the start_frame hand-over (target None = brake only)
+    start_rest: dict | None = None
     rest_speed: float = 0.5
     rest_max_frames: int = 600
     warm_pool: bool = False  # pre-launch the next process on warm_copy while the current one runs
@@ -291,6 +294,11 @@ class BallanceEnv(gym.Env):
             return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
         if self.curriculum is not None:
             return self.curriculum.sample(self._start_rng)
+        if c.start_rest is not None and (c.start_frame or 0) > 0:  # a given at-rest start (pool task): not snapped
+            t = c.start_rest.get("target")
+            mf = c.start_rest.get("max_frames")
+            self._rest_next = True if t is None else ((float(t[0]), float(t[1])) + ((int(mf),) if mf else ()))
+            return int(c.start_frame)
         k = self.cfg.start_frame or 0
         return self.starts.nearest_valid(k) if k > 0 else 0
 

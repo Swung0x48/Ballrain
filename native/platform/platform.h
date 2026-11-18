@@ -27,10 +27,32 @@ struct DirEntry {
 };
 bool list_files(const std::string &dir, std::vector<DirEntry> &out, size_t max_files = 20000);
 bool is_dir(const std::string &path);
+std::vector<std::string> list_dir(const std::string &dir);  // the names in dir (no "." / ".."), unsorted
+bool rename_file(const std::string &from, const std::string &to);  // replaces an existing target
+int64_t file_size(const std::string &path);                       // -1 when missing
+int64_t unix_time();                                              // wall-clock seconds
 
-// One HTTP(S) request. Windows: WinHTTP (http and https, the system's TLS and proxy settings). POSIX: http only for
-// now (a loopback test gateway); https on macOS / Linux / Android is not implemented yet. Throws ballrain::Error on a
-// connection failure, a timeout or a body larger than max_body.
+// The client's data directory: %USERPROFILE%\.ballrain on Windows, ~/.ballrain elsewhere (everything the client
+// writes that does not belong next to the program: config, token, logs, cache, upload queue, run and work directories)
+std::string data_dir();
+std::string home_dir();
+std::string executable_path();  // this program (absolute)
+std::string user_name();        // the login name (diagnostics scrub it from paths)
+std::string short_path(const std::string &path);  // Windows: the 8.3 form when the volume has one, else path
+bool open_url(const std::string &url);  // the system browser (ShellExecute / open / xdg-open)
+// One client per data directory: true when this process holds the lock (kept until it exits)
+bool single_instance(const std::string &data_dir);
+
+// Automatic-pause probes (best effort: false when unknown). process_running compares image names case-insensitively
+// (Windows: the process list; Linux: /proc/<pid>/cmdline contains the name, e.g. Player.exe under Wine)
+bool process_running(const std::string &image_name);
+bool on_battery();
+int cpu_count();
+
+// One HTTP(S) request. Windows: WinHTTP (http and https, the system's TLS and proxy settings). POSIX: https through
+// libcurl when the build found it (macOS always; Linux the distro's libcurl), plain http by the built-in client
+// (a loopback test gateway); Android: http only so far. Throws ballrain::Error on a connection failure, a timeout or a
+// body larger than max_body.
 struct HttpResponse {
     int status = 0;
     std::string body;
@@ -66,6 +88,10 @@ public:
         std::vector<std::pair<std::string, std::string>> env;  // the complete environment of the child
         std::string cwd;          // "" = inherit
         std::string stderr_path;  // "" = discard
+        // the volunteer client's engines: below-normal priority, and (Windows) inside a Job Object of this process
+        // with KILL_ON_JOB_CLOSE, so no engine outlives the client however it ends (POSIX: the engine exits when its
+        // socket closes; nice 10)
+        bool background = false;
     };
     virtual ~Process() = default;
     virtual int pid() const = 0;
