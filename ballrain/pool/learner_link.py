@@ -114,8 +114,12 @@ class LearnerLink:
     def connect(self, timeout_s: float = 30.0) -> bool:
         try:
             c = Client(self.addr, authkey=self.authkey)
+            # branch_assets_version 1: the link carries the learner's route-branch bundle into the export state (the
+            # hub refuses a hello without it when the learner distributes one). branch_rules_version is NOT claimed:
+            # non-default branch rules change the rollout, which the pool's task loops do not implement, so the hub
+            # refuses the link for such a learner (fail-safe) until they do
             c.send({"type": "hello", "protocol": PROTOCOL, "host": HOST_LABEL, "session": self.session + 1,
-                    "backend": HOST_LABEL, "n_workers": 0})
+                    "backend": HOST_LABEL, "n_workers": 0, "branch_assets_version": 1})
             if not c.poll(timeout_s):
                 raise ConnectionError(f"no config within {timeout_s:.0f} s")
             m = c.recv()
