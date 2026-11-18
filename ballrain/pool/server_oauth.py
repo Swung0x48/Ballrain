@@ -75,6 +75,29 @@ class ForumConfig:
     redirect_uri: str  # <public_base_url>/pool/oauth/callback, registered exactly at the forum
     scope: str = "user.read"
     timeout_s: float = 10.0
+    debug_log: str | None = None  # [forum] debug_log = true: the forum's replies, redacted, to <pool>/forum-debug.jsonl
+
+
+SECRET_KEYS = ("access_token", "refresh_token", "id_token", "client_secret", "password")
+
+
+def redact(o):
+    """A forum reply for the debug log: tokens and secrets replaced by a marker, email addresses by their shape
+    (present, length); every other value kept as sent (the operator's own account, read on the operator's machine)."""
+    if isinstance(o, dict):
+        out = {}
+        for k, v in o.items():
+            lk = str(k).lower()
+            if lk in SECRET_KEYS or lk.endswith("_token"):
+                out[k] = f"<redacted {type(v).__name__}>"
+            elif lk == "email" or lk.endswith("_email") or lk == "email_address":
+                out[k] = None if v is None else f"<email: {type(v).__name__}, length {len(str(v))}>"
+            else:
+                out[k] = redact(v)
+        return out
+    if isinstance(o, list):
+        return [redact(v) for v in o]
+    return o
 
 
 def _clean(s, n: int) -> str:
@@ -86,6 +109,17 @@ class ForumClient:
     def __init__(self, cfg: ForumConfig, opener=None):
         self.cfg = cfg
         self.opener = opener or urllib.request.build_opener()
+
+    def _debug(self, what: str, o) -> None:
+        if not self.cfg.debug_log:
+            return
+        import time
+        try:
+            with open(self.cfg.debug_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"t": int(time.time()), "call": what, "reply": redact(o)}, ensure_ascii=False,
+                                   default=str) + "\n")
+        except OSError:
+            pass
 
     def authorize_url(self, state: str) -> str:
         q = urllib.parse.urlencode({"response_type": "code", "client_id": self.cfg.client_id,
@@ -118,6 +152,7 @@ class ForumClient:
                                      headers={"Content-Type": "application/x-www-form-urlencoded",
                                               "Accept": "application/json", "User-Agent": USER_AGENT})
         o = self._json(req)
+        self._debug("oauth/token", o)
         tok = o.get("access_token")
         if not isinstance(tok, str) or not tok or len(tok) > 4096:
             raise ForumError("no access token")
@@ -129,6 +164,7 @@ class ForumClient:
                                      headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json",
                                               "User-Agent": USER_AGENT})
         o = self._json(req)
+        self._debug("api/user", o)
         if isinstance(o.get("data"), dict):  # JSON:API wrapping ({"data": {"id", "attributes": {...}}})
             d = o["data"]
             o = dict(d.get("attributes") or {}, id=d.get("id"))

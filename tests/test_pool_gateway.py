@@ -821,6 +821,39 @@ def test_forum_requests_name_the_gateway_agent():
     assert [ua for _, ua in seen] == [SO.USER_AGENT, SO.USER_AGENT] and "python" not in SO.USER_AGENT.lower()
 
 
+def test_forum_debug_log_redacts_tokens_and_email(tmp_path):
+    import io
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    replies = [b'{"access_token": "SECRET-T", "refresh_token": "R", "token_type": "Bearer", "scope": "user.read"}',
+               b'{"id": 7, "username": "u", "email": "me@example.invalid", "is_email_confirmed": null, "joined_at": null}']
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp(replies.pop(0))
+    log = tmp_path / "forum-debug.jsonl"
+    fc = ForumClient(ForumConfig("https://f", "cid", "sec", "https://x/cb", debug_log=str(log)), opener=_Opener())
+    fc.user(fc.exchange("code"))
+    text = log.read_text(encoding="utf-8")
+    assert "SECRET-T" not in text and "me@example" not in text and '"R"' not in text
+    rows = [json.loads(x) for x in text.splitlines()]
+    assert rows[0]["call"] == "oauth/token" and rows[0]["reply"]["scope"] == "user.read"
+    assert rows[1]["reply"]["email"] == "<email: str, length 18>" and rows[1]["reply"]["joined_at"] is None
+    assert rows[1]["reply"]["username"] == "u"
+    from ballrain.pool.server_config import load_config
+    cfg = tmp_path / "c.toml"
+    cfg.write_text("[forum]\ndebug_log = true\n", encoding="utf-8")
+    assert load_config(cfg, pool_dir=tmp_path, environ={}).forum.debug_log == str(tmp_path / "forum-debug.jsonl")
+    cfg.write_text("", encoding="utf-8")
+    assert load_config(cfg, pool_dir=tmp_path, environ={}).forum.debug_log is None
+
+
 def test_forum_user_fields_in_other_serialisations():
     """joined_at as ISO with fraction / without zone / a space, or Unix seconds / ms; 0 / 1 flags; digit-string counts.
     A failure names the type, never the value."""

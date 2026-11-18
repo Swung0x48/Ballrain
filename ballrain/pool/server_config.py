@@ -5,6 +5,8 @@
     client_id = "..."                  # or BALLRAIN_POOL_FORUM_CLIENT_ID
     client_secret = "..."              # or BALLRAIN_POOL_FORUM_CLIENT_SECRET
     # redirect_uri defaults to <pool.public_base_url>/pool/oauth/callback (must be registered exactly at the forum)
+    # debug_log = true: append the forum's /oauth/token and /api/user replies to <pool>/forum-debug.jsonl, tokens
+    # redacted, email addresses replaced by their shape (for working out what the forum sends; switch off after)
 
     [pool]
     public_base_url = "https://<public host>"   # the site origin (a trailing /pool is dropped); dev: http://127.0.0.1:<port>
@@ -167,7 +169,8 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
     forum = ForumConfig(base_url=str(fo.get("base_url", FORUM_URL)).rstrip("/"),
                         client_id=str(environ.get(ENV_CLIENT_ID) or fo.get("client_id", "")),
                         client_secret=str(environ.get(ENV_CLIENT_SECRET) or fo.get("client_secret", "")),
-                        redirect_uri=str(fo.get("redirect_uri", f"{public}/pool/oauth/callback")))
+                        redirect_uri=str(fo.get("redirect_uri", f"{public}/pool/oauth/callback")),
+                        debug_log=str(pool_dir / "forum-debug.jsonl") if fo.get("debug_log") is True else None)
     engines = {}
     if "engines" not in raw:
         for kind, (b, r) in DEFAULT_ENGINES.items():
