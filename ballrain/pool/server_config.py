@@ -30,6 +30,11 @@
     min_replies = 5                    # (old configs: [pool] min_replies)
     unknown_replies = "refuse"         # the same when the forum gives no reply count
 
+    [guards]                           # upload bounds beyond the format's own checks (a broken client, not only NaN)
+    obs_slack = 0.5                    # |obs| may exceed the policy's feature clip by this much
+    max_abs_value = 1000.0             # |values| (the policy's value estimates)
+    max_abs_reward = 1000.0            # |rewards| and |env_rewards| per step
+
     [policy]
     run = "r6"
     ckpt_dir = "runtime/m2-train-mac/r6"   # default runtime/m2-train-mac/<run>; read-only: the newest readable
@@ -119,7 +124,10 @@ class PoolConfig:
     min_account_days: int = 30
     min_replies: int = 5
     max_instances: int = 8
-    eligibility: "EligibilityRules | None" = None  # [eligibility]; None: all checks with min_account_days / min_replies
+    eligibility: "EligibilityRules | None" = None
+    guard_obs_slack: float = 0.5  # [guards] (server_app._magnitudes)
+    guard_max_abs_value: float = 1000.0
+    guard_max_abs_reward: float = 1000.0  # [eligibility]; None: all checks with min_account_days / min_replies
     min_client_version: str = "0.3.0"  # chunk format 3, task format 3
     heartbeat_s: int = 30
     task_poll_s: int = 10
@@ -205,7 +213,17 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
     for k in ("account_age", "email_confirmed", "replies"):
         if k in el and not isinstance(el[k], bool):
             raise ValueError(f"[eligibility] {k} must be true or false")
+    gu = raw.get("guards", {})
+    unknown_g = set(gu) - {"obs_slack", "max_abs_value", "max_abs_reward"}
+    if unknown_g:
+        raise ValueError(f"[guards] in {path.name}: unknown keys {sorted(unknown_g)}")
+    guards = {k: float(gu.get(k, d)) for k, d in (("obs_slack", 0.5), ("max_abs_value", 1000.0),
+                                                   ("max_abs_reward", 1000.0))}
+    if any(not v > 0 for v in guards.values()):
+        raise ValueError("[guards] bounds must be positive")
     return PoolConfig(
+        guard_obs_slack=guards["obs_slack"], guard_max_abs_value=guards["max_abs_value"],
+        guard_max_abs_reward=guards["max_abs_reward"],
         pool_dir=pool_dir, public_base_url=public, forum=forum,
         min_account_days=rules.min_account_days, min_replies=rules.min_replies, eligibility=rules,
         max_instances=min(int(po.get("max_instances", 8)), 64),

@@ -49,6 +49,8 @@ def chunk_message(c: "P.Chunk", version: int, reach_patch=None) -> dict:
     if reach_patch is not None:
         rows, reach, start = reach_patch
         obs[rows, start:start + reach.shape[1]] = reach
+    if not np.isfinite(obs).all():  # guard: never hand the learner a non-finite row (a bad patch, a decoder slip)
+        raise ValueError("non-finite observation after the reach patch")
     values = np.asarray(A["values"], np.float32)
     flags = np.asarray(A["flags"], np.uint8)
     term = (flags & P.FLAG_TERMINATED) != 0
@@ -156,8 +158,11 @@ class LearnerLink:
         self.template = tpl
         self.run = str(self.template.get("run"))
         self.learner_ingests = bool(tpl.get("pool_ingest"))
-        # a reconnect may be a restarted / rolled-back learner: publish its parameters again from scratch
+        # a reconnect may be a restarted / rolled-back learner: publish its parameters again from scratch, and only
+        # what this session's learner sends (never the previous session's last parameters: after the r8 NaN stop on
+        # 2026-11-18 the old learner's non-finite last send was published at the reconnect, caught by the export)
         self._published_version, self._published_t = None, -1e18
+        self._forget_params()
         if getattr(self.policies, "run", self.run) != self.run:
             # the policies this link publishes carry the learner's run name (manifest source.run), which feed_once
             # compares with the template's: a differing [policy] run would mark every chunk "not for this learner"
@@ -169,8 +174,15 @@ class LearnerLink:
                  f"{'ingests pool chunks' if self.learner_ingests else 'runs without --pool-ingest: no chunks sent'})")
         return True
 
+    def _forget_params(self):
+        """Drop the cached parameters and the learner version (nothing is published or fed until the current
+        session's learner sends its own)."""
+        self._latest = None
+        self.version = None
+
     def _lost(self):
         c, self.conn = self.conn, None
+        self._forget_params()
         if c is not None:
             try:
                 c.close()
@@ -192,7 +204,7 @@ class LearnerLink:
             except (EOFError, OSError, ConnectionError):
                 self._lost()
                 continue
-            if m.get("type") == "params" and "model" in m.get("msg", {}):
+            if m.get("type") == "params" and "model" in m.get("msg", {}) and c is self.conn:  # this session's only
                 self._latest = m["msg"]
                 self.version = int(m["msg"]["version"])
 
