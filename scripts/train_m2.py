@@ -757,6 +757,8 @@ def main(argv=None) -> int:
             cu.load_state_dict(src["curriculum"])
             guard.rolled_back(u)
             msg += f" -> reloaded {f.name} (policy, optimiser, rms, curriculum; frontier {cu.frontier})"
+            # a weight swap can change behaviour far from the guarded band (L1: the section-4 ramp was lost in a rollback)
+            msg += "; check the section-4 ramp share of the reloaded policy (runtime/analysis/alt3/ramp.py on an eval)"
             log.msg(msg)
             broadcast()
         with open(run_dir / "ALERT_auto_rollback.txt", "a", encoding="utf-8") as fh:
