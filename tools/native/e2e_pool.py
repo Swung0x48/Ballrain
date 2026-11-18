@@ -127,6 +127,10 @@ def main(argv=None) -> int:
                     help="first hard-kill the client this many seconds into a run (its engines must die with it: the job "
                          "object), then run it again: the killed run's queued chunks are posted and its tasks closed")
     ap.add_argument("--max-steps", type=int, default=3000)
+    ap.add_argument("--phase-summary-s", type=float, default=20.0,
+                    help="the client's phase summary interval: the headless run must append it to <client>/logs/client.log")
+    ap.add_argument("--wait-upload", action="store_true", help="the client's 0.5.0 behaviour (wait for the previous upload)")
+    ap.add_argument("--rate-only", action="store_true", help="a throughput run: the gateway's receive rate, no verification")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--latency-ms", type=float, default=0.0, help="delay every gateway response (a tunnel's round trip)")
     ap.add_argument("--heartbeat-s", type=int, default=5, help="the gateway's heartbeat interval (5: heartbeats during tasks)")
@@ -259,8 +263,11 @@ def main(argv=None) -> int:
         if not engines or alive:
             return 1
     t0 = time.time()
+    client_log = client_dir / "logs" / "client.log"
+    log_before = client_log.stat().st_size if client_log.exists() else 0
     cmd = ([a.client, "run", "--gateway", gateway, "--data-dir", str(client_dir), "--ballance-dir", a.client_game,
-            "--engine", a.client_engine, "--tasks", str(a.tasks), "--instances", str(a.instances)]
+            "--engine", a.client_engine, "--tasks", str(a.tasks), "--instances", str(a.instances),
+            "--phase-summary-s", str(a.phase_summary_s)] + (["--wait-upload"] if a.wait_upload else [])
            + [x for kv in a.client_engine_env for x in ("--engine-env", kv)]
            + (["--auto-pause", "on"] if a.fake_player else [])
            + (["--quiet-file", str(d / "ballrain-quiet")] if a.quiet else []))
@@ -340,6 +347,23 @@ def main(argv=None) -> int:
         log(f"client exit {p.returncode}: {p.stderr[-2000:]}")
         return 1
     ends = [e for e in events if e["event"] == "task_end"]
+    # the headless run's log: client.log grows after the start (the log lines, the phase summary among them), the log
+    # lines are events too, the summary also a "phases" event
+    run_s = time.time() - t0
+    new_log = (client_log.read_bytes()[log_before:].decode("utf-8", "replace").splitlines()
+               if client_log.exists() else [])
+    summaries = [x for x in new_log if "实例时间" in x]
+    ph_events = [e for e in events if e["event"] == "phases"]
+    log_events = [e for e in events if e["event"] == "log"]
+    want_summary = run_s > a.phase_summary_s + 10
+    log(f"client.log: {len(new_log)} new lines, {len(summaries)} phase summaries; events: {len(log_events)} log, "
+        f"{len(ph_events)} phases" + (f"; last summary: {summaries[-1][:160]}" if summaries else ""))
+    if len(new_log) < 2 or len(log_events) < 2 or (want_summary and not (summaries and ph_events)):
+        log("the headless run did not keep client.log / the log events going")
+        return 1
+    if ph_events:
+        e = ph_events[-1]
+        log("phases: " + ", ".join(f"{k} {e[k]:.1f}" for k in ("wait", "fetch", "assets", "start", "play", "close", "hidden")))
     beats = sum(1 for e in events if e["event"] == "heartbeat")
     other = [e for e in events if e["event"] in ("refused", "task_failed", "error")]
     if a.kill_engine_after > 0:  # the killed engine's task: one task_failed (end "error", its prefix is verified)
@@ -358,6 +382,20 @@ def main(argv=None) -> int:
     if bad or len(ends) != a.tasks or other or (a.heartbeat_s <= 10 and beats == 0):
         log(f"refused chunks / missing tasks: {bad[:3]}")
         return 1
+    # the rate the gateway received (chunks.received, unix s) per minute: the sustained rate, not the start-up burst
+    rec = store.q("SELECT received, steps FROM chunks ORDER BY received")
+    if rec:
+        r0 = rec[0]["received"]
+        buckets = {}
+        for c in rec:
+            k = int((c["received"] - r0) // 60)
+            buckets[k] = buckets.get(k, 0) + c["steps"]
+        span = max(rec[-1]["received"] - r0, 1)
+        log(f"gateway received {sum(c['steps'] for c in rec)} steps in {span} s = {sum(c['steps'] for c in rec) / span:.0f} "
+            f"steps/s; per minute: " + ", ".join(f"{v / 60:.0f}" for k, v in sorted(buckets.items())))
+    if a.rate_only:
+        log("PASSED (rate only: no verification)")
+        return 0
 
     # ---- the verifier replays every task (probation: every chunk selected)
     t0 = time.time()

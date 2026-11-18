@@ -23,7 +23,10 @@ const char *const CLIENT_VERSION = BALLRAIN_CLIENT_VERSION;
 std::vector<std::string> client_capabilities() {
     std::string reach = "reach_" + reach_version();
     std::replace(reach.begin(), reach.end(), '.', '_');
-    return {"task_format3", "branch_v1", "branch_rules_v1", "multi_branch_v2", reach};
+    // task_prefetch_v1: "may hold up to 3 open tasks per instance" (the gateway's rule: < 3 x hello.instances per
+    // session, < 3 x max_instances per account). Declared always: an instance fetches its next task while its
+    // previous task's last chunks still upload (and prepares it early with the prefetch setting)
+    return {"task_format3", "branch_v1", "branch_rules_v1", "multi_branch_v2", "task_prefetch_v1", reach};
 }
 static const size_t MAX_RESPONSE = 64 * 1024, MAX_MANIFEST = 256 * 1024, MAX_DOWNLOAD = 64 * 1024 * 1024;
 
@@ -121,7 +124,6 @@ Json GatewayClient::hello(const std::string &plat, const Json &engine, const Jso
     f.set("instances", Json::integer(instances));
     Json caps = Json::array();  // what this client can run (ballrain.pool.capabilities; the gateway gates tasks by them)
     for (const std::string &c : client_capabilities()) caps.push(Json::string(c));
-    if (prefetch) caps.push(Json::string("task_prefetch_v1"));  // only a client that prepares its next task
     f.set("capabilities", caps);
     Json r = call("POST", "/pool/hello", {"hello_ok"}, json_body(make_message("hello", f)), JSON_CT, true, false);
     session_id = r.at("session_id").as_string();

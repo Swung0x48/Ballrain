@@ -207,6 +207,8 @@ private:
     std::map<std::string, std::string> refused_;    // task_id -> why its chunks are refused (the instance stops)
     std::map<std::string, int> read_fail_;          // the uploaders' unreadable chunk files (under upload_mu_)
     std::set<std::string> uploading_;               // the tasks an uploader thread holds (under upload_mu_)
+    // the chunk posts since the last phase summary: count, seconds (summed over the uploaders), bytes
+    std::atomic<int64_t> up_n_{0}, up_us_{0}, up_bytes_{0};
     // where the instances' wall time goes (summed over tasks, logged every 5 minutes): waiting for the previous
     // task's upload, the task fetch, assets, engine start, steps, close; tasks and steps
     struct Phases {
@@ -214,6 +216,11 @@ private:
         int64_t tasks = 0, steps = 0;
     } phases_;
     double phases_t0_ = -1;
+    int phases_n_ = 0;
+public:
+    double phase_summary_s = 300.0;  // the phase summary interval (client.log, the log and "phases" events)
+    bool wait_upload = false;        // the 0.5.0 behaviour: wait for the previous task's upload before the next fetch
+private:
     void add_phases(double wait, double fetch, const TaskOutcome &out, bool prefetched);
     std::mutex upload_mu_;
     double t_start_ = 0;
