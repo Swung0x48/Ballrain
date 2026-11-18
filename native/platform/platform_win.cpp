@@ -525,17 +525,21 @@ HttpResponse http_request(const std::string &method, const std::string &url,
         ~H() {
             if (h) WinHttpCloseHandle(h);
         }
-    } ses, con, req;
-    ses.h = WinHttpOpen(L"ballrain-native-client", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
-                        WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses.h) throw Error("http: WinHttpOpen failed");
+    } con, req;
+    // one session for the whole process: WinHTTP keeps the connections to a host alive and reuses them (no new TCP and
+    // TLS handshake per chunk through the tunnel), and resolves the proxy once; handles are thread-safe
+    static HINTERNET session = [] {
+        return WinHttpOpen(L"ballrain-native-client", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                           WINHTTP_NO_PROXY_BYPASS, 0);
+    }();
+    if (!session) throw Error("http: WinHttpOpen failed");
     int ms = int(timeout_s * 1000);
-    WinHttpSetTimeouts(ses.h, ms, ms, ms, ms);
-    con.h = WinHttpConnect(ses.h, whost.c_str(), uc.nPort, 0);
+    con.h = WinHttpConnect(session, whost.c_str(), uc.nPort, 0);
     if (!con.h) throw Error("http: connect failed");
     req.h = WinHttpOpenRequest(con.h, widen(method).c_str(), wpath.c_str(), nullptr, WINHTTP_NO_REFERER,
                                WINHTTP_DEFAULT_ACCEPT_TYPES, tls ? WINHTTP_FLAG_SECURE : 0);
     if (!req.h) throw Error("http: open request failed");
+    WinHttpSetTimeouts(req.h, ms, ms, ms, ms);  // this request's timeouts (resolve, connect, send, receive)
     DWORD no_redirect = WINHTTP_DISABLE_REDIRECTS;
     WinHttpSetOption(req.h, WINHTTP_OPTION_DISABLE_FEATURE, &no_redirect, sizeof no_redirect);
     std::wstring hs;

@@ -27,6 +27,9 @@ struct TaskOutcome {
     int episodes = 0;
     bool final_chunk = false;  // the last chunk handed out was the final one (else the caller sends task_end)
     double wall_s = 0;
+    // where the task's wall time went: the assets (policy, starts, line, branch, reach fields: download, checks), the
+    // engine (launch, level load, hand-over, the rest start) until the first step, the steps, the close
+    double assets_s = 0, start_s = 0, play_s = 0, close_s = 0;
 };
 
 // Where the engine's copies and run directories go when the client's own paths are not plain ASCII (the engine

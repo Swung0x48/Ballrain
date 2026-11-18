@@ -1,6 +1,7 @@
 #include "ballrain/controller.h"
 
 #include <algorithm>
+#include <deque>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@ static const double RECONNECT_S = 30.0;   // at most one automatic hello per thi
 static const double PROBE_S = 5.0;        // automatic-pause probes
 static const double ME_S = 60.0;          // /pool/me (the totals) while connected
 static const int64_t QUEUE_LIMIT = 256LL << 20;  // queued chunk bytes before the instances wait for the network
+static const int UPLOAD_THREADS = 4;       // parallel uploaders (one task each at a time: its chunks in order)
 static const char *PAUSE_PLAYER = "检测到 Ballance（Player.exe）正在运行，已自动暂停；关闭游戏后会自动继续。";
 static const char *PAUSE_BATTERY = "电脑正在使用电池，已自动暂停；接上电源后会自动继续。";
 static const char *PHYSICS_RT_2002_SHA256 = "e72e4afcfa5c33a7d3d27776137f8c997b3c52d89d8a8a4745f1ca21e45893ec";
@@ -222,6 +224,7 @@ struct Controller::Slot {
     std::string state = "idle", task_id, detail;
     int64_t task_steps = 0, total_steps = 0, accepted = 0;
     double task_t0 = 0, busy_s = 0;
+    std::deque<std::pair<double, int64_t>> rate_hist;  // (time, cumulative steps): the recent rate in view()
     int fails = 0;
     double retry_at = 0;
     bool fetched = false;  // a task was fetched and is not counted in tasks_done_ yet (this slot's thread only)
@@ -371,7 +374,7 @@ std::string Controller::login_poll(const Json &started) {
         {
             std::lock_guard<std::mutex> g2(mu_);
             token_ = tok, token_dead_ = false;
-            if (banner_ && banner_->kind == "revoked") banner_.reset();
+            banner_.reset();  // a successful login: whatever an earlier attempt showed (email_not_verified, ...) is gone
         }
         say("论坛登录成功，已保存算力池令牌。");
         Json f = Json::object();
@@ -482,8 +485,13 @@ bool Controller::connect() {
         write_atomic(dir_ + "/user.json", h.at("user").dump(true));
     } catch (const Error &) {
     }
-    say("已连接网关：" + name + "，上榜" + (h.at("leaderboard").as_bool() ? "开" : "关") + "，最多 " +
-        std::to_string(int(h.at("max_instances").as_int())) + " 个实例。");
+    int eff;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        eff = max_instances_;
+    }
+    say("已连接网关：" + name + "，上榜" + (h.at("leaderboard").as_bool() ? "开" : "关") + "，最多 " + std::to_string(eff) +
+        " 个实例。");
     Json f = Json::object();
     f.set("user", h.at("user"));
     f.set("leaderboard", h.at("leaderboard"));
@@ -491,6 +499,26 @@ bool Controller::connect() {
     emit("hello_ok", f);
     cv_.notify_all();
     return true;
+}
+
+// 64-character hex ids (weights, assets) shortened for the player: the first 12 and an ellipsis
+static std::string short_ids(const std::string &t) {
+    std::string out;
+    size_t i = 0;
+    while (i < t.size()) {
+        size_t j = i;
+        while (j < t.size() && ((t[j] >= '0' && t[j] <= '9') || (t[j] >= 'a' && t[j] <= 'f'))) ++j;
+        if (j - i >= 64) {
+            out += t.substr(i, 12) + "…";
+            i = j;
+        } else if (j > i) {
+            out += t.substr(i, j - i);
+            i = j;
+        } else {
+            out += t[i++];
+        }
+    }
+    return out;
 }
 
 void Controller::refused(const GatewayRefusal &e, const char *where) {
@@ -594,7 +622,9 @@ void Controller::start_service() {
         };
     };
     threads_.emplace_back(guarded(&Controller::service_loop, "service"));
-    threads_.emplace_back(guarded(&Controller::upload_loop, "upload"));
+    // several uploaders (each task by one of them at a time, its chunks in order): through a tunnel one serial
+    // uploader falls behind 8 instances, and an instance waits for its previous task's upload before the next one
+    for (int i = 0; i < UPLOAD_THREADS; ++i) threads_.emplace_back(guarded(&Controller::upload_loop, "upload"));
 }
 
 void Controller::shutdown() {
@@ -815,16 +845,29 @@ bool Controller::run_one_task(Slot *s) {
     };
     // the previous task of this slot is open at the gateway until its last chunk (or task_end) arrived: wait for the
     // uploader first, else a slot at the gateway's max_instances gets too_many_instances (uploads are asynchronous)
+    double t_wait0 = platform::monotonic_s(), t_wait1 = t_wait0, t_fetch1 = t_wait0;
     if (!s->last_task.empty()) {
         std::string d = dir_ + "/queue/" + s->last_task;
         {
             std::lock_guard<std::mutex> g(mu_);
             s->state = "starting", s->detail = "等上一个任务的数据上传";
         }
-        double until = platform::monotonic_s() + 600.0;
-        while (platform::is_dir(d) && platform::monotonic_s() < until && !closing_ && !s->quit) wait_for(0.25);
+        double t0 = platform::monotonic_s(), until = t0 + 600.0;
+        bool told = false;
+        while (platform::is_dir(d) && platform::monotonic_s() < until && !closing_ && !s->quit) {
+            wait_for(0.25);
+            if (!told && platform::monotonic_s() - t0 >= 60.0) {  // the uploads fall behind (network): say so once
+                told = true;
+                int64_t mb = queue_bytes() >> 20;
+                log_.line("实例 " + std::to_string(s->index + 1) + " 已等上一个任务的数据上传 60 秒（上传队列约 " +
+                          std::to_string(mb) + " MB）");
+                std::lock_guard<std::mutex> g(mu_);
+                s->detail = "等上一个任务的数据上传（网络较慢，队列约 " + std::to_string(mb) + " MB）";
+            }
+        }
         s->last_task.clear();
     }
+    t_wait1 = platform::monotonic_s();
     {
         std::lock_guard<std::mutex> g(mu_);
         s->state = "starting", s->detail = "取任务";
@@ -861,6 +904,7 @@ bool Controller::run_one_task(Slot *s) {
         return false;
     }
     s->fetched = true;
+    t_fetch1 = platform::monotonic_s();
     Task task = Task::from_json(tm.at("task"));
     s->last_task = task.task_id;
     queue_open(task, s->index);
@@ -952,14 +996,20 @@ bool Controller::run_one_task(Slot *s) {
                                              (s->index + 1 < 10 ? "0" : "") + std::to_string(s->index + 1) +
                                              ".log；按“开始”可以再试。");
         } else {
-            say("实例 " + std::to_string(s->index + 1) + " 的任务出错（" + error.substr(0, 200) + "），稍后重试（连续第 " +
+            say("实例 " + std::to_string(s->index + 1) + " 的任务出错（" + short_ids(error).substr(0, 200) + "），稍后重试（连续第 " +
                 std::to_string(fails) + " 次）。");
         }
     } else {
-        std::lock_guard<std::mutex> lk(mu_);
-        s->fails = 0;
+        bool recovered;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            recovered = s->fails > 0;
+            s->fails = 0;
+        }
+        if (recovered) say("实例 " + std::to_string(s->index + 1) + " 已恢复正常。");
     }
     if (!failed && !out.final_chunk) queue_end(task.task_id, out.chunks, "end " + out.end + " without a final chunk");
+    if (!threw) add_phases(t_wait1 - t_wait0, t_fetch1 - t_wait1, out);
     if (!threw) {
         Json f = Json::object();
         f.set("task_id", Json::string(task.task_id));
@@ -971,6 +1021,11 @@ bool Controller::run_one_task(Slot *s) {
         f.set("chunks", Json::integer(out.chunks));
         f.set("wall_s", Json::number(out.wall_s));
         f.set("steps_per_s", Json::number(out.wall_s > 0 ? double(out.steps) / out.wall_s : 0.0));
+        Json ph = Json::object();  // where this task's wall time went (s)
+        ph.set("wait", Json::number(t_wait1 - t_wait0)), ph.set("fetch", Json::number(t_fetch1 - t_wait1));
+        ph.set("assets", Json::number(out.assets_s)), ph.set("start", Json::number(out.start_s));
+        ph.set("play", Json::number(out.play_s)), ph.set("close", Json::number(out.close_s));
+        f.set("phases", ph);
         emit("task_end", f);
     }
     ++tasks_done_;
@@ -981,6 +1036,29 @@ bool Controller::run_one_task(Slot *s) {
     s->state = "idle", s->task_id.clear(), s->task_steps = 0;
     refused_.erase(task.task_id);
     return true;
+}
+
+void Controller::add_phases(double wait, double fetch, const TaskOutcome &out) {
+    std::string line;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        double now = platform::monotonic_s();
+        if (phases_t0_ < 0) phases_t0_ = now;
+        Phases &p = phases_;
+        p.wait += wait, p.fetch += fetch, p.assets += out.assets_s, p.start += out.start_s, p.play += out.play_s;
+        p.close += out.close_s, ++p.tasks, p.steps += out.steps;
+        if (now - phases_t0_ < 300.0) return;
+        double tot = p.wait + p.fetch + p.assets + p.start + p.play + p.close;
+        auto pc = [&](double x) { return std::to_string(int(100.0 * x / std::max(tot, 1e-9) + 0.5)) + "%"; };
+        char head[96];
+        std::snprintf(head, sizeof head, "最近 %.0f 秒：%lld 个任务、%lld 步（%.0f 步/秒）；实例时间：", now - phases_t0_,
+                      (long long)p.tasks, (long long)p.steps, double(p.steps) / std::max(now - phases_t0_, 1e-9));
+        line = std::string(head) + "等上传 " + pc(p.wait) + "，取任务 " + pc(p.fetch) + "，准备资源 " + pc(p.assets) +
+               "，启动引擎和开局 " + pc(p.start) + "，采样 " + pc(p.play) + "，收尾 " + pc(p.close);
+        p = Phases();
+        phases_t0_ = now;
+    }
+    log_.line(line);
 }
 
 // ---------------------------------------------------------------------------------------------- upload queue
@@ -1042,11 +1120,19 @@ void Controller::upload_loop() {
         bool progress = false, down = false;
         for (auto &t : tasks) {
             if (stop_) break;
+            {
+                std::lock_guard<std::mutex> ug(upload_mu_);
+                if (!uploading_.insert(t).second) continue;  // another uploader has it
+            }
             try {
                 if (upload_task(t)) progress = true;
                 else down = true;
             } catch (const std::exception &e) {  // retried next round (the chunks stay until the task's deadline)
                 log_.line("上传队列：" + t.substr(0, 12) + "：" + e.what());
+            }
+            {
+                std::lock_guard<std::mutex> ug(upload_mu_);
+                uploading_.erase(t);
             }
             if (down) break;
         }
@@ -1109,13 +1195,19 @@ bool Controller::upload_task(const std::string &task_id) {
         int64_t seq = std::atoll(f.substr(0, 6).c_str());
         Bytes data;
         if (!read_file(d + "/" + f, data)) {  // briefly locked (e.g. a virus scanner): next round
-            if (++read_fail_[d + "/" + f] < 60) return true;
+            {
+                std::lock_guard<std::mutex> ug(upload_mu_);
+                if (++read_fail_[d + "/" + f] < 60) return true;
+                read_fail_.erase(d + "/" + f);
+            }
             log_.line("上传队列：数据段 " + task_id.substr(0, 8) + "/" + f + " 一直读不出来，丢弃这个任务。");
-            read_fail_.erase(d + "/" + f);
             remove_tree(d);
             return true;
         }
-        read_fail_.erase(d + "/" + f);
+        {
+            std::lock_guard<std::mutex> ug(upload_mu_);
+            read_fail_.erase(d + "/" + f);
+        }
         Json r;
         try {
             r = g.chunk(data);
@@ -1234,8 +1326,12 @@ ControllerView Controller::view() const {
         i.slot = s->index, i.state = s->state, i.state_text = state_text(s->state), i.task_id = s->task_id;
         i.detail = s->detail, i.task_steps = s->task_steps, i.total_steps = s->total_steps + s->task_steps;
         i.accepted_steps = s->accepted;
-        double busy = s->busy_s + (s->task_id.empty() ? 0.0 : now - s->task_t0);
-        i.steps_per_s = busy > 0 ? double(i.total_steps) / busy : 0.0;
+        // the rate over the last 60 s (cumulative steps sampled at most once a second)
+        auto &h = s->rate_hist;
+        if (h.empty() || now - h.back().first >= 1.0) h.emplace_back(now, i.total_steps);
+        while (h.size() > 2 && now - h[1].first >= 60.0) h.pop_front();
+        double span = now - h.front().first;
+        i.steps_per_s = span >= 5.0 ? double(i.total_steps - h.front().second) / span : 0.0;
         v.inst.push_back(i);
     }
     return v;
