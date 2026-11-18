@@ -37,7 +37,7 @@ from .server_verify import policy_consistency, select_task
 TOKEN_PREFIX = "bp1_"
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
 SESSION_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
-SHA_FILE = re.compile(r"/pool/(weights|assets)/([0-9a-f]{64})\.(json|npz)")
+SHA_FILE = re.compile(r"/pool/(weights|assets)/([0-9a-f]{64})\.(json|npz|zst)")  # .zst: f7 reach fields
 COOKIE = "pool_oauth"
 LOGIN_COOKIE = "pool_login"
 USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I
@@ -700,7 +700,7 @@ class PoolApp:
     def sha_file(self, path: str) -> Response:
         m = SHA_FILE.fullmatch(path)
         kind, sha, ext = m.groups()
-        if kind == "assets" and ext != "npz":
+        if (kind == "assets" and ext not in ("npz", "zst")) or (kind == "weights" and ext == "zst"):
             return _error(payload(Reason.BAD_MESSAGE, detail="not found"), 404)
         f = Path(self.cfg.pool_dir) / kind / f"{sha}.{ext}"
         if not f.is_file():
