@@ -26,6 +26,35 @@ USER_AGENT = "ballrain-pool-gateway/1.0"
 USER_FIELDS = ("id", "username", "nickname", "avatar_url", "is_email_confirmed", "joined_at", "comment_count")
 
 
+@dataclass(frozen=True)
+class EligibilityRules:
+    """Which forum-account checks the gateway applies before it hands out a pool token ([eligibility] in
+    runtime/pool/config.toml, server_config.load_config), in this order: account age, email, replies. Each can be
+    switched off; unknown_join_date says what happens when the forum gives no join date (joined_at null: some forum
+    accounts, e.g. imported ones, have none): "refuse" (a clear message) or "allow" (only the age check is skipped)."""
+    account_age: bool = True
+    min_account_days: int = 30
+    unknown_join_date: str = "refuse"
+    email_confirmed: bool = True
+    replies: bool = True
+    min_replies: int = 5
+
+    def describe(self) -> str:
+        """The conditions in force, for the login page (Chinese)."""
+        parts = []
+        if self.account_age and self.min_account_days > 0:
+            parts.append(f"论坛注册满 {int(self.min_account_days)} 天"
+                         + ("（论坛没有提供注册时间的账号不受这条限制）" if self.unknown_join_date == "allow" else ""))
+        if self.email_confirmed:
+            parts.append("邮箱已验证")
+        if self.replies and self.min_replies > 0:
+            parts.append(f"至少 {int(self.min_replies)} 条回复")
+        return "、".join(parts) if parts else "任何论坛账号都可以"
+
+
+UNKNOWN_JOIN_DATE = ("refuse", "allow")
+
+
 class ForumError(RuntimeError):
     """The forum refused or returned something unusable. .detail is safe to show (no user data in it)."""
 
@@ -102,10 +131,12 @@ class ForumClient:
         return {k: o.get(k) for k in USER_FIELDS}  # nothing else (email) survives this line
 
 
-def parse_joined(j) -> datetime:
+def parse_joined(j) -> datetime | None:
     """The forum's joined_at in any of the forms a forum API serialises a date in: ISO 8601 (with or without zone,
     fraction, "Z"), "YYYY-MM-DD HH:MM:SS", or a Unix time in seconds / milliseconds (number or digit string). A
     failure names only the value's type and length (never the value: it is user data)."""
+    if j is None:  # the forum gives no join date for this account: eligibility decides (unknown_join_date)
+        return None
     try:
         if isinstance(j, bool):
             raise ValueError
@@ -154,17 +185,30 @@ def parse_user(u: dict) -> dict:
     if isinstance(cc, bool) or not isinstance(cc, int) or cc < 0:
         raise ForumError(f"forum comment_count ({type(cc).__name__})")
     return {"user": {"forum_id": fid, "username": username, "nickname": nickname, "avatar_url": av},
-            "joined": joined.timestamp(), "email_confirmed": confirmed, "comments": cc}
+            "joined": joined.timestamp() if joined is not None else None, "email_confirmed": confirmed,
+            "comments": cc}
 
 
-def eligibility(rec: dict, now: float, min_days: int = 30, min_replies: int = 5) -> dict | None:
-    """None when the account may hold a pool token, else the refusal payload. Checked in this order: account age
-    (account_too_new), email (email_not_verified), replies (too_few_replies)."""
-    days = int(math.floor((now - rec["joined"]) / 86400))
-    if days < min_days:
-        return payload(Reason.ACCOUNT_TOO_NEW, days=max(days, 0), min_days=min_days)
-    if not rec["email_confirmed"]:
+def eligibility(rec: dict, now: float, min_days: int = 30, min_replies: int = 5,
+                rules: EligibilityRules | None = None) -> dict | None:
+    """None when the account may hold a pool token, else the refusal payload. Checked in this order (each only when
+    rules switch it on): account age (account_too_new), email (email_not_verified), replies (too_few_replies).
+    Without rules: all three with min_days / min_replies, an unknown join date refused."""
+    r = rules or EligibilityRules(min_account_days=int(min_days), min_replies=int(min_replies))
+    if r.account_age and r.min_account_days > 0:
+        if rec.get("joined") is None:
+            if r.unknown_join_date != "allow":
+                # the existing code (old clients check codes against their own list), a message of its own
+                return {"code": Reason.ACCOUNT_TOO_NEW.value,
+                        "message": f"论坛没有提供这个账号的注册时间，无法核对“注册满 {int(r.min_account_days)} 天”的条件，"
+                                   "暂时不能领取算力池令牌。请联系算力池管理员。",
+                        "params": {"min_days": int(r.min_account_days), "join_date": "unknown"}}
+        else:
+            days = int(math.floor((now - rec["joined"]) / 86400))
+            if days < r.min_account_days:
+                return payload(Reason.ACCOUNT_TOO_NEW, days=max(days, 0), min_days=int(r.min_account_days))
+    if r.email_confirmed and not rec["email_confirmed"]:
         return payload(Reason.EMAIL_NOT_VERIFIED)
-    if rec["comments"] < min_replies:
-        return payload(Reason.TOO_FEW_REPLIES, replies=rec["comments"], min_replies=min_replies)
+    if r.replies and rec["comments"] < r.min_replies:
+        return payload(Reason.TOO_FEW_REPLIES, replies=rec["comments"], min_replies=int(r.min_replies))
     return None

@@ -8,8 +8,6 @@
 
     [pool]
     public_base_url = "https://<public host>"   # the site origin (a trailing /pool is dropped); dev: http://127.0.0.1:<port>
-    min_account_days = 30
-    min_replies = 5
     max_instances = 8
     min_client_version = "0.3.0"     # 0.3: chunk format 3 (engine-state chain v3), task format 3; older clients get
                                      # client_too_old
@@ -17,6 +15,16 @@
     task_poll_s = 10
     trust_forwarded = true             # required when public_base_url is https (the tunnel): rate limits per
                                        # CF-Connecting-IP; the gateway itself listens on 127.0.0.1 only
+
+    [eligibility]                      # which forum accounts may take a pool token; checked in this order, each can
+                                       # be switched off (server_oauth.EligibilityRules)
+    account_age = true
+    min_account_days = 30              # (old configs: [pool] min_account_days)
+    unknown_join_date = "refuse"       # the forum gives no join date: "refuse" (a clear message) or "allow" (only
+                                       # the age check is skipped)
+    email_confirmed = true
+    replies = true
+    min_replies = 5                    # (old configs: [pool] min_replies)
 
     [policy]
     run = "r6"
@@ -68,7 +76,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .server_oauth import ForumConfig
+from .server_oauth import UNKNOWN_JOIN_DATE, EligibilityRules, ForumConfig
 
 FORUM_URL = "https://forum.ballance.top"
 MIN_CLIENT_VERSION = "0.3.0"  # chunk format 3 / task format 3 (load_config never goes below it)
@@ -107,6 +115,7 @@ class PoolConfig:
     min_account_days: int = 30
     min_replies: int = 5
     max_instances: int = 8
+    eligibility: "EligibilityRules | None" = None  # [eligibility]; None: all checks with min_account_days / min_replies
     min_client_version: str = "0.3.0"  # chunk format 3, task format 3
     heartbeat_s: int = 30
     task_poll_s: int = 10
@@ -172,9 +181,25 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
         # buckets would be everyone's (a single polling controller, or a stranger, could block all logins)
         raise ValueError("public_base_url is https (behind the tunnel): set trust_forwarded = true in [pool] of "
                          f"{path.name} so rate limits use the forwarded client address")
+    el = raw.get("eligibility", {})
+    unknown = set(el) - set(EligibilityRules.__dataclass_fields__)
+    if unknown:  # a typo would silently keep (or drop) a check
+        raise ValueError(f"[eligibility] in {path.name}: unknown keys {sorted(unknown)}")
+    rules = EligibilityRules(
+        account_age=bool(el.get("account_age", True)),
+        min_account_days=max(0, int(el.get("min_account_days", po.get("min_account_days", 30)))),
+        unknown_join_date=str(el.get("unknown_join_date", "refuse")),
+        email_confirmed=bool(el.get("email_confirmed", True)),
+        replies=bool(el.get("replies", True)),
+        min_replies=max(0, int(el.get("min_replies", po.get("min_replies", 5)))))
+    if rules.unknown_join_date not in UNKNOWN_JOIN_DATE:
+        raise ValueError(f"[eligibility] unknown_join_date must be one of {list(UNKNOWN_JOIN_DATE)}")
+    for k in ("account_age", "email_confirmed", "replies"):
+        if k in el and not isinstance(el[k], bool):
+            raise ValueError(f"[eligibility] {k} must be true or false")
     return PoolConfig(
         pool_dir=pool_dir, public_base_url=public, forum=forum,
-        min_account_days=int(po.get("min_account_days", 30)), min_replies=int(po.get("min_replies", 5)),
+        min_account_days=rules.min_account_days, min_replies=rules.min_replies, eligibility=rules,
         max_instances=min(int(po.get("max_instances", 8)), 64),
         # never below MIN_CLIENT_VERSION (a config pinning an older client would hand format-3 tasks to it)
         min_client_version=max(str(po.get("min_client_version", MIN_CLIENT_VERSION)), MIN_CLIENT_VERSION, key=version_tuple),

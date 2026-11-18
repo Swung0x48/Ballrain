@@ -374,9 +374,14 @@ class PoolApp:
             return self._redirect_to_forum(None)
         return self._page("Ballrain 算力池：登录",
                           "<p>用 Ballance 社区论坛账号登录，领取算力池令牌。</p>"
-                          "<p>领取条件：论坛注册满 {d} 天、邮箱已验证、至少 {r} 条回复。网关只保存论坛用户 ID、用户名和昵称，"
+                          "<p>领取条件：{c}。网关只保存论坛用户 ID、用户名和昵称，"
                           "不保存邮箱。</p><p><a href=\"/pool/login?go=1\">用论坛账号登录</a></p>"
-                          .format(d=int(self.cfg.min_account_days), r=int(self.cfg.min_replies)))
+                          .format(c=html.escape(self._rules().describe())))
+
+    def _rules(self):
+        from .server_oauth import EligibilityRules
+        return getattr(self.cfg, "eligibility", None) or EligibilityRules(
+            min_account_days=int(self.cfg.min_account_days), min_replies=int(self.cfg.min_replies))
 
     @staticmethod
     def _cookie(headers: dict, name: str) -> str | None:
@@ -435,7 +440,7 @@ class PoolApp:
         acct = self.store.account(user["forum_id"])
         if acct is not None and acct["revoked"]:
             return refuse(_stored_reason(acct["revoke_reason"], Reason.TOKEN_REVOKED), 403)
-        bad = eligibility(rec, self.clock(), self.cfg.min_account_days, self.cfg.min_replies)
+        bad = eligibility(rec, self.clock(), rules=self._rules())
         if bad is not None:
             return refuse(bad, 403)
         self.store.upsert_account(user)
