@@ -833,7 +833,40 @@ def test_forum_user_fields_in_other_serialisations():
     assert parse_user(dict(good, is_email_confirmed=1))["email_confirmed"] is True
     assert parse_user(dict(good, is_email_confirmed="0"))["email_confirmed"] is False
     assert parse_user(dict(good, comment_count="12"))["comments"] == 12
-    with pytest.raises(ForumError, match=r"joined_at \(NoneType\)"):
-        parse_user(dict(good, joined_at=None))
+    assert parse_user(dict(good, joined_at=None))["joined"] is None  # no join date: the eligibility rules decide
     with pytest.raises(ForumError, match=r"joined_at \(str, length 9\)"):
         parse_user(dict(good, joined_at="yesterday"))
+
+
+def test_eligibility_rules_from_the_config(tmp_path):
+    """[eligibility]: each check can be switched off, thresholds set, and an unknown join date refused or allowed."""
+    from ballrain.pool.server_config import load_config
+    from ballrain.pool.server_oauth import EligibilityRules
+    now = 1_800_000_000.0
+    old = {"joined": now - 400 * 86400, "email_confirmed": True, "comments": 9}
+    nojoin = dict(old, joined=None)
+    # defaults = the old behaviour; an unknown join date is refused with its own message, the existing code
+    assert eligibility(old, now) is None
+    r = eligibility(nojoin, now)
+    assert r["code"] == "account_too_new" and "没有提供" in r["message"] and r["params"]["join_date"] == "unknown"
+    assert eligibility(nojoin, now, rules=EligibilityRules(unknown_join_date="allow")) is None
+    assert eligibility(nojoin, now, rules=EligibilityRules(account_age=False)) is None
+    assert eligibility(dict(nojoin, email_confirmed=False), now,
+                       rules=EligibilityRules(unknown_join_date="allow"))["code"] == "email_not_verified"
+    assert eligibility(dict(old, email_confirmed=False), now, rules=EligibilityRules(email_confirmed=False)) is None
+    assert eligibility(dict(old, comments=0), now, rules=EligibilityRules(replies=False)) is None
+    assert eligibility(dict(old, comments=2), now, rules=EligibilityRules(min_replies=2)) is None
+    # the config file
+    cfg = tmp_path / "c.toml"
+    cfg.write_text('[eligibility]\nunknown_join_date = "allow"\nreplies = false\nmin_account_days = 7\n', encoding="utf-8")
+    c = load_config(cfg, pool_dir=tmp_path)
+    assert c.eligibility == EligibilityRules(min_account_days=7, unknown_join_date="allow", replies=False)
+    assert c.min_account_days == 7 and "7 天" in c.eligibility.describe() and "回复" not in c.eligibility.describe()
+    cfg.write_text("[pool]\nmin_account_days = 3\nmin_replies = 1\n", encoding="utf-8")  # an old config
+    assert load_config(cfg, pool_dir=tmp_path).eligibility == EligibilityRules(min_account_days=3, min_replies=1)
+    for bad in ('[eligibility]\nunknown_join_date = "maybe"\n', "[eligibility]\nemail = false\n",
+                '[eligibility]\nreplies = "no"\n'):
+        cfg.write_text(bad, encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_config(cfg, pool_dir=tmp_path)
+    assert EligibilityRules(account_age=False, email_confirmed=False, replies=False).describe() == "任何论坛账号都可以"

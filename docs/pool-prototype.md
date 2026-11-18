@@ -69,6 +69,21 @@
    3. 用 `GET https://forum.ballance.top/api/user` 读取 `id`、`username`、`nickname`、`avatar_url`、`is_email_confirmed`、`joined_at`、`comment_count`；
    4. **`email` 读到就丢，不保存，也不写日志**；论坛令牌用完就丢；
    5. 检查门槛：注册满 30 天（`account_too_new`）、邮箱已验证（`email_not_verified`）、至少 5 条回复（`too_few_replies`，按 `comment_count` 算）。
+      每一条都能在网关配置的 `[eligibility]` 里单独关掉或改门槛：
+      ```toml
+      [eligibility]
+      account_age = true
+      min_account_days = 30
+      unknown_join_date = "refuse"   # 论坛没给注册时间（joined_at 为空，例如导入的老账号）："refuse" 拒绝并说明原因，"allow" 只跳过账号年龄这一条
+      email_confirmed = true
+      replies = true
+      min_replies = 5
+      ```
+      - 不写这一节就是上面的默认值；旧配置里 `[pool]` 的 `min_account_days` / `min_replies` 仍然有效。键名写错、取值不对时网关拒绝启动。
+      - 注册时间未知而被拒时，原因码仍是 `account_too_new`（旧客户端只认已有的原因码），说明文字单独写明“论坛没有提供注册时间”，参数里有 `join_date: "unknown"`。
+      - 登录页上的“领取条件”按生效的规则显示。
+      - 论坛的 `joined_at` 接受 ISO 8601（带不带时区、小数秒、空格分隔）和 Unix 秒 / 毫秒；`is_email_confirmed` 接受 0 / 1；`comment_count` 接受数字字符串。解析失败时只报类型和长度，不报值。
+      - 网关请求论坛时带 `User-Agent: ballrain-pool-gateway/1.0`：论坛前面的 Cloudflare 会拦住 Python 默认的 `Python-urllib`（错误 1010，HTTP 403）。
 4. 主控程序按 `poll_s` 的间隔 `POST /pool/login` 发 `login_poll`，状态是 `pending`、`ok`（带 `token` 和 `user`）、`refused`（带 `reason`）或 `expired`。成功页显示论坛用户名和登录代码。
 5. 每个论坛账号只有一个有效令牌：重新登录会发新令牌，旧令牌随即失效（`token_invalid`）。
 
@@ -482,7 +497,7 @@ r6 当前的权重文件约 0.97 MB。
 | `ballrain/pool/` | 共享约定（本文） | 是 |
 | `tools/pool/` | 网关、验证器、模拟论坛、主控程序的入口 | 是 |
 | `tests/test_pool_*.py` | 单元测试 | 是 |
-| `runtime/pool/config.toml` | 网关本机配置：`[forum] base_url / client_id / client_secret / redirect_uri`，`[pool] public_base_url / min_account_days = 30 / min_replies = 5 / max_instances = 8`。也可以用环境变量 `BALLRAIN_POOL_FORUM_CLIENT_ID` / `BALLRAIN_POOL_FORUM_CLIENT_SECRET` 设置 | **否** |
+| `runtime/pool/config.toml` | 网关本机配置：`[forum] base_url / client_id / client_secret / redirect_uri`，`[pool] public_base_url / max_instances = 8`，`[eligibility]`（领令牌的门槛，见第 2 节登录流程第 5 步）。也可以用环境变量 `BALLRAIN_POOL_FORUM_CLIENT_ID` / `BALLRAIN_POOL_FORUM_CLIENT_SECRET` 设置 | **否** |
 | `runtime/pool/weights/<policy_sha>.{npz,json}` | 导出的权重 | 否 |
 | `runtime/pool/assets/<sha256>.npz` | 开局包、参考线 | 否 |
 | `runtime/pool/chunks/<task_id>/<seq:06d>.brpc` | 收下的数据段，原样保存 | 否 |
