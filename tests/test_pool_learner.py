@@ -491,6 +491,8 @@ def test_capability_refusal_explains_what_changed_with_an_existing_code():
     msg = P.parse_message("no_task", P.encode_message("no_task", reason=r, retry_s=600))
     assert msg["reason"]["message"] == m
     assert "新功能 future_x" in refusal("0.4.0", ["future_x"])["message"]
+    f7 = refusal("0.3.0", ["reach_f7"])
+    assert "可达性" in f7["message"] and f7["params"]["min_version"] == "0.4.0"
 
 
 @win_only
@@ -540,3 +542,22 @@ def test_gateway_start_draw_equals_the_env_draw_with_rehearse_always(tmp_path):
         if rest is not None:
             seen.add("drive" if rest["target"] else "brake")
     assert seen == {"always", "drive", "brake"}
+
+
+def test_link_hello_carries_branch_assets_version_and_non_default_rules_stay_refused(tmp_path):
+    """A learner distributing a route-branch bundle accepts the link (its hello says branch_assets_version 1); one with
+    non-default branch rules still refuses it (the pool does not claim branch_rules_version: its task loops do not
+    implement them)."""
+    import json as _json
+    for rules, ok in (({}, True), ({"drive_gain": 0.5}, False)):
+        env = SimpleNamespace(branch_assets={"level": 2, "line_npz": b"L", "drive_npz": b"D",
+                                             "desc_json": _json.dumps({"rules": rules}).encode()})
+        hub, addr = _hub({"env": env, "run": "r", "worker": {}, "pool_ingest": True})
+        link = LL.LearnerLink(addr, b"k" * 16, SimpleNamespace(run="r"), None, tmp_path)
+        try:
+            assert link.connect() is ok, link.last_error
+            if not ok:
+                assert "branch_rules_version" in link.last_error
+        finally:
+            link.close()
+            hub.close()
