@@ -16,7 +16,7 @@ from ballrain.reach import BALLS
 LIVE = Path("D:/repos/Ballrain/runtime")
 REC = LIVE / "datasets/tas-v1/SR02_1_28_992_264"
 OUT = LIVE / "viz/l2s4/stone"
-ASSET = ROOT / "runtime/refpaths-alt/L02-stone/L02.npz"
+ASSET = ROOT / "benchmarks/refpaths-alt/L02-stone/L02.npz"
 
 
 def geom():
@@ -109,6 +109,37 @@ def seat(T, p, r):
     if not np.isfinite(top):
         raise ValueError(("no support", p))
     return [p[0], top, p[2]]
+
+
+def measured_clock(main, i, j, Q, sec, ds):
+    """Fit a monotone first-passage clock; retain the real TAS tail after rejoin."""
+    import re
+    run = OUT / "hlw-99-fimyydc1"
+    rows = [json.loads(line) for line in (run / "controller.jsonl").read_text().splitlines()
+            if line.startswith("{")]
+    path = ReferencePath(Q, sec)
+    arcs = []
+    for row in rows:
+        arcs.append(path.project(row["pos"], 4, arcs[-1] if arcs else None)["s"])
+    frames = [r["frame"] for r in rows]
+    clock = [r["sr"] for r in rows]
+    events = [(int(f), name) for f, name in re.findall(r"^(\d+) (\w+)",
+              (run / "events.txt").read_text(), re.M) if int(f) > frames[0]]
+    entry = next(f for f, n in events if n == "BallNavInactive")
+    cp = next(f for f, n in events if n.startswith("PreC"))
+    # Frame gaps at the two transforms contain no ball samples. Interpolate IGT,
+    # not row count; first passages ignore backtracking. Smooth over 4 m bins.
+    frontier, ids = np.unique(np.maximum.accumulate(arcs), return_index=True)
+    local = main.cum[i] + np.r_[0, np.cumsum(ds)]
+    knots = np.r_[np.arange(local[0], local[-1], 4.), local[-1]]
+    assert frontier[0] < knots[0] and frontier[-1] > knots[-1]
+    raw = np.interp(knots, frontier, np.asarray(clock)[ids])
+    entry_s = np.interp(entry, frames, arcs)
+    duration = np.diff(np.interp([entry, cp], frames, clock))[0]
+    cp_s = np.interp(cp, frames[-2:], [main.project(r['pos'], 4)['s'] for r in rows[-2:]])
+    tail = np.interp(cp_s, main.cum, main.t_ms) - main.t_ms[j]
+    scale = (duration - tail) / (raw[-1] - np.interp(entry_s, knots, raw))
+    return main.t_ms[i] + (np.interp(local, knots, raw) - raw[0]) * scale
 
 
 def build():
@@ -214,7 +245,7 @@ def build():
     Q = np.vstack([main.P[:i], P, main.P[j + 1 :]])
     sec = np.r_[main.point_sector[:i], np.full(len(P), 4), main.point_sector[j + 1 :]]
     ds = np.linalg.norm(np.diff(P, axis=0), axis=1)
-    t = main.t_ms[i] + np.r_[0, np.cumsum(ds)] * 1000 / 10
+    t = measured_clock(main, i, j, Q, sec, ds)
     times = np.r_[main.t_ms[:i], t, main.t_ms[j + 1 :] - main.t_ms[j] + t[-1]]
     out = ReferencePath(Q, sec, meta=main.meta, t_ms=times)
     out.meta.update(
@@ -235,14 +266,12 @@ def build():
         main_s=main.cum[[i, j]].tolist(),
         branch_s=out.cum[[i, k]].tolist(),
         endpoints=main.P[[i, j]].tolist(),
-        timing="TAS before splice; nominal 10 world units/s on diversion; shifted TAS after merge.",
+        timing="TAS before splice; measured hlw-99-fimyydc1 first passages (trafo to PreC); shifted TAS after merge.",
     )
     desc["stations"] = [
         [float(main.project(pt, 4)["s"]), float(out.project(pt, 4)["s"])]
         for pt in (
             [948.74, 2.7, -56.51],
-            [1022, 7.6, -56.5],
-            [1040.55, 7, -16],
             [1040.61, 6.76, 12.35],
         )
     ]

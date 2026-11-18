@@ -57,7 +57,7 @@ def test_off_episode_bytes(tmp_path):
 
 def route():
     main = ReferencePath.load(REFPATH_DIR / "L02.npz")
-    return load_branch(main, 2, "runtime/refpaths-alt/L02-stone", None)
+    return load_branch(main, 2, "benchmarks/refpaths-alt/L02-stone", None)
 
 
 def test_switch_and_respawn():
@@ -127,7 +127,55 @@ def test_branch_observation_uses_local_metres(monkeypatch):
     )
     obs_at(tr, f.alt.point_at(1705.0), btype=2)
     _, latter = fx.compute(tr)
-    assert latter["path"]["ref_elapsed_ms"] == pytest.approx(500, abs=1)
-    assert pr["ref_remaining_ms"] - latter["path"]["ref_remaining_ms"] == pytest.approx(
-        500, abs=1
-    )
+    dt = np.diff(np.interp([pr["local_s"], latter["path"]["local_s"]], f.alt.cum, f.alt.t_ms))[0]
+    assert latter["path"]["ref_elapsed_ms"] == pytest.approx(dt)
+    assert pr["ref_remaining_ms"] - latter["path"]["ref_remaining_ms"] == pytest.approx(dt)
+
+
+def test_progress_budget_and_density():
+    from ballrain.rewards import Reward
+    from test_features import make_tracker
+
+    f = route()
+    tr = make_tracker()
+    ms, bs = f.stations
+    totals = []
+    for path, bt, bounds in ((f.main, 1, ms), (f.alt, 2, bs)):
+        f.reset()
+        reward = Reward()
+        total = 0.
+        for n, distance in enumerate(np.linspace(bounds[1], bounds[-2], 600)):
+            _, pr = f.update(path.point_at(distance), 4, bt)
+            if not n:
+                reward.begin(tr, pr['s'])
+            else:
+                _, terms = reward.step(tr, pr['s'], False, False, False, supported=True)
+                gain = terms['progress']
+                total += gain
+                if bt == 2 and 1584 < distance < 2139:
+                    density = (ms[-3] - ms[2]) / (bs[-3] - bs[2])
+                    assert gain == pytest.approx(reward.cfg.progress_weight * density *
+                                                 (bounds[-2]-bounds[1])/599, abs=1e-6)
+        totals.append(total)
+    assert totals == pytest.approx([reward.cfg.progress_weight * (ms[-2]-ms[1])] * 2)
+
+
+def test_failed_drive_relaunches_normal_tas(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from ballrain.env import BallanceEnv, EnvConfig
+
+    env = BallanceEnv(EnvConfig(start_check=False))
+    def prepared():
+        return dict(session=Mock(), start={'kind': 'tas', 'frame': 14730},
+                    recorder=SimpleNamespace(meta=SimpleNamespace(start_state={})))
+    failed, fresh = prepared(), prepared()
+    launch = Mock(side_effect=[failed, fresh])
+    monkeypatch.setattr(env, '_launch', launch)
+    monkeypatch.setattr(env, '_branch_rest', Mock(side_effect=RuntimeError('lost drive')))
+    got = env._prepare('hlw-98', 14730, {'branch_s': 1975})
+    failed['session'].close.assert_called_once_with(kill=True)
+    assert got is fresh and launch.call_count == 2
+    assert got['start']['kind'] == 'tas' and 'branch_s' not in got['start']
+    assert got['start']['branch_rest_failures'] == env.branch_rest_failures == 1
+    assert got['recorder'].meta.start_state['branch_rest_error'] == 'lost drive'

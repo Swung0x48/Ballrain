@@ -225,6 +225,7 @@ class BallanceEnv(gym.Env):
         self.run_dir: Path | None = None
         self.finished_runs: list = []  # meta json paths
         self.last_run_ok = True
+        self.branch_rest_failures = 0
         self._ep_steps = 0
         self._ep_frames = 0
         self._ep_pause_frames = 0
@@ -392,6 +393,16 @@ class BallanceEnv(gym.Env):
             if isinstance(rest, dict):
                 try:
                     self._branch_rest(p, k, rest["branch_s"])
+                except Exception as exc:
+                    # The failed simulation is not a valid handover. Launch once without
+                    # the drive, preserving the requested TAS frame (and curriculum band).
+                    p["session"].close(kill=True)
+                    self.branch_rest_failures += 1
+                    p = self._prepare(copy, k, rest=False)
+                    failure = dict(branch_rest_failures=self.branch_rest_failures,
+                                   branch_rest_target=rest["branch_s"], branch_rest_error=str(exc))
+                    p["start"].update(failure)
+                    p["recorder"].meta.start_state.update(failure)
                 except BaseException:
                     p["session"].close(kill=True)
                     raise

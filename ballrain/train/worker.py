@@ -202,6 +202,24 @@ def wall_push_hit(push, walls, cos_min: float = 0.5) -> bool:
     return any(float(np.dot(push, -w)) >= cos_min for w in walls)
 
 
+def stall_age(ep, frame, s, branch, speed, progress, pause_speed, hard_limit, window):
+    """Age in game frames. Never compare odometers across a route switch."""
+    if s is not None and (branch != ep.stall_branch or s > ep.mark_s + progress):
+        ep.mark_s, ep.mark_frame = s, frame
+        ep.stall_branch = branch
+    since = frame - ep.mark_frame
+    if pause_speed is not None:
+        # On the board a supported climb below 3 m/s is normal. Keep the hard
+        # no-new-metres limit so lateral motion cannot postpone a stall forever.
+        threshold = min(1., pause_speed) if branch else pause_speed
+        if speed is not None and speed > threshold:
+            ep.move_frame = frame
+        since = min(since, frame - ep.move_frame)
+        if frame - ep.mark_frame >= hard_limit:
+            since = window
+    return since
+
+
 class _Episode:
     def __init__(self, info: dict, env, version: int, cap_frames: int | None):
         st = info.get("start") or {}
@@ -219,6 +237,11 @@ class _Episode:
         self.s0 = env.reward.s
         self.best_s = env.reward.s if env.reward.s is not None else -np.inf
         self.mark_s, self.mark_frame = self.best_s, 0
+        self.stall_branch = bool(info.get("branch"))
+        if self.stall_branch and "local_s" in info:
+            self.mark_s = info["local_s"]
+        if "branch_rest_failures" in st:
+            self.d["branch_rest_failures"] = st["branch_rest_failures"]
         self.move_frame = 0
         self.actions = np.zeros(env.action_space.n, np.int64)
         self.probes_seen: set = set()
@@ -722,17 +745,19 @@ class Worker:
                 if not (term or trunc):
                     ef = self.env._ep_frames
                     s = self.env.reward.s
-                    if s is not None and s > ep.mark_s + sp.stall_progress:
-                        ep.mark_s, ep.mark_frame = s, ef
-                    win = stall_rsp if ep.d["kind"] == "respawn" else stall_all
-                    since = ef - ep.mark_frame
+                    branch = bool(info2.get("branch"))
+                    odometer = info2.get("local_s") if branch else s
+                    speed = None
                     if sp.stall_speed is not None:
                         o = self.env.session.tracker.obs if self.env.session is not None else None
-                        if o is not None and o.ball is not None and float(np.linalg.norm(o.ball["speed"])) > sp.stall_speed:
-                            ep.move_frame = ef
-                        since = min(since, ef - ep.move_frame)
-                        if ef - ep.mark_frame >= stall_max:
-                            since = win
+                        if o is not None and o.ball is not None:
+                            velocity = o.ball["speed"]
+                            if branch:
+                                velocity = np.asarray(velocity) + o.ball["speed_change"]
+                            speed = float(np.linalg.norm(velocity))
+                    win = stall_rsp if ep.d["kind"] == "respawn" else stall_all
+                    since = stall_age(ep, ef, odometer, branch, speed, sp.stall_progress,
+                                      sp.stall_speed, stall_max, win)
                     if self._gate_hit(ep, s, info2):
                         trunc, end = True, "gate_truncate"
                     elif ep.d["cap_frames"] is not None and ef >= ep.d["cap_frames"]:

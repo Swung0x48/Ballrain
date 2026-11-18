@@ -67,7 +67,7 @@ def run(live, build, k):
                         if branch is None:
                             branch = ReferencePath.load(
                                 Path(__file__).resolve().parents[1]
-                                / "runtime/refpaths-alt/L02-stone/L02.npz"
+                                / "benchmarks/refpaths-alt/L02-stone/L02.npz"
                             )
                         pr = branch.project(p, 4, prev)
                         prev = pr["s"]
@@ -139,7 +139,7 @@ def run(live, build, k):
                                 asset_path(
                                     2,
                                     Path(__file__).resolve().parents[1]
-                                    / "runtime/refpaths-alt/L02-stone",
+                                    / "benchmarks/refpaths-alt/L02-stone",
                                 )
                             ),
                             record_sha256=json.loads((rec / "meta.json").read_text())[
