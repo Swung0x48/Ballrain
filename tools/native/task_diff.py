@@ -103,6 +103,10 @@ def main(argv=None) -> int:
         if a.branch_dir:  # the stone branch: its measured rest start, and TAS starts upstream of the trafo
             with np.load(Path(a.branch_dir) / "drive.npz", allow_pickle=False) as dz:
                 kb = int(dz["prefix_frame"])
+            # rest_speed 0: the drive replays in full, the brake runs to its frame limit, the at-rest check fails (a late
+            # fallback after a full replay)
+            m_slow = export(dict(state, env_config=dict(state["env_config"], rest_speed=0.0)), out / "weights", "r7slow")
+            assert m_slow["env"]["rest_speed"] == 0.0
             scenarios = {
                 "branch_rest_policy": (m_r7, kb, "policy", 2500, 60000, 0, 41,
                                        "stone rest start (drive.npz replay, drive, brake) + the policy", {"target": None, "branch_s": 1700.0}),
@@ -112,6 +116,9 @@ def main(argv=None) -> int:
                 "branch_rest_fallback": (m_r7, kb, "policy", 2500, 60000, 0, 45,
                                          "a failed stone rest start (target outside the drive) falls back to the TAS start",
                                          {"target": None, "branch_s": 99999.0}),
+                "branch_rest_late_fallback": (m_slow, kb, "policy", 2500, 60000, 0, 46,
+                                              "the drive replays, the at-rest check fails, the TAS start follows",
+                                              {"target": None, "branch_s": 1700.0}),
                 "branch_tas_policy": (m_r7, st.nearest_valid(kb), "policy", 2500, 60000, 0, 43, "TAS start upstream of the trafo + the policy"),
                 "branch_tas_sticky": (m_r7, st.nearest_valid(kb - 600), "sticky:7", 2500, 60000, 0, 44,
                                       "TAS start in 小节 3-4 + sticky actions"),

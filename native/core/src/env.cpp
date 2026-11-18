@@ -204,6 +204,12 @@ bool BallanceEnv::handover_ok(int64_t k) const {
            o->ball->pos[0] == exp->pos[0] && o->ball->pos[1] == exp->pos[1] && o->ball->pos[2] == exp->pos[2];
 }
 
+// a failed stone rest start (its own checks: assets, range, ball lost, ball type / sector, not at rest on the line):
+// start_process falls back to the TAS start; engine and session faults are not caught
+struct BranchRestFailed : Error {
+    explicit BranchRestFailed(const std::string &m) : Error(m) {}
+};
+
 int BallanceEnv::launch_checked(int64_t k) {
     int mismatches = 0;
     for (int attempt = 0;; ++attempt) {
@@ -229,9 +235,8 @@ void BallanceEnv::start_process() {
         std::string err;
         try {
             branch_rest(*rest_->branch_s);
-        } catch (const std::exception &e) {
+        } catch (const BranchRestFailed &e) {  // the drive's own checks; engine and session faults propagate
             err = e.what();
-            if (err.empty()) err = "branch rest failed";
         } catch (...) {
             if (sess_) sess_->close(true), sess_.reset();
             after_death_ = false;
@@ -296,45 +301,45 @@ static bool episode_event(const GameTracker &t, size_t ev0) {
 // extractor (its projection state is not the episode's)
 void BallanceEnv::branch_rest(double station) {
     const FeatureConfig &fc = fx_.config();
-    if (fc.branch_dir.empty()) throw Error("branch rest start needs branch_dir");
+    if (fc.branch_dir.empty()) throw BranchRestFailed("branch rest start needs branch_dir");
     Session &s = *sess_;
     FeatureExtractor fx(fc);
     fx.reference_path(s.tracker());
     const BranchFollower *br = fx.branch();
-    if (!br) throw Error("no matching branch at handover");
+    if (!br) throw BranchRestFailed("no matching branch at handover");
     auto z = load_npz(fc.branch_dir + "/drive.npz");
     char ln[16];
     std::snprintf(ln, sizeof ln, "/L%02d.npz", cfg_.level);
     if (z.at("record_sha256").unicode() != starts_->record_sha256 ||
         z.at("branch_sha256").unicode() != file_sha256(fc.branch_dir + ln))
-        throw Error("drive replay does not match TAS recording or branch asset");
+        throw BranchRestFailed("drive replay does not match TAS recording or branch asset");
     const NpyArray &sa = z.at("samples");
     std::vector<double> samples = sa.f64();
     int64_t prefix = z.at("prefix_frame").ints().at(0);
     size_t ns = samples.size() / 2;
-    if (sa.shape.size() != 2 || sa.shape[1] != 2 || ns == 0) throw Error("drive.npz: samples");
+    if (sa.shape.size() != 2 || sa.shape[1] != 2 || ns == 0) throw BranchRestFailed("drive.npz: samples");
     double lo = samples[1], hi = samples[1];
     for (size_t i = 0; i < ns; ++i) lo = std::min(lo, samples[2 * i + 1]), hi = std::max(hi, samples[2 * i + 1]);
     if (start_frame_ != prefix || !(lo <= station && station <= hi))
-        throw Error("prefix frame or target outside the recorded stone drive");
+        throw BranchRestFailed("prefix frame or target outside the recorded stone drive");
     size_t best = 0;  // np.argmin(abs(samples[:, 1] - station)): the first minimum
     for (size_t i = 1; i < ns; ++i)
         if (std::abs(samples[2 * i + 1] - station) < std::abs(samples[2 * best + 1] - station)) best = i;
     int64_t offset = int64_t(samples[2 * best]);
     const NpyArray &fr = z.at("frames");
     size_t nf = fr.data.size() / 8;
-    if (offset < 0 || size_t(offset) > nf) throw Error("drive.npz: offset outside the frames");
+    if (offset < 0 || size_t(offset) > nf) throw BranchRestFailed("drive.npz: offset outside the frames");
     std::vector<Frame> frames(static_cast<size_t>(offset));
     for (size_t i = 0; i < frames.size(); ++i)
         std::memcpy(&frames[i].delta, fr.data.data() + 8 * i, 4), std::memcpy(&frames[i].keys, fr.data.data() + 8 * i + 4, 4);
     for (size_t b = 0; b < frames.size(); b += 512) {
         std::vector<Frame> blk(frames.begin() + std::ptrdiff_t(b), frames.begin() + std::ptrdiff_t(std::min(frames.size(), b + 512)));
         s.act(blk, 1, episode_stop());
-        if (s.ended() || s.tracker().flags.ball_off) throw Error("ball lost during branch drive replay");
+        if (s.ended() || s.tracker().flags.ball_off) throw BranchRestFailed("ball lost during branch drive replay");
     }
     V3 target = br->alt->point_at(station);
     if (s.tracker().ball_type() != br->ball_type || s.tracker().sector() != br->sector)
-        throw Error("branch drive did not produce the required ball type and sector");
+        throw BranchRestFailed("branch drive did not produce the required ball type and sector");
     RestStart r;
     r.drive = true, r.x = target[0], r.z = target[2];
     drive(r);
@@ -349,7 +354,7 @@ void BallanceEnv::branch_rest(double station) {
                       (o->ball->pos[2] - target[2]) * (o->ball->pos[2] - target[2]));
     double vxz = std::sqrt(fi.vel[0] * fi.vel[0] + fi.vel[2] * fi.vel[2]);
     if (!fi.supported || !(fi.has_branch && fi.branch) || d > 2 || vxz > cfg_.rest_speed)
-        throw Error("branch rest target not reached at rest on the correct surface");
+        throw BranchRestFailed("branch rest target not reached at rest on the correct surface");
 }
 
 // env._drive: push the ball with world arrows towards (x, z), aiming at a velocity proportional to the remaining
