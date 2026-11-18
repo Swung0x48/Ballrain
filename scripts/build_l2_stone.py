@@ -15,7 +15,7 @@ from ballrain.state import GameTracker
 from ballrain.path import ReferencePath, file_sha256
 from ballrain.reach import BALLS
 
-LIVE = Path("D:/repos/Ballrain/runtime")
+LIVE = Path(__import__("os").environ.get("BALLRAIN_RUNTIME") or Path(__file__).resolve().parents[1] / "runtime")
 REC = LIVE / "datasets/tas-v1/SR02_1_28_992_264"
 OUT = LIVE / "viz/l2s4/stone"
 ASSET = ROOT / "benchmarks/refpaths-alt/L02-stone/L02.npz"

@@ -29,8 +29,7 @@ import time
 import traceback
 from multiprocessing.connection import Client, Listener
 
-from ..branch_assets import bundle_rules
-from ..branch_rules import DEFAULT_RULES
+from ..branch_assets import uses_custom_rules
 
 PROTOCOL = 1
 
@@ -99,10 +98,13 @@ class RemoteHub:
                 conn.send({"type": "error", "error": f"bad hello {hello!r}"})
                 return
             assets = getattr(self.template.get("env"), "branch_assets", None)
+            if assets and assets.get("version") == 2 and hello.get("multi_branch_v2") is not True:
+                conn.send({"type": "error", "error": "multi-branch bundle requires multi_branch_v2"})
+                return
             if assets is not None and hello.get("branch_assets_version") != 1:
                 conn.send({"type": "error", "error": "distributed branch requires branch_assets_version=1"})
                 return
-            if assets and hello.get("branch_rules_version") != 1 and bundle_rules(assets) != DEFAULT_RULES:
+            if assets and hello.get("branch_rules_version") != 1 and uses_custom_rules(assets):
                 conn.send({"type": "error", "error": "non-default branch rules require branch_rules_version=1"})
                 return
             host = f"{hello.get('host', '?')}#{hello.get('session', 0)}"
@@ -240,7 +242,7 @@ class RemoteBridge:
                     try:
                         cc = Client(self.addr, authkey=self.authkey)
                         cc.send({"type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session + 1,
-                                 "branch_assets_version": 1, "branch_rules_version": 1, "backend": self.label, "n_workers": len(self.copies)})
+                                 "branch_assets_version": 1, "branch_rules_version": 1, "multi_branch_v2": True, "backend": self.label, "n_workers": len(self.copies)})
                         if not cc.poll(30):
                             raise ConnectionError("no config within 30 s")
                         box["conn"], box["msg"] = cc, cc.recv()

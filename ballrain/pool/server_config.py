@@ -39,7 +39,7 @@
                                # this many tasks are replayed in full
     reach_max_row_frac = 0.02  # f7: rows per chunk whose reach block may differ beyond OBS_TOL (docs/f7-native-port.md 7)
     reach_max_logp_shift = 1.0 # f7: on such a row, the most the submitted reach may move the taken action's log-prob
-                               # (both PROVISIONAL until the native port's measured flip / jump rates)
+                               # (both set 2026-11-18 from the native port's measurements, f7-native-port.md 7.1)
     engines = ["x87soft"]      # the engine kinds tasks are issued for = what the verifier replays with (each task is
                                # replayed on its own engine kind; a hello with another kind gets engine_mismatch)
     workers = 1                # replays in parallel (one engine process each; below-normal priority)
@@ -123,8 +123,8 @@ class PoolConfig:
     probation_chunks: int = 200
     task_sample: float = 0.15  # per-task full-replay probability after the probation (2026-11-18: per task, not per chunk)
     escalate_tasks: int = 20
-    reach_max_row_frac: float = 0.02  # f7 (rollout.REACH_MAX_ROW_FRAC), provisional
-    reach_max_logp_shift: float = 1.0  # f7 (rollout.REACH_MAX_LOGP_SHIFT), provisional
+    reach_max_row_frac: float = 0.02  # f7 (rollout.REACH_MAX_ROW_FRAC)
+    reach_max_logp_shift: float = 1.0  # f7 (rollout.REACH_MAX_LOGP_SHIFT)
     engines: dict = field(default_factory=dict)  # kind -> EngineRef
     verify_engines: tuple = ("x87soft",)  # engine kinds tasks are issued for (the verifier replays each on its kind)
     verify_workers: int = 1
