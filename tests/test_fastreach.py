@@ -15,6 +15,7 @@ from ballrain import dataset, fastreach as F, geometry as G, instances, reach
 WOOD = reach.BALLS[0]
 DS = instances.runtime_dir() / "datasets" / f"tas-v{dataset.DATASET_VERSION}"
 L1 = DS / "SR01_1_14_457_264"
+L2 = DS / "SR02_1_28_992_264"
 
 
 def box(lo, hi):
@@ -44,13 +45,13 @@ def tube(p0, p1, R=0.25, sides=8):
     return tris
 
 
-def make(tris, rails=(), depth=()):
+def make(tris, rails=(), depth=(), fans=()):
     allt = list(tris) + list(rails)
     A, B, C = (np.array([t[i] for t in allt]) for i in range(3))
     owner = np.r_[np.zeros(len(tris), np.int64), np.ones(len(rails), np.int64)]
     ts = G.TriangleSet(A, B, C, owner)
     rs = G.TriangleSet(A[len(tris):], B[len(tris):], C[len(tris):], owner[len(tris):])
-    return F.FastReach.build(ts, rs, depth)
+    return F.FastReach.build(ts, rs, depth, fans=fans)
 
 
 DEATH = [(0, np.array([-200.0, -60.0, -200.0]), np.array([200.0, -20.0, 200.0]))]
@@ -387,3 +388,212 @@ def test_no_landing_within_the_horizon_but_above_the_death_height_is_unknown_not
     vec, info = platforms.perceive([-10.0, 300.0, 0.0], [0.0, 0.0, 0.0], debug=True)
     assert info["named"]["air_any"] == 0 and info["named"]["doomed"] == 0 and info["named"]["unknown_zone"] == 1
     assert info["dbg"]["doom_reason"] == 4
+
+
+# ------------------------------------------------------------------------------------------------ fans (P_Modul_18)
+
+def fan_at(x, y, z, yscale=1.0, name=F.FAN_ENTITY):
+    """A fan push box (local x, z -1..1, y 0..16) with its base at (x, y, z); yscale stretches it vertically."""
+    return (name, np.array([[1.0, 0, 0], [0, yscale, 0], [0, 0, 1.0], [x, y, z]]))
+
+
+@pytest.mark.parametrize("bt, v_inf", [(1, 8.667), (0, -18.36)])
+def test_fan_push_steady_speed_and_time_constant(bt, v_inf):
+    """Inside a push box v' = lam v + F/m - g per PSI: paper rises to (0.5 - 0.303) / (1.5/66) = 8.67 with a time
+    constant of 44 PSIs, wood falls at 18.4 instead of 22.2; the kernel's profile follows that recurrence."""
+    ball = reach.BALLS[bt]
+    v_ss, tau = F.fan_steady(ball)
+    assert v_ss == pytest.approx(v_inf, abs=0.01)
+    assert tau == pytest.approx(66.0 / ball.lin_damp)
+    if bt == 1:
+        assert tau == pytest.approx(44.0)
+    lam, dv = ball.air_lambda, F.FAN_FORCE / ball.mass
+    v = 0.0
+    for n in range(3000):
+        v = lam * v + dv - 20 / 66
+    assert v == pytest.approx(v_ss, rel=1e-9)
+    # the field-level profile in a 1600-tall push box far above the ground
+    fr = make(box((-20, -1, -10), (0, 0, 10)), depth=DEATH, fans=[fan_at(100.0, -500.0, 0.0, yscale=100.0)])
+    prof = fr.fan_profile([100.0, 300.0, 0.0], [0.0, 0.0, 0.0], bt)
+    assert prof["inside"].all()
+    vy = np.diff(prof["y"]) * 66.0  # v[n] = (y[n+1] - y[n]) * 66
+    want = v_ss * (1.0 - lam ** np.arange(len(vy)))  # v[n] = lam^n v0 + a (1 - lam^n) / (1 - lam), v0 = 0
+    assert np.allclose(vy, want, atol=1e-9)
+    k = int(round(tau))
+    assert 0.62 < vy[k] / v_ss < 0.65  # ~1 - 1/e after one time constant
+    # the fan-free reference is the flight formula
+    S1, S2 = F.air_tables(ball)
+    assert np.allclose(prof["y_nofan"], 300.0 - 20 / 66 * S2)
+
+
+def test_stone_ignores_fans_and_fan_boxes_from_the_level():
+    assert F.fan_dv(reach.BALLS[2]) == 0.0 and F.fan_dv(reach.BALLS[1]) == pytest.approx(0.5)
+    assert F.fan_steady(reach.BALLS[2])[0] == pytest.approx(-64.47, abs=0.01)  # (with the push it would give)
+
+    class _E:
+        def __init__(self, m):
+            self.matrix = m
+
+    class _L:
+        by_name = {F.FAN_ENTITY: 1, F.FAN_ENTITY + "003": 2, F.FAN_ENTITY + "_Mesh": 3, "P_Modul_18_Rotor": 4}
+        entities = {1: _E(np.eye(4, 3)), 2: _E(np.r_[np.eye(3), [[5.0, 6.0, 7.0]]]), 3: _E(np.eye(4, 3)),
+                    4: _E(np.eye(4, 3))}
+    fans = F.fan_boxes(_L)
+    assert [n for n, _ in fans] == [F.FAN_ENTITY, F.FAN_ENTITY + "003"]
+    o = F.fan_obbs(fans)
+    assert o.shape == (2, F.FAN_COLS)
+    assert np.allclose(o[1, :3], [5.0, 14.0, 7.0]) and np.allclose(o[1, 3:6], [1.0, 8.0, 1.0])
+    # a box turned 45 degrees about y: its world AABB half-extent is sqrt 2
+    c, s = math.cos(math.pi / 4), math.sin(math.pi / 4)
+    o = F.fan_obbs([("f", np.array([[c, 0, -s], [0, 1.0, 0], [s, 0, c], [0, 0, 0]]))])
+    assert o[0, 15] == pytest.approx(math.sqrt(2)) and o[0, 17] == pytest.approx(math.sqrt(2))
+    assert F.FastReach.cache_key("abc", DEATH, []) != F.FastReach.cache_key("abc", DEATH, [], fans=fans)
+
+
+FAN_TRIS = box((-20, -1, -10), (0, 0, 10)) + box((35, -16, -5), (45, -15, 5)) + box((42, -1, -5), (50, 2, 5))
+
+
+@pytest.fixture(scope="module")
+def fan_level():
+    """The test platform plus a fan at x 40 (push box x 39..41, z -1..1, y -15..1) with a floor under it (top -15) and
+    a ledge beside its top (x 42..50, top 2), and a fan over the death box at x 80 (nothing under it)."""
+    return make(FAN_TRIS, depth=DEATH, fans=[fan_at(40.0, -15.0, 0.0), fan_at(80.0, -15.0, 0.0, name=F.FAN_ENTITY + "001")])
+
+
+def test_fan_lifts_paper_never_doomed_inside(fan_level):
+    fr = fan_level
+    # paper inside the push box, at rest: the flight formula drops it onto the floor under the fan, the push lifts it to
+    # the box top, where the ledge beside it is the key-free landing
+    vec, info = fr.perceive([40.0, -5.0, 0.0], [0.0, 0.0, 0.0], 1, debug=True)
+    n = info["named"]
+    assert n["doomed"] == 0 and n["air_any"] == 1 and info["dbg"]["fan"] == 1
+    assert info["dbg"]["near_h"] == pytest.approx(2.0, abs=0.05) and n["air_near_dy"] > 0
+    prof = fr.fan_profile([40.0, -5.0, 0.0], [0.0, 0.0, 0.0], 1)
+    assert prof["y"].max() > 1.0 + F.FAN_R_NOM - 0.5 and prof["y_nofan"][-1] < -60
+    nofan = make(FAN_TRIS, depth=DEATH)
+    vec, info = nofan.perceive([40.0, -5.0, 0.0], [0.0, 0.0, 0.0], 1, debug=True)
+    assert info["dbg"]["near_h"] == pytest.approx(-15.0, abs=0.05) and info["named"]["air_near_dy"] < 0
+    # falling fast through the fan over the void: wood (pushed 0.053 per PSI) can be pushed before it dies, so unknown,
+    # never doomed (the conservative choice: module docstring); stone ignores fans: doomed
+    for bt, doomed, unknown in ((0, 0, 1), (1, 0, None), (2, 1, 0)):
+        vec, info = fr.perceive([80.0, -5.0, 0.0], [0.0, -20.0, 0.0], bt, debug=True)
+        assert info["named"]["doomed"] == doomed, (bt, info["dbg"])
+        if unknown is not None:
+            assert info["named"]["unknown_zone"] == unknown, (bt, info["dbg"])
+    # far from the fan over the death box: still doomed (no reachable centre comes near a push box before it dies)
+    vec, info = fr.perceive([150.0, 5.0, 150.0], [0.0, -5.0, 0.0], 1, debug=True)
+    assert info["named"]["doomed"] == 1 and info["dbg"]["fan_t"] == -1
+
+
+def test_fan_grounded_inside_is_never_doomed(fan_level):
+    fr = fan_level
+    # paper on the floor under the fan (inside its push box): lifted off, so unknown; never doomed
+    vec, info = fr.perceive([40.0, -15.0 + 2.004, 0.0], [12.0, 0.0, 0.0], 1, debug=True)
+    n = info["named"]
+    assert n["grounded"] == 1 and n["doomed"] == 0 and n["unknown_zone"] == 1 and info["dbg"]["fan"] == 4
+    # wood there is not lifted (net push down): grounded, not doomed, not unknown
+    vec, info = fr.perceive([40.0, -13.0, 0.0], [12.0, 0.0, 0.0], 0, debug=True)
+    assert info["named"]["grounded"] == 1
+    assert info["named"]["doomed"] == 0 and info["named"]["unknown_zone"] == 0
+
+
+def test_fan_free_levels_are_unchanged(platforms):
+    """No fans: the fan code is never reached: dbg fan stays nan."""
+    assert platforms.fans.shape == (0, F.FAN_COLS)
+    vec, info = platforms.perceive([100.0, 5.0, 100.0], [0.0, -5.0, 0.0], 1, debug=True)
+    assert info["named"]["doomed"] == 1 and info["dbg"]["fan"] != info["dbg"]["fan"]
+
+
+_SUB_FAN = r"""
+import json, sys, numpy as np
+sys.path.insert(0, sys.argv[1])
+from ballrain import fastreach as F
+assert not F.HAVE_NUMBA
+fr = F.FastReach.load(sys.argv[2])
+print(json.dumps([fr.perceive(p, v, bt, 0)[0].tolist() for p, v, bt in json.loads(sys.argv[3])]))
+"""
+FAN_STATES = [([40.0, -5.0, 0.0], [0.0, 0.0, 0.0], 1), ([40.0, -5.0, 0.0], [0.0, -20.0, 0.0], 0),
+              ([40.0, -5.0, 0.0], [0.0, -20.0, 0.0], 2), ([40.0, -12.996, 0.0], [12.0, 0.0, 0.0], 1),
+              ([36.0, -12.996, 0.0], [-9.0, 0.0, 0.0], 1), ([44.0, 6.0, 0.0], [3.0, 1.0, 0.0], 1)]
+
+
+@pytest.mark.skipif(not F.HAVE_NUMBA, reason="numba not installed: only the plain-Python path exists")
+def test_fan_numba_and_plain_python_identical(fan_level, tmp_path):
+    fan_level.save(tmp_path / "fan.npz")
+    want = [fan_level.perceive(p, v, bt, 0)[0].tolist() for p, v, bt in FAN_STATES]
+    env = dict(os.environ, BALLRAIN_NO_NUMBA="1")
+    r = subprocess.run([sys.executable, "-I", "-c", _SUB_FAN, str(instances.REPO_ROOT), str(tmp_path / "fan.npz"),
+                        json.dumps(FAN_STATES)], env=env, capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert np.array_equal(np.array(json.loads(r.stdout.strip().splitlines()[-1])), np.array(want))
+
+
+def test_load_of_a_file_without_fans(platforms, tmp_path):
+    """A cache file written before BUILD_VERSION 5 has no fans array: it loads (no fans); its key never matches."""
+    np.savez(tmp_path / "old.npz", **{k: getattr(platforms, k) for k in F.FastReach.ARRAYS if k != "fans"})
+    old = F.FastReach.load(tmp_path / "old.npz")
+    assert old.fans.shape == (0, F.FAN_COLS)
+    assert np.array_equal(old.perceive([-10.0, 8.0, 0.0], [1.0, 0.0, 2.0])[0],
+                          platforms.perceive([-10.0, 8.0, 0.0], [1.0, 0.0, 2.0])[0])
+
+
+# ------------------------------------------------------------------------------------------ L2: the TAS fan stretch
+
+@pytest.fixture(scope="module")
+def l2_fields(tmp_path_factory):
+    if not (L2 / "level.msg").is_file():
+        pytest.skip("tas-v1 dataset not built")
+    if not F.HAVE_NUMBA:
+        pytest.skip("the L2 fields are built and queried with numba (plain Python is far too slow for a whole level)")
+    from ballrain import protocol as P
+    from ballrain.state import GameTracker
+    tr = GameTracker(2)
+    tr.merge_level(P.parse_level_message((L2 / "level.msg").read_bytes())[0])
+    for m in P.parse_level_stream((L2 / "level.msg.inc").read_bytes())[0]:
+        tr.merge_level(m)
+    tr.level_no = 2
+    fr = F.FastReach.for_tracker(tr, cache_dir=tmp_path_factory.mktemp("fr2"), name="L02")
+    states = {}
+    for i, o in enumerate(dataset.load_observations(L2 / "raw.npz")):
+        tr.update(o)
+        if not (18900 <= i <= 22400) or o.ball is None:
+            continue
+        p = np.asarray(o.ball["pos"], float)
+        if np.abs(p).sum() < 1e-6:
+            continue
+        bt = tr.ball_type()
+        states[i] = (p, np.asarray(o.ball["speed"], float) + np.asarray(o.ball["speed_change"], float),
+                     0 if bt is None else int(bt))
+    return fr, states
+
+
+def test_l2_fans_found(l2_fields):
+    fr, _ = l2_fields
+    assert fr.fans.shape == (9, F.FAN_COLS)
+    assert np.allclose(fr.fans[:, 3:6], [1.0, 8.0, 1.0], atol=1e-3)
+    names = [f["name"] for f in fr.info["fans"]]
+    assert names[0] == F.FAN_ENTITY and names[-1] == F.FAN_ENTITY + "008"
+
+
+def test_l2_tas_fan_stretch_never_doomed_and_vertical_motion(l2_fields):
+    """TAS 18900-22400 rides fans 003-006 and 008 and passes 001 (paper): no doomed flag; inside fan 005 (frames
+    20720-20960) the key-free vertical motion with the push matches the TAS over 0.5 s, the flight formula misses by
+    ~3."""
+    fr, st = l2_fields
+    k_doomed = F.FEATURE_NAMES.index("doomed")
+    doomed = [i for i, (p, v, bt) in st.items() if fr.perceive(p, v, bt, 0)[0][k_doomed] > .5]
+    assert doomed == []
+    psi = sorted(st)
+    psi = [psi[0]] + [k for a, k in zip(psi, psi[1:]) if np.any(st[k][1] != st[a][1])]  # a new PSI: speed changes
+    errs, errs0 = [], []
+    for j, i0 in enumerate(psi):
+        if not (20760 <= i0 <= 20880) or psi[j + 33] - i0 != 66:
+            continue
+        p, v, bt = st[i0]
+        prof = fr.fan_profile(p, v, bt)
+        y = np.array([st[psi[j + n]][0][1] for n in range(34)])
+        errs.append(np.abs(prof["y"][:34] - y).max())
+        errs0.append(np.abs(prof["y_nofan"][:34] - y).max())
+    assert len(errs) > 20
+    assert np.median(errs) < 0.01 and max(errs) < 0.5
+    assert min(errs0) > 2.0

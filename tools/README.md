@@ -44,3 +44,10 @@ are only ever started in `runtime/<copy>/Bin` through `ballrain.instances`.
   mindist, ray fan, cameras, SR); they read the probe output directories given in each script.
 - `agentdev/`: the stub agent-mode client used before `ballrain.client` existed (`stub.py`) and its
   comparison with the probe dumps (`cmp_probe.py`, `agent-protocol.md` 8.6).
+- `fastreach_fans/`: the L2 fans (P_Modul_18) in `ballrain.fastreach` (module docstring "Fans").
+  `nmo_box.py` reads mesh extents from the game's `.nmo` files (the push box `Modul_18_Kollisionsquader_Mesh`
+  in `3D Entities/PH/P_Modul_18.nmo`, the ball boxes in `Balls.nmo`); `fan_fit.py` checks the box test
+  against the impulses in the r8 traced episodes (`runtime/m2-train-mac/r8/episodes-traced`) and fits the
+  rotation-free radius; `fan_val.py <tag>` is the before/after validation (TAS doomed flags, the L2 pit,
+  traced deaths and false alarms at the fans, vertical motion, latency; `FR_SRC` picks the code, `FR_EPISODES`
+  freezes the episode set).
