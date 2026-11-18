@@ -308,7 +308,7 @@ static BranchGate parse_gate(const Json &g) {
 }
 
 static bool valid_id(const std::string &id) {
-    if (id.empty() || !(id[0] >= 'a' && id[0] <= 'z')) return false;
+    if (id.empty() || id.size() > 32 || !(id[0] >= 'a' && id[0] <= 'z')) return false;  // [a-z][a-z0-9-]{0,31}
     for (char c : id)
         if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
     if (id == "con" || id == "prn" || id == "aux" || id == "nul") return false;
