@@ -449,6 +449,9 @@ class Worker:
         """Segment start of a new life for the split bonus."""
         if not self.spec.split_k or self.env.starts is None:
             return
+        if "ref_elapsed_ms" in info:
+            ep.seg = (ep.d["start_sr_ms"], info["ref_elapsed_ms"], None)
+            return
         kind, k, sec = ep.d["kind"], ep.d["start_frame"], ep.d["start_sector"]
         agent = ep.d["start_sr_ms"]
         if kind == "tas_rest" and k > 0 and self.env.starts.index_of(k) is None:
@@ -470,7 +473,7 @@ class Worker:
         if ep.seg is None or not self.spec.split_k:
             return 0.0
         sec = 0 if finished else int(info.get("sector") or 0)
-        end_ref = self._tas_cross(sec)
+        end_ref = info["ref_elapsed_ms"] if "ref_elapsed_ms" in info else self._tas_cross(sec)
         sr = info.get("sr_ms")
         if end_ref is None or sr is None:
             return 0.0
@@ -487,6 +490,9 @@ class Worker:
         return b
 
     def _cap_frames(self, info) -> int | None:
+        if "ref_remaining_ms" in info:
+            budget = (info["ref_elapsed_ms"] + info["ref_remaining_ms"]) * self.spec.cap_mult
+            return int((budget + 1000*self.spec.cap_extra_s) / self.spec.env.delta_ms)
         st = self.env.starts
         if st is None:
             return None
@@ -710,6 +716,9 @@ class Worker:
                                 ep.ret += gb
                                 ep.terms["gate_bonus"] = ep.terms.get("gate_bonus", 0.0) + gb
                 end = info2.get("episode_end") if (term or trunc) else None
+                if "branch" in info2 and ep.d.get("cap_branch") != info2["branch"]:
+                    ep.d["cap_frames"] = self._cap_frames(info2)
+                    ep.d["cap_branch"] = info2["branch"]
                 if not (term or trunc):
                     ef = self.env._ep_frames
                     s = self.env.reward.s

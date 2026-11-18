@@ -78,7 +78,9 @@ def parse_rest_starts(spec: str):
             continue
         rng, _, tgt = r.partition("@")
         e = [int(v) for v in rng.split("-")]
-        if tgt:
+        if tgt.startswith("branch:"):
+            e.append({"branch_s": float(tgt.removeprefix("branch:"))})
+        elif tgt:
             e += [float(v) for v in tgt.split(":")]
             if len(e) not in (5, 6):
                 raise SystemExit(f"--rest-starts entry {r!r}: lo-hi@x:z:jitter[:max_frames]")
@@ -159,6 +161,7 @@ def parse(argv=None):
     p.add_argument("--split-min-ref-s", type=float, default=5.0)
     p.add_argument("--split-extra", default="", help="JSON [[lo_frame, hi_frame, seconds], ...] (WorkerSpec.split_extra)")
     p.add_argument("--exclude-starts", default="", help="record frame ranges lo-hi never used as starts")
+    p.add_argument("--branch-dir", help="paired ball-type diversion assets (main line unchanged)")
     p.add_argument("--path-dir", default=None, help="directory of the reference line assets (FeatureConfig.path_dir)")
     p.add_argument("--gates", default="", help="JSON sub-goal gates (ballrain.train.worker.WorkerSpec.gates)")
     p.add_argument("--zones", default="",
@@ -230,7 +233,7 @@ def parse(argv=None):
                    help="the stall clock pauses while the ball is faster than this (units/s): run-ups are not cut")
     p.add_argument("--stall-max-s", type=float, default=15.0, help="with --stall-speed: max time without new arc progress")
     p.add_argument("--rest-starts", default="", help="at-rest starts: lo-hi record frame ranges, e.g. 11760-11900,13450-13650; "
-                   "lo-hi@x:z:jitter drives the ball to a target in [x +- jitter] x [z +- jitter] before braking "
+                   "lo-hi@branch:s uses the measured branch drive; lo-hi@x:z:jitter drives the ball to a target in [x +- jitter] x [z +- jitter] before braking "
                    "(lo-hi@x:z:jitter:max_frames: that entry's drive limit; the hand-over may be an excluded frame)")
     p.add_argument("--counter-rand", default="",
                    help='counter randomisation on TAS / at-rest starts (WorkerSpec.counter_rand), JSON, e.g. '
@@ -357,7 +360,7 @@ def make_env_config(a, out_root: Path):
         raise SystemExit(f"--path-dir {a.path_dir}: no reference line {asset}")
     fc = FeatureConfig(hs_block=a.hs_block, camera="world" if a.world_actions else "orient_ref",
                        far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=path_dir,
-                       path_sha256=file_sha256(asset) if asset.is_file() else None)
+                       branch_dir=portable_path_dir(a.branch_dir), path_sha256=file_sha256(asset) if asset.is_file() else None)
     cu = {"start_back": a.start_back, "step": a.cu_step, "band": a.cu_band, "recent": a.cu_recent,
           "advance_at": a.advance_at, "min_episodes": a.min_episodes, "p_level_start": a.p_level_start}
     hl = None

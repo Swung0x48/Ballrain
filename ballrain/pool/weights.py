@@ -177,6 +177,8 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     env = {k: _plain(ec[k]) if k in ec else _plain(getattr(EnvConfig(), k)) for k in ENV_FIELDS if k in known_env}
     fc = dict(ec.get("features") or {})
     feats = _plain({f.name: fc.get(f.name, getattr(FeatureConfig(), f.name)) for f in fields(FeatureConfig)})
+    if feats.pop('branch_dir', None):
+        raise ValueError('pool clients do not yet implement ball-type branch assets')
     feats["path_dir"] = None  # the client installs the asset itself (task assets, sha256 below)
     rc = ec.get("reward") or {}
     reward = _plain({f.name: rc.get(f.name, getattr(RewardConfig(), f.name)) for f in fields(RewardConfig)})

@@ -52,6 +52,7 @@ class FeatureConfig:
     path_source: str = "tas"  # "tas" (TAS line; the polyline only for levels without an asset) | "checkpoints"
     path_dir: str | None = None  # directory of the L<nn>.npz assets, repo-relative (default benchmarks/refpaths)
     path_sha256: str | None = None  # sha256 the level's asset must have (set by the learner; None = unchecked)
+    branch_dir: str | None = None  # optional paired Lnn.json / Lnn.npz diversion
     path_lateral_scale: float = 10.0  # path_lateral = distance to the line / this
     path_back: float = 10.0  # projection window behind the previous arc length
     path_ahead: float = 30.0  # ... and ahead of it
@@ -75,7 +76,10 @@ class FeatureConfig:
     clip: float = 10.0  # final clip of every entry
 
     def to_dict(self):
-        return asdict(self)
+        d = asdict(self)
+        if self.branch_dir is None:
+            del d["branch_dir"]  # preserve serialized configurations when off
+        return d
 
 
 # ------------------------------------------------------------------------------- geometry cache
@@ -262,6 +266,7 @@ class FeatureExtractor:
         self.size = sum(n for _, n in self._layout)
         self.path: ReferencePath | None = None
         self.follower: PathFollower | None = None
+        self.branch = None
         self._path_key = None
 
     # layout -------------------------------------------------------------------------------
@@ -330,6 +335,11 @@ class FeatureExtractor:
                 self.follower = None if path is None else PathFollower(
                     path, back=self.cfg.path_back, ahead=self.cfg.path_ahead, margin=self.cfg.path_margin,
                     reacquire=self.cfg.path_reacquire)
+                self.branch = None
+                if self.cfg.branch_dir and path is not None and path.source == "tas":
+                    from .branch import load_branch
+                    self.branch = load_branch(path, tracker.level_no, self.cfg.branch_dir, self.cfg.path_dir,
+                                              **self.follower.kw)
             self.path = path
             self._path_key = key
         return self.path
@@ -351,6 +361,8 @@ class FeatureExtractor:
         """Forget the projection state (call at every episode start: new process, respawn, TAS hand-over)."""
         if self.follower is not None:
             self.follower.reset()
+        if self.branch is not None:
+            self.branch.reset()
 
     def frame(self, tracker: GameTracker):
         obs = tracker.obs
@@ -396,26 +408,31 @@ class FeatureExtractor:
             self._contacts(tracker, F, info, pos, vel, radius, right, fwd)
             info["supported"] = "support_point" in info  # floor-facing contact within SUPPORT_GAP (SR reward hold)
             self._terrain(tracker, F, info, pos, radius, right, fwd)
-            if path is not None:
-                pr = self.follower.update(pos, tracker.sector)
+            if path is not None and (self.branch is None or valid):
+                if self.branch is None:
+                    pr = self.follower.update(pos, tracker.sector)
+                    local_s = pr["s"]
+                else:
+                    path, pr = self.branch.update(pos, tracker.sector, bt)
+                    local_s = pr["local_s"]
                 info["path"] = pr
-                info["path_source"] = path.source
-                F["path_progress"][0] = pr["s"] / max(path.length, 1e-9)
-                F["path_remaining"][0] = (path.length - pr["s"]) / (20 * c.pos_scale)
+                info["path_source"] = "branch" if pr.get("branch") else path.source
+                F["path_progress"][0] = pr["s"] / max(self.path.length, 1e-9)
+                F["path_remaining"][0] = (path.length - local_s) / (20 * c.pos_scale)
                 F["path_lateral"][0] = pr["dist"] / c.path_lateral_scale
                 tc = to_frame(pr["tangent"], right, fwd)
                 F["path_tangent_cam"][:] = (tc[0], tc[2])
                 pr_r = np.array([pr["tangent"][2], 0, -pr["tangent"][0]])
                 F["vel_path"][:] = to_frame(vel, pr_r, pr["tangent"]) / c.vel_scale
                 if c.waypoints:
-                    wp = path.points_ahead(pr["s"], c.waypoints, c.waypoint_spacing) - pos
+                    wp = path.points_ahead(local_s, c.waypoints, c.waypoint_spacing) - pos
                     F["waypoints"][:] = (to_frame(wp, right, fwd) / c.pos_scale).ravel()
                 if c.far_waypoints:
-                    fw = path.points_at(pr["s"], c.far_waypoints) - pos
+                    fw = path.points_at(local_s, c.far_waypoints) - pos
                     F["far_waypoints"][:] = (to_frame(fw, right, fwd) / c.pos_scale).ravel()
                 if c.ref_speed_at:
                     for j, o in enumerate(c.ref_speed_at):
-                        v = path.speed_at(pr["s"] + float(o))
+                        v = path.speed_at(local_s + float(o))
                         F["ref_speed"][j] = (v or 0.0) / c.vel_scale
             if c.bodies:
                 self._bodies(tracker, F, pos, vel, right, fwd)

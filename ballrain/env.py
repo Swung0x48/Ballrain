@@ -288,6 +288,9 @@ class BallanceEnv(gym.Env):
         if c.rest_starts and c.p_rest and self._start_rng.random() < c.p_rest:
             e = c.rest_starts[int(self._start_rng.integers(len(c.rest_starts)))]
             lo, hi = e[0], e[1]
+            if len(e) == 3 and isinstance(e[2], dict):
+                self._rest_next = e[2]
+                return self.starts.nearest_any(int(self._start_rng.integers(int(lo), int(hi)+1)))
             self._rest_next = True
             if len(e) >= 5:  # drive to a target first: (x, z) drawn in the jitter box
                 j = float(e[4])
@@ -386,10 +389,58 @@ class BallanceEnv(gym.Env):
         p["recorder"].meta.start_state = dict(p["recorder"].meta.start_state or {},
                                               handover_mismatches=len(mismatches))
         if rest and k:
+            if isinstance(rest, dict):
+                try:
+                    self._branch_rest(p, k, rest["branch_s"])
+                except BaseException:
+                    p["session"].close(kill=True)
+                    raise
+                return p
             if isinstance(rest, tuple):
                 self._drive(p, rest)
             self._brake(p)
         return p
+
+    def _branch_rest(self, p, k, station):
+        """Replay the measured drive through the trafo, then close the loop on an arc target.
+        Never synthesize a transform, teleport, or accept a paper / unsupported handover.
+        Use a private extractor: warm-preparation can run concurrently with training.
+        """
+        from .path import asset_path, file_sha256, resolve_path_dir
+        cfg = self.cfg.features
+        if not cfg.branch_dir:
+            raise ValueError('branch rest start needs branch_dir')
+        s = p['session']
+        fx = FeatureExtractor(cfg)
+        fx.reference_path(s.tracker)
+        branch = fx.branch
+        if branch is None:
+            raise ValueError('no matching branch at handover')
+        with np.load(resolve_path_dir(cfg.branch_dir) / 'drive.npz', allow_pickle=False) as drive:
+            if (str(drive['record_sha256']) != p['start'].get('record_sha256') or
+                    str(drive['branch_sha256']) != file_sha256(asset_path(self.cfg.level, resolve_path_dir(cfg.branch_dir)))):
+                raise ValueError('drive replay does not match TAS recording or branch asset')
+            samples = drive['samples']
+            if k != int(drive['prefix_frame']) or not samples[:, 1].min() <= station <= samples[:, 1].max():
+                raise ValueError('prefix frame or target outside the recorded stone drive')
+            offset = int(samples[np.argmin(abs(samples[:, 1] - station)), 0])
+            frames = drive['frames'][:offset]
+        for block in range(0, len(frames), 512):
+            s.act(frames[block:block+512], stop=(Ev.BallOff, Ev.GameOver, Ev.LevelFinish))
+            if s.ended or s.tracker.flags.ball_off:
+                raise RuntimeError('ball lost during branch drive replay')
+        target = branch.alt.point_at(station)
+        if s.tracker.ball_type() != branch.ball_type or s.tracker.sector != branch.sector:
+            raise RuntimeError('branch drive did not produce the required ball type and sector')
+        self._drive(p, target[[0, 2]])
+        self._brake(p)
+        _, fi = fx.compute(s.tracker)
+        o = s.tracker.obs.ball
+        if (not fi.get('supported') or not fi.get('path', {}).get('branch') or
+                np.linalg.norm(o['pos'] - target) > 2 or np.linalg.norm(fi['vel'][[0, 2]]) > self.cfg.rest_speed):
+            raise RuntimeError('branch rest target not reached at rest on the correct surface')
+        p['start']['branch_s'] = station
+        p['recorder'].meta.start_state.update(branch_s=station)
 
     def _drive(self, p: dict, target) -> None:
         """At-rest start with a target (rest_starts entry [lo, hi, x, z, jitter]): push the ball with world arrows towards
@@ -889,6 +940,12 @@ class BallanceEnv(gym.Env):
                 "supported": finfo.get("supported"), "progress_held": self.reward.held,
                 "life": len(self.recorder.lives) - 1 if self.recorder else None,
                 "run_id": self.recorder.meta.run_id if self.recorder else None, "start": self._start}
+        route = finfo.get("path") or {}
+        if "branch" in route:
+            info.update({key: route[key] for key in ("branch", "local_s", "ref_elapsed_ms", "ref_remaining_ms")})
+        elif self.fx.branch is not None:
+            # No IVP ball during transforms / finish: never compare the route clock to absolute TAS IGT.
+            info.update(self.fx.branch.timing)
         if terms:
             info["reward_terms"] = terms
         return info
