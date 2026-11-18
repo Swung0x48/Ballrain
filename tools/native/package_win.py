@@ -11,6 +11,7 @@ variables: they are build inputs, never committed) and assembles
 
     BallrainPool-<version>-windows-x64/
         BallrainPool.exe                      the TUI client (static, no runtime needed)
+        nc_client.exe                         the same controller without a UI (login / run / diag; servers, SSH)
         engine/x87soft/windows/BallanceMMOSimTool.exe, msvcp140.dll, vcruntime140.dll (x86, app-local), ENGINE_VERSION
         使用说明.txt                          the tester quick start (docs/native-client-testers.md is the full guide)
         LICENSES/                             Ballrain's vendored libraries + the engine's licences given by --license
@@ -127,6 +128,7 @@ def main(argv=None) -> int:
     edir = stage / "engine" / "x87soft" / "windows"
     edir.mkdir(parents=True)
     shutil.copyfile(bdir / "ballrain_pool.exe", stage / "BallrainPool.exe")
+    shutil.copyfile(bdir / "nc_client.exe", stage / "nc_client.exe")  # the headless driver (hosts without a console UI)
     shutil.copyfile(a.engine, edir / "BallanceMMOSimTool.exe")
     crt = vc_redist_x86()
     for n in VCREDIST:

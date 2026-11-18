@@ -5,7 +5,8 @@
 //       out the token, which is saved to <D>/token (D defaults to ./ballrain-pool-data)
 //   nc_client diag [--data-dir D] [--out F.zip]
 //       the scrubbed diagnostics zip (default <D>/diagnostics-<time>.zip)
-//   nc_client run --gateway URL --ballance-dir G --engine BallanceMMOSimTool[.exe] [--data-dir D] [--tasks N]
+//   nc_client run [--gateway URL] [--ballance-dir G] [--engine BallanceMMOSimTool[.exe]] [--data-dir D] [--tasks N]
+//                 (options default to the saved config.json; the engine to the one shipped next to nc_client.exe)
 //                 [--instances K] [--engine-kind x87soft|2002] [--engine-env NAME=VALUE ...] [--leaderboard on|off]
 //                 [--auto-pause on|off] [--quiet-file PATH]
 //       the controller (native/core/src/controller.cpp) without a UI: hello, K instances playing tasks, the upload
@@ -116,14 +117,18 @@ static int cmd_run(int argc, char **argv) {
     bool fatal = false;
     Controller ctl(dir, print_event);
     ClientConfig c = ctl.config();
-    c.gateway_url = arg(argc, argv, "--gateway");
-    c.ballance_dir = platform::absolute_path(arg(argc, argv, "--ballance-dir"));
-    c.engine_binary = platform::absolute_path(arg(argc, argv, "--engine"));
-    c.engine_kind = arg(argc, argv, "--engine-kind", "x87soft");
-    c.instances = std::atoi(arg(argc, argv, "--instances", "1").c_str());
+    // every option falls back to the saved config.json (a scheduled task or an SSH session runs `nc_client run`
+    // after one configured run); --engine absent and none saved: the engine shipped next to nc_client.exe
+    auto opt = [&](const char *name, const std::string &saved) { return std::string(arg(argc, argv, name, saved.c_str())); };
+    c.gateway_url = opt("--gateway", c.gateway_url);
+    std::string g = opt("--ballance-dir", c.ballance_dir), e = opt("--engine", c.engine_binary);
+    c.ballance_dir = g.empty() ? g : platform::absolute_path(g);
+    c.engine_binary = e.empty() ? e : platform::absolute_path(e);
+    c.engine_kind = opt("--engine-kind", c.engine_kind);
+    c.instances = std::atoi(opt("--instances", std::to_string(c.instances)).c_str());
     // the automatic pause is the TUI's (a test machine may run Player.exe for other reasons): off unless asked
-    c.auto_pause_player = c.auto_pause_battery = std::string(arg(argc, argv, "--auto-pause", "off")) == "on";
-    c.quiet_file = arg(argc, argv, "--quiet-file", "");  // the stop switch (independent of --auto-pause)
+    c.auto_pause_player = c.auto_pause_battery = opt("--auto-pause", "off") == "on";
+    c.quiet_file = opt("--quiet-file", c.quiet_file);  // the stop switch (independent of --auto-pause)
     ctl.set_config(c);
     ctl.max_tasks = std::atoll(arg(argc, argv, "--tasks", "0").c_str());
     for (auto &kv : args_all(argc, argv, "--engine-env")) {
