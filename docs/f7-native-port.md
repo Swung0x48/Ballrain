@@ -174,7 +174,7 @@ file = f"L{level_no:02d}-{hex(sha256(key.utf8))[:16]}.npz"
     1. 核对 `zsize` 和 `zsha256`；
     2. zstd 解压，输出上限就是 `size`（防解压炸弹）；
     3. 核对 `sha256`；
-    4. 存为 `<根目录>/fastreach/L<nn>-<key_sha256 前 16 位>.npz`，与 Python 缓存的文件名相同。根目录是 `BALLRAIN_WORK_DIR`，默认 `~/.ballrain`。客户端只写在这个根目录下，不另设路径环境变量；
+    4. 存为 `<根目录>/cache/fastreach/L<nn>-<key_sha256 前 16 位>.npz`（客户端下载的素材都在 `<根目录>/cache` 下），文件名与 Python 缓存的相同。根目录是 `BALLRAIN_WORK_DIR`，默认 `~/.ballrain`。客户端只写在这个根目录下，不另设路径环境变量；
     5. 读入后要求 `info.key` 等于自己算出的 `fields_key`。
 
     当前几何的键在 `assets.reach` 里没有对应项时，这个任务无法计算，以 `error` 结束（不算不一致）。
