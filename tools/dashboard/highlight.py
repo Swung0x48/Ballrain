@@ -5,6 +5,10 @@ on, recorded from the game's own picture, verified and published on the dashboar
     uv run python tools/dashboard/highlight.py --once [--force]      # one pass now (--force: even if unchanged)
     uv run python tools/dashboard/highlight.py gate                  # capture build vs. 0.3.2: traces byte-identical
 
+Level: the run's own (config --level / --record, level 1 before r8): its TAS record checks the prefix, gives the
+start bins and the TAS time, and the replay env comes from the run's checkpoint, whose level and start record must
+be the config's.
+
 Selection (current run, runs.csv): the runs of the last 60 minutes of learner time; of those that finished without a
 death (LevelFinish, deaths 0, valid, frame log matched), the ones whose takeover frame k lies in the earliest
 2000-frame start bin among them (the longest agent-controlled ones), fastest full-level SR first, then the other
@@ -73,8 +77,16 @@ FPS = 60.0
 POST_S = 6.0  # idle game seconds after the SR tail: the airship ending
 STEP = 2  # agent frames per block (action repeat of the training)
 MAX_CANDIDATES = 5
-TAS_RECORD = "SR01_1_14_457_264"
-TAS_FILE = ROOT / "runtime" / "ref" / "ModLoader" / "TASRecords" / f"{TAS_RECORD}.tas"
+TAS_DIR = ROOT / "runtime" / "ref" / "ModLoader" / "TASRecords"
+TAS_RECORD = D.LEVEL_RECORDS[1]  # level 1 default; a run's own record comes from D.run_level
+TAS_FILE = TAS_DIR / f"{TAS_RECORD}.tas"
+GATE_EXTRA = "SR06_1_29_838_264"  # gate: a second level next to the current run's record
+
+
+def tas_file(record: str) -> Path:
+    if not D.RECORD_RE.match(str(record or "")):
+        raise ValueError("not a TAS record name")
+    return TAS_DIR / f"{record}.tas"
 CAPTURE_BUILD = ROOT / "runtime" / "mod-builds" / "BallrainIO-0.3.3-capture.bmodp"
 BASE_BUILD = ROOT / "runtime" / "mod-builds" / "BallrainIO-0.3.2.bmodp"
 
@@ -124,8 +136,11 @@ def backend_of(copy: str) -> str:
     return "headless" if str(copy).startswith("hl") else "retail"
 
 
-def candidates(run: D.Run, window_s: float = WINDOW_S, bins=D.SR_BIN_EDGES) -> tuple[list[dict], dict]:
-    """Ordered candidates of the run's last `window_s` learner seconds, and a summary of the choice."""
+def candidates(run: D.Run, window_s: float = WINDOW_S, bins=None) -> tuple[list[dict], dict]:
+    """Ordered candidates of the run's last `window_s` learner seconds, and a summary of the choice. bins: start-frame
+    bin edges (default: those of the run's TAS record)."""
+    if bins is None:
+        bins = D.bin_edges(D.run_level(run)["record"])
     cols = ["update", "t", "copy", "run_id", "end_reason", "sr_ms", "start_frame", "frames", "deaths",
             "framelog_match", "invalid", "dir"]
     d = D.read_many(run.files("runs*.csv"), usecols=cols, dedup=None)
@@ -428,15 +443,17 @@ def publish(media: Path, meta_pub: dict, plain: Path, overlay_mp4: Path) -> dict
 
 def public_meta(run: D.Run, row: dict, meta: dict, res: dict, ver: dict, dur: float | None, sizes: dict) -> dict:
     started = float(meta.get("started_at") or 0)
+    level = D.run_level(run)["level"]
     return {
         "run": run.name,
+        "level": int(level),
         "update": int(row["update"]),
         "episode_at": dt.datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M") if started else None,
         "recorded_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "tz": tz_label(),
         "sr_ms": int(res["sr_ms"]),
         "k": int(row["start_frame"]),
-        "tas_ms": int(D.benchmarks()["tas"]),
+        "tas_ms": int(D.benchmarks(level)["tas"]),
         # the run's own record of its backend (a copy name does not tell x87-soft from a headless 2002 engine)
         "backend": D.BACKEND_LABEL.get(str(meta.get("backend") or backend_of(row["copy"])), "其他"),
         "matched": bool(ver["matched"]),
@@ -459,8 +476,12 @@ def run_once(force: bool = False, max_candidates: int = MAX_CANDIDATES, keep_wor
     logs = [p for p in run.path.glob("runs*.csv") if p.is_file()]
     if not logs or time.time() - max(p.stat().st_mtime for p in logs) > 2 * 3600:
         return {"status": "no recent training data"}
+    lv = D.run_level(run)
+    if lv["record"] is None:
+        return {"status": "no TAS record for the run's level", "level": lv["level"]}
     rows, summ = candidates(run)
-    log(f"{run.name}: {summ}")
+    summ["level"] = lv["level"]
+    log(f"{run.name} (level {lv['level']}, {lv['record']}): {summ}")
     if not rows:
         return {"status": "no finished run in the window", **summ}
     why = ensure_capture_build()
@@ -473,6 +494,7 @@ def run_once(force: bool = False, max_candidates: int = MAX_CANDIDATES, keep_wor
     except Exception:
         pass
     tried = []
+    tas_prefix = tas.load_any(tas_file(lv["record"]))
     for row in rows[:max_candidates]:
         rid = str(row["run_id"])
         if not force and old.get("_id") == _short_id(rid):
@@ -485,7 +507,7 @@ def run_once(force: bool = False, max_candidates: int = MAX_CANDIDATES, keep_wor
             k = int((meta.get("start_state") or {}).get("frame") or row["start_frame"])
             if k != int(row["start_frame"]) or len(frames) != int(meta.get("frames") or -1):
                 raise RuntimeError(f"run files disagree with runs.csv (k {k}, frames {len(frames)})")
-            if k > 0 and frames[:k].tobytes() != tas.load_any(TAS_FILE)[:k].tobytes():
+            if k > 0 and frames[:k].tobytes() != tas_prefix[:k].tobytes():
                 raise RuntimeError("prefix is not the TAS record's first k frames")
         except Exception as e:  # noqa: BLE001
             log(f"candidate {_short_id(rid)}: input unavailable: {type(e).__name__}: {e}")
@@ -568,7 +590,13 @@ def cmd_gate(a) -> int:
     """Byte-identity of the capture build: the same frames on video-00 with BallrainIO 0.3.2 (rendering skipped, no
     capture) and with the capture build (rendering on, capture on); traces, frame logs and SR must be identical."""
     from ballrain import trace  # noqa: F401
-    records = a.records.split(",")
+    if a.records:
+        records = a.records.split(",")
+    else:  # the current run's record (its level) and a second level
+        runs = D.discover_runs()
+        cur = next((r for r in runs if r.name == D.default_run(runs)), None)
+        rec = (D.run_level(cur)["record"] if cur is not None else None) or TAS_RECORD
+        records = list(dict.fromkeys([rec, GATE_EXTRA]))
     out_root = WORK / "gate"
     res = {}
     try:
@@ -619,7 +647,8 @@ def main(argv=None) -> int:
     p.add_argument("--test-env-fail", type=int, default=0, help=argparse.SUPPRESS)  # fallback test: fail after N steps
     sub = p.add_subparsers(dest="cmd")
     g = sub.add_parser("gate")
-    g.add_argument("--records", default="SR01_1_14_457_264,SR06_1_29_838_264")
+    g.add_argument("--records", default="", help="comma list of TAS records (default: the current run's record and "
+                   f"{GATE_EXTRA})")
     g.add_argument("--k", type=int, default=6000, help="prefix frames (the rest goes through 2-frame agent blocks)")
     a = p.parse_args(argv)
     lower_priority()

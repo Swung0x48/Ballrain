@@ -28,6 +28,11 @@ const TZ = (() => {
 })();
 const sec = (ms) => (ms == null ? "—" : (ms / 1000).toFixed(3) + " s");
 const runColor = (r) => RUN_COLORS[r] || "#ddd";
+// the level of a run (from its config on the server; runs before r8 are level 1): it picks the maps, the TAS line,
+// the checkpoints and the SR thresholds shown
+const levelOf = (r) => (((S && S.status) || {})[r] || {}).level || 1;
+const LV = () => levelOf(sel);
+const levelName = (n) => `第 ${n} 关`;
 
 let S = null;           // last /api/status
 let sel = null;         // selected run
@@ -151,6 +156,7 @@ function renderHeader() {
     });
   }
   document.querySelectorAll(".rn").forEach((e) => (e.textContent = sel));
+  document.querySelectorAll(".lvn").forEach((e) => (e.textContent = levelName(LV())));
   $("milestone").textContent = S.milestone || "M2";
   const tb = $("tb");
   if (S.tensorboard_url) { tb.href = S.tensorboard_url; tb.classList.remove("off"); tb.title = ""; tb.querySelector("span").textContent = "TensorBoard"; }
@@ -191,7 +197,7 @@ function renderStatus() {
   const share = src ? Object.entries(src).map(([k, v]) => `<div class="row"><span class="gt">${esc(k)}</span><span class="gt">${esc(v + "%")}</span></div>` +
     (det[k] ? `<div class="sub">${esc(det[k].join(" + "))}</div>` : "")).join("") : "—";
   $("tiles").innerHTML = [
-    tile("run", sel, s.machine ? `训练机：${s.machine}` : "", true),
+    tile("run", sel, [levelName(levelOf(sel)), s.machine ? `训练机：${s.machine}` : ""].filter(Boolean).join(" · "), true),
     tile(`最后记录（${TZ}）`, lt(s.last_log_ts, s.last_log || "—"), s.last_log_age_min != null ? `${num(s.last_log_age_min, 0)} 分钟前；开始于 ${lt(s.started_ts, s.started || "—")}` : "", true),
     tile("更新次数", num(s.update), "", true),
     tile("训练步数", s.steps != null ? (s.steps / 1e6).toFixed(2) + " M" : "—", "", true),
@@ -263,7 +269,7 @@ function renderHighlight() {
     b.onclick = () => { hlOverlay = b.dataset.ov === "1"; try { localStorage.setItem("dash-hl-ov", hlOverlay ? "1" : "0"); } catch (e) { /* */ } renderHighlight(); };
   });
   $("hl-at").textContent = (h.recorded_ts != null ? `录制于 ${lt(h.recorded_ts)}（${TZ}）` : h.recorded_at ? `录制于 ${h.recorded_at.slice(5)}（${h.tz}）` : "") + (pending ? " · 有新的回放，暂停后切换" : "");
-  const parts = [`<b>${esc(h.run)}</b>`, h.k > 0 ? `TAS 第 ${num(h.k)} 帧接手` : "从头开始",
+  const parts = [`<b>${esc(h.run)}</b>${h.level ? " · " + levelName(h.level) : ""}`, h.k > 0 ? `TAS 第 ${num(h.k)} 帧接手` : "从头开始",
     `<b>${(h.sr_ms / 1000).toFixed(3)} 秒</b>${h.tas_ms ? `（TAS ${(h.tas_ms / 1000).toFixed(3)}）` : ""}`];
   $("hl-cap").innerHTML = parts.join(" · ");
   $("hl-cap").title = `第 ${num(h.update)} 次更新 · 原始尝试 ${h.backend || "—"}${h.episode_ts != null ? " " + lt(h.episode_ts) : h.episode_at ? " " + h.episode_at.slice(5) : ""} · ${h.matched ? "原版游戏复现一致" : "原版游戏复现不一致"}
@@ -274,6 +280,7 @@ function renderHighlight() {
 function renderSR() {
   const r = (S.sr || {})[sel];
   if (!r) { $("sr-head").innerHTML = `<p class="note">尚未计算（启动后约半分钟）。</p>`; return; }
+  $("sr-lv").textContent = levelName(r.level || LV());
   const b = r.benchmarks || {};
   const extra = r.alt ? r.shortcut_extra_s : 0;
   const est = (ratio) => (ratio == null ? null : +(b.tas / 1000 * ratio + extra * ratio).toFixed(2));
@@ -343,34 +350,34 @@ function renderSR() {
   }
   $("sr-table").innerHTML = t + "</tbody></table>";
 
-  const k0 = (S.k0 || []).filter((x) => x.run === sel || (r.runs_used || []).includes(x.run));
+  const k0 = (S.k0 || []).filter((x) => (x.run === sel || (r.runs_used || []).includes(x.run)) && (x.level || 1) === (r.level || LV()));
   if (!k0.length) $("k0").innerHTML = `<p class="note" style="margin:0">这个 run 还没有从头开始的原版评估。</p>`;
   else {
     let k = `<table><thead><tr><th>run</th><th>时间</th><th>更新</th><th>游戏</th><th>采样</th><th>局数</th><th>通关率</th><th>无死亡通关</th><th>每局死亡</th><th>SR 中位</th><th>SR 最佳</th></tr></thead><tbody>`;
     for (const x of k0) k += `<tr><td>${esc(x.run)}</td><td>${esc(x.ts != null ? lt(x.ts) : x.t || "")}</td><td>${num(x.update)}</td><td>${esc(x.backend)}</td><td>${x.greedy ? "贪心" : "温度 " + esc(x.temperature)}</td><td>${num(x.runs)}</td><td>${pct(x.success)}</td><td>${num(x.finished_no_death)}</td><td>${num(x.deaths_per_run, 1)}</td><td>${sec(x.sr_ms_median)}</td><td>${sec(x.sr_ms_min)}</td></tr>`;
     $("k0").innerHTML = k + "</tbody></table>";
   }
-  $("sr-note").innerHTML = `<details><summary>怎么算的</summary>比率 = 智能体从接手帧 k 跑到终点的用时 ÷ TAS 同一段的用时（TAS 在第 k 帧的计时 = (k − c0) × 1000 / 264，c0 = 20483 − 74446 × 0.264）。` +
-    `整关估计 = ${(b.tas / 1000).toFixed(3)} s × 比率${r.alt ? ` + 鬼躲石变约 ${r.shortcut_extra_s} s × 比率` : ""}；范围取局数 ≥ ${r.min_n} 且 TAS 剩余段 ≥ ${r.min_seg_s} s 的分箱的中位比率最小值到最大值（柱状图中亮色的柱子，竖线为 p10–p90）。` +
+  $("sr-note").innerHTML = `<details><summary>怎么算的</summary>${levelName(r.level || LV())}。比率 = 智能体从接手帧 k 跑到终点的用时 ÷ TAS 同一段的用时（TAS 在第 k 帧的计时取 TAS 记录自己逐帧的 SR 计时，整段 ${sec(r.tas_record_ms)}）。` +
+    `整关估计 = ${(b.tas / 1000).toFixed(3)} s × 比率${r.alt ? ` + ${esc(r.alt_name || "替代路线")}约 ${r.shortcut_extra_s} s × 比率` : ""}；范围取局数 ≥ ${r.min_n} 且 TAS 剩余段 ≥ ${r.min_seg_s} s 的分箱的中位比率最小值到最大值（柱状图中亮色的柱子，竖线为 p10–p90）。` +
     `这是外推：只统计无死亡的通关局，前段还没练到的部分按后段的比率估计，近终点分箱的段很短、噪声大，无头后端与原版游戏也略有差别；最终以从头开始的原版评估为准。</details>`;
 }
 
 /* --------------------------------------------------------------------------------- the maps */
-let geoReady = false;
-async function ensureGeo() {
-  if (geoReady) return true;
-  const g = await getPayload("geometry");
+const geoReady = {};  // level -> registered as map "L<level>"
+async function ensureGeo(lv) {
+  if (geoReady[lv]) return true;
+  const g = await getPayload(`geometry_l${lv}`);
   if (!g) return false;
   const ring = (r) => { const p = []; for (let i = 0; i < r.length; i += 2) p.push([r[i], r[i + 1]]); p.push(p[0]); return [p]; };
   const fc = { type: "FeatureCollection", features: ["walk", "steep", "rail"].map((k) => ({ type: "Feature", properties: { name: k }, geometry: { type: "MultiPolygon", coordinates: (g[k] || []).map(ring) } })) };
-  echarts.registerMap("L1", fc);
-  geoReady = true;
+  echarts.registerMap("L" + lv, fc);
+  geoReady[lv] = true;
   return true;
 }
 
-function geoBase(roam) {
+function geoBase(roam, lv) {
   return {
-    map: "L1", roam: roam ? true : false, aspectScale: 1, silent: true, zoom: 1.05, scaleLimit: { min: 0.8, max: 60 },
+    map: "L" + lv, roam: roam ? true : false, aspectScale: 1, silent: true, zoom: 1.05, scaleLimit: { min: 0.8, max: 60 },
     layoutCenter: ["50%", "50%"], layoutSize: "96%",
     itemStyle: { areaColor: "#cbbf9f", borderColor: "#7d6f52", borderWidth: 0.4 },
     regions: [{ name: "steep", itemStyle: { areaColor: "#5f6f88" } }, { name: "rail", itemStyle: { areaColor: "#c08a3e", borderColor: "#6b4a17" } }],
@@ -432,12 +439,15 @@ function tasSeries(F) {
 }
 
 async function renderFrontier(force, full) {
-  const F = await getPayload("frontier");
-  if (!F || !(await ensureGeo())) return;
+  const lv = LV(), fname = `frontier_l${lv}`;
+  const F = await getPayload(fname);
   const id = "m-frontier", ch = chart(id), box = $("t-frontier");
+  if (!F || !(await ensureGeo(lv))) { ch.clear(); ch._drawn = false; ch._v = null; return; }
   if (!box.dataset.wired) { box.innerHTML = roamToggle(id); wireRoam(box, id, () => renderFrontier(true, true)); box.dataset.wired = 1; }
-  if (!force && ch._v === P.frontier.v) return;
-  ch._v = P.frontier.v;
+  const key = fname + "@" + P[fname].v;
+  if (!force && ch._v === key) return;
+  if (ch._lv !== lv) full = true;  // another level: a new map, so a full redraw (apply() keeps the old geo otherwise)
+  ch._v = key; ch._lv = lv;
   const runs = [...new Set(F.history.map((h) => h.run))];
   const pt = (arr, extra) => arr.map((p) => ({ value: [p[0], p[1]], frame: p[2], label: p[3], ...extra }));
   const series = [
@@ -460,8 +470,8 @@ async function renderFrontier(force, full) {
       label: { show: true, formatter: (p) => `当前 ${p.data.frame}`, color: AMBER, fontWeight: "bold", fontSize: 13, position: "right", textBorderColor: "#000", textBorderWidth: 3 },
       tooltip: { formatter: (p) => `<b>当前（${p.data.run}）</b><br>第 ${p.data.frame} 帧<br>智能体已能接手全程的 ${p.data.covered_pct}%` } },
   ];
-  if (F.alt) series.splice(2, 0, { type: "lines", name: "鬼躲石变参考线", coordinateSystem: "geo", polyline: true, silent: true, z: 3, data: [{ coords: F.alt }], lineStyle: { color: "#7ed69a", width: 3, type: "dotted" } });
-  apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: series.map((s) => s.name) }, geo: { ...geoBase(roamOn[id]), top: 40 }, series }, full);
+  if (F.alt) series.splice(2, 0, { type: "lines", name: `${F.alt_name || "替代路线"}参考线`, coordinateSystem: "geo", polyline: true, silent: true, z: 3, data: [{ coords: F.alt }], lineStyle: { color: "#7ed69a", width: 3, type: "dotted" } });
+  apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: series.map((s) => s.name) }, geo: { ...geoBase(roamOn[id], lv), top: 40 }, series }, full);
 }
 
 function trajTooltip(d) {
@@ -524,13 +534,13 @@ function wirePick(ch, id, pickBox) {
 }
 
 async function renderAttempts(force, full) {
-  const name = "attempts_" + sel;
+  const name = "attempts_" + sel, lv = LV();
   const A = await getPayload(name);
-  const F = await getPayload("frontier");
+  const F = await getPayload(`frontier_l${lv}`);
   const id = "m-attempts", ch = chart(id), box = $("t-attempts"), st = mapState[id];
-  if (!A || !F || !(await ensureGeo())) { ch.clear(); ch._drawn = false; ch._run = null; box.innerHTML = "<span>这个 run 没有记录轨迹。</span>"; box.dataset.wired = ""; return; }
-  if (!force && box.dataset.shown === name + P[name].v) return;
-  box.dataset.shown = name + P[name].v;
+  if (!A || !F || !(await ensureGeo(lv))) { ch.clear(); ch._drawn = false; ch._run = null; box.innerHTML = "<span>这个 run 没有记录轨迹。</span>"; box.dataset.wired = ""; return; }
+  if (!force && box.dataset.shown === name + P[name].v + "@" + lv) return;
+  box.dataset.shown = name + P[name].v + "@" + lv;
   box.innerHTML = `<span>最新 ${A.traj.length} 局 / 共记录 ${A.total} 局</span>${outcomeChecks(id)}${roamToggle(id)}`;
   wireRoam(box, id, () => renderAttempts(true, true));
   box.querySelectorAll("[data-o]").forEach((c) => (c.onchange = () => { st.outcomes[c.dataset.o] = c.checked; box.dataset.shown = ""; renderAttempts(true); }));
@@ -538,18 +548,22 @@ async function renderAttempts(force, full) {
   const groups = Object.entries(OUT).filter(([k]) => st.outcomes[k]).map(([k, o]) => [o.n, o.c]);
   const series = [tasSeries(F), ...trajSeries(trs, (d) => (OUT[d.end] || OUT.stopped).c, (d) => (OUT[d.end] || OUT.stopped).n, groups), pickedSeries(st)];
   if (ch._run !== sel) { st.picked = null; $("p-attempts").textContent = "点击轨迹查看详情"; series[series.length - 1] = pickedSeries(st); }
-  apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: series.filter((s) => s.name !== "选中").map((s) => s.name) }, geo: { ...geoBase(roamOn[id]), top: 40 }, series }, full || ch._run !== sel);
+  apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: series.filter((s) => s.name !== "选中").map((s) => s.name) }, geo: { ...geoBase(roamOn[id], lv), top: 40 }, series }, full || ch._run !== sel);
   ch._run = sel;
   wirePick(ch, id, "p-attempts");
 }
 
 async function renderHistory(force, full) {
-  const H = await getPayload("history");
-  const F = await getPayload("frontier");
+  const lv = LV(), hname = `history_l${lv}`;
+  const H = await getPayload(hname);
+  const F = await getPayload(`frontier_l${lv}`);
   const id = "m-history", ch = chart(id), box = $("t-history"), st = mapState[id];
-  if (!H || !F || !(await ensureGeo())) return;
-  if (!force && box.dataset.shown === String(P.history.v)) return;
-  box.dataset.shown = String(P.history.v);
+  if (!H || !F || !(await ensureGeo(lv))) { ch.clear(); ch._drawn = false; ch._lv = null; box.innerHTML = "<span>这一关还没有记录轨迹的回合。</span>"; box.dataset.shown = ""; return; }
+  const key = hname + "@" + P[hname].v;
+  if (!force && box.dataset.shown === key) return;
+  box.dataset.shown = key;
+  if (ch._lv !== lv) { full = true; st.picked = null; $("p-history").textContent = "颜色越亮越新 · 点击轨迹查看详情"; }
+  ch._lv = lv;
   const ts = H.traj.map((d) => d.ts);
   const tmin = Math.min(...ts), tmax = Math.max(...ts), span = Math.max(1, tmax - tmin);
   const hrs = (t) => ((t - tmin) / 3600).toFixed(1);
@@ -567,7 +581,7 @@ async function renderHistory(force, full) {
   const groups = H.runs.map((r) => [r, runColor(r)]);
   const series = [tasSeries(F), ...trajSeries(trs, (d) => plasma((d.ts - tmin) / span), (d) => d.run, groups), pickedSeries(st)];
   apply(ch, {
-    animation: false, tooltip: TT, legend: { ...LEG, data: series.filter((s) => s.name !== "选中").map((s) => s.name) }, geo: { ...geoBase(roamOn[id]), top: 40 }, series,
+    animation: false, tooltip: TT, legend: { ...LEG, data: series.filter((s) => s.name !== "选中").map((s) => s.name) }, geo: { ...geoBase(roamOn[id], lv), top: 40 }, series,
     visualMap: { type: "continuous", show: true, min: 0, max: +(span / 3600).toFixed(1), seriesIndex: [], calculable: false, orient: "horizontal", right: 10, bottom: 6, itemWidth: 10, itemHeight: 120,
       text: ["新", "旧（小时）"], textStyle: { color: INK, fontSize: 11 }, inRange: { color: [0, 0.25, 0.5, 0.75, 1].map(plasma) } },
   }, full);
@@ -577,10 +591,13 @@ async function renderHistory(force, full) {
 /* ----------------------------------------------------------------------------------- curves */
 let curveMode = { log: true };
 async function renderCurves(force, full) {
-  const C = await getPayload("curves");
-  const F = await getPayload("frontier");
-  if (!C) return;
+  const C0 = await getPayload("curves");
+  const lv = LV();
+  const F = await getPayload(`frontier_l${lv}`);
+  if (!C0) return;
   const id = "c-curves", ch = chart(id), box = $("t-curves");
+  // runs of the selected run's level only: the frontier is a frame of that level's TAS record
+  const C = Object.fromEntries(Object.entries(C0).filter(([, d]) => (d.level || 1) === lv));
   const runs = Object.keys(C);
   if (!box.dataset.wired) {
     box.innerHTML = `<button type="button" class="tbtn${curveMode.log ? " on" : ""}" data-c="log">横轴对数</button>
@@ -593,8 +610,10 @@ async function renderCurves(force, full) {
     }));
     box.dataset.wired = 1;
   }
-  if (!force && box.dataset.shown === String(P.curves.v)) return;
-  box.dataset.shown = String(P.curves.v);
+  if (!force && box.dataset.shown === P.curves.v + "@" + lv) return;
+  if (ch._lv !== lv) full = true;
+  ch._lv = lv;
+  box.dataset.shown = P.curves.v + "@" + lv;
   const panels = [
     ["frontier", "课程开局点（TAS 帧）"], ["band", "开局区间成功率"], ["finish", "回合通关率"], ["entropy", "策略熵"], ["sps", "每秒步数"],
   ];
@@ -604,7 +623,7 @@ async function renderCurves(force, full) {
   const grids = panels.map((p, i) => ({ left: 58, right: 14, top: top0 + i * (ph + gap), height: ph }));
   const xAxis = panels.map((p, i) => ({ type: curveMode.log ? "log" : "value", gridIndex: i, min: "dataMin", max: "dataMax", axisLabel: { show: i === n - 1, color: MUTED, formatter: (v) => (v >= 1 ? (+v).toFixed(0) : (+v).toPrecision(1)) + (i === n - 1 ? " M" : "") }, axisLine: { lineStyle: { color: BRASS } }, splitLine: { show: false }, name: i === n - 1 ? "训练步数（百万）" : "", nameLocation: "middle", nameGap: 26, nameTextStyle: { color: MUTED } }));
   const yAxis = panels.map((p, i) => ({ type: "value", gridIndex: i, name: p[1], nameTextStyle: { color: AMBER, align: "left", fontSize: 12 }, nameGap: 6, axisLabel: { color: MUTED, fontSize: 10.5 }, splitLine: { lineStyle: { color: "rgba(255,220,150,.07)" } },
-    ...(i === 0 ? { min: 0, max: 20500 } : i === 1 || i === 2 ? { min: 0, max: 1 } : { scale: true }) }));
+    ...(i === 0 ? { min: 0, max: F && F.n ? Math.ceil(F.n / 500) * 500 : 20500 } : i === 1 || i === 2 ? { min: 0, max: 1 } : { scale: true }) }));
   const series = [];
   panels.forEach(([k], i) => {
     for (const r of runs) {
@@ -641,8 +660,9 @@ async function renderCurves(force, full) {
 }
 
 function zoomCurves(mode) {
-  const C = P.curves && P.curves.data, ch = charts["c-curves"];
-  if (!C || !ch) return;
+  const C0 = P.curves && P.curves.data, ch = charts["c-curves"];
+  if (!C0 || !ch) return;
+  const C = Object.fromEntries(Object.entries(C0).filter(([, d]) => (d.level || 1) === LV()));
   if (mode === "all") { ch.dispatchAction({ type: "dataZoom", start: 0, end: 100 }); return; }
   const d = C[sel];
   if (!d) return;

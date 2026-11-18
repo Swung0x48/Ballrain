@@ -26,17 +26,16 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[2]
 MAC_DIR = ROOT / "runtime" / "m2-train-mac"
 PC_DIR = ROOT / "runtime" / "m2-train"
-TAS_TRACE = ROOT / "runtime" / "datasets" / "tas-v1" / "SR01_1_14_457_264" / "trace.txt"
-REF_TAS = ROOT / "benchmarks" / "refpaths" / "L01.npz"
-REF_ALT = ROOT / "runtime" / "refpaths-alt" / "L01.npz"
+DATASET = ROOT / "runtime" / "datasets" / "tas-v1"
+REFPATHS = ROOT / "benchmarks" / "refpaths"
 RECORDS = ROOT / "benchmarks" / "records.json"
+# default start record per level: mirrors scripts/train_m2.py RECORDS (checked by tests/test_dashboard_levels.py)
+LEVEL_RECORDS = {1: "SR01_1_14_457_264", 2: "SR02_1_28_992_264"}
+RECORD_RE = re.compile(r"^SR(\d\d)_\d+_\d\d_\d{3}_\d{3}$")
 
-TAS_TOTAL_MS = 74446
-TAS_END_FRAME = 20483
-C0 = TAS_END_FRAME - TAS_TOTAL_MS * 0.264  # frame at which the SR timer reads 0 on the TAS line
-SHORTCUT_EXTRA_S = 3.0
+SHORTCUT_EXTRA_S = 3.0  # level 1 (鬼躲石变) when a run does not record its split_extra
 SR_WINDOW_UPDATES = 1500
-SR_BIN_EDGES = list(range(0, 20000, 2000)) + [TAS_END_FRAME + 1]
+SR_BIN_FRAMES = 2000
 SR_MIN_N = 10
 SR_MIN_SEG_S = 10.0  # bins whose remaining TAS segment is shorter are too noisy for the range
 DEFAULT_MAC_OFFSET_H = 12.0  # Mac log clock minus PC clock, used when it cannot be measured
@@ -199,19 +198,117 @@ def run_config(run: Run) -> dict:
         return {}
 
 
+# ------------------------------------------------------------------------------------- levels
+
+def record_ok(record, level: int | None = None) -> bool:
+    """A TAS record name as the dataset spells it (SR<level>_...), of `level` when given, present on this machine."""
+    m = RECORD_RE.match(str(record or ""))
+    if not m or (level is not None and int(m.group(1)) != int(level)):
+        return False
+    return (DATASET / str(record) / "starts.npz").is_file()
+
+
+def run_level(run: Run) -> dict:
+    """{"level", "record"} of a run from its config (args --level / --record; runs before r8 have neither: level 1).
+    The config is mirrored from the training machine, so the record must be a dataset record of that level."""
+    c = run_config(run)
+    try:
+        level = int(c.get("level") or 1)
+    except (TypeError, ValueError):
+        level = 1
+    if not 1 <= level <= 13:
+        level = 1
+    rec = c.get("record") or LEVEL_RECORDS.get(level)
+    if not record_ok(rec, level):
+        rec = LEVEL_RECORDS.get(level) if record_ok(LEVEL_RECORDS.get(level), level) else None
+    return {"level": level, "record": rec}
+
+
+def _local_dir(path_dir) -> Path | None:
+    """A config's path_dir on this checkout: repo-relative as stored since r7, or another machine's absolute path
+    mapped by its runtime/... suffix (r5, r6)."""
+    if not path_dir:
+        return None
+    p = str(path_dir).replace("\\", "/")
+    m = re.search(r"(?:^|/)(runtime/.+|benchmarks/.+)$", p)
+    if m:
+        return ROOT / m.group(1)
+    q = Path(p)
+    return None if q.is_absolute() else ROOT / q
+
+
+def ref_line(run: Run) -> Path:
+    """The run's reference line: <path_dir>/L0N.npz, else benchmarks/refpaths/L0N.npz."""
+    name = f"L{run_level(run)['level']:02d}.npz"
+    d = _local_dir(run_config(run).get("path_dir"))
+    if d is not None and (d / name).is_file():
+        return d / name
+    return REFPATHS / name
+
+
 def run_uses_alt(run: Run) -> bool:
-    return "refpaths-alt" in str(run_config(run).get("path_dir") or "")
+    """The run follows another reference line than the TAS one (L1: runtime/refpaths-alt, 鬼躲石变)."""
+    p = ref_line(run)
+    return p.is_file() and p.resolve() != (REFPATHS / p.name).resolve()
+
+
+def alt_name(level: int) -> str:
+    return "鬼躲石变" if int(level) == 1 else "替代路线"
 
 
 def shortcut_extra_s(run: Run) -> float:
     """Extra seconds of the alternative route over the TAS line, from the run's own split_extra setting
-    ([[from_frame, to_frame, seconds], ...]); SHORTCUT_EXTRA_S only if the run does not record it."""
+    ([[from_frame, to_frame, seconds], ...]); SHORTCUT_EXTRA_S (level 1) only if the run does not record it."""
+    dflt = SHORTCUT_EXTRA_S if run_level(run)["level"] == 1 else 0.0
     v = run_config(run).get("split_extra")
     try:
         v = json.loads(v) if isinstance(v, str) else v
-        return round(sum(float(x[2]) for x in v), 2) if v else SHORTCUT_EXTRA_S
+        return round(sum(float(x[2]) for x in v), 2) if v else dflt
     except Exception:
-        return SHORTCUT_EXTRA_S
+        return dflt
+
+
+class TasClock:
+    """The TAS record's own SR timer by frame (starts.npz: frames_done -> sr_double, BML+ 0.3.12 sum), its final
+    time and LevelFinish frame, and the dashboard's start-frame bins for it."""
+
+    def __init__(self, record: str):
+        z = np.load(DATASET / record / "starts.npz", allow_pickle=False)
+        o = np.argsort(z["frames_done"])
+        self.record, self.level = record, int(record[2:4])
+        self.fd = np.asarray(z["frames_done"], np.float64)[o]
+        self.sr = np.asarray(z["sr_double"], np.float64)[o]
+        self.total_ms = int(math.trunc(float(z["sr_final"])))
+        self.end_frame = int(z["levelfinish_frame"])
+        self.bins = list(range(0, self.end_frame // SR_BIN_FRAMES * SR_BIN_FRAMES, SR_BIN_FRAMES)) + [self.end_frame + 1]
+
+    def ms(self, k):
+        """TAS SR timer at frame(s) k (0 before the spawn; past the last start frame it runs on at 1000/264 ms)."""
+        k = np.asarray(k, dtype=float)
+        v = np.interp(k, self.fd, self.sr, left=0.0)
+        return np.where(k > self.fd[-1], self.sr[-1] + (k - self.fd[-1]) * 1000.0 / 264.0, v)
+
+
+_CLOCKS: dict = {}
+
+
+def tas_clock(record: str | None = None) -> TasClock:
+    record = record or LEVEL_RECORDS[1]
+    if record not in _CLOCKS:
+        _CLOCKS[record] = TasClock(record)
+    return _CLOCKS[record]
+
+
+def bin_edges(record: str | None) -> list[int]:
+    """Start-frame bin edges of a TAS record; level 1's when the dataset is not on this machine."""
+    try:
+        return tas_clock(record).bins
+    except OSError:
+        return list(range(0, 20000, SR_BIN_FRAMES)) + [20588]
+
+
+def tas_trace(record: str) -> Path:
+    return DATASET / record / "trace.txt"
 
 
 def n_actions(c: dict) -> int:
@@ -294,9 +391,10 @@ def ts_from_label(at, tz) -> int | None:
 
 # ---------------------------------------------------------------------------------- status
 
-def run_status(run: Run, off_h: float, level_n: int, machines: dict) -> dict:
+def run_status(run: Run, off_h: float, L, machines: dict) -> dict:
+    """L: the run's Level (geometry.Level; None while it is not loaded yet: no covered share then)."""
     lines = log_lines(run)
-    st: dict = {"run": run.name, "machine": machines["train" if run.remote else "eval"]}
+    st: dict = {"run": run.name, "machine": machines["train" if run.remote else "eval"], "level": run_level(run)["level"]}
     cfg = run_config(run)
     if cfg.get("advance_at") is not None:
         st["advance_at"] = float(cfg["advance_at"])
@@ -339,8 +437,8 @@ def run_status(run: Run, off_h: float, level_n: int, machines: dict) -> dict:
             st["finish_tas_avg20"] = _num(tail["finish_tas"].mean())
         if "band_success" in u:
             st["band_success_avg20"] = _num(tail["band_success"].mean())
-        if st.get("frontier") is not None:
-            st["covered_pct"] = round(100 * (level_n - st["frontier"]) / (level_n - 936), 1)
+        if st.get("frontier") is not None and L is not None:
+            st["covered_pct"] = round(100 * (L.n - st["frontier"]) / (L.n - L.first), 1)
     e = read_many(run.files("episodes*.csv"), usecols=["update", "backend", "steps", "host", "finish", "sr_ms_end",
                                                        "start_frame"], dedup=None)
     # best full-level time among finishes that started near the current curriculum frontier: the trainer's own
@@ -457,10 +555,13 @@ def curriculum_text(msg: str) -> str:
 
 # ---------------------------------------------------------------------------- frontier history
 
-def frontier_history(runs, off_h) -> list[dict]:
+def frontier_history(runs, off_h, record: str | None = None) -> list[dict]:
+    """Curriculum frontier moves of the runs (only those on TAS record `record` when given: frames of one level)."""
     out = []
     for r in runs:
         if r.num < 2:
+            continue
+        if record is not None and run_level(r)["record"] != record:
             continue
         for line in log_lines(r):
             m = LOG_RE.match(line)
@@ -474,6 +575,8 @@ def frontier_history(runs, off_h) -> list[dict]:
 
 
 def frontier_payload(L, runs, off_h, cur_run, cur, show_alt: bool) -> dict:
+    """The curriculum map of level L: its TAS line, checkpoints, the frontier moves of the runs on its record and
+    the current frontier of `cur_run` (the level's latest run)."""
     pos, ok, n = L.pos, L.ok, L.n
     tas = ok[::3]
     xz = lambda i: [round(float(pos[i, 0]), 2), round(float(pos[i, 2]), 2)]  # noqa: E731
@@ -485,15 +588,17 @@ def frontier_payload(L, runs, off_h, cur_run, cur, show_alt: bool) -> dict:
         "start": xz(ok[0]) + [int(ok[0]), "出生点"],
         "end": xz(n - 1) + [int(n - 1), "飞船"],
         "history": [dict(h, x=xz(min(h["frame"], n - 1))[0], z=xz(min(h["frame"], n - 1))[1])
-                    for h in frontier_history(runs, off_h)],
+                    for h in frontier_history(runs, off_h, L.record)],
         "current": {"run": cur_run, "frame": int(cur), "x": xz(min(cur, n - 1))[0], "z": xz(min(cur, n - 1))[1],
-                    "covered_pct": round(100 * (n - cur) / (n - 936), 1)},
-        "alt": None,
+                    "covered_pct": round(100 * (n - cur) / (n - L.first), 1)},
+        "alt": None, "alt_name": alt_name(L.level),
+        "level": L.level, "n": int(n), "end_frame": int(L.clock.end_frame),
     }
-    if show_alt and REF_ALT.exists():
+    cr = next((r for r in runs if r.name == cur_run), None)
+    if show_alt and cr is not None and run_uses_alt(cr):
         try:
-            A = np.load(REF_ALT)["points"]  # line geometry only
-            T = np.load(REF_TAS)["points"]
+            A = np.load(ref_line(cr))["points"]  # line geometry only
+            T = np.load(REFPATHS / f"L{L.level:02d}.npz")["points"]
             d = np.min(np.linalg.norm(A[:, None, [0, 2]] - T[None, ::4, [0, 2]], axis=2), axis=1)
             idx = np.flatnonzero(d > 1.0)
             if len(idx):
@@ -525,7 +630,7 @@ def curves_payload(runs, machines) -> dict:
             return [None if math.isnan(x) else round(float(x), nd) for x in v]
 
         out[r.name] = {
-            "machine": machines["train" if r.remote else "eval"], "smooth": w,
+            "machine": machines["train" if r.remote else "eval"], "smooth": w, "level": run_level(r)["level"],
             "update": [int(x) for x in d["update"].to_numpy()[sel]],
             "steps": col(d["steps"] / 1e6, 4),
             "frontier": col(d["frontier"], 0),
@@ -540,15 +645,24 @@ def curves_payload(runs, machines) -> dict:
 
 # ----------------------------------------------------------------------------------- SR estimate
 
-def tas_ms(k):
-    return (np.asarray(k, dtype=float) - C0) * 1000.0 / 264.0
+def tas_ms(k, record: str | None = None):
+    """TAS SR timer at frame k of the record (level 1 by default): the record's own sr_double by frame."""
+    return tas_clock(record).ms(k)
 
 
-def benchmarks() -> dict:
-    b = {"tas": TAS_TOTAL_MS, "human_wr": 75853, "featured": 83499, "threshold": 92999}
+# used when benchmarks/records.json lacks a value (same numbers as the table; TAS = BML+ 0.3.12 timer)
+BENCH_DEFAULTS = {1: {"tas": 74446, "human_wr": 75853, "featured": 83499, "threshold": 92999},
+                  2: {"tas": 88977, "human_wr": 96382, "featured": 143499, "threshold": 158499}}
+
+
+def benchmarks(level: int = 1) -> dict:
+    """SR thresholds of a level from benchmarks/records.json: TAS (current record, BML+ 0.3.12 timer), human record,
+    精品线 and 上榜线 (values only, no player names)."""
+    level = int(level)
+    b = dict(BENCH_DEFAULTS.get(level) or {"tas": None, "human_wr": None, "featured": None, "threshold": None})
     try:
         for r in json.loads(RECORDS.read_text(encoding="utf-8")):
-            if r.get("level") != 1 or r.get("category") != "SR":
+            if r.get("level") != level or r.get("category") != "SR":
                 continue
             k = r.get("kind")
             if k == "tas" and r.get("is_current_record"):
@@ -565,16 +679,22 @@ def benchmarks() -> dict:
 
 
 def sr_estimate(runs, sel: str) -> dict:
+    """Full-level SR estimate of run `sel` (pooled with the run before it when that one ran the same TAS record)."""
     m = mac_runs(runs)
     names = [r.name for r in m]
     if sel not in names:
         return {"error": "无数据"}
     i = names.index(sel)
-    use = m[max(0, i - 1): i + 1]
+    lv = run_level(m[i])
+    if lv["record"] is None:
+        return {"error": "无数据", "level": lv["level"]}
+    use = [r for r in m[max(0, i - 1): i + 1] if run_level(r)["record"] == lv["record"]]
+    clk = tas_clock(lv["record"])
     cols = ["update", "end_reason", "sr_ms", "start_frame", "deaths", "invalid", "copy"]
     parts = [d for d in (read_many(r.files("runs*.csv"), usecols=cols, dedup=None) for r in use) if d is not None]
-    out: dict = {"runs_used": [r.name for r in use], "window": SR_WINDOW_UPDATES, "bins": [],
-                 "benchmarks": benchmarks(), "alt": run_uses_alt(m[i]),
+    out: dict = {"runs_used": [r.name for r in use], "window": SR_WINDOW_UPDATES, "bins": [], "level": lv["level"],
+                 "benchmarks": benchmarks(lv["level"]), "alt": run_uses_alt(m[i]), "alt_name": alt_name(lv["level"]),
+                 "tas_record_ms": clk.total_ms, "end_frame": clk.end_frame,
                  "shortcut_extra_s": shortcut_extra_s(m[i]), "min_n": SR_MIN_N, "min_seg_s": SR_MIN_SEG_S}
     if not parts:
         out["error"] = "无数据"
@@ -598,17 +718,17 @@ def sr_estimate(runs, sel: str) -> dict:
     if not len(d):
         return out
     k = d["start_frame"].to_numpy(float)
-    tk = tas_ms(k)
-    seg_tas = TAS_TOTAL_MS - tk
+    tk = clk.ms(k)
+    seg_tas = clk.total_ms - tk
     seg_agent = d["sr_ms"].to_numpy(float) - tk
     good = seg_tas > 200
     d["ratio"] = np.where(good, seg_agent / np.where(good, seg_tas, 1), np.nan)
     keep = []
-    for a, b in zip(SR_BIN_EDGES[:-1], SR_BIN_EDGES[1:]):
+    for a, b in zip(clk.bins[:-1], clk.bins[1:]):
         r = d[(d["start_frame"] >= a) & (d["start_frame"] < b) & d["ratio"].notna()]["ratio"].to_numpy()
-        mid = min((a + b) / 2, TAS_END_FRAME)
-        row = {"lo": a, "hi": min(b, TAS_END_FRAME), "n": int(len(r)),
-               "tas_seg_s": round(float(TAS_TOTAL_MS - tas_ms(mid)) / 1000, 1)}
+        mid = min((a + b) / 2, clk.end_frame)
+        row = {"lo": a, "hi": min(b, clk.end_frame), "n": int(len(r)),
+               "tas_seg_s": round(float(clk.total_ms - clk.ms(mid)) / 1000, 1)}
         if len(r):
             row["median"] = round(float(np.median(r)), 3)
             row["p10"] = round(float(np.percentile(r, 10)), 3)
@@ -624,6 +744,13 @@ def sr_estimate(runs, sel: str) -> dict:
         out["estimate_s"] = [round(tas_s * lo + extra * lo, 1), round(tas_s * hi + extra * hi, 1)]
         out["ratio_range"] = [lo, hi]
     return out
+
+
+def _level_of_name(name: str) -> int:
+    for base in (MAC_DIR, PC_DIR):
+        if (base / name / "config.json").is_file():
+            return run_level(Run(name, base / name, base == MAC_DIR))["level"]
+    return 1
 
 
 def k0_evals() -> list[dict]:
@@ -647,7 +774,7 @@ def k0_evals() -> list[dict]:
                 continue
             if str(j.get("backend")) != "retail":  # this table is the original game only
                 continue
-            rows.append({"run": run, "update": j.get("update"),
+            rows.append({"run": run, "update": j.get("update"), "level": _level_of_name(run),
                          "backend": BACKEND_LABEL.get(str(j.get("backend")), "其他"),
                          "greedy": bool(j.get("greedy")), "temperature": j.get("temperature"),
                          "runs": p.get("runs"), "success": p.get("success"),
@@ -661,18 +788,19 @@ def k0_evals() -> list[dict]:
 # -------------------------------------------------------------------------------- traced runs
 
 OUTCOME = {"LevelFinish": "finish", "GameOver": "gameover"}
+BALLS = ("Ball_Wood", "Ball_Stone", "Ball_Paper")
 
 
 class Traces:
     """Index of traced episodes (small json) + a disk cache of parsed, downsampled agent paths."""
 
-    CACHE_VERSION = 3
+    CACHE_VERSION = 4  # 4: any Ball_* line (level 2 switches to the paper ball), TAS line per record
 
     def __init__(self, cache_file: Path):
         self.cache_file = cache_file
         self.meta: dict = {}     # json path -> (sig, info)   (paths stay server-side)
         self.parsed: dict = {}   # json path -> (sig, parsed)
-        self._tas = None
+        self._tas: dict = {}
         try:
             with open(cache_file, "rb") as f:
                 c = pickle.load(f)
@@ -681,35 +809,37 @@ class Traces:
         except Exception:
             self.parsed = {}
 
-    def tas(self):
-        if self._tas is None:
-            fr, P = self._load(TAS_TRACE)
+    def tas(self, record: str | None = None):
+        record = record or LEVEL_RECORDS[1]
+        if record not in self._tas:
+            fr, P = self._load(tas_trace(record))
             o = np.argsort(fr)
-            self._tas = (fr[o], P[o])
-        return self._tas
+            self._tas[record] = (fr[o], P[o])
+        return self._tas[record]
 
     @staticmethod
     def _load(p: Path):
         fr, P = [], []
         with open(p, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if " Ball_Wood " not in line:
+            for line in f:  # the player ball, whichever kind it is (wood / stone / paper)
+                if " Ball_" not in line:
                     continue
                 s = line.split()
-                if len(s) >= 14 and s[1] == "Ball_Wood":
+                if len(s) >= 14 and s[1] in BALLS:
                     fr.append(int(s[0]))
                     P.append((float(s[11]), float(s[12]), float(s[13])))
         return np.asarray(fr, dtype=np.int64), np.asarray(P, dtype=np.float64).reshape(-1, 3)
 
     def index(self, run: Run) -> list[dict]:
         out = []
+        rec = run_level(run)["record"]
         for j in run.files("episodes-traced/*/*/*.json"):
             p = Path(j)
             if not p.with_name("trace.txt").exists():
                 continue
             s = _sig(p)
             hit = self.meta.get(j)
-            if hit and hit[0] == s:
+            if hit and hit[0] == s and hit[1].get("record") == rec:
                 out.append(hit[1])
                 continue
             try:
@@ -719,7 +849,7 @@ class Traces:
             h = zlib.crc32(p.stem.encode())
             info = {"key": j, "id": f"{h:08x}", "run": run.name, "end": OUTCOME.get(d.get("end_reason"), "stopped"),
                     "sr": d.get("sr_ms"), "t": float(d.get("started_at") or 0), "h": h / 2 ** 32,
-                    "backend": BACKEND_LABEL.get(str(d.get("backend")), "其他")}
+                    "backend": BACKEND_LABEL.get(str(d.get("backend")), "其他"), "record": rec}
             self.meta[j] = (s, info)
             out.append(info)
         out.sort(key=lambda r: r["t"])
@@ -729,8 +859,11 @@ class Traces:
         j = info["key"]
         tp = Path(j).with_name("trace.txt")
         s = _sig(tp)
+        rec = info.get("record")
+        if rec is None:
+            return None
         hit = self.parsed.get(j)
-        if hit and hit[0] == s:
+        if hit and hit[0] == (s, rec):
             return hit[1]
         try:
             fr, P = self._load(tp)
@@ -738,7 +871,7 @@ class Traces:
             return None
         if len(fr) < 100:
             return None
-        tfr, tP = self.tas()
+        tfr, tP = self.tas(rec)
         idx = np.clip(np.searchsorted(tfr, fr), 0, len(tfr) - 1)
         same = (tfr[idx] == fr) & np.all(tP[idx] == P, axis=1)
         bad = np.flatnonzero(~same)
@@ -751,7 +884,7 @@ class Traces:
         segs = [s_[:, [0, 2]].astype(np.float32) for s_ in np.split(Q, cut) if len(s_)]
         res = {"k": k, "segs": segs, "deaths": [(float(Q[i - 1, 0]), float(Q[i - 1, 2]), int(F[i - 1])) for i in cut],
                "start": (float(Q[0, 0]), float(Q[0, 2])), "end_frame": int(F[-1])}
-        self.parsed[j] = (s, res)
+        self.parsed[j] = ((s, rec), res)
         return res
 
     def save(self, keep_keys):

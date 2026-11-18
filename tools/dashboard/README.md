@@ -20,7 +20,10 @@ uv run python tools/dashboard/server.py --host 127.0.0.1 --tensorboard-url /tens
 
 工作方式：后台线程每 10 分钟读一次训练输出，把地图 / 曲线 / SR 估计算成 JSON（gzip）写到 `runtime/dashboard/`（不提交）；
 页面每 60 秒拉一次 `/api/status`，数据版本变了才重新下载对应 JSON，全部图表在浏览器里用 ECharts 绘制（缩放、悬停、图例开关、点击高亮）。
-关卡俯视轮廓只在第一次启动时由 TAS 记录重建一次，缓存在 `runtime/dashboard/cache/`。启动时从本机游戏拷贝的 `Textures/`
+每个 run 的关卡与 TAS 记录取自它的 `config.json`（`level` / `record`，r8 之前的 run 没有这两项，按第 1 关），
+页面上选中的 run 决定地图、TAS 轨迹、盘点、SR 计时与基准线（TAS / 人类纪录 / 精品线 / 上榜线，来自 `benchmarks/records.json`）显示哪一关；
+训练曲线与历史抽样只画同一关的 run，SR 估计只合并同一条 TAS 记录的 run。TAS 在第 k 帧的计时取 TAS 记录自己逐帧的 SR 计时（`starts.npz`）。
+每一关的俯视轮廓和 TAS 轨迹只在第一次用到时由该关的 TAS 记录重建一次，缓存在 `runtime/dashboard/cache/`。启动时从本机游戏拷贝的 `Textures/`
 复制几张贴图（天空、木板、地砖、菜单按钮、菜单字体）到 `runtime/dashboard/assets/`，游戏素材不进 git；找不到时页面退回纯色。
 进程自动降低 CPU 优先级，只读训练输出，不启动游戏，不碰训练进程。
 

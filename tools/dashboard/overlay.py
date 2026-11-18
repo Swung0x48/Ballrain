@@ -164,6 +164,14 @@ def env_replay(run, row: dict, meta: dict, frames: np.ndarray, k: int, out: Path
         raise RuntimeError("no checkpoint of the run")
     ck = torch.load(ckp, weights_only=False)
     a = ck["args"]
+    # the env comes from the checkpoint: it must be the run's level and start record (config --level / --record)
+    import data as D
+    want = D.run_level(run)
+    ec0 = ck.get("env_config") or {}
+    got_level, got_rec = int(ec0.get("level") or 1), ec0.get("start_record") or D.LEVEL_RECORDS[1]
+    if got_level != want["level"] or (want["record"] and got_rec != want["record"]):
+        raise RuntimeError(f"checkpoint env is level {got_level} / {got_rec}, the run is level {want['level']} / "
+                           f"{want['record']}")
     hidden = tuple(int(x) for x in str(a.get("hidden", "256,256")).split(",") if x.strip())
     model = ActorCritic(int(ck["n_obs"]), int(ck["n_act"]), hidden, a.get("activation", "tanh"))
     model.load_state_dict(ck["model"])
@@ -471,8 +479,9 @@ class Panel:
         d.rounded_rectangle([x0 - 4, 10, x0 + 128, 38], radius=5, fill=(30, 22, 8) if col == AMBER else (14, 22, 44),
                             outline=col, width=2)
         d.text((x0 + 62, 24), mode, font=self.fb[16], fill=col, anchor="mm")
-        d.text((PANEL_W - 14, 16), f"{self.pub['run']} · 第 {self.pub['update']} 次更新", font=self.f[12], fill=MUTED,
-               anchor="ra")
+        lv = f"第 {self.pub['level']} 关 · " if self.pub.get("level") else ""
+        d.text((PANEL_W - 14, 16), f"{self.pub['run']} · {lv}第 {self.pub['update']} 次更新", font=self.f[12],
+               fill=MUTED, anchor="ra")
         d.text((PANEL_W - 14, 31), f"从 TAS 第 {self.k} 帧接手", font=self.f[12], fill=MUTED, anchor="ra")
         # tick / step / SR
         y = 48
