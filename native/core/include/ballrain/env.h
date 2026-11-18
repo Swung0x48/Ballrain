@@ -60,6 +60,7 @@ struct RestStart {
     // the stone branch's at-rest start (env._branch_rest): replay <branch_dir>/drive.npz's verified key stream from the
     // prefix frame through the trafo to this arc length of the branch line, drive onto it and brake
     std::optional<double> branch_s;
+    std::string branch_id;  // wire v2: the member (TASK.rest.branch_id; "" = the unique legacy member)
     static std::optional<RestStart> from_json(const Json *rest);  // nullptr / null: no at-rest start
 };
 
@@ -71,6 +72,8 @@ struct StartInfo {
     int handover_mismatches = 0;
     int64_t drive_frames = 0, rest_frames = 0;
     std::optional<double> branch_s;
+    std::string branch_id;  // wire v2: the verified member and phase (env._branch_rest)
+    int branch_phase = -1;
     // env._prepare: a failed branch drive relaunches a normal TAS start at the same frame (kind "tas")
     int branch_rest_failures = 0;  // the env's running count (env.branch_rest_failures), set on a fallback start
     std::optional<double> branch_rest_target;
@@ -88,6 +91,9 @@ struct StepInfo {
     // env._info with a branch: the route's branch / local_s / reference clock, else the branch's last timing
     bool has_branch = false, branch = false;
     bool has_local_s = false;  // local_s comes with a projection only (not with the branch's last timing)
+    bool branch_multi = false;  // wire v2 (env._info branch_id / phase)
+    std::string branch_id;
+    int branch_phase = -1;
     double local_s = 0, ref_elapsed_ms = 0, ref_remaining_ms = 0;
     std::optional<std::string> error;
     FeatureInfo feat;
@@ -134,7 +140,11 @@ private:
     void drive(const RestStart &r, const BranchRules &rules = BranchRules());
     void brake(const BranchRules &rules = BranchRules());
     BranchRules branch_rules_;  // the installed branch's rules (env.branch_rules), the defaults without a branch
-    void branch_rest(double station);
+    void branch_rest(double station, const std::string &branch_id);
+    const BranchRules &rest_rules(const std::string &branch_id);  // env._rules_for_rest
+    std::string rest_branch_id_;  // the verified member / phase of the last branch_rest (StartInfo)
+    int rest_branch_phase_ = -1;
+    BranchRules rest_rules_cache_;
     void intro();
     void finish_process();
     std::vector<float> features(StepInfo *info);

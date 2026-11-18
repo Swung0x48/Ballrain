@@ -49,9 +49,9 @@ public:
                        double margin, double reacquire) const;
     V3 point_at(double s) const;
     std::optional<double> speed_at(double s, double half = 2.5) const;
+    void segments(double s_lo, double s_hi, int64_t &i0, int64_t &i1) const;  // ReferencePath._segments: [i0, i1)
 
 private:
-    void segments(double s_lo, double s_hi, int64_t &i0, int64_t &i1) const;
     std::vector<V3> tan_;
 };
 
@@ -66,6 +66,12 @@ public:
         return r;
     }
     std::shared_ptr<const ReferencePath> path;
+    // the follower's continuity state and window (multi_branch.MultiFollower.project reads them, restore sets s_prev)
+    const std::optional<double> &s_prev() const { return s_prev_; }
+    void set_s_prev(double s) { s_prev_ = s; }
+    double back() const { return back_; }
+    double ahead() const { return ahead_; }
+    double reacquire() const { return reacquire_; }
 
 private:
     double back_, ahead_, margin_, reacquire_;

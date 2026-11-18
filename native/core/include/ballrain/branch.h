@@ -8,6 +8,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -45,26 +46,42 @@ struct BranchStep {
     double local_s = 0;                   // arc length on the active line
     bool branch = false;
     double ref_elapsed_ms = 0, ref_remaining_ms = 0;
+    // multi-branch (wire v2) only: the active member id ("" on the main line) and its phase (-1 on the main line)
+    bool multi = false;
+    std::string branch_id;
+    int phase = -1;
 };
 
 struct BranchTiming {  // branch.timing (env info when no ball is visible: transforms, finish)
     bool set = false, branch = false;
     double ref_elapsed_ms = 0, ref_remaining_ms = 0;
+    bool multi = false;
+    std::string branch_id;
+    int phase = -1;
 };
 
-class BranchFollower {
+// A diversion of the reference line: one v1 branch (BranchFollower) or the wire-v2 multi-branch routes (MultiFollower)
+class RouteFollower {
+public:
+    virtual ~RouteFollower() = default;
+    virtual void reset() = 0;
+    virtual BranchStep update(const V3 &pos, int sector, int ball_type) = 0;
+    BranchTiming timing;
+};
+
+class BranchFollower : public RouteFollower {
 public:
     BranchFollower(std::shared_ptr<const ReferencePath> main, std::shared_ptr<const ReferencePath> alt, const Json &meta,
                    double back, double ahead, double margin, double reacquire);
-    void reset();
-    BranchStep update(const V3 &pos, int sector, int ball_type);
+    void reset() override;
+    BranchStep update(const V3 &pos, int sector, int ball_type) override;
+    PathFollower &route(int i) { return routes_[i]; }  // 0 main, 1 the branch line (MultiFollower)
 
     std::shared_ptr<const ReferencePath> main, alt;
     int ball_type = 0, sector = 0;
     double lo = 0, hi = 0;
     std::vector<double> ms, bs;  // the station pairs: main-line and branch-line metres
     std::vector<double> clocks[2];
-    BranchTiming timing;
     BranchRules rules;
 
 private:
@@ -74,8 +91,60 @@ private:
     std::optional<std::array<double, 3>> anchor_;
 };
 
-// branch.load_branch: <branch_dir>/L<nn>.npz + L<nn>.json, checked against the level and the main line's sha256
-std::unique_ptr<BranchFollower> load_branch(std::shared_ptr<const ReferencePath> main, int level,
+// multi_branch: a gate (when / merge): all supplied predicates ANDed, bounds inclusive
+struct BranchGate {
+    std::optional<int> sector, ball;
+    std::optional<std::array<double, 2>> s;
+    std::optional<std::array<double, 6>> box;  // lo x y z, hi x y z
+    bool matches(const V3 &pos, int sector, int ball, double arc) const;
+};
+struct BranchPhase {
+    BranchGate when;
+    double lo = 0, hi = 0;   // local_s
+    std::vector<int> from;   // eligible predecessors (empty: the immediately previous phase)
+};
+struct BranchEntry {  // one member of branches.json
+    std::string id;
+    bool legacy = false;
+    std::vector<BranchPhase> phases;
+    BranchGate merge;
+};
+// multi_branch.manifest: the closed schema of branches.json (version 2, ordered members); RouteError when invalid
+std::vector<BranchEntry> parse_branch_manifest(const Bytes &raw);
+
+// multi_branch.MultiFollower: the wire-v2 routes over one main line; one ledger and clock per life across all lines
+class MultiFollower : public RouteFollower {
+public:
+    MultiFollower(std::shared_ptr<const ReferencePath> main, std::vector<BranchEntry> entries,
+                  std::vector<std::unique_ptr<BranchFollower>> members);
+    void reset() override;
+    BranchStep update(const V3 &pos, int sector, int ball_type) override;
+    // the verified rest start's route cursor (MultiFollower.restore)
+    void restore(const std::string &key, int phase, double local);
+    int index_of(const std::string &id) const;  // -1: unknown
+    // rest_member: the member a rest start addresses (id, or "" = the unique legacy one); RouteError otherwise
+    int rest_member(const std::string &id) const;
+
+    std::shared_ptr<const ReferencePath> main;
+    std::vector<BranchEntry> entries;
+    std::vector<std::unique_ptr<BranchFollower>> members;
+    std::optional<int> key;  // the active member
+    int phase = 0;
+    std::set<int> done;
+
+private:
+    Projection project(int i, const V3 &pos, int sector);
+    void account(double local, const ReferencePath &path, const std::vector<double> &clock, const std::vector<double> &ms,
+                 const std::vector<double> &bs, bool switched);
+    PathFollower &primary() { return members[0]->route(0); }
+    std::optional<double> peak_;
+    double credit_ = 0, clock_ms_ = 0;
+    std::optional<std::array<double, 3>> anchor_;
+};
+
+// branch.load_branch: <branch_dir>/L<nn>.npz + L<nn>.json, checked against the level and the main line's sha256;
+// a directory with branches.json is the wire-v2 multi-branch routes (each member a v1 child directory)
+std::unique_ptr<RouteFollower> load_branch(std::shared_ptr<const ReferencePath> main, int level,
                                             const std::string &branch_dir, const std::string &main_sha256, double back,
                                             double ahead, double margin, double reacquire);
 

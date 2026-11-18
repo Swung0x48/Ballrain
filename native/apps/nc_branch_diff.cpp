@@ -32,6 +32,7 @@ struct Out {
     double s, local_s, elapsed, remaining, dist, point[3], tangent[3];
     int32_t branch, active;
     int64_t seg;
+    int32_t member, phase;  // wire v2: the active member's manifest index and phase (-1 on the main line / v1)
 };
 #pragma pack(pop)
 
@@ -53,7 +54,11 @@ int main(int argc, char **argv) {
             o.s = st.pr.s, o.local_s = st.local_s, o.elapsed = st.ref_elapsed_ms, o.remaining = st.ref_remaining_ms;
             o.dist = st.pr.dist;
             for (int k = 0; k < 3; ++k) o.point[k] = st.pr.point[k], o.tangent[k] = st.pr.tangent[k];
-            o.branch = st.branch, o.active = st.path == f->alt.get(), o.seg = st.pr.seg;
+            auto *multi = dynamic_cast<MultiFollower *>(f.get());
+            auto *one = dynamic_cast<BranchFollower *>(f.get());
+            o.branch = st.branch, o.active = one ? st.path == one->alt.get() : st.branch, o.seg = st.pr.seg;
+            o.member = multi && !st.branch_id.empty() ? multi->index_of(st.branch_id) : -1;
+            o.phase = st.phase;
             std::fwrite(&o, sizeof o, 1, fo);
             ++n;
         }

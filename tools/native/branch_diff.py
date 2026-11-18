@@ -22,7 +22,8 @@ from ballrain.path import ReferencePath  # noqa: E402
 
 IN = np.dtype([("p", "<f8", 3), ("sector", "<i4"), ("bt", "<i4"), ("reset", "<i4")])
 OUT = np.dtype([("s", "<f8"), ("local_s", "<f8"), ("elapsed", "<f8"), ("remaining", "<f8"), ("dist", "<f8"),
-                ("point", "<f8", 3), ("tangent", "<f8", 3), ("branch", "<i4"), ("active", "<i4"), ("seg", "<i8")])
+                ("point", "<f8", 3), ("tangent", "<f8", 3), ("branch", "<i4"), ("active", "<i4"), ("seg", "<i8"),
+                ("member", "<i4"), ("phase", "<i4")])
 
 
 def scenarios(f, rng, n_random):
@@ -68,13 +69,92 @@ def scenarios(f, rng, n_random):
 
 def py_run(f, seq):
     rows = np.zeros(len(seq), OUT)
+    multi = hasattr(f, "by_id")
+    ids = [e["id"] for e, _ in f.members] if multi else []
     for i, (pos, sector, bt, reset) in enumerate(seq):
         if reset:
             f.reset()
         path, pr = f.update(np.asarray(pos, dtype=np.float64), sector, bt)
+        if multi:
+            member = ids.index(pr["branch_id"]) if pr["branch_id"] is not None else -1
+            phase = pr["phase"] if pr["phase"] is not None else -1
+            active = int(bool(pr["branch"]))
+        else:
+            member, phase, active = -1, -1, int(path is f.alt)
         rows[i] = (pr["s"], pr["local_s"], pr["ref_elapsed_ms"], pr["ref_remaining_ms"], pr["dist"], pr["point"],
-                   pr["tangent"], int(bool(pr["branch"])), int(path is f.alt), pr["seg"])
+                   pr["tangent"], int(bool(pr["branch"])), active, pr["seg"], member, phase)
     return rows
+
+
+def multi_scenarios(m, rng, n_random):
+    """tests/test_multi_branch.py's sequences on the wire-v2 routes, then seeded walks through every member."""
+    out = []
+    for key in ("back-to-wood", "east-platform"):
+        e, f = m.by_id[key]
+        sec, ms = f.sector, f.stations[0]
+        seq = [(f.main.point_at(ms[1]), sec, 0, 1)]
+        ball = 0
+        for ph in e["phases"]:
+            lo, hi = ph["local_s"]
+            ball = ph["when"]["ball"]
+            seq += [(f.alt.point_at(x), sec, ball, 0) for x in np.linspace(lo, hi, 1 + int(np.ceil((hi - lo) * 4)))]
+        for _ in range(12):
+            seq += [(f.main.point_at(st), sec, ball, 0) for st in (ms[-2] - 0.8, ms[-2] + 1)]
+        cond = e["phases"][0]["when"]
+        seq += [(np.mean(cond["box"], axis=0), sec, cond["ball"], 1)]
+        out.append((f"multi_paid_{key}", seq))
+    e, f = m.by_id["east-platform"]
+    center = np.mean(e["phases"][0]["when"]["box"], axis=0)
+    out.append(("multi_paper_plate", [(f.alt.point_at(f.hi), 3, 1, 1), (center, 2, 1, 0), (center, 3, 0, 0),
+                                      (center, 3, 1, 0), (f.alt.point_at(f.hi), 3, 2, 0)]))
+    e, f = m.by_id["back-to-wood"]
+    out.append(("multi_early_wood", [(np.mean(e["phases"][0]["when"]["box"], axis=0), 2, 2, 1),
+                                     (np.array([716.0, 32.0, -268.0]), 2, 0, 0),
+                                     (np.mean(e["phases"][-1]["when"]["box"], axis=0), 2, 0, 0)]))
+    _, leg = m.by_id["south-loop"]
+    seq = []
+    for i, st in enumerate(np.linspace(leg.lo - 3, leg.hi + 3, 600)):
+        seq.append((leg.alt.point_at(st), leg.sector, 2 if leg.lo <= st <= leg.hi else 1, int(i == 0)))
+    out.append(("multi_south_loop", seq))
+    # seeded walks: through a member's phases (the right material most of the time), lateral noise, back steps,
+    # wrong materials / sectors, jumps back to main, resets
+    members = [(e, f) for e, f in m.members]
+    for k in range(n_random):
+        e, f = members[int(rng.integers(len(members)))]
+        seq = []
+        sec = f.sector
+        if e.get("legacy"):
+            spans = [(f.lo, f.hi, f.ball_type)]
+        else:
+            spans = [(p["local_s"][0], p["local_s"][1], p["when"]["ball"]) for p in e["phases"]]
+        d = float(spans[0][0] - rng.uniform(0, 30))
+        seq.append((f.main.point_at(max(d, 0)), sec, spans[0][2], 1))
+        j = 0
+        for i in range(int(rng.integers(150, 700))):
+            lo, hi, ball = spans[j]
+            r = rng.random()
+            if r < 0.01:
+                d = float(rng.uniform(0, f.alt.length))
+            elif r < 0.05:
+                d -= rng.uniform(0, 3)
+            else:
+                d += rng.uniform(0.1, 0.9)
+            if d > hi and j + 1 < len(spans):
+                j += 1
+                lo, hi, ball = spans[j]
+            bt = ball if rng.random() > 0.05 else int(rng.integers(0, 3))
+            sc = sec if rng.random() > 0.02 else int(rng.choice([sec - 1, sec + 1]))
+            on_main = rng.random() < 0.03
+            line = f.main if on_main else f.alt
+            pos = line.point_at(float(np.clip(d, 0, line.length))) + rng.normal(0, [0.5, 0.2, 0.5])
+            # sometimes inside an entrance / phase box exactly
+            if not e.get("legacy") and rng.random() < 0.03:
+                box = e["phases"][int(rng.integers(len(e["phases"])))]["when"].get("box")
+                if box is not None:
+                    pos = rng.uniform(box[0], box[1])
+            seq.append((pos, sc, bt, int(rng.random() < 0.004)))
+        out.append((f"multi_random_{k}_{e['id']}", seq))
+    return out
 
 
 def main():
@@ -91,7 +171,8 @@ def main():
                     reacquire=5)
     bad = 0
     with tempfile.TemporaryDirectory() as td:
-        for name, seq in scenarios(f, np.random.default_rng(a.seed), a.random):
+        gen = multi_scenarios if hasattr(f, "by_id") else scenarios
+        for name, seq in gen(f, np.random.default_rng(a.seed), a.random):
             steps = np.zeros(len(seq), IN)
             for i, (pos, sector, bt, reset) in enumerate(seq):
                 steps[i] = (pos, sector, bt, reset)

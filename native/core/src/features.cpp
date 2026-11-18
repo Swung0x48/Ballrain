@@ -460,6 +460,7 @@ std::vector<float> FeatureExtractor::compute(const GameTracker &t, FeatureInfo *
                 active = st.path, pr = st.pr, local_s = st.local_s;
                 info.has_branch = true, info.branch = st.branch, info.local_s = st.local_s;
                 info.ref_elapsed_ms = st.ref_elapsed_ms, info.ref_remaining_ms = st.ref_remaining_ms;
+                info.branch_multi = st.multi, info.branch_id = st.branch_id, info.branch_phase = st.phase;
             }
             info.path = pr;
             info.path_source = info.has_branch && info.branch ? "branch" : active->source;
