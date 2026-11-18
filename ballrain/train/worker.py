@@ -144,6 +144,7 @@ class WorkerSpec:
     wall_min_rise: float = 2.0
     wall_push_cos: float = 0.5
     wall_max_progress: float = 2.0
+    actor_heads: str = "single"
 
 
 def in_zone(pos, zone: dict, margin: float = 0.0) -> bool:
@@ -331,7 +332,7 @@ class Worker:
         self.pending_runs: list = []
         self._make_env()
         self.model = ActorCritic(self.env.observation_space.shape[0], self.env.action_space.n, spec.hidden,
-                                 spec.activation)
+                                 spec.activation, spec.actor_heads)
         self.model.eval()
         self.version = -1
         self.rms = None

@@ -21,7 +21,7 @@ from .reasons import TOKEN_FATAL, Reason
 
 CLIENT_VERSION = "0.3.0"  # 0.2: chunk format 2 (the engine-state chain); 0.3: format 3 (chain v3)
 # what this client can run (hello.capabilities; ballrain.pool.capabilities): format 3 tasks, the route branch
-CLIENT_CAPABILITIES = ("task_format3", "branch_v1", "branch_rules_v1")
+CLIENT_CAPABILITIES = ("task_format3", "branch_v1", "branch_rules_v1", "actor_ball_type_v1")
 MAX_RESPONSE = P.MAX_JSON_BYTES
 MAX_MANIFEST = 256 * 1024
 MAX_DOWNLOAD = 64 * 1024 * 1024

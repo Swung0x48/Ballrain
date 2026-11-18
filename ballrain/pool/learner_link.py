@@ -150,7 +150,7 @@ class LearnerLink:
             # only to clients with the multi_branch_v2 capability, and the verifier replays with the Python env
             c.send({"type": "hello", "protocol": PROTOCOL, "host": HOST_LABEL, "session": self.session + 1,
                     "backend": HOST_LABEL, "n_workers": 0, "branch_assets_version": 1, "branch_rules_version": 1,
-                    "multi_branch_v2": True})
+                    "multi_branch_v2": True, "actor_ball_type_v1": True})
             if not c.poll(timeout_s):
                 raise ConnectionError(f"no config within {timeout_s:.0f} s")
             m = c.recv()

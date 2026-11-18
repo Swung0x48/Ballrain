@@ -61,7 +61,8 @@ def play(spec: dict) -> list:
     torch.set_num_threads(1)
     ck = torch.load(spec["ckpt"], weights_only=False)
     a = ck["args"]
-    model = ActorCritic(ck["n_obs"], ck["n_act"], tuple(int(x) for x in a["hidden"].split(",")), a["activation"])
+    model = ActorCritic(ck["n_obs"], ck["n_act"], tuple(int(x) for x in a["hidden"].split(",")), a["activation"],
+                        a.get("actor_heads", "single"))
     model.load_state_dict(ck["model"])
     model.eval()
     rms = ck["rms"]
