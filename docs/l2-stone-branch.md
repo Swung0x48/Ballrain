@@ -10,7 +10,7 @@
 - **时钟**：`ref_elapsed_ms` 从本命起点累计，仅积分新走过区间的活动线 `t_ms`；`ref_remaining_ms` 从最高站点沿当前线估算到飞船。换线重算分段参考和时间预算，不改游戏的 SR。未观测到球的变球动画不推进投影。
 - **石球静止起点**：`--rest-starts 14730-14730@branch:1700 --p-rest 1`（`branch:` 后是整条石线的米数）。`drive.npz` 来自 `probe_l2_stone.py` 成功一命的按键回放，不是状态编辑。严格按同一 TAS 前缀回放至对应路标，核对石球和小节，再闭环驱动到目标、制动；不受支撑、速度或位置不符则关闭这次进程，以相同 TAS 帧重新正常开局；`start.branch_rest_failures` 记录本环境累计失败数，`branch_rest_error` 记录原因。区域不可停时不把失败当成课程起点。普通 `lo-hi@x:z:jitter` 语义不变。
 
-复现：用项目 Python 运行 `scripts/build_l2_stone.py` 生成资产与两幅图；`scripts/probe_l2_stone.py D:/repos/Ballrain/runtime x86p2002d 14730` 在独立目录生成控制日志，成功才写 `drive.npz`；将该文件与同版本的分线配对。`scripts/probe_stone_rest.py D:/repos/Ballrain/runtime <build> <copy> <branch-dir> <main-dir>` 测试真实石球静止交接。`scripts/summarize_stone_probe.py` 汇总过盘和速度，失败尝试不参与最快用时计算。
+复现：用项目 Python 运行 `scripts/build_l2_stone.py` 生成资产与两幅图；`scripts/probe_l2_stone.py <runtime-dir> x86p2002d 14730` 在独立目录生成控制日志，成功才写 `drive.npz`；将该文件与同版本的分线配对。`scripts/probe_stone_rest.py <runtime-dir> <build> <copy> <branch-dir> <main-dir>` 测试真实石球静止交接。`scripts/summarize_stone_probe.py` 汇总过盘和速度，失败尝试不参与最快用时计算。
 
 ## Learner 下发协议（v1）
 

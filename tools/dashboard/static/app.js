@@ -222,8 +222,10 @@ function renderReport() {
   const R = S.reports || [];
   $("s-report").hidden = !R.length;
   if (!R.length) return;
-  const one = (r) => `<div class="rtitle">${esc(r.title)}</div><ul class="ritems">${r.items.map((i) => `<li>${esc(i)}</li>`).join("")}</ul>` +
-    (r.next ? `<div class="rnext"><b>下一步</b>${esc(r.next)}</div>` : "");
+  // {{t:<epoch seconds>}} in report text: a time, shown in the reader's own time zone
+  const rt = (t) => esc(t).replace(/\{\{t:(\d{9,11})\}\}/g, (_, e) => `<time>${lt(Number(e))}</time>`);
+  const one = (r) => `<div class="rtitle">${rt(r.title)}</div><ul class="ritems">${r.items.map((i) => `<li>${rt(i)}</li>`).join("")}</ul>` +
+    (r.next ? `<div class="rnext"><b>下一步</b>${rt(r.next)}</div>` : "");
   const [cur, ...old] = R;
   const rat = (r) => (r.ts != null ? `${lt(r.ts)}（${TZ}）` : `${r.at.slice(5)}（${r.tz}）`);
   $("r-at").textContent = rat(cur);

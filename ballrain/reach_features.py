@@ -3,8 +3,8 @@
     rb = ReachBlock()
     block, raw = rb.compute(tracker, pos, vel, quarter, ball_type)   # block (N_REACH,) float64 in [-1, 1]
 
-Fields: FastReach.fields_for_tracker (static geometry only, content-addressed in <runtime>/fastreach or
-$BALLRAIN_FASTREACH_DIR, one build per host under a lock, atomic writes); the unknown zones (rest-pose boxes of the
+Fields: FastReach.fields_for_tracker (static geometry only, content-addressed in
+<runtime>/fastreach ($BALLRAIN_RUNTIME), one build per host under a lock, atomic writes); the unknown zones (rest-pose boxes of the
 physicalized moving entities, player balls excluded) are recomputed from the tracker whenever its level data changes,
 and the moving bodies of the BODY section within the extractor's body_radius set unknown_zone near them. Both caches
 are per process (module level): every env of a process shares the fields of one geometry.

@@ -204,7 +204,7 @@ SR01 全程平均 5.8 → 1.4 ms，HS01 6.7 → 1.5 ms（每 4 帧取 1 帧，`t
 - 场：`FastReach.fields_for_tracker`，只取决于静态几何（停止器除外的固定实体三角形、DepthTestCubes、风扇推力盒 `fan_boxes`（L2 有 9 个，
   按实体名排序）、构建参数、物理和风扇常数、`BUILD_VERSION`），
   按名字 + 坐标的规范顺序哈希（`canonical_geometry`：零售和无头 SimTool 的 L2 静态实体和网格逐位相同，但 CK id 和 id 顺序不同，按 id 顺序的
-  `static_key` 会不一样），所以各引擎、各主机的键相同。文件 `<runtime>/fastreach/L<nn>-<键的 sha256 前 16 位>.npz`（`$BALLRAIN_FASTREACH_DIR` 可改），
+  `static_key` 会不一样），所以各引擎、各主机的键相同。文件 `<runtime>/fastreach/L<nn>-<键的 sha256 前 16 位>.npz`（随 `$BALLRAIN_RUNTIME` 改变），
   同一主机上多个 worker 同时需要时只有一个在锁文件下构建（`O_EXCL`，构建者的线程每 5 s 刷新锁的 mtime，内核是 numba `nogil`，冷启动的 L2
   构建里心跳最长间隔 0.16 s（不加 nogil 时 2.2 s）；25 s 不动的锁视为残留，接管时先改名再复查，另一个进程刚放上的新锁会保留），其余等待后读取；
   写入是临时文件 + `os.replace`，不会读到半个文件。L2 的 TAS 一共用到两份场（第 3–4 小节的模块机关物理化时静态几何不同），每份 58 MB，

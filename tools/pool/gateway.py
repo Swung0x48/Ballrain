@@ -64,7 +64,9 @@ def build(cfg: PoolConfig, launcher_factory=None, clock=time.time):
     store = Store(Path(cfg.pool_dir) / "state.sqlite3", clock=clock)
     policies = PolicySource(cfg.pool_dir, cfg.run, cfg.datasets_dir, cfg.path_dirs, cfg.ckpt_dir, clock=clock)
     app = PoolApp(cfg, store, policies, ForumClient(cfg.forum), clock=clock, log=log)
-    verifier = Verifier(store, cfg.pool_dir, cfg.engines, launcher_factory=launcher_factory, log=log)
+    verifier = Verifier(store, cfg.pool_dir, cfg.engines, launcher_factory=launcher_factory, log=log,
+                        reach_max_row_frac=getattr(cfg, "reach_max_row_frac", 0.02),
+                        reach_max_logp_shift=getattr(cfg, "reach_max_logp_shift", 1.0))
     return app, store, policies, verifier
 
 

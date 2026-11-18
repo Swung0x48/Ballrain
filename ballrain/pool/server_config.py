@@ -37,6 +37,9 @@
     task_sample = 0.15         # after that, each task is replayed in full with this probability (drawn at issue)
     escalate_tasks = 20        # a chunk failing the cheap policy-consistency check: its task and the account's next
                                # this many tasks are replayed in full
+    reach_max_row_frac = 0.02  # f7: rows per chunk whose reach block may differ beyond OBS_TOL (docs/f7-native-port.md 7)
+    reach_max_logp_shift = 1.0 # f7: on such a row, the most the submitted reach may move the taken action's log-prob
+                               # (both PROVISIONAL until the native port's measured flip / jump rates)
     engines = ["x87soft"]      # the engine kinds tasks are issued for = what the verifier replays with (each task is
                                # replayed on its own engine kind; a hello with another kind gets engine_mismatch)
     workers = 1                # replays in parallel (one engine process each; below-normal priority)
@@ -120,6 +123,8 @@ class PoolConfig:
     probation_chunks: int = 200
     task_sample: float = 0.15  # per-task full-replay probability after the probation (2026-11-18: per task, not per chunk)
     escalate_tasks: int = 20
+    reach_max_row_frac: float = 0.02  # f7 (rollout.REACH_MAX_ROW_FRAC), provisional
+    reach_max_logp_shift: float = 1.0  # f7 (rollout.REACH_MAX_LOGP_SHIFT), provisional
     engines: dict = field(default_factory=dict)  # kind -> EngineRef
     verify_engines: tuple = ("x87soft",)  # engine kinds tasks are issued for (the verifier replays each on its kind)
     verify_workers: int = 1
@@ -185,6 +190,8 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
         probation_chunks=int(ve.get("probation_chunks", 200)),
         task_sample=min(max(float(ve.get("task_sample", 0.15)), 0.0), 1.0),
         escalate_tasks=max(0, int(ve.get("escalate_tasks", 20))),
+        reach_max_row_frac=min(max(float(ve.get("reach_max_row_frac", 0.02)), 0.0), 1.0),
+        reach_max_logp_shift=max(float(ve.get("reach_max_logp_shift", 1.0)), 0.0),
         engines=engines, verify_engines=tuple(str(k) for k in ve.get("engines", ["x87soft"])),
         verify_workers=max(1, int(ve.get("workers", 1))),
         learner_hub=str(le.get("hub", "")), learner_key_env=str(le.get("key_env", "BALLRAIN_REMOTE_KEY")),

@@ -45,6 +45,7 @@ class Published:
     starts: object = None  # TasStarts of the record with exclude_starts applied (nearest_valid / nearest_any)
     draws: dict | None = None  # the trainer's start draws: rehearse_starts, p_rehearse, rest_starts, p_rest
     branch_sha: str | None = None  # the route-branch pack (export_branch_pack) when the policy follows a branch
+    reach: list | None = None  # f7: the reach field entries of the level (reach_assets.export_reach_assets)
 
     @property
     def n_obs(self) -> int:
@@ -120,11 +121,20 @@ class PolicySource:
         pub = Published(manifest=m, policy_sha=m["policy_sha"], run=self.run, record=record,
                         record_sha256=meta["record_sha256"], starts_sha=ssha, path_sha=psha,
                         level=int(m["env"]["level"]), valid=T.valid_start_frames(rd, excl), curriculum=cu,
-                        source=source, published_at=int(self.clock()), starts=st, draws=draws, branch_sha=bsha)
+                        source=source, published_at=int(self.clock()), starts=st, draws=draws, branch_sha=bsha,
+                        reach=self._reach_entries(m, rd))
         with self.lock:
             self.current = pub
             self.history[pub.policy_sha] = pub
         return pub
+
+    def _reach_entries(self, manifest: dict, record_dir):
+        """f7 (features.reach): the level's reach fields as task assets (docs/f7-native-port.md 8), else None."""
+        f = manifest["features"]
+        if not f.get("reach"):
+            return None
+        from .reach_assets import export_reach_assets
+        return export_reach_assets(record_dir, int(manifest["env"]["level"]), f.get("reach_version"), self.assets_dir)
 
     def refresh(self, max_tries: int = 3) -> Published | None:
         """Publish the newest readable checkpoint of ckpt_dir if it is not the current one. Returns the current."""
@@ -207,6 +217,7 @@ class PolicySource:
                       respawn_frontier=rf,
                       ball_order_seed=T.new_ball_order_seed(), engine=engine,
                       assets=dict({"starts": pub.starts_sha, "path": pub.path_sha},
-                                  **({"branch": pub.branch_sha} if pub.branch_sha else {})), chunk_steps=min(chunk, 4096),
+                                  **({"branch": pub.branch_sha} if pub.branch_sha else {}),
+                                  **({"reach": pub.reach} if pub.reach else {})), chunk_steps=min(chunk, 4096),
                       max_steps=int(max_steps), max_frames=int(max_frames), deadline_s=int(deadline_s),
                       issued_at=int(now), kind=kind, greedy=kind == "eval", sample_seed=T.new_sample_seed())

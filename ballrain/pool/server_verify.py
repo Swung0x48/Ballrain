@@ -52,7 +52,8 @@ from .server_store import Store
 
 class Verifier:
     def __init__(self, store: Store, pool_dir, engines: dict, launcher_factory=None, log=None,
-                 retry_s: int = 300):
+                 retry_s: int = 300, reach_max_row_frac: float = R.REACH_MAX_ROW_FRAC,
+                 reach_max_logp_shift: float = R.REACH_MAX_LOGP_SHIFT):
         """engines: kind -> object with .binary / .root (server_config.EngineRef); launcher_factory: tests
         (ballrain.fakegame.FakeLauncher), None = the headless engine of HeadlessConfig."""
         self.store = store
@@ -61,6 +62,9 @@ class Verifier:
         self.launcher_factory = launcher_factory
         self.log = log or (lambda msg: None)
         self.retry_s = retry_s
+        # f7 reach block (docs/f7-native-port.md 7): its tolerance bounds; reach_slice overrides the env's (tests)
+        self.reach_max_row_frac, self.reach_max_logp_shift = float(reach_max_row_frac), float(reach_max_logp_shift)
+        self.reach_slice = None
         self._policies: dict = {}
         self._plock = threading.Lock()
         self._claim_lock = threading.Lock()
@@ -135,13 +139,21 @@ class Verifier:
             if eng is None or (self.launcher_factory is None and not eng.binary):
                 raise R.EngineFailure(f"no {task.engine} engine configured for the verifier")
             sdir, pdir, bdir = self._assets(task, manifest)
+            if task.assets.get("reach"):  # f7: replay from the same field files the client got (byte-identical)
+                from .reach_assets import check_cache
+                why = check_cache(task.assets["reach"], self.pool_dir / "assets")
+                if why is not None:
+                    raise R.EngineFailure(f"reach fields: {why}")
             lg = T.LocalGame(engine=task.engine, binary=eng.binary, root=eng.root)
             launcher = self.launcher_factory() if self.launcher_factory else None
             env = T.build_env(task, manifest, lg, sdir, pdir, out_root, copy="verify-00", launcher=launcher,
                               branch_dir=bdir)
             runner = R.TaskRunner(env, task, manifest)
             self.replays += 1
-            mm = R.replay_task(runner, policy, decoded)
+            reach = {}
+            mm = R.replay_task(runner, policy, decoded, reach_slice=self.reach_slice,
+                               reach_max_row_frac=self.reach_max_row_frac,
+                               reach_max_logp_shift=self.reach_max_logp_shift, report=reach)
         except Exception as e:  # noqa: BLE001  the verifier's own failure: replay_failed, retried later
             self.log(f"verify {task_id[:8]}: replay_failed: {type(e).__name__}: {str(e)[:300]}")
             if not isinstance(e, R.EngineFailure):
@@ -153,8 +165,21 @@ class Verifier:
                 runner.close()
             shutil.rmtree(out_root, ignore_errors=True)
         if mm is None:
+            # f7: chunks with too many reach-deviant rows are rejected alone (no suspect flag, the task's other chunks
+            # pass); the passed chunks' deviant rows get this replay's reach values for the learner (a patch file)
+            excess = sorted(q for q, r in reach.items() if r["excess"])
+            step0_of = {int(x.header["seq"]): int(x.header["step0"]) for x in decoded}
+            for q in excess:
+                s.reject_chunk(task_id, q, payload(Reason.REPLAY_MISMATCH, task_id=task_id, chunk=q,
+                                                   step=step0_of[q] + int(reach[q]["rows"][0])))
+            files = {c["seq"]: c["file"] for c in chunks}
+            for q, r in reach.items():
+                if not r["excess"] and q in files:
+                    write_reach_patch(self.pool_dir / "chunks" / files[q], r)
             s.finish_verify(task_id, upto, True, None, None, max_seq=top)
-            self.log(f"verify {task_id[:8]}: passed up to chunk {upto}")
+            self.log(f"verify {task_id[:8]}: passed up to chunk {upto}"
+                     + (f"; reach-deviant rows in chunks {sorted(reach)} (patched)" if reach else "")
+                     + (f"; rejected for reach (not flagged): {[(q, reach[q]['excess']) for q in excess]}" if excess else ""))
             return "passed"
         params = mm.params(task_id)
         s.reject_task(task_id, mm.seq, payload(mm.reason, **params))
@@ -215,6 +240,32 @@ class Verifier:
             th.start()
             out.append(th)
         return out
+
+
+def reach_patch_path(chunk_file) -> Path:
+    """<task>/<seq>.reach.npz next to the chunk file <task>/<seq>.brpc."""
+    p = Path(chunk_file)
+    return p.with_name(p.stem + ".reach.npz")
+
+
+def write_reach_patch(chunk_file, r: dict) -> None:
+    """The verifier's reach values of a passed chunk's deviant rows (rows j of the chunk, row T = the row after the last
+    step), for the learner link (learner_link.chunk_message applies it)."""
+    from .task import save_npz_deterministic
+    dst = reach_patch_path(chunk_file)
+    tmp = dst.with_name(f".{dst.name}.{secrets.token_hex(4)}.tmp.npz")
+    save_npz_deterministic(tmp, {"rows": np.asarray(r["rows"], "<i4"), "reach": np.asarray(r["reach"], "<f4"),
+                                 "start": np.asarray(int(r["start"]), "<i4")})
+    tmp.replace(dst)
+
+
+def read_reach_patch(chunk_file):
+    """(rows, reach float32 (n, width), start) of a chunk's patch, or None."""
+    p = reach_patch_path(chunk_file)
+    if not p.is_file():
+        return None
+    with np.load(p, allow_pickle=False) as z:
+        return np.asarray(z["rows"], np.int64), np.asarray(z["reach"], np.float32), int(z["start"])
 
 
 def pseudonym(forum_id: int) -> str:

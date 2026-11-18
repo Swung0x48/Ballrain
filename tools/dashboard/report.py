@@ -98,8 +98,29 @@ def public(reports: list[dict], n: int = 12) -> list[dict]:
     return out
 
 
+# A time inside report text is written as {{t:<epoch seconds>}} (or {{t:<ISO 8601 with offset>}}, converted to epoch
+# seconds when the report is added); the page shows it in the reader's own time zone.
+_T_TOKEN = re.compile(r"\{\{t:([^}]+)\}\}")
+
+
+def _norm_times(text: str) -> str:
+    def one(m):
+        v = m.group(1).strip()
+        if re.fullmatch(r"\d{9,11}", v):
+            return "{{t:%s}}" % v
+        try:
+            d = dt.datetime.fromisoformat(v)
+        except ValueError:
+            sys.exit(f"时间标记无法解析：{v}（用 epoch 秒，或带时区的 ISO 8601，例如 2026-11-18T16:28+08:00）")
+        if d.tzinfo is None:
+            sys.exit(f"时间标记缺少时区：{v}")
+        return "{{t:%d}}" % int(d.timestamp())
+    return _T_TOKEN.sub(one, text)
+
+
 def add(title: str, items: list[str], nxt: str) -> dict:
-    items = [i.strip() for i in items if i.strip()]
+    title, nxt = _norm_times(title), _norm_times(nxt)
+    items = [_norm_times(i.strip()) for i in items if i.strip()]
     if not title.strip() or not items:
         sys.exit("需要 --title 和至少一个 --item")
     if len(items) > MAX_ITEMS:

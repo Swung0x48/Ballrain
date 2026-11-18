@@ -2724,7 +2724,7 @@ class FastReach:
                            verbose: bool = False) -> "FastReach":
         """Static fields of the tracker's current geometry, built from canonical_geometry (identical on every engine
         and host for the same geometry) and cached content-addressed in <cache_dir>/L<nn>-<sha16 of fields_key>.npz
-        (default <runtime>/fastreach, or $BALLRAIN_FASTREACH_DIR), with no unknown zones (set them with
+        (default <runtime>/fastreach, i.e. $BALLRAIN_RUNTIME/fastreach), with no unknown zones (set them with
         set_unknown_boxes). Safe when many processes on one host need the same file at once: one builds under a lock
         file (O_EXCL; the builder refreshes its mtime every LOCK_BEAT_S = 5 s from a thread, which the nogil kernels
         let run: the largest gap on a cold L2 build is 0.16 s, 2.2 s without nogil; a lock older than lock_timeout_s = 25 s is
@@ -2735,12 +2735,8 @@ class FastReach:
         geom = geometry if geometry is not None else cls.canonical_geometry(tracker)
         key = cls.fields_key(tracker, geom)
         if cache_dir is None:
-            env = os.environ.get("BALLRAIN_FASTREACH_DIR")
-            if env:
-                cache_dir = Path(env)
-            else:
-                from . import instances
-                cache_dir = instances.runtime_dir() / "fastreach"
+            from . import instances
+            cache_dir = instances.runtime_dir() / "fastreach"
         cache_dir = Path(cache_dir)
         name = f"L{int(getattr(tracker, 'level_no', 0) or 0):02d}-{hashlib.sha256(key.encode()).hexdigest()[:16]}"
         path = cache_dir / f"{name}.npz"

@@ -167,7 +167,7 @@ def test_fake_road_directions_in_the_action_frame(tmp_path, monkeypatch, world):
     """The FakeGame road runs from z 0 to z -200 (x within +-5); the ball starts at z -5, the camera looks along -z
     (Cam_OrientRef yaw 180 = quarter 2). World actions: UP = +z, the near end of the road (an edge ~5 ahead), DOWN = -z
     is open for more than L_MAX. Camera-relative keys at quarter 2: UP pushes -z (open), DOWN +z (the near edge)."""
-    monkeypatch.setenv("BALLRAIN_FASTREACH_DIR", str(tmp_path / "fr"))
+    monkeypatch.setenv("BALLRAIN_RUNTIME", str(tmp_path / "rt"))
     monkeypatch.setattr(RF, "_FIELDS", type(RF._FIELDS)())  # the process cache would serve the other variant's fields
     env = make_env(tmp_path, world)
     try:
@@ -196,7 +196,7 @@ def test_fake_road_directions_in_the_action_frame(tmp_path, monkeypatch, world):
             assert np.isfinite(b).all() and np.abs(b).max() <= 1.0
             if term or trunc:
                 break
-        files = sorted(p.name for p in (tmp_path / "fr").iterdir())
+        files = sorted(p.name for p in (tmp_path / "rt" / "fastreach").iterdir())
         assert len(files) == 1 and files[0].startswith("L01-") and files[0].endswith(".npz"), files
     finally:
         env.close()
