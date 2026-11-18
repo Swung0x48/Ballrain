@@ -76,6 +76,7 @@ ClientConfig ClientConfig::load(const std::string &dir) {
                 c.auto_pause_player = j.get_bool("auto_pause_player", c.auto_pause_player);
                 c.auto_pause_battery = j.get_bool("auto_pause_battery", c.auto_pause_battery);
                 c.setup_done = j.get_bool("setup_done", c.setup_done);
+                c.quiet_file = j.get_string("quiet_file", c.quiet_file);
             }
         } catch (const Error &) {  // a broken file: the defaults (the setup asks again)
         }
@@ -96,6 +97,7 @@ void ClientConfig::save(const std::string &dir) const {
     j.set("auto_pause_player", Json::boolean(auto_pause_player));
     j.set("auto_pause_battery", Json::boolean(auto_pause_battery));
     j.set("setup_done", Json::boolean(setup_done));
+    j.set("quiet_file", Json::string(quiet_file));
     write_atomic(dir + "/config.json", j.dump());
 }
 
@@ -709,7 +711,9 @@ void Controller::heartbeat_once() {
 void Controller::probe() {
     ClientConfig c = config();
     std::string reason;
-    if (c.auto_pause_player && platform::process_running("Player.exe")) reason = PAUSE_PLAYER;
+    if (!c.quiet_file.empty() && (file_exists(c.quiet_file) || platform::is_dir(c.quiet_file)))
+        reason = "暂停开关 " + c.quiet_file + " 存在，已自动暂停；删除它后会自动继续。";
+    else if (c.auto_pause_player && platform::process_running("Player.exe")) reason = PAUSE_PLAYER;
     else if (c.auto_pause_battery && platform::on_battery()) reason = PAUSE_BATTERY;
     bool changed;
     {

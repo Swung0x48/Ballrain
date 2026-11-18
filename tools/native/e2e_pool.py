@@ -117,6 +117,8 @@ def main(argv=None) -> int:
     ap.add_argument("--kill-engine-after", type=float, default=0.0, help="kill one of the client's engines mid-task")
     ap.add_argument("--fake-player", default="", help="AT:FOR seconds: a dummy Player.exe runs (the client runs with "
                     "--auto-pause on and must pause, then resume)")
+    ap.add_argument("--quiet", default="", help="AT:FOR seconds: the client's stop-switch file exists (it must pause, "
+                    "then resume)")
     ap.add_argument("--tui", help="also run the terminal UI (ballrain_pool --snapshot live:25) on the client's data")
     ap.add_argument("--kill-after", type=float, default=0.0,
                     help="first hard-kill the client this many seconds into a run (its engines must die with it: the job "
@@ -224,7 +226,8 @@ def main(argv=None) -> int:
     cmd = ([a.client, "run", "--gateway", gateway, "--data-dir", str(client_dir), "--ballance-dir", a.client_game,
             "--engine", a.client_engine, "--tasks", str(a.tasks), "--instances", str(a.instances)]
            + [x for kv in a.client_engine_env for x in ("--engine-env", kv)]
-           + (["--auto-pause", "on"] if a.fake_player else []))
+           + (["--auto-pause", "on"] if a.fake_player else [])
+           + (["--quiet-file", str(d / "ballrain-quiet")] if a.quiet else []))
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
     notes = []
 
@@ -238,6 +241,9 @@ def main(argv=None) -> int:
         if a.fake_player:
             at, dur = (float(x) for x in a.fake_player.split(":"))
             plan.append((at, "player", dur))
+        if a.quiet:
+            at, dur = (float(x) for x in a.quiet.split(":"))
+            plan.append((at, "quiet", dur))
         for at, what, dur in sorted(plan):
             time.sleep(max(0.0, t0 + at - time.time()))
             if p.poll() is not None:
@@ -255,6 +261,14 @@ def main(argv=None) -> int:
                     subprocess.run(["taskkill", "/F", "/PID", str(eng[0])], capture_output=True)
                     log(f"killed engine pid {eng[0]} of the client")
                     notes.append("kill_engine")
+            elif what == "quiet":
+                q = d / "ballrain-quiet"
+                q.mkdir()
+                log(f"stop switch on for {dur:.0f} s")
+                time.sleep(dur)
+                q.rmdir()
+                log("stop switch off")
+                notes.append("quiet")
             elif what == "player":
                 fake = d / "fake-player" / "Player.exe"
                 fake.parent.mkdir(exist_ok=True)
@@ -274,6 +288,12 @@ def main(argv=None) -> int:
     events = [json.loads(x) for x in p.stdout.splitlines() if x.strip().startswith("{")]
     (d / "client_events.jsonl").write_text(p.stdout, encoding="utf-8")
     (d / "client_stderr.txt").write_text(p.stderr, encoding="utf-8")
+    if a.quiet:
+        paused = "暂停开关" in p.stderr and "自动暂停的条件已解除" in p.stderr
+        stopped = any(e["event"] == "task_end" and e["end"] == "stopped" for e in events)
+        log(f"stop switch: paused and resumed {paused}, a task ended stopped {stopped}")
+        if not (paused and stopped):
+            return 1
     if a.fake_player:
         paused = "已自动暂停" in p.stderr and "自动暂停的条件已解除" in p.stderr
         stopped = any(e["event"] == "task_end" and e["end"] == "stopped" for e in events)

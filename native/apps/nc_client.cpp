@@ -7,7 +7,7 @@
 //       the scrubbed diagnostics zip (default <D>/diagnostics-<time>.zip)
 //   nc_client run --gateway URL --ballance-dir G --engine BallanceMMOSimTool[.exe] [--data-dir D] [--tasks N]
 //                 [--instances K] [--engine-kind x87soft|2002] [--engine-env NAME=VALUE ...] [--leaderboard on|off]
-//                 [--auto-pause on|off]
+//                 [--auto-pause on|off] [--quiet-file PATH]
 //       the controller (native/core/src/controller.cpp) without a UI: hello, K instances playing tasks, the upload
 //       queue, heartbeats; with --tasks N it stops after N tasks once their chunks are posted. A refusal is printed
 //       verbatim; a token-fatal one stops the client (exit code 3).
@@ -123,6 +123,7 @@ static int cmd_run(int argc, char **argv) {
     c.instances = std::atoi(arg(argc, argv, "--instances", "1").c_str());
     // the automatic pause is the TUI's (a test machine may run Player.exe for other reasons): off unless asked
     c.auto_pause_player = c.auto_pause_battery = std::string(arg(argc, argv, "--auto-pause", "off")) == "on";
+    c.quiet_file = arg(argc, argv, "--quiet-file", "");  // the stop switch (independent of --auto-pause)
     ctl.set_config(c);
     ctl.max_tasks = std::atoll(arg(argc, argv, "--tasks", "0").c_str());
     for (auto &kv : args_all(argc, argv, "--engine-env")) {

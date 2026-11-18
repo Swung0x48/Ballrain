@@ -38,6 +38,9 @@ struct ClientConfig {  // <data dir>/config.json
     int instances = 1;
     bool auto_pause_player = true, auto_pause_battery = true;
     bool setup_done = false;  // the first-run setup was completed once
+    // a stop switch for shared machines: while this file or directory exists every instance pauses (checked every
+    // 5 s, like the other automatic pauses; "" = none), e.g. C:\ballrain-quiet
+    std::string quiet_file;
     static int default_instances();  // min(8, cores / 2), at least 1
     static ClientConfig load(const std::string &data_dir);
     void save(const std::string &data_dir) const;
