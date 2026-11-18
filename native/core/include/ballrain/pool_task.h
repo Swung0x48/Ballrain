@@ -29,10 +29,16 @@ struct TaskOutcome {
     double wall_s = 0;
 };
 
+// Where the engine's copies and run directories go when the client's own paths are not plain ASCII (the engine
+// resolves its files with narrow code-page paths): BALLRAIN_WORK_DIR if set, else <data_dir>/engine-work, in its 8.3
+// form when that path is not plain ASCII itself (a Chinese user name). Throws a message for the player when no
+// plain-ASCII form exists.
+std::string engine_work_dir(const std::string &data_dir);
 // The engine's view of le (Windows): a binary or Ballance folder whose path is not plain ASCII is replaced by its 8.3
-// form, else by a copy under platform::engine_work_dir() (the engine's directory; the four game entries the x87-soft
-// edition reads, re-copied when the folder's game-file hashes change). note: what was done (for the log), or "".
-LocalEngine engine_view(const LocalEngine &le, const Json &game_files, std::string *note = nullptr);
+// form, else by a copy under work_dir (the engine's directory; the four game entries the x87-soft edition reads,
+// re-copied when the folder's game-file hashes change). note: what was done (for the log), or "".
+LocalEngine engine_view(const LocalEngine &le, const Json &game_files, const std::string &data_dir,
+                        std::string *note = nullptr);
 bool plain_ascii(const std::string &s);
 
 // Plays the task. on_chunk(seq, data, final) receives every encoded chunk in order; stop() is sample_task's;

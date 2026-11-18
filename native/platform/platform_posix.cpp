@@ -111,14 +111,7 @@ std::string home_dir() {
     return pw && pw->pw_dir ? pw->pw_dir : "/tmp";
 }
 
-std::string data_dir() {
-#ifdef __APPLE__
-    return home_dir() + "/Library/Application Support/BallrainPool";
-#else
-    const char *x = std::getenv("XDG_DATA_HOME");
-    return (x && *x ? std::string(x) : home_dir() + "/.local/share") + "/ballrain-pool";
-#endif
-}
+std::string data_dir() { return home_dir() + "/.ballrain"; }
 
 std::string executable_path() {
 #ifdef __APPLE__
@@ -135,11 +128,6 @@ std::string executable_path() {
     ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
     return n > 0 ? std::string(buf, size_t(n)) : std::string();
 #endif
-}
-
-std::string engine_work_dir() {
-    const char *w = std::getenv("BALLRAIN_WORK_DIR");
-    return w && *w ? std::string(w) : data_dir();
 }
 
 std::string short_path(const std::string &path) { return path; }

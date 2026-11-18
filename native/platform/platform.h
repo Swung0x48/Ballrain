@@ -32,18 +32,12 @@ bool rename_file(const std::string &from, const std::string &to);  // replaces a
 int64_t file_size(const std::string &path);                       // -1 when missing
 int64_t unix_time();                                              // wall-clock seconds
 
-// The client's data directory: %LOCALAPPDATA%\BallrainPool, ~/Library/Application Support/BallrainPool,
-// $XDG_DATA_HOME/ballrain-pool (else ~/.local/share/ballrain-pool)
+// The client's data directory: %USERPROFILE%\.ballrain on Windows, ~/.ballrain elsewhere (everything the client
+// writes that does not belong next to the program: config, token, logs, cache, upload queue, run and work directories)
 std::string data_dir();
 std::string home_dir();
 std::string executable_path();  // this program (absolute)
 std::string user_name();        // the login name (diagnostics scrub it from paths)
-// A directory for what the headless engine must read or write when the client's own paths are not plain ASCII (the
-// engine resolves its files with narrow, code-page paths): BALLRAIN_WORK_DIR if set, else Windows
-// %ProgramData%\BallrainPool\u-<user> with a DACL for this user only (no token or personal data goes there: a
-// game-file copy, the engine copy, run directories); POSIX the
-// data directory (the engine takes UTF-8 bytes there)
-std::string engine_work_dir();
 std::string short_path(const std::string &path);  // Windows: the 8.3 form when the volume has one, else path
 bool open_url(const std::string &url);  // the system browser (ShellExecute / open / xdg-open)
 // One client per data directory: true when this process holds the lock (kept until it exits)

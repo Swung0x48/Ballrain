@@ -198,9 +198,9 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 
 ### 7.1 控制器（`native/core/src/controller.cpp`）
 `ballrain/pool/client_core.py` 的移植，和界面无关（以后的 Android 应用直接用它）：
-- **数据目录** `%LOCALAPPDATA%\BallrainPool`（macOS `~/Library/Application Support/BallrainPool`，Linux `$XDG_DATA_HOME/ballrain-pool`）：
-  `config.json`、`token`（POSIX 0600）、`cache/`（按 sha 存的策略、开局包、参考线）、`queue/`（上传队列）、`logs/`（`client.log` 超过 2 MB 轮转，保留 3 份；
-  出错实例最近一次的引擎日志 `engine-NN.log`）、`runs/`。同一个数据目录只能开一个客户端（Windows 命名互斥体，POSIX 文件锁）。
+- **数据目录** `%USERPROFILE%\.ballrain`（macOS / Linux `~/.ballrain`）：客户端写的、不放在程序目录里的东西全在这里（程序目录可以是只读的）。
+  `config.json`、`token`（POSIX 0600）、`user.json`（论坛账号，诊断导出时用来替换）、`cache/`（按 sha 存的策略、开局包、参考线）、`queue/`（上传队列）、
+  `logs/`（`client.log` 超过 2 MB 轮转，保留 3 份；出错实例最近一次的引擎日志 `engine-NN.log`）、`runs/`、`engine-work/`（见下面的非 ASCII 路径）。同一个数据目录只能开一个客户端（Windows 命名互斥体，POSIX 文件锁）。
 - **实例**：最多 8 个线程（默认 min(8, 核数 / 2)，网关的 `max_instances` 优先），每个线程一个引擎子进程，按任务取、跑、切段。
   引擎在 Windows 上低于正常优先级、建成挂起、放进客户端的 Job Object（`KILL_ON_JOB_CLOSE`）再恢复，所以客户端怎么退出（包括崩溃、被结束进程）
   引擎都会跟着结束；POSIX 上 nice 10，引擎在连接断开时自己退出。没有窗口，不会抢焦点。
@@ -217,9 +217,9 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - **横幅**：网关拒收、吊销、刷新会话失败时，横幅原样显示网关的 `reason.message`（FTXUI 的 `text` / `paragraph` 不解析任何标记）。
   令牌失效类原因会停掉所有实例，直到重新登录。
 - **非 ASCII 路径**：无头引擎用代码页路径找文件，Ballance 目录或引擎路径里有中文时（中文用户名、桌面上的游戏）它会找不到 base.cmo。
-  这时客户端先试 8.3 短名，没有短名就把引擎目录、以及 x87-soft 版要读的四项游戏文件复制到 `%ProgramData%\BallrainPool\u-<用户>`（每个 Windows 用户一个目录，受保护的 DACL 只给这个用户和 SYSTEM，
-  已有的目录不属于本用户时拒绝使用；按引擎 sha256 /
-  游戏文件哈希命名，只复制一次；`BALLRAIN_WORK_DIR` 可以改位置），运行目录也放在那里。令牌、配置、日志仍在 `%LOCALAPPDATA%`。
+  这时客户端先试 8.3 短名，没有短名就把引擎目录、以及 x87-soft 版要读的四项游戏文件复制到数据目录下的 `engine-work/`（按引擎 sha256 /
+  游戏文件哈希命名，只复制一次），运行目录也放在那里。用户名是中文时数据目录本身也不是纯 ASCII，这时用 `engine-work` 的 8.3 短名（系统盘通常有）；
+  连短名都没有时给出中文提示，玩家可以设环境变量 `BALLRAIN_WORK_DIR` 指向一个纯英文的文件夹。
   实测：数据目录、引擎、游戏目录都放在中文路径下，端到端 12/12 段通过。
 
 ### 7.2 终端界面（`native/apps/ballrain_pool.cpp`，FTXUI）

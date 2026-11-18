@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -348,7 +349,7 @@ std::string Controller::login_poll(const Json &started) {
         std::string tok = st.at("token").as_string();
         write_atomic(dir_ + "/token", tok);
 #ifndef _WIN32
-        std::error_code pe;  // a credential: owner only (Windows: %LOCALAPPDATA% is the user's own)
+        std::error_code pe;  // a credential: owner only (Windows: the user profile is the user's own)
         std::filesystem::permissions(dir_ + "/token", std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
                                      std::filesystem::perm_options::replace, pe);
 #endif
@@ -873,7 +874,7 @@ bool Controller::run_one_task(Slot *s) {
     char rn[32];
     std::snprintf(rn, sizeof rn, "/runs/slot-%02d", s->index + 1);
     // the engine writes its run files by narrow paths too: a non-ASCII data directory runs under the work directory
-    std::string run_dir = (plain_ascii(dir_) ? dir_ : platform::engine_work_dir()) + rn;
+    std::string run_dir;
     TaskOutcome out;
     std::string error;
     bool threw = false;
@@ -884,8 +885,9 @@ bool Controller::run_one_task(Slot *s) {
             cache = cache_.get();
         }
         if (!cache) throw Error("not connected");
+        run_dir = (plain_ascii(dir_) ? dir_ : engine_work_dir(dir_)) + rn;
         std::string note;
-        le = engine_view(le, files, &note);
+        le = engine_view(le, files, dir_, &note);
         if (!note.empty() && note != s->path_note) say(note), s->path_note = note;
         out = play_task(
             task, *cache, cache_mu_, le, run_dir,
@@ -1285,7 +1287,7 @@ DiagFiles Controller::diagnostics() const {
     std::string home = platform::home_dir(), user = platform::user_name();
     if (!home.empty()) rep.push_back({home, "~"});
     if (user.size() >= 2) rep.push_back({user, "<用户>"});
-    rep.push_back({platform::engine_work_dir(), "<引擎工作目录>"});
+    if (const char *w = std::getenv("BALLRAIN_WORK_DIR"); w && *w) rep.push_back({w, "<引擎工作目录>"});
     info.set("queued_chunks", Json::integer(view().queued_chunks));
     DiagFiles out;
     out.push_back({"info.json", scrub_text(info.dump(true), rep)});

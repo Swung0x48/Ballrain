@@ -351,8 +351,6 @@ std::unique_ptr<Process> Process::spawn(const Spec &spec) { return std::make_uni
 // ---------------------------------------------------------------------------------------------- files, HTTP (Windows)
 #ifdef _WIN32
 #include <winhttp.h>
-#include <aclapi.h>
-#include <sddl.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
@@ -410,61 +408,9 @@ static std::string known_folder(REFKNOWNFOLDERID id) {
     return out;
 }
 
-std::string data_dir() {
-    std::string base = known_folder(FOLDERID_LocalAppData);
-    if (base.empty()) base = home_dir() + "\\AppData\\Local";
-    return base + "\\BallrainPool";
-}
+std::string data_dir() { return home_dir() + "\\.ballrain"; }
 
 std::string home_dir() { return known_folder(FOLDERID_Profile); }
-
-std::string engine_work_dir() {
-    wchar_t buf[1024];
-    DWORD n = GetEnvironmentVariableW(L"BALLRAIN_WORK_DIR", buf, 1024);
-    std::string base;
-    if (n > 0 && n < 1024) {
-        base = narrow(std::wstring(buf, n));  // tests: another parent, the same per-user directory and DACL below
-    } else {
-        base = known_folder(FOLDERID_ProgramData);
-        if (base.empty()) base = "C:\\ProgramData";
-        base += "\\BallrainPool";
-    }
-    // %ProgramData% is writable by every local user and the client runs the engine copied there: each Windows user
-    // gets a directory whose DACL is protected and grants only that user and SYSTEM (re-applied when it exists; a
-    // directory owned by someone else cannot be re-ACLed and is refused)
-    std::wstring sid;
-    HANDLE tok = nullptr;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
-        DWORD n = 0;
-        GetTokenInformation(tok, TokenUser, nullptr, 0, &n);
-        std::vector<char> b(n ? n : 1);
-        LPWSTR s = nullptr;
-        if (GetTokenInformation(tok, TokenUser, b.data(), n, &n) &&
-            ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER *>(b.data())->User.Sid, &s)) {
-            sid = s;
-            LocalFree(s);
-        }
-        CloseHandle(tok);
-    }
-    if (sid.empty()) throw Error("cannot read this user's SID for the engine work directory");
-    uint32_t h = 2166136261u;
-    for (wchar_t c : sid) h = (h ^ uint32_t(c)) * 16777619u;
-    std::string dir = base + "\\u-" + std::to_string(h);
-    make_dirs(dir);
-    std::wstring sddl = L"D:P(A;OICI;FA;;;" + sid + L")(A;OICI;FA;;;SY)";
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sd, nullptr))
-        throw Error("cannot build the work directory's security descriptor");
-    BOOL present = FALSE, defaulted = FALSE;
-    PACL dacl = nullptr;
-    GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted);
-    std::wstring wd = widen(dir);
-    DWORD rc = SetNamedSecurityInfoW(&wd[0], SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                                     nullptr, nullptr, dacl, nullptr);
-    LocalFree(sd);
-    if (rc != ERROR_SUCCESS) throw Error("the engine work directory " + dir + " is not this user's (" + std::to_string(rc) + ")");
-    return dir;
-}
 
 std::string short_path(const std::string &path) {
     std::wstring w = widen(path);

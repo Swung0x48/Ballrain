@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
             LocalEngine le;
             le.binary = eng.binary, le.root = eng.root, le.kind = task.engine;
             std::string note;
-            le = engine_view(le, hash_game_files(eng.root, task.engine), &note);
+            le = engine_view(le, hash_game_files(eng.root, task.engine), arg(argc, argv, "--out"), &note);
             if (!note.empty()) std::fprintf(stderr, "%s\n", note.c_str());
             eng.binary = le.binary, eng.root = le.root;
         }

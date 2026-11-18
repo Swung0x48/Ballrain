@@ -7,7 +7,7 @@
 namespace ballrain {
 
 // paths are UTF-8 everywhere in the client; on Windows a narrow std::fstream path would be read in the ANSI code page
-// (a Chinese user name in %LOCALAPPDATA%, a Ballance folder on the 桌面)
+// (a Chinese user name in the profile path, a Ballance folder on the 桌面)
 std::filesystem::path u8_path(const std::string &p) { return std::filesystem::u8path(p); }
 
 uint32_t fourcc(const char s[4]) {

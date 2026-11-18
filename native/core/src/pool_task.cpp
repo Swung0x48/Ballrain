@@ -1,5 +1,6 @@
 #include "ballrain/pool_task.h"
 
+#include <cstdlib>
 #include <filesystem>
 
 #include "ballrain/sha256.h"
@@ -39,7 +40,20 @@ static void copy_tree(const std::string &from, const std::string &to) {
     if (ec) throw Error("cannot copy " + from + " for the engine: " + ec.message());
 }
 
-LocalEngine engine_view(const LocalEngine &le, const Json &game_files, std::string *note) {
+std::string engine_work_dir(const std::string &data_dir) {
+    const char *w = std::getenv("BALLRAIN_WORK_DIR");
+    std::string d = w && *w ? std::string(w) : data_dir + "/engine-work";
+    platform::make_dirs(d);
+    if (plain_ascii(d)) return d;
+    std::string sp = platform::short_path(d);
+    if (plain_ascii(sp)) return sp;
+    throw Error("你的 Ballance 目录或客户端路径里有中文，客户端要把引擎用的文件复制到一个纯英文路径，但 " + d +
+                " 没有纯英文的形式。请把 Ballance 和客户端放到纯英文路径下，或者设置环境变量 BALLRAIN_WORK_DIR 指向一个纯英文的文件夹"
+                "（例如 C:\\ballrain-work）。");
+}
+
+LocalEngine engine_view(const LocalEngine &le, const Json &game_files, const std::string &data_dir,
+                        std::string *note) {
     static std::mutex mu;  // instances share the copies: one copies, the others wait and reuse it
     std::lock_guard<std::mutex> g(mu);
     LocalEngine out = le;
@@ -50,13 +64,13 @@ LocalEngine engine_view(const LocalEngine &le, const Json &game_files, std::stri
             out.binary = sp;
         } else {  // the engine's own directory (its DLLs, ENGINE_VERSION), keyed by the binary's sha256
             std::string sha = file_sha256(le.binary);
-            std::string d = platform::engine_work_dir() + "/engine-" + sha.substr(0, 16);
+            std::string d = engine_work_dir(data_dir) + "/engine-" + sha.substr(0, 16);
             std::string name = le.binary.substr(le.binary.find_last_of("/\\") + 1);
             if (!file_exists(d + "/" + name) || file_sha256(d + "/" + name) != sha) copy_tree(parent_of(le.binary), d);
             out.binary = d + "/" + name;
             why += "引擎路径含非 ASCII 字符，已复制到 " + d + "；";
         }
-        if (!plain_ascii(out.binary)) throw Error("no plain-ASCII path for the engine (set BALLRAIN_WORK_DIR)");
+        if (!plain_ascii(out.binary)) throw Error("引擎没有纯英文路径可用（可以设置 BALLRAIN_WORK_DIR）");
     }
     if (!plain_ascii(le.root)) {
         std::string sp = platform::short_path(le.root);
@@ -64,7 +78,7 @@ LocalEngine engine_view(const LocalEngine &le, const Json &game_files, std::stri
             out.root = sp;
         } else {  // the entries the engine reads, keyed by their hashes (hello's game_files)
             std::string key = Sha256::hex(game_files.dump(true));
-            std::string d = platform::engine_work_dir() + "/game-" + key.substr(0, 16);
+            std::string d = engine_work_dir(data_dir) + "/game-" + key.substr(0, 16);
             if (!file_exists(d + "/.complete")) {
                 platform::make_dirs(d);
                 for (const char *n : {"base.cmo", "Database.tdb"}) {
@@ -86,7 +100,7 @@ LocalEngine engine_view(const LocalEngine &le, const Json &game_files, std::stri
             out.root = d;
             why += "Ballance 目录路径含非 ASCII 字符，引擎用的四项游戏文件已复制到 " + d + "；";
         }
-        if (!plain_ascii(out.root)) throw Error("no plain-ASCII path for the game files (set BALLRAIN_WORK_DIR)");
+        if (!plain_ascii(out.root)) throw Error("游戏文件没有纯英文路径可用（可以设置 BALLRAIN_WORK_DIR）");
     }
     if (note) *note = why;
     return out;

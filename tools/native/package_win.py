@@ -45,7 +45,7 @@ QUICKSTART = """Ballrain 算力池客户端 {version}（Windows 测试版）
 5. 回到客户端点“开始”。玩 Ballance（Player.exe）或电脑用电池时会自动暂停。
 6. 遇到问题：点“导出诊断”，把生成的 zip 发给测试负责人（里面的令牌、用户名、路径、IP 都已替换掉）。
 
-数据和登录状态保存在 %LOCALAPPDATA%\\BallrainPool；删除这个文件夹即可清除。
+数据、日志和登录状态都保存在 %USERPROFILE%\\.ballrain（程序文件夹不会被写入）；删除这个文件夹即可清除。
 完整说明见项目文档 docs/native-client-testers.md。
 """
 
