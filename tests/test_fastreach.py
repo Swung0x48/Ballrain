@@ -54,6 +54,7 @@ def make(tris, rails=(), depth=(), fans=()):
     return F.FastReach.build(ts, rs, depth, fans=fans)
 
 
+NAMES = {n: i for i, n in enumerate(F.FEATURE_NAMES)}
 DEATH = [(0, np.array([-200.0, -60.0, -200.0]), np.array([200.0, -20.0, 200.0]))]
 
 
@@ -544,6 +545,22 @@ def test_fan_hover_lands_only_in_reach_of_the_column():
     assert b.air_accel * F.air_tables(b)[1][-1] > 10.0  # the far ledge is within the key square
 
 
+@pytest.mark.parametrize("p, v", [([40.0, -5.0, 0.0], [0.0, 0.0, 0.0]), ([40.0, 10.0, 0.0], [0.0, -15.0, 0.0]),
+                                  ([80.0, -5.0, 0.0], [0.0, 0.0, 0.0])])
+def test_fan_landing_features_use_the_actual_profile_heights(p, v):
+    """Fan code 1: air_first_dy / air_near_dy are the key-free fan profile's heights at the landing PSIs (not its upper
+    envelope), e.g. paper falling into the column and lifted again."""
+    tris = FAN_TRIS + box((83.0, 1.0, -5), (88.0, 2.0, 5))
+    fr = make(tris, depth=DEATH, fans=[fan_at(40.0, -15.0, 0.0), fan_at(80.0, -15.0, 0.0, name=F.FAN_ENTITY + "001")])
+    vec, info = fr.perceive(p, v, 1, debug=True)
+    assert info["dbg"]["fan"] == 1
+    y = fr.fan_profile(p, v, 1)["y"]
+    nf, nn = int(info["dbg"]["n_first"]), int(info["dbg"]["n_near"])
+    assert vec[NAMES["air_first_dy"]] == pytest.approx(y[nf] - p[1], abs=1e-9)
+    assert vec[NAMES["air_near_dy"]] == pytest.approx(y[nn] - p[1], abs=1e-9)
+    assert info["dbg"]["land_cy"] == pytest.approx(y[nn], abs=1e-9)
+
+
 def test_fan_collect_holds_the_reported_scans_landings():
     """collect: fan code 2 (the fan-free landing kept) returns the fan-free scan's landings (as a fan-free build),
     fan code 1 those of the pushed scan only (none before its first landing PSI)."""
@@ -618,13 +635,31 @@ FAN_STATES = [([40.0, -5.0, 0.0], [0.0, 0.0, 0.0], 1), ([40.0, -5.0, 0.0], [0.0,
               ([-1.0, 2.0, 0.0], [20.0, 0.0, 0.0], 0), ([-1.0, 2.0, 0.0], [30.0, 0.0, 0.0], 1)]
 
 
+# the takeoff band (fan 5 / 6 / 9) and the band-only ledge (fan 3) on their own geometries
+BAND_LEVELS = [
+    (lambda: make(box((-20, -1, -10), (0, 0, 10)), depth=DEATH, fans=[fan_at(8.0, -15.0, 0.0)]),
+     [([-1.0, 2.004, 0.0], [20.0, 0.0, 0.0], 1), ([-1.0, 2.0, 0.0], [20.0, 0.0, 0.0], 0)], {5.0, 9.0}),
+    (lambda: make(box((-20, -1, -10), (0, 0, 10)), depth=DEATH, fans=[fan_at(20.0, -5.0, 0.0)]),
+     [([-4.0, 2.004, 0.0], [20.0, 0.0, 0.0], 1)], {6.0}),
+    (lambda: make(box((-30, 9, -10), (-20, 10, 10)) + box((14.0, -11.0, -1.0), (15.0, -10.0, 1.0)),
+                  depth=[(0, np.array([-200.0, -120.0, -200.0]), np.array([200.0, -60.0, 200.0]))],
+                  fans=[fan_at(0.0, -60.0, 0.0, yscale=4.0)]),
+     [([4.3, 0.0, 0.0], [0.0, 0.0, 0.0], 0), ([4.3, 0.0, 0.0], [0.0, -10.0, 0.0], 0)], {3.0}),
+]
+
+
 @pytest.mark.skipif(not F.HAVE_NUMBA, reason="numba not installed: only the plain-Python path exists")
-def test_fan_numba_and_plain_python_identical(fan_level, tmp_path):
-    fan_level.save(tmp_path / "fan.npz")
-    want = [fan_level.perceive(p, v, bt, 0)[0].tolist() for p, v, bt in FAN_STATES]
+@pytest.mark.parametrize("which", ["fan_level", 0, 1, 2])
+def test_fan_numba_and_plain_python_identical(fan_level, tmp_path, which):
+    fr, states = (fan_level, FAN_STATES) if which == "fan_level" else (BAND_LEVELS[which][0](), BAND_LEVELS[which][1])
+    fr.save(tmp_path / "fan.npz")
+    want = [fr.perceive(p, v, bt, 0)[0].tolist() for p, v, bt in states]
+    codes = {fr.perceive(p, v, bt, 0, debug=True)[1]["dbg"]["fan"] for p, v, bt in states}
+    if which != "fan_level":
+        assert codes >= BAND_LEVELS[which][2], codes  # the paths this case is for
     env = dict(os.environ, BALLRAIN_NO_NUMBA="1")
     r = subprocess.run([sys.executable, "-I", "-c", _SUB_FAN, str(instances.REPO_ROOT), str(tmp_path / "fan.npz"),
-                        json.dumps(FAN_STATES)], env=env, capture_output=True, text=True, timeout=600)
+                        json.dumps(states)], env=env, capture_output=True, text=True, timeout=600)
     assert r.returncode == 0, r.stderr[-3000:]
     assert np.array_equal(np.array(json.loads(r.stdout.strip().splitlines()[-1])), np.array(want))
 

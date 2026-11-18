@@ -1509,6 +1509,8 @@ def _perceive(tiles, Hh, P1, P2, Pd, Poff, Pdim, Rr, Rl, Rn, Rf, bidx, bricks, s
                               stamp_id, collect, res, 1, yl, ya, fins, fans)
                 if pushed > 0 and res[0] > 0.0:
                     dbg[DBG_FAN] = 1.0  # landing on the key-free fan profile
+                    for n in range(N + 1):  # the features use its actual heights (the scan left the envelope in yy)
+                        yy[n] = ya[n]
                 elif found0:
                     dbg[DBG_FAN] = 2.0  # none on it: the fan-free flight's landing (approximate)
                     for i in range(res.shape[0]):
