@@ -103,7 +103,7 @@ class ChunkBuilder:
         self._clear()
 
     def _clear(self):
-        self.rows, self.values = [], []
+        self.rows, self.values, self.digests = [], [], []
         self.cols = {k: [] for k in ("actions", "logp", "rewards", "flags") + _OPTIONAL}
         self.frames = self.episodes = 0
         self.t0 = time.perf_counter()
@@ -111,8 +111,9 @@ class ChunkBuilder:
     def __len__(self):
         return len(self.rows)
 
-    def add(self, obs, a, logp, v, r, flag, env_r, sector, frames, sr_ms, arc, episode_end: bool):
+    def add(self, obs, a, logp, v, r, flag, env_r, sector, frames, sr_ms, arc, episode_end: bool, digest: bytes):
         self.rows.append(np.asarray(obs, np.float32))
+        self.digests.append(bytes(digest))
         self.values.append(float(v))
         c = self.cols
         c["actions"].append(int(a))
@@ -127,12 +128,12 @@ class ChunkBuilder:
         self.frames += int(frames)
         self.episodes += int(episode_end)
 
-    def build(self, next_obs, next_value: float, final: bool, end: str | None) -> tuple[bytes, dict]:
+    def build(self, next_obs, next_value: float, final: bool, end: str | None, next_digest: bytes) -> tuple[bytes, dict]:
         T = len(self.rows)
         if T == 0:
             raise ValueError("empty chunk")
         obs = np.stack(self.rows + [np.asarray(next_obs, np.float32)]).astype("<f4")
-        h = P.chain_hashes(obs, self.prev)
+        h = P.chain_from_digests(self.digests + [bytes(next_digest)], self.prev)
         c = self.cols
         arrays = {"actions": np.asarray(c["actions"], np.uint8), "logp": np.asarray(c["logp"], np.float32),
                   "rewards": np.asarray(c["rewards"], np.float32), "flags": np.asarray(c["flags"], np.uint8),
@@ -310,7 +311,10 @@ class TaskSampler(_worker_base()):
         sp, env = self.spec, self.env
         n_obs = env.observation_space.shape[0]
         b = ChunkBuilder(task.task_id, task.policy_sha, n_obs, n_act or env.action_space.n)
+        from .engine_chain import EngineDigest
+        env.engine_digest = EngineDigest()  # the engine-state chain (protocol chain v2)
         obs, info = env.reset()
+        digest = env.engine_digest.take()
         self._collect_runs()
         if on_start is not None:
             on_start(env)
@@ -329,7 +333,7 @@ class TaskSampler(_worker_base()):
             if len(b) == 0:
                 raise TaskAborted(f"第 {steps} 步引擎出错：{what}")
             b.cols["flags"][-1] |= P.FLAG_TRUNCATED if not b.cols["flags"][-1] & P.FLAG_TERMINATED else 0
-            chunk_out(*b.build(obs, actions.value(obs), True, "error"))
+            chunk_out(*b.build(obs, actions.value(obs), True, "error", digest))
             return "error"
 
         while final_end is None:
@@ -434,14 +438,15 @@ class TaskSampler(_worker_base()):
                     ep = _Episode(i3, env, self.version, self._cap_frames(i3))
                     self._split_start(ep, i3)
             arc = (self.fx_info.get("path") or {}).get("s")
+            next_digest = env.engine_digest.take()
             b.add(obs, a, logp, v, r, flag, env_r, int(info2.get("sector") or 0), step_frames,
-                  float(info2.get("sr_ms") or 0.0), np.nan if arc is None else float(arc), bool(term or trunc))
+                  float(info2.get("sr_ms") or 0.0), np.nan if arc is None else float(arc), bool(term or trunc), digest)
             if on_step is not None:
                 on_step(steps)
             if final_end is not None or len(b) >= int(task.chunk_steps):
                 nv = actions.value(next_obs)
-                chunk_out(*b.build(next_obs, nv, final_end is not None, final_end))
-            obs, info = next_obs, next_info
+                chunk_out(*b.build(next_obs, nv, final_end is not None, final_end, next_digest))
+            obs, info, digest = next_obs, next_info, next_digest
         frames = 0
         try:
             frames = int(info2.get("frames_done") or 0) - f_hand

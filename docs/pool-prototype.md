@@ -10,7 +10,7 @@
 | 模块 | 内容 | 谁用 |
 |---|---|---|
 | `ballrain/pool/reasons.py` | 拒收 / 吊销原因码 `Reason`，中文说明 `MESSAGES`，`render()` / `payload()` / `http_status()`，`TOKEN_FATAL` | 网关、主控程序 |
-| `ballrain/pool/protocol.py` | 严格 JSON（`loads_strict` / `dumps`）、消息 schema（`MESSAGES`、`validate` / `parse_message` / `make_message` / `encode_message`）、数据段编解码（`encode_chunk` / `decode_chunk`）、观测哈希链（`chain_seed` / `chain_hashes` / `verify_chain` / `check_chain_link`）、游戏文件清单（`GAME_FILE_LIST(_2002)`、`tree_digest`） | 全部 |
+| `ballrain/pool/protocol.py` | 严格 JSON（`loads_strict` / `dumps`）、消息 schema（`MESSAGES`、`validate` / `parse_message` / `make_message` / `encode_message`）、数据段编解码（`encode_chunk` / `decode_chunk`）、引擎状态哈希链（`chain_seed` / `chain_from_digests` / `check_chain_link`；行摘要在 `engine_chain.py`）、验证容差（`OBS_TOL` / `REWARD_TOL` / `ARC_TOL`、`obs_close` / `value_close`）、游戏文件清单（`GAME_FILE_LIST(_2002)`、`tree_digest`） | 全部 |
 | `ballrain/pool/weights.py` | 检查点导出成 npz + 清单（`export_checkpoint` / `export_state`，只在服务端、只读学习器自己的检查点），客户端加载（`read_manifest` / `load_policy`），纯 numpy 前向 `NumpyPolicy` | 网关（导出）、客户端、验证器 |
 | `ballrain/pool/sampling.py` | 采样任务的确定性动作抽取：`sample_u(sample_seed, t)`、`sample_action`、重放用的 `action_consistent`（第 10.6 节，第 2c 步新增） | 主控程序、验证器 |
 | `ballrain/pool/task.py` | 任务 `Task`、本机游戏 `LocalGame`、`hash_game_files`、开局包和参考线（`export_starts_pack` / `install_starts_pack`、`export_path_asset` / `find_path_asset` / `install_path_asset`）、`build_env_config` / `build_env`、`valid_start_frames`、`save_npz_deterministic` | 网关（发任务、导出素材）、客户端、验证器 |
@@ -305,7 +305,7 @@
 
 ```
 magic   "BRPC"                   4 字节
-format  u16 = 1                  2
+format  u16 = 2                  2    （2：哈希链改成引擎状态链 v2，第 3.2 节）
 flags   u16 = 0                  2
 hlen    u32                      4
 header  JSON（UTF-8，规范形式）    hlen 字节，上限 16 KiB
@@ -329,8 +329,8 @@ digest  sha256                   32 字节，覆盖它前面的全部内容
 | `logp` | f32 | T | 是 | behaviour log-prob（温度 1），取值在 [-60, 1e-5] |
 | `values` | f32 | T+1 | 是 | 每一行观测的价值，最后一行用于自举 |
 | `flags` | u8 | T | 是 | bit0 terminated，bit1 truncated；截断只能出现在最后一段的最后一步 |
-| `obs` | f16 | (T+1, n_obs) | 是，只能 zstd | 未归一化的原始观测，float16 副本只给学习器用 |
-| `obs_hash` | u8 | (T+1, 32) | 是 | 每一行之后的哈希链值 |
+| `obs` | f16 | (T+1, n_obs) | 是，只能 zstd | 未归一化的原始观测，float16 副本给学习器用；验证器在容差内和自己算的特征比对 |
+| `obs_hash` | u8 | (T+1, 32) | 是 | 每一行之后的引擎状态哈希链值（第 3.2 节） |
 | `env_rewards` | f32 | T | 否 | `BallanceEnv.step` 本身的奖励 |
 | `sector` | u8 | T | 否 | 这一步之后所在的小节 |
 | `frames` | u16 | T | 否 | 这一步推进的帧数 |
@@ -349,14 +349,24 @@ digest  sha256                   32 字节，覆盖它前面的全部内容
 9. 每段解码后的大小必须精确等于预期（zstd 解压时输出上限就是预期大小，防解压炸弹；窗口最大 8 MiB，`window_log_max = 23`），再核对 sha256。raw 段的存储大小必须等于解码大小；zstd 段的存储大小不能超过 `zstd_bound(解码大小) = n + n/128 + 64`（高于 libzstd 的 compressBound），所以不能用空块把一段撑大；
 10. 内容：浮点有限、动作小于 n_act、log-prob 在范围内、flags 位合法、最后一段的最后一步必须结束。
 
-### 3.2 观测哈希链
+### 3.2 引擎状态哈希链（链 v2，2026-11-17 起；原生客户端 M2）
 
-- `h(-1) = sha256("ballrain-pool/obs-chain/v1\0" + task_id)`；
-- `h(i) = sha256(h(i-1) || 第 i 行观测的 float32 小端字节)`。
+链覆盖的是**引擎发来的原始字节**，不是从它算出来的 float32 特征。原因：志愿者可能用原生 C++ 客户端，或者在另一种 CPU / 编译器上算特征，
+float 的舍入会有极小的差别；引擎（x87-soft）本身是确定的，同一组按键给出同样的字节。
+
+- `h(-1) = sha256("ballrain-pool/engine-chain/v2\0" + task_id)`；
+- `h(i) = sha256(h(i-1) || d_i)`，`d_i` 是第 i 行的**引擎摘要**：从第 i-1 行形成之后到第 i 行形成为止（第 0 行：从进程启动起，含开局交接和开场）收到的全部引擎消息的规范记录，
+  `sha256("ballrain-pool/engine-row/v2\0" + 记录…)`（`ballrain/pool/engine_chain.py`，原生实现 `native/core/src/engine_chain.cpp`）：
+  - `"O"` + 一条 OBS1：magic、u16 版本、u16 flags、u32 frames_done、u32 段数，然后每段 u32 tag、u16 版本、u16 flags、u32 长度、内容；**去掉 SCOR、SREN**；
+  - `"F"` + level.msg（读到的那一条 LVL1，同样的布局）、`"I"` + 一次读 `.inc` 消费掉的完整增量消息：u32 条数，每条同上，**去掉 IVPO**。
+  - 去掉的三段里有地址：SCOR / SREN 的 Energy 第 4 列是参数指针，IVPO 按 IVP 对象地址去重（`headless.md` §5、`native-client.md` §4.1：同一输入跑两次只有这三处不同）。特征不读它们（`hs_block` 关）；HS 策略要先给 SCOR 的跟随计数单独处理。
+- 读关卡消息的时刻同 AgentSession（StartLevel 或未加载时读全量，有 PHYS 或 StartLevel 时读增量）；交接检查不通过而重开的进程，摘要从新进程重新开始。
 
 观测是每一步之前的那一行，加上最后一步之后的一行。第 s 段带第 `step0 .. step0+steps` 行（共 steps+1 行），`chain_prev = h(step0-1)`，所以第 s 段的最后一行就是第 s+1 段的第一行（`check_chain_link`）。
 
-哈希链按 float32 计算，是策略归一化之前看到的值。验证器重放时必须逐位复现（`verify_chain` 返回第一个不一致的任务步）；float16 副本有损，只比对它的位模式。
+验证器重放时链必须逐位复现（引擎确定）；它在特征、log-prob、价值、奖励上**用容差**和提交的值比对（第 10.6 节）。
+同一台机器上，原生客户端和 Python 的引擎摘要在 17299 行录制上完全相同，两个 x87-soft 构建（`bin-x86soft`、`bin-x86p2002d` + `BALLRAIN_HL_PHYS2002=0`）也相同；
+Mac arm64 / Linux 的引擎构建之间是否逐字节相同还没验证（`native-client.md` §4.1）。
 
 ### 3.3 网关收段（原型）
 
@@ -368,8 +378,8 @@ digest  sha256                   32 字节，覆盖它前面的全部内容
 网关实际还多查几项（第 10.4 节）：第 0 段的 `step0 = 0`、`chain_prev = chain_seed(task_id)`；`step0` 接着已收的步数；非最终段正好 `chunk_steps` 步；总步数不超过 `max_steps`；`n_obs` / `n_act` 与策略一致。
 
 验证器重放（第 10.5 节）：
-- 观测（哈希链或 float16 副本）、flags、`end`、可选数组不一致返回 `replay_mismatch`；
-- 奖励不一致返回 `replay_reward_mismatch`；
+- 引擎状态链（逐位）、float16 观测（容差内）、flags、`end`、可选数组（sector / frames / sr_ms 逐位，env_rewards / arc 容差内）不一致返回 `replay_mismatch`；
+- 奖励超出容差返回 `replay_reward_mismatch`；
 - 用 `NumpyPolicy` 重算 log-prob / 价值，不一致返回 `replay_logp_mismatch` / `replay_value_mismatch`；
 - 采样任务的动作不是按任务的 `sample_seed` 抽出的，返回 `replay_action_mismatch`。
 
@@ -512,8 +522,9 @@ r6 当前的权重文件约 0.97 MB。
 - **zstd：** 开发环境是 Python 3.14，用标准库的 `compression.zstd`，所以客户端目前需要 Python 3.14。给旧版 Python 准备的 `zstandard` 回退分支（有输出上限的流式读取）没有在本机测试过，因为本机没有装这个包；它也不检查帧后面的多余数据（解码后的 sha256 仍然要对上）。
 - **`build_env` 只负责建环境：** `max_steps`、`max_frames`、`deadline_s`、`greedy` 由客户端的采样循环执行。
 - **k = 0：** 从关卡加载开始，没有前缀重放。第 1 关的教程跳过（按 Q 直到 CamNavActive）由 env 自己完成，同样的配置重放时会重复同样的操作。
-- **跨机器逐位一致是假设：** 哈希链要求志愿者的 CPU、numpy 和本机特征计算产出逐位相同的 float32 观测。这一点在同一台机器上成立，跨 CPU / numpy 版本还没有测过，要在验证器上线前用不同机器核对。
-- **奖励语义：** 数据段里的 `rewards` 是 worker 的训练奖励，包括 stall、split、gate 等塑形项，参数取自清单的 `rollout`。客户端的采样循环要和 `ballrain/train/worker.py` 一致，验证器才能逐位复现。这一部分由下一步的客户端实现。
+- **跨机器：** 链 v2 不再要求特征逐位相同（第 3.2 节），只要求引擎字节相同；不同引擎构建（Windows x86 / Mac arm64 / Linux）之间的引擎字节还没有核对过。
+  容差能吸收的只是舍入；特征里的离散判定（射线擦边、投影重新捕获、stall / cap 的帧数阈值）在另一种 CPU 上翻转时，奖励或结束方式会差出容差，这种情况会被当成不一致，现在只能靠概率很小来接受。
+- **奖励语义：** 数据段里的 `rewards` 是 worker 的训练奖励，包括 stall、split、gate 等塑形项，参数取自清单的 `rollout`。客户端的采样循环要和 `ballrain/train/worker.py` 一致，验证器才能在容差内复现（Python 主控程序的 `client_sampler` 和原生客户端的 `native/core/src/task_runner.cpp` 都照 `rollout.TaskRunner` 实现）。
 - **只支持 SR：** 原型不支持 Esc / collect 动作（HS 模式），导出时会直接拒绝。
 
 ## 9. 主控程序（第 2b 步）
@@ -751,9 +762,9 @@ python tools/pool/mock_forum.py --port 8098 --redirect-uri http://127.0.0.1:8099
 - **“通过验证的步数”**（`me.stats.steps_verified`、排行榜）= 重放通过的段 + 抽查放行的段。被拒收和被隔离的段不算。
 - **重放代码：** `rollout.TaskRunner` 在 `task.build_env` 建的环境里逐步执行。奖励塑形直接复用 `ballrain.train.worker` 的 `_Episode` 和 `Worker` 的辅助方法（绑定到一个替身对象上，`worker.py` 没有改动）。任务层的判定与 `client_sampler.TaskSampler.run_task` 逐项一致，包括 `end` 名称、上限先于重生判定、`max_frames` 从交接起计数、`stopped` / `deadline` 在重生之前判定、可选数组的取值。`tests/test_pool_verifier.py` 用主控程序的采样器产生数据段，再由验证器重放，要求全部通过。
 - **比较顺序：** 先比步号，最早的一步胜出。同一步内依次比较：
-  1. 观测（哈希链和 float16 副本，逐位）；
-  2. 价值、log-prob（容差 1e-3，log-prob 先截到 [-60, 0]，和客户端一样）、贪心任务是否取了 argmax、采样任务的动作是否是 `sample_seed` 的抽取；
-  3. 执行这一步，再比训练奖励（float32 逐位）、flags、`end`、可选数组（逐位）。
+  1. 引擎状态链（逐位，`engine state`）；float16 观测和验证器自己算的特征比，每个分量允许一个 float16 ulp 加 `OBS_TOL`（1e-4）× max(1, |值|）（`observation`）；
+  2. 价值、log-prob（容差 1e-3，log-prob 先截到 [-60, 0]，和客户端一样；都用验证器自己算的特征）、贪心任务是否取了 argmax、采样任务的动作是否是 `sample_seed` 的抽取（`u_t` 离累积分布边界不到 1e-4 时放过）；
+  3. 执行这一步，再比训练奖励（`REWARD_TOL` 1e-4 × max(1, |r|)）、flags、`end`、可选数组（sector / frames / sr_ms 逐位，env_rewards 同奖励的容差，arc `ARC_TOL` 1e-3 × max(1, |arc|)，两边都是 NaN 算相同）。
 - **客户端声明的结束：** `stopped` / `deadline` 只能出现在最终段的最后一步，重放也在那一步停下（不重生）。`error` 表示下一步引擎出错，所以这最后一步照常执行，flags 允许从 0 变成截断。
 - **引擎故障不是不一致：** `BallanceEnv.step` 自己捕获 `PeerGone` / `Timeout`，设 `info["error"]` 后正常返回一个截断步。两边都在 `env.step` 之后、`ep.step` 之前检查 `info["error"]`：主控程序丢掉这半步（重生时引擎出错也一样，丢掉死亡那一步），在上一步以 `error` 结束最终段，这一段还没有步时放弃任务（`TaskAborted`，已交的段到期后照常验证）；验证器抛 `EngineFailure`，记 `replay_failed` 以后重试。重生时引擎断开会抛异常而不是返回 `None`（`client.run_until` 把 `PeerGone` 往上抛），所以不会被当成 `GameOver`。
 - **不一致时：**
@@ -769,7 +780,7 @@ python tools/pool/mock_forum.py --port 8098 --redirect-uri http://127.0.0.1:8099
 | 文件 | 内容 |
 |---|---|
 | `tests/test_pool_gateway.py` | 模拟论坛上的 OAuth：合格账号拿到令牌，三种不合格账号的原因码和参数，门槛顺序，论坛字段格式不对；state 只能用一次、必须带 cookie、拒绝授权、错误的应用密钥；模拟论坛本身要求精确的 redirect_uri、不允许隐式授权、必须带 state、授权码只能用一次；只用浏览器登录时令牌只显示一次；令牌轮换，管理员吊销后各接口的应答，重新登录被拒；`hello` 的各项检查；乱码、超大请求、错误的方法和路径；限速；真实 HTTP 服务器按 `Content-Length` 拒收 5 MiB 的数据段、拒收 chunked、日志里没有地址和查询串；sqlite 和输出里没有邮箱和令牌明文；配置文件和环境变量；`runtime/pool` 不进 git；r6 的策略导出和课程抽样（没有 r6 时跳过） |
-| `tests/test_pool_verifier.py` | 假游戏上端到端：采样和重放逐位相同；诚实的数据段被收下并通过验证，`me` 和排行榜的步数；重复、跳段、最终段之后再交、别人的任务、别的策略、链起点不对、链断开、未知任务、8 个任务的上限；**伪造的数据段**（改奖励、改观测并重算链、改动作、改 log-prob、改价值、改 flags）都被抓到，原因码和步号正确，账号吊销，其他任务的数据被隔离，原因原样显示，从排行榜上消失；过了试用期后的抽查和放行；验证器引擎故障不吊销；过期任务只验证已到的段；主控程序的采样器和 `rollout` 的采样器（含玩家停止、重生）都能通过验证 |
+| `tests/test_pool_verifier.py` | 假游戏上端到端：采样和重放逐位相同；诚实的数据段被收下并通过验证，`me` 和排行榜的步数；重复、跳段、最终段之后再交、别人的任务、别的策略、链起点不对、链断开、未知任务、8 个任务的上限；**伪造的数据段**（改奖励、改观测、改引擎状态并重算链、改动作、改 log-prob、改价值、改 flags）都被抓到；另一种 CPU 级别的浮点噪声（所有浮点数组都加小扰动）照常通过，原因码和步号正确，账号吊销，其他任务的数据被隔离，原因原样显示，从排行榜上消失；过了试用期后的抽查和放行；验证器引擎故障不吊销；过期任务只验证已到的段；主控程序的采样器和 `rollout` 的采样器（含玩家停止、重生）都能通过验证 |
 
 **本机实测**（r6 最新检查点，课程前沿 4100，一次只开一个引擎）：
 - **2002 宿主**（`bin-x86p2002d` + `game-min`）：用主控程序的采样器跑 4 个诚实任务（2 个各 600 步；2 个跑到 `stall` 结束，各 4090 / 3789 步，含一次死亡重生），共 37 段，全部通过；一个 15–16 段的任务重放约 19–21 秒。另一个账号的任务把第 1 段第 10 步的奖励加 0.25，验证器报 `replay_reward_mismatch`（第 1 段第 266 步），账号吊销，后面的段全部隔离。
@@ -779,7 +790,7 @@ python tools/pool/mock_forum.py --port 8098 --redirect-uri http://127.0.0.1:8099
 
 - **没有接真论坛测过。** OAuth 只在模拟论坛上测过。真论坛的 `/api/user` 如果是 JSON:API 包装（`data.attributes`）也能解析，但字段名没有实际核对过。
 - **自己挑动作已经查得出（第 10.6 节的 `sample_seed`）**，但只对被重放的段有效；过了试用期，没抽中的段仍然只按规则放行。
-- **跨机器逐位一致还是假设**（第 8 节）：实测都在同一台机器上。
+- **跨机器**（第 8 节）：链 v2 只要求引擎字节相同；实测都在同一台机器上（原生客户端 + Python 验证器，两个 x87-soft 构建）。
 - **任务循环有两份：** `rollout.TaskRunner`（验证器）和 `client_sampler.TaskSampler`（主控程序）实现同一套规则，靠对照测试保持一致，以后应合并成一份。有一处值得注意：死亡那一步的 `arc` 记的是重生之后那一行的弧长。主控程序是这样记录的，验证器照样比较。
 - **有选择地放弃任务查不出来：** 玩家可以只交“跑得好”的任务，把其余的停掉或丢掉，这会让结果分布偏向好局。重放只能证明交上来的数据是真的。
 - **实例上限按活着的会话计算：** 一个会话超过 max(3 × 心跳间隔, 90) 秒没有动静，它名下没结束的任务就不再占用 8 个实例的名额（主控程序被强杀后重启，最多等这么久）；这些任务仍然到期限才过期，验证器再验证已到的段。

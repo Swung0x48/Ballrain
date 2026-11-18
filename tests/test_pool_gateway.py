@@ -553,7 +553,7 @@ def _honest_like_chunk(steps=4, n_obs=3, codec_obs=None):
     arrays = {"actions": np.zeros(steps, np.uint8), "rewards": np.zeros(steps, np.float32),
               "logp": np.full(steps, -0.5, np.float32), "values": np.zeros(steps + 1, np.float32),
               "flags": np.zeros(steps, np.uint8), "obs": np.zeros((steps + 1, n_obs), np.float32)}
-    arrays["obs_hash"] = P.chain_hashes(arrays["obs"], P.chain_seed("t1"))
+    arrays["obs_hash"] = P.chain_from_digests([bytes(32)] * len(arrays["obs"]), P.chain_seed("t1"))
     h = {"task_id": "t1", "seq": 0, "step0": 0, "steps": steps, "n_obs": n_obs, "n_act": 9, "policy_sha": "a" * 64,
          "chain_prev": P.chain_seed("t1").hex(), "final": False, "end": None}
     return P.encode_chunk(h, arrays)
@@ -746,7 +746,7 @@ def test_gateway_unlinks_the_file_of_a_chunk_refused_in_the_transaction(tmp_path
         arrays = {"actions": np.zeros(steps, np.uint8), "rewards": np.zeros(steps, np.float32),
                   "logp": np.full(steps, -0.5, np.float32), "values": np.zeros(steps + 1, np.float32),
                   "flags": np.zeros(steps, np.uint8), "obs": np.zeros((steps + 1, n_obs), np.float32)}
-        arrays["obs_hash"] = P.chain_hashes(arrays["obs"], P.chain_seed(t["task_id"]))
+        arrays["obs_hash"] = P.chain_from_digests([bytes(32)] * len(arrays["obs"]), P.chain_seed(t["task_id"]))
         h = {"task_id": t["task_id"], "seq": 0, "step0": 0, "steps": steps, "n_obs": n_obs, "n_act": 9,
              "policy_sha": t["policy_sha"], "chain_prev": P.chain_seed(t["task_id"]).hex(), "final": False, "end": None}
         data = P.encode_chunk(h, arrays)
