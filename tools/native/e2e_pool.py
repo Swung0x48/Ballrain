@@ -128,6 +128,7 @@ def main(argv=None) -> int:
                          "object), then run it again: the killed run's queued chunks are posted and its tasks closed")
     ap.add_argument("--max-steps", type=int, default=3000)
     ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--latency-ms", type=float, default=0.0, help="delay every gateway response (a tunnel's round trip)")
     ap.add_argument("--heartbeat-s", type=int, default=5, help="the gateway's heartbeat interval (5: heartbeats during tasks)")
     ap.add_argument("--env-draws", default="", help="JSON over the checkpoint's env_config start draws, e.g. "
                     '{"p_rest": 0.8} (format 3: at-rest / rehearsal starts at test rates)')
@@ -170,6 +171,8 @@ def main(argv=None) -> int:
     real_handle = app.handle
 
     def handle(*args, **kw):
+        if a.latency_ms:
+            time.sleep(a.latency_ms / 1000.0)
         if down.is_set():
             from ballrain.pool.server_app import Response
             return Response(502, b"<html><body>502 Bad Gateway (tunnel down)</body></html>", "text/html",

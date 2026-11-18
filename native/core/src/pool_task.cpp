@@ -114,6 +114,7 @@ TaskOutcome play_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, 
                       const std::string &run_dir, const std::function<void(int64_t, const Bytes &, bool)> &on_chunk,
                       const std::function<std::string()> &stop, const std::function<void(int64_t)> &on_step) {
     if (task.engine != le.kind) throw Error("task engine " + task.engine + ", local engine " + le.kind);
+    double ta = platform::monotonic_s();
     Policy pol;
     TasStarts starts;
     std::string path_dir, branch_dir, reach_dir;
@@ -173,6 +174,8 @@ TaskOutcome play_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, 
     remove_tree(run_dir);
     TaskOutcome out;
     double t0 = platform::monotonic_s();
+    out.assets_s = t0 - ta;
+    double t_first = -1;
     bool failed = false;
     try {
         BallanceEnv env(ec, fc, eng, run_dir, nullptr, &starts, task.start_frame,
@@ -190,9 +193,13 @@ TaskOutcome play_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, 
                 out.final_chunk = final;
             },
             [&]() -> std::string {
+                if (t_first < 0) t_first = platform::monotonic_s();
                 if (on_step) on_step(runner.steps);
                 return stop ? stop() : "";
             });
+        double t_end = platform::monotonic_s();
+        if (t_first < 0) t_first = t_end;
+        out.start_s = t_first - t0, out.play_s = t_end - t_first;
         env.close();
         out.steps = runner.steps, out.frames = runner.frames, out.episodes = runner.episodes, out.chunks = seq;
         failed = out.end == "error";
@@ -204,7 +211,9 @@ TaskOutcome play_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, 
     }
     if (failed) keep_engine_log(run_dir);
     remove_tree(run_dir);
-    out.wall_s = platform::monotonic_s() - t0;
+    double t1 = platform::monotonic_s();
+    out.wall_s = t1 - t0;
+    out.close_s = t1 - t0 - out.start_s - out.play_s;
     return out;
 }
 

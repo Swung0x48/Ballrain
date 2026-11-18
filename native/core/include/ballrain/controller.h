@@ -15,6 +15,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -29,7 +30,7 @@
 
 namespace ballrain {
 
-constexpr int MAX_INSTANCES = 8;
+constexpr int MAX_INSTANCES = 32;  // the client's own cap (the gateway's max_instances and the player's choice decide)
 
 struct ClientConfig {  // <data dir>/config.json
     std::string gateway_url, ballance_dir;
@@ -193,7 +194,17 @@ private:
     std::unique_ptr<PoolCache> cache_;
     std::map<std::string, int> task_slot_;          // task_id -> slot (accepted steps shown per instance)
     std::map<std::string, std::string> refused_;    // task_id -> why its chunks are refused (the instance stops)
-    std::map<std::string, int> read_fail_;          // the uploader's unreadable chunk files (its thread only)
+    std::map<std::string, int> read_fail_;          // the uploaders' unreadable chunk files (under upload_mu_)
+    std::set<std::string> uploading_;               // the tasks an uploader thread holds (under upload_mu_)
+    // where the instances' wall time goes (summed over tasks, logged every 5 minutes): waiting for the previous
+    // task's upload, the task fetch, assets, engine start, steps, close; tasks and steps
+    struct Phases {
+        double wait = 0, fetch = 0, assets = 0, start = 0, play = 0, close = 0;
+        int64_t tasks = 0, steps = 0;
+    } phases_;
+    double phases_t0_ = -1;
+    void add_phases(double wait, double fetch, const TaskOutcome &out);
+    std::mutex upload_mu_;
     double t_start_ = 0;
     std::string update_version_, update_url_, update_notes_;
 };

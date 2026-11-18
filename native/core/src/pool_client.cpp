@@ -1,6 +1,8 @@
 #include "ballrain/pool_client.h"
 
 #include <algorithm>
+#include <mutex>
+#include <map>
 #include <cctype>
 #include <cmath>
 
@@ -187,6 +189,25 @@ static bool is_hex64(const std::string &s) {
     return true;
 }
 
+// the files this process has checked (or written) with their sha256, keyed by path and size: a cached asset is hashed
+// once per run, not at every task (8 instances x two 58 MB reach fields per task)
+static std::mutex g_verified_mu;
+static std::map<std::string, std::pair<int64_t, std::string>> g_verified;
+
+static bool verified(const std::string &path, const std::string &sha) {
+    int64_t size = platform::file_size(path);
+    if (size < 0) return false;
+    {
+        std::lock_guard<std::mutex> g(g_verified_mu);
+        auto it = g_verified.find(path);
+        if (it != g_verified.end() && it->second.first == size && it->second.second == sha) return true;
+    }
+    if (file_sha256(path) != sha) return false;
+    std::lock_guard<std::mutex> g(g_verified_mu);
+    g_verified[path] = {size, sha};
+    return true;
+}
+
 static void put_file(const std::string &path, const Bytes &data) {
     std::string tmp = path + ".part";
     write_file(tmp, data);
@@ -220,7 +241,7 @@ std::string PoolCache::asset(const std::string &sha) {
     std::string d = root_ + "/assets";
     platform::make_dirs(d);
     std::string p = d + "/" + sha + ".npz";
-    if (!file_exists(p) || file_sha256(p) != sha) put_file(p, api_.download("/pool/assets/" + sha + ".npz", MAX_DOWNLOAD, sha));
+    if (!verified(p, sha)) put_file(p, api_.download("/pool/assets/" + sha + ".npz", MAX_DOWNLOAD, sha));
     return p;
 }
 
@@ -255,7 +276,7 @@ std::string PoolCache::path_dir(const std::string &sha, int level) {
     char name[16];
     std::snprintf(name, sizeof name, "/L%02d.npz", level);
     std::string dst = d + name;
-    if (!file_exists(dst) || file_sha256(dst) != sha) {
+    if (!verified(dst, sha)) {
         Bytes b;
         read_file(src, b);
         put_file(dst, b);
@@ -277,7 +298,7 @@ std::string PoolCache::reach_dir(const std::vector<Task::ReachAsset> &assets, in
         char n[16];
         std::snprintf(n, sizeof n, "L%02d-", level);
         std::string p = d + "/" + n + a.key_sha256.substr(0, 16) + ".npz";
-        if (file_exists(p) && platform::file_size(p) == a.size && file_sha256(p) == a.sha256) continue;
+        if (platform::file_size(p) == a.size && verified(p, a.sha256)) continue;
         Bytes z = api_.download("/pool/assets/" + a.zsha256 + ".zst", size_t(a.zsize), a.zsha256);
         if (int64_t(z.size()) != a.zsize) throw Error("reach fields: the download has another size");
         Bytes raw = zstd_decompress_capped(z, size_t(a.size));
