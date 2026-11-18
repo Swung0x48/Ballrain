@@ -117,8 +117,8 @@ def gated_curriculum(starts, cfg, finish_gate: float):
                     if frate < self.finish_gate:
                         self.gate_blocked += 1
                         return False
-                    new = self._snap(max(self.frontier - self.cfg.step, self.floor))
-                    if new >= self.frontier:  # at the floor: no move
+                    new = self.next_frontier(max(self.frontier - self.cfg.step, self.floor))
+                    if new >= self.frontier or new < self.floor:  # at the floor: no move
                         self.outcomes.clear()
                         self.finishes.clear()
                         return False
