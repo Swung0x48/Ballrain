@@ -172,7 +172,8 @@ private:
     void play_pending(Slot *s, Pending &p);
     void discard_next(Slot *s, const char *why);
     void upload_loop();
-    bool upload_task(const std::string &task_id);  // false: stop this round (network down / waiting)
+    // false: stop this round (network down / waiting); did: something was posted or closed (else nothing to do yet)
+    bool upload_task(const std::string &task_id, bool &did);
     void queue_chunk(const std::string &task_id, int64_t seq, const Bytes &data, bool final);
     void queue_end(const std::string &task_id, int64_t chunks, const std::string &reason);
     void queue_open(const Task &t, int slot);

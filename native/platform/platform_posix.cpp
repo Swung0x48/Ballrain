@@ -48,6 +48,12 @@ double monotonic_s() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
+double thread_cpu_s() {
+    timespec ts{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0.0;
+    return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
+}
+
 int self_pid() { return int(getpid()); }
 
 std::vector<std::pair<std::string, std::string>> environment() {

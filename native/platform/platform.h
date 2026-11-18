@@ -12,6 +12,7 @@ namespace ballrain {
 namespace platform {
 
 double monotonic_s();
+double thread_cpu_s();  // the calling thread's CPU time (user + kernel), seconds
 int self_pid();
 std::vector<std::pair<std::string, std::string>> environment();  // the current process environment
 bool make_dirs(const std::string &path);

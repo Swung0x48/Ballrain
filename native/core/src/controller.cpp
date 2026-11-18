@@ -1127,6 +1127,8 @@ void Controller::play_pending(Slot *s, Pending &p) {
         ph.set("assets", Json::number(out.assets_s)), ph.set("start", Json::number(out.start_s));
         ph.set("play", Json::number(out.play_s)), ph.set("close", Json::number(out.close_s));
         ph.set("prefetched", Json::boolean(p.prefetched));
+        ph.set("assets_cpu", Json::number(out.assets_cpu)), ph.set("start_cpu", Json::number(out.start_cpu));
+        ph.set("play_cpu", Json::number(out.play_cpu));
         f.set("phases", ph);
         emit("task_end", f);
     }
@@ -1255,7 +1257,8 @@ void Controller::upload_loop() {
                 if (!uploading_.insert(t).second) continue;  // another uploader has it
             }
             try {
-                if (upload_task(t)) progress = true;
+                bool did = false;  // a chunk posted or a task closed (else the loop sleeps: no busy re-listing)
+                if (upload_task(t, did)) progress = progress || did;
                 else down = true;
             } catch (const std::exception &e) {  // retried next round (the chunks stay until the task's deadline)
                 log_.line("上传队列：" + t.substr(0, 12) + "：" + e.what());
@@ -1278,12 +1281,13 @@ void Controller::upload_loop() {
 }
 
 // true: progress or nothing to do yet; false: the gateway is out of reach (back off)
-bool Controller::upload_task(const std::string &task_id) {
+bool Controller::upload_task(const std::string &task_id, bool &did) {
     std::string d = dir_ + "/queue/" + task_id;
+    did = true;
     Bytes mb;
     // no meta.json yet: queue_open is between creating the directory and writing it (a directory a crash left
     // that way is cleaned up at the next start, in the constructor)
-    if (!read_file(d + "/meta.json", mb)) return true;
+    if (!read_file(d + "/meta.json", mb)) return did = false, true;
     Json meta;
     try {
         meta = Json::parse(mb, 4);
@@ -1327,7 +1331,7 @@ bool Controller::upload_task(const std::string &task_id) {
         if (!read_file(d + "/" + f, data)) {  // briefly locked (e.g. a virus scanner): next round
             {
                 std::lock_guard<std::mutex> ug(upload_mu_);
-                if (++read_fail_[d + "/" + f] < 60) return true;
+                if (++read_fail_[d + "/" + f] < 60) return did = false, true;
                 read_fail_.erase(d + "/" + f);
             }
             log_.line("上传队列：数据段 " + task_id.substr(0, 8) + "/" + f + " 一直读不出来，丢弃这个任务。");
@@ -1395,7 +1399,7 @@ bool Controller::upload_task(const std::string &task_id) {
         }
         return true;
     }
-    if (!has_end) return true;  // still being played
+    if (!has_end) return did = false, true;  // still being played
     Bytes eb;
     read_file(d + "/end.json", eb);
     Json e = Json::parse(eb, 4);

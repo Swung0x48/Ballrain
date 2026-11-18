@@ -123,7 +123,7 @@ PreparedTask::~PreparedTask() {
 std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, const LocalEngine &le,
                                            const std::string &run_dir) {
     if (task.engine != le.kind) throw Error("task engine " + task.engine + ", local engine " + le.kind);
-    double ta = platform::monotonic_s();
+    double ta = platform::monotonic_s(), ca = platform::thread_cpu_s();
     auto p = std::make_unique<PreparedTask>();
     p->task = task;
     Policy &pol = p->pol;
@@ -183,8 +183,8 @@ std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, s
         eng.extra_env.push_back(kv);
     }
     remove_tree(run_dir);
-    double t0 = platform::monotonic_s();
-    p->assets_s = t0 - ta;
+    double t0 = platform::monotonic_s(), c0 = platform::thread_cpu_s();
+    p->assets_s = t0 - ta, p->assets_cpu = c0 - ca;
     try {
         p->env = std::make_unique<BallanceEnv>(ec, fc, eng, run_dir, nullptr, &starts, task.start_frame,
                                                RewardConfig::from_json(m.at("reward")), task.rest);
@@ -202,15 +202,15 @@ std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, s
         throw;
     }
     p->run_dir = run_dir;
-    p->start_s = platform::monotonic_s() - t0;
+    p->start_s = platform::monotonic_s() - t0, p->start_cpu = platform::thread_cpu_s() - c0;
     return p;
 }
 
 TaskOutcome run_prepared(PreparedTask &p, const std::function<void(int64_t, const Bytes &, bool)> &on_chunk,
                          const std::function<std::string()> &stop, const std::function<void(int64_t)> &on_step) {
     TaskOutcome out;
-    out.assets_s = p.assets_s, out.start_s = p.start_s;
-    double t0 = platform::monotonic_s();
+    out.assets_s = p.assets_s, out.start_s = p.start_s, out.assets_cpu = p.assets_cpu, out.start_cpu = p.start_cpu;
+    double t0 = platform::monotonic_s(), c0 = platform::thread_cpu_s();
     bool failed = false;
     TaskRunner &runner = *p.runner;
     try {
@@ -225,7 +225,7 @@ TaskOutcome run_prepared(PreparedTask &p, const std::function<void(int64_t, cons
                 if (on_step) on_step(runner.steps);
                 return stop ? stop() : "";
             });
-        out.play_s = platform::monotonic_s() - t0;
+        out.play_s = platform::monotonic_s() - t0, out.play_cpu = platform::thread_cpu_s() - c0;
         p.env->close();
         out.steps = runner.steps, out.frames = runner.frames, out.episodes = runner.episodes, out.chunks = seq;
         failed = out.end == "error";
