@@ -28,6 +28,8 @@
 #include "ballrain/pool_client.h"
 #include "ballrain/pool_task.h"
 
+#include "ballrain/task_runner.h"
+
 namespace ballrain {
 
 constexpr int MAX_INSTANCES = 32;  // the client's own cap (the gateway's max_instances and the player's choice decide)
@@ -38,6 +40,9 @@ struct ClientConfig {  // <data dir>/config.json
     std::string engine_kind = "x87soft";
     int instances = 1;
     bool auto_pause_player = true, auto_pause_battery = true;
+    // prepare the next task while the current one plays (task_prefetch_v1). Off by default: the engine start (the TAS
+    // prefix) is CPU-bound, so a second engine per instance slows both (measured: 681 -> 570 steps/s at 8 instances)
+    bool prefetch = false;
     bool setup_done = false;  // the first-run setup was completed once
     // a stop switch for shared machines: while this file or directory exists every instance pauses (checked every
     // 5 s, like the other automatic pauses; "" = none), e.g. C:\ballrain-quiet
@@ -160,6 +165,12 @@ private:
     void reconcile();
     void slot_loop(Slot *s);
     bool run_one_task(Slot *s);  // false: no task / not run (waited)
+    // task_prefetch_v1: a fetched task and its preparation (the next one is prepared while the slot's current plays)
+    struct Pending;
+    std::optional<Task> fetch_task(Slot *s, bool prefetch, double &wait_s, double &fetch_s);
+    std::unique_ptr<Pending> prepare_pending(Slot *s, const Task &task, bool prefetched);
+    void play_pending(Slot *s, Pending &p);
+    void discard_next(Slot *s, const char *why);
     void upload_loop();
     bool upload_task(const std::string &task_id);  // false: stop this round (network down / waiting)
     void queue_chunk(const std::string &task_id, int64_t seq, const Bytes &data, bool final);
@@ -199,11 +210,11 @@ private:
     // where the instances' wall time goes (summed over tasks, logged every 5 minutes): waiting for the previous
     // task's upload, the task fetch, assets, engine start, steps, close; tasks and steps
     struct Phases {
-        double wait = 0, fetch = 0, assets = 0, start = 0, play = 0, close = 0;
+        double wait = 0, fetch = 0, assets = 0, start = 0, play = 0, close = 0, hidden = 0;
         int64_t tasks = 0, steps = 0;
     } phases_;
     double phases_t0_ = -1;
-    void add_phases(double wait, double fetch, const TaskOutcome &out);
+    void add_phases(double wait, double fetch, const TaskOutcome &out, bool prefetched);
     std::mutex upload_mu_;
     double t_start_ = 0;
     std::string update_version_, update_url_, update_notes_;

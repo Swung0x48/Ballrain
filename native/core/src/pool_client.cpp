@@ -112,7 +112,7 @@ Json GatewayClient::login_poll(const std::string &id, const std::string &secret)
     return call("POST", "/pool/login", {"login_status"}, json_body(make_message("login_poll", f)), JSON_CT, false, false);
 }
 
-Json GatewayClient::hello(const std::string &plat, const Json &engine, const Json &game_files, int instances) {
+Json GatewayClient::hello(const std::string &plat, const Json &engine, const Json &game_files, int instances, bool prefetch) {
     Json f = Json::object();
     f.set("client_version", Json::string(CLIENT_VERSION));
     f.set("platform", Json::string(plat));
@@ -121,6 +121,7 @@ Json GatewayClient::hello(const std::string &plat, const Json &engine, const Jso
     f.set("instances", Json::integer(instances));
     Json caps = Json::array();  // what this client can run (ballrain.pool.capabilities; the gateway gates tasks by them)
     for (const std::string &c : client_capabilities()) caps.push(Json::string(c));
+    if (prefetch) caps.push(Json::string("task_prefetch_v1"));  // only a client that prepares its next task
     f.set("capabilities", caps);
     Json r = call("POST", "/pool/hello", {"hello_ok"}, json_body(make_message("hello", f)), JSON_CT, true, false);
     session_id = r.at("session_id").as_string();

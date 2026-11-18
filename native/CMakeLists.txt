@@ -8,7 +8,7 @@
 # Android: -DCMAKE_TOOLCHAIN_FILE=<ndk>/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=28
 cmake_minimum_required(VERSION 3.16)
 # the client version (hello.client_version, the release zip name): the one place to change it
-project(ballrain_native VERSION 0.5.0 LANGUAGES C CXX)
+project(ballrain_native VERSION 0.5.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

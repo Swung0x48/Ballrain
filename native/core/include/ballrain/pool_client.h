@@ -41,7 +41,8 @@ public:
 
     Json login_start();
     Json login_poll(const std::string &login_id, const std::string &poll_secret);
-    Json hello(const std::string &platform, const Json &engine, const Json &game_files, int instances);
+    Json hello(const std::string &platform, const Json &engine, const Json &game_files, int instances,
+               bool prefetch = false);
     Json task();  // a "task" or "no_task" message
     Json chunk(const Bytes &data);  // chunk_result (a "rejected" result is returned, an error message raised)
     // task_end: close a task that ended without a final chunk once its `chunks` chunks were all posted

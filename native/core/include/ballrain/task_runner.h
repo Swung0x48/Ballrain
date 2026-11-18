@@ -182,6 +182,12 @@ private:
 // failure right after a chunk was cut leaves no final chunk (end "error", no final on_chunk): the caller closes the
 // task with task_end.
 // choose (tests only): the action of step t instead of the policy's draw (forced actions; a gateway refuses them)
+// the same from a runner already started (runner.start() returned obs0: a prefetched task's engine, held at its
+// first observation without advancing a frame)
+std::string sample_task_started(TaskRunner &runner, const std::vector<float> &obs0, const Policy &policy, const Task &task,
+                                const std::function<void(const Bytes &, bool)> &on_chunk,
+                                const std::function<std::string()> &stop,
+                                const std::function<int(int64_t, const std::vector<float> &)> &choose = nullptr);
 std::string sample_task(TaskRunner &runner, const Policy &policy, const Task &task,
                         const std::function<void(const Bytes &, bool final)> &on_chunk,
                         const std::function<std::string()> &stop = nullptr,
