@@ -1,6 +1,8 @@
 #include "ballrain/reach_block.h"
 
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -260,7 +262,16 @@ std::shared_ptr<const fastreach::Fields> ReachBlock::fields(int level, const std
     if (dir_.empty()) throw Error("the reach block needs its fields (no fields directory)");
     std::string path = dir_ + "/" + reach_fields_name(level, key);
     if (!file_exists(path)) throw Error("no reach fields for this geometry: " + reach_fields_name(level, key));
-    auto f = fastreach::Fields::load(path);
+    // one load per file and process (Fields are read-only and thread-safe): every instance's ReachBlock and every
+    // task share it while any of them holds it
+    static std::mutex mu;
+    static std::map<std::string, std::weak_ptr<const fastreach::Fields>> shared;
+    std::shared_ptr<const fastreach::Fields> f;
+    {
+        std::lock_guard<std::mutex> g(mu);
+        f = shared[path].lock();
+        if (!f) f = fastreach::Fields::load(path), shared[path] = f;
+    }
     if (f->key != key) throw Error("reach fields " + reach_fields_name(level, key) + " were built for another key");
     cache_.emplace_front(key, f);
     while (cache_.size() > 2) cache_.pop_back();
