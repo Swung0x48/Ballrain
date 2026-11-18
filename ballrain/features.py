@@ -17,6 +17,7 @@ from .path import PathFollower, ReferencePath, RouteError, is_synthetic_level, l
 from .state import G_RAILS, G_STOPPER, GameTracker
 
 FEATURE_VERSION = "f6"  # f6: optional look-ahead block (far_waypoints, ref_speed_at; off by default = the f5 layout)
+REACH_FEATURE_VERSION = "f7"  # f7 = f6 + the fastreach "reach" block at the end (FeatureConfig.reach; ballrain.reach_features)
 # f5: edge fan referenced to the floor under the ball when airborne / in side contact
 # f4: TAS reference line + continuity projection, arc waypoints, slope-robust edge fan
 # f3: transforming from the ball (un)physicalize events; HS block (followers, pause)
@@ -74,6 +75,25 @@ class FeatureConfig:
     follower_sources: int = 4  # per-instance follower counts (largest first)
     checkpoint_frames_scale: float = 10000.0
     clip: float = 10.0  # final clip of every entry
+    # f7: the fastreach block (ballrain.reach_features, 59 entries scaled to [-1, 1]) appended after every other entry,
+    # so an f6 policy is extended with zero input weights; version becomes "f7". Needs numba (refused without)
+    reach: bool = False
+    # f7 pin: what defines the block's values (reach_features.reach_version(): fastreach BUILD_VERSION and
+    # QUERY_VERSION, reach_features.BLOCK_VERSION). Filled with this code's version when reach is on and none is given
+    # (the learner's config then pins it for every worker); a worker whose fastreach computes another version refuses
+    # to build the extractor (as path_sha256 for the reference line). None without the block.
+    reach_version: str | None = None
+
+    def __post_init__(self):
+        if self.reach:
+            self.version = REACH_FEATURE_VERSION
+            if self.reach_version is None:
+                from .reach_features import reach_version
+                self.reach_version = reach_version()
+        else:
+            self.reach_version = None
+            if self.version == REACH_FEATURE_VERSION:  # an f7 label without the block: the f6 layout
+                self.version = FEATURE_VERSION
 
     branch_sha256: str | None = None  # digest of the complete learner-distributed bundle
 
@@ -263,6 +283,56 @@ def yaw_of(matrix43) -> float:
 
 # --------------------------------------------------------------------------------- extractor
 
+def make_layout(c: FeatureConfig) -> list:
+    """(name, size) of every block of the vector under config c (no fields, no numba: for the learner's checks)."""
+    L = [("valid", 1), ("ball_type", 3), ("vel_cam", 3), ("vel_path", 3), ("speed", 1), ("angvel", 3),
+         ("cam_yaw_ref", 2), ("cam_yaw", 2), ("cam_rotating", 1)]
+    if c.absolute_position:
+        L.append(("pos_world", 3))
+    L += [("geom_contact", 1), ("fric_contact", 1), ("n_fric", 1), ("n_mind", 1), ("min_gap", 1),
+          ("normal_cam", 3), ("surface", len(SURFACE_SLOTS)), ("partner_moving", 1), ("partner_rail", 1),
+          ("rel_vel_partner", 3)]
+    if c.mesh_edge:
+        L.append(("edge_mesh", 1))
+    if c.fan_dirs:
+        L.append(("edge_fan", c.fan_dirs))
+    L += [("rail_dist", 1), ("rail_dir", 2)]
+    if c.height_grid:
+        L += [("heights", c.height_grid ** 2), ("height_hit", c.height_grid ** 2)]
+    L += [("path_progress", 1), ("path_remaining", 1), ("path_lateral", 1), ("path_tangent_cam", 2),
+          ("waypoints", 3 * c.waypoints)]
+    if c.bodies:
+        L += [("bodies", 7 * c.bodies)]
+    if c.counters:
+        L += [("lives", 1), ("points", 1), ("sr_s", 1), ("sector", 1), ("transforming", 1), ("ball_nav", 1),
+              ("depth_margin", 1)]
+    if c.hs_block:
+        L += [("followers", 1), ("follower_sources", c.follower_sources), ("follower_near", 1), ("paused", 1),
+              ("since_checkpoint", 1)]
+    if c.far_waypoints:
+        L.append(("far_waypoints", 3 * len(c.far_waypoints)))
+    if c.ref_speed_at:
+        L.append(("ref_speed", len(c.ref_speed_at)))
+    if c.reach:  # f7: always the last block
+        from .fastreach import N_FEATURES
+        L.append(("reach", N_FEATURES))
+    return L
+
+
+def layout_slices(c: FeatureConfig) -> dict:
+    """{block name: slice} of the vector under config c, from make_layout only (no extractor: the learner never needs
+    numba or the fields, also with the f7 block)."""
+    out, o = {}, 0
+    for n, k in make_layout(c):
+        out[n] = slice(o, o + k)
+        o += k
+    return out
+
+
+def layout_size(c: FeatureConfig) -> int:
+    return sum(k for _, k in make_layout(c))
+
+
 class FeatureExtractor:
     def __init__(self, config: FeatureConfig | None = None, *, branch_root=None):
         self.cfg = config or FeatureConfig()
@@ -275,39 +345,14 @@ class FeatureExtractor:
         self.follower: PathFollower | None = None
         self.branch = None
         self._path_key = None
+        self.reach = None
+        if self.cfg.reach:  # cheap: the numba check only; the fields are loaded at the first state with a ball
+            from .reach_features import ReachBlock
+            self.reach = ReachBlock(body_radius=self.cfg.body_radius, expect_version=self.cfg.reach_version)
 
     # layout -------------------------------------------------------------------------------
     def _make_layout(self):
-        c = self.cfg
-        L = [("valid", 1), ("ball_type", 3), ("vel_cam", 3), ("vel_path", 3), ("speed", 1), ("angvel", 3),
-             ("cam_yaw_ref", 2), ("cam_yaw", 2), ("cam_rotating", 1)]
-        if c.absolute_position:
-            L.append(("pos_world", 3))
-        L += [("geom_contact", 1), ("fric_contact", 1), ("n_fric", 1), ("n_mind", 1), ("min_gap", 1),
-              ("normal_cam", 3), ("surface", len(SURFACE_SLOTS)), ("partner_moving", 1), ("partner_rail", 1),
-              ("rel_vel_partner", 3)]
-        if c.mesh_edge:
-            L.append(("edge_mesh", 1))
-        if c.fan_dirs:
-            L.append(("edge_fan", c.fan_dirs))
-        L += [("rail_dist", 1), ("rail_dir", 2)]
-        if c.height_grid:
-            L += [("heights", c.height_grid ** 2), ("height_hit", c.height_grid ** 2)]
-        L += [("path_progress", 1), ("path_remaining", 1), ("path_lateral", 1), ("path_tangent_cam", 2),
-              ("waypoints", 3 * c.waypoints)]
-        if c.bodies:
-            L += [("bodies", 7 * c.bodies)]
-        if c.counters:
-            L += [("lives", 1), ("points", 1), ("sr_s", 1), ("sector", 1), ("transforming", 1), ("ball_nav", 1),
-                  ("depth_margin", 1)]
-        if c.hs_block:
-            L += [("followers", 1), ("follower_sources", c.follower_sources), ("follower_near", 1), ("paused", 1),
-                  ("since_checkpoint", 1)]
-        if c.far_waypoints:
-            L.append(("far_waypoints", 3 * len(c.far_waypoints)))
-        if c.ref_speed_at:
-            L.append(("ref_speed", len(c.ref_speed_at)))
-        return L
+        return make_layout(self.cfg)
 
     def layout(self) -> list:
         return list(self._layout)
@@ -384,6 +429,16 @@ class FeatureExtractor:
         k = 0 if self.cfg.camera == "orient_ref" else 1
         return yaw_basis(cams["cams"][k]["matrix"])
 
+    def action_quarter(self, tracker: GameTracker) -> int:
+        """Camera quarter of the arrow keys (reach block, fastreach.perceive): 0 in the world frame (world actions:
+        UP = +z, RIGHT = +x = the keys at quarter 0); otherwise the Cam_OrientRef quarter turn the keys push under
+        (env._cam_quarter; also with camera "orient", whose frame turns with Cam_Orient during a camera turn)."""
+        obs = tracker.obs
+        cams = obs.cams if obs is not None else None
+        if self.cfg.camera == "world" or cams is None:
+            return 0
+        return int(round(yaw_of(cams["cams"][0]["matrix"]) / (math.pi / 2))) % 4
+
     # main ---------------------------------------------------------------------------------
     def compute(self, tracker: GameTracker):
         c = self.cfg
@@ -448,6 +503,10 @@ class FeatureExtractor:
                         F["ref_speed"][j] = (v or 0.0) / c.vel_scale
             if c.bodies:
                 self._bodies(tracker, F, pos, vel, right, fwd)
+            if self.reach is not None and valid:
+                q = self.action_quarter(tracker)
+                F["reach"][:], raw, key = self.reach.compute(tracker, pos, vel, q, bt)
+                info["reach_raw"], info["reach_quarter"], info["reach_key"] = raw, q, key
         if c.counters:
             F["lives"][0] = tracker.lives / 10
             F["points"][0] = tracker.points / 1000

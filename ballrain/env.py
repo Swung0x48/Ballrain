@@ -231,6 +231,12 @@ class BallanceEnv(gym.Env):
         self.launcher = launcher
         from .branch_assets import install
         fc = self.cfg.features
+        if fc.reach and (fc.camera == "world") != bool(self.cfg.world_actions):
+            # the reach block's 8 directions are the arrow keys under FeatureExtractor.action_quarter: world actions
+            # need the world frame (quarter 0), camera-relative keys a camera frame (the Cam_OrientRef quarter)
+            raise ValueError(f"FeatureConfig.reach with camera {fc.camera!r} and world_actions={self.cfg.world_actions}: "
+                             "the reach directions would not be the action directions (world actions need "
+                             "camera='world', camera-relative actions a camera frame)")
         self._branch_temp = install(self.cfg.branch_assets, self.cfg.level, fc.path_sha256, fc.branch_sha256)
         self.branch_rules = bundle_rules(self.cfg.branch_assets) if self._branch_temp else DEFAULT_RULES
         self.fx = FeatureExtractor(fc, branch_root=self._branch_temp.name if self._branch_temp else None)

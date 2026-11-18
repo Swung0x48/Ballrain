@@ -6,9 +6,13 @@ Writes:
   <name>.pt            sanitized PyTorch checkpoint: model, rms, args, n_obs, n_act, env_config (no optimizer state;
                        absolute local paths rewritten to repo-relative ones; refuses to write if any path, user name
                        or private address remains in the non-tensor fields)
-  plain/<sha>.npz/.json  pickle-free plain-array export (ballrain/pool/weights.py)
+  plain/<sha>.npz/.json  pickle-free plain-array export (ballrain/pool/weights.py); not for an f7 checkpoint (the reach
+                       block: the pool format and the native client compute f6 only, docs/f7-native-port.md), which
+                       gets the .pt and a README note instead
   *.tas                the exported .tas of the evaluation in --eval (eval_export.json), if any
   README.md            title, note and the evaluation summary from --eval/eval.json, if given
+Every check (private strings, the plain export, which runs into a temporary directory first) happens before the
+first write: a refusal or error leaves models/<name>/ as it was.
 TRUSTED INPUT ONLY: the checkpoint is unpickled.
 """
 from __future__ import annotations
@@ -18,6 +22,7 @@ import json
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -78,7 +83,12 @@ def _eval_summary(ev: Path) -> str:
     return "\n".join(lines)
 
 
-def main() -> None:
+def is_f7(ck: dict) -> bool:
+    fc = (ck.get("env_config") or {}).get("features") or {}
+    return bool(fc.get("reach")) or fc.get("version") == "f7"
+
+
+def main(argv=None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("ckpt")
     ap.add_argument("name")
@@ -87,14 +97,14 @@ def main() -> None:
     ap.add_argument("--eval", default=None, help="evaluation directory (eval.json [, eval_export.json])")
     ap.add_argument("--title", default="")
     ap.add_argument("--note", action="append", default=[])
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     import torch
     from ballrain.pool.weights import export_state
 
     out = REPO / "models" / a.name
-    out.mkdir(parents=True, exist_ok=True)
     ck = torch.load(a.ckpt, weights_only=False, map_location="cpu")
+    f7 = is_f7(ck)
     clean = {k: _fix(ck[k]) for k in KEEP if k in ck}
     clean["source"] = {"run": a.run, "update": a.update}
     meta = {k: v for k, v in clean.items() if k not in ("model", "rms")}
@@ -104,11 +114,9 @@ def main() -> None:
            if PRIVATE.search(public_addr.sub("", s)) or any(n in s.lower() for n in names)]
     if bad:
         sys.exit(f"refusing: private-looking strings remain: {bad[:5]}")
-    torch.save(clean, out / f"{a.name}.pt")
-    export_state(ck, out / "plain", a.run)
-
     lines = [f"# {a.title or a.name}", "", f"来源：训练 {a.run}，第 {a.update} 次更新。", ""]
     lines += [f"{n}" for n in a.note] + ([""] if a.note else [])
+    copies = []  # (source .tas, name in out)
     if a.eval:
         ev = Path(a.eval)
         lines += ["## 评估", "", _eval_summary(ev), ""]
@@ -120,15 +128,41 @@ def main() -> None:
                 src = ev / "export" / "records" / Path(str(x["tas"]).replace("\\", "/")).name
                 if src.exists():
                     dst = f"L01_{sr // 1000}_{sr % 1000:03d}_{a.run}-u{a.update}.tas"
-                    shutil.copy(src, out / dst)
+                    copies.append((src, dst))
                     lines.append(f"- `{dst}`：{sr / 1000:.3f} s，真实 TASSupport 重放 {x.get('ref_identical_to_agent')} 一致"
                                  f"（{x.get('verdict')}）")
             lines.append("")
     lines += ["## 文件", "",
               f"- `{a.name}.pt`：PyTorch 检查点（网络、观测归一化、训练参数、环境配置；无优化器状态，路径为仓库相对路径），"
-              "可直接用于 `scripts/eval_m2.py --ckpt`。",
-              "- `plain/<sha>.npz` + `.json`：不用 pickle 的纯数组导出（`ballrain/pool/weights.py`），文件名是策略的 sha256。", ""]
+              "可直接用于 `scripts/eval_m2.py --ckpt`。"]
+    if f7:
+        rv = ((ck.get("env_config") or {}).get("features") or {}).get("reach_version")
+        lines += [f"- 没有 `plain/` 导出：这是 f7 检查点（观测含 fastreach reach 块，版本 `{rv}`），资源池格式和原生客户端只算 f6"
+                  "（`docs/f7-native-port.md`）。", ""]
+    else:
+        lines += ["- `plain/<sha>.npz` + `.json`：不用 pickle 的纯数组导出（`ballrain/pool/weights.py`），文件名是策略的 sha256。",
+                  ""]
+
+    # everything that can refuse has run; the plain export goes to a temporary directory first
+    with tempfile.TemporaryDirectory() as tmp:
+        plain = None
+        if not f7:
+            try:
+                export_state(ck, Path(tmp) / "plain", a.run)
+            except ValueError as e:
+                sys.exit(f"refusing: the plain export fails ({e}); nothing written")
+            plain = Path(tmp) / "plain"
+        out.mkdir(parents=True, exist_ok=True)
+        torch.save(clean, out / f"{a.name}.pt")
+        if plain is not None:
+            (out / "plain").mkdir(exist_ok=True)
+            for f in plain.iterdir():
+                shutil.copy(f, out / "plain" / f.name)
+    for src, dst in copies:
+        shutil.copy(src, out / dst)
     (out / "README.md").write_text("\n".join(lines), encoding="utf-8")
+    if f7:
+        print("f7 checkpoint (reach block): no plain/ export (the pool format and the native client compute f6 only)")
     print("wrote", out)
 
 

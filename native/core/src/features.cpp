@@ -72,8 +72,16 @@ FeatureConfig FeatureConfig::from_json(const Json &j) {
         else if (k == "follower_sources") c.follower_sources = int(v.as_int());
         else if (k == "checkpoint_frames_scale") c.checkpoint_frames_scale = v.as_double();
         else if (k == "clip") c.clip = v.as_double();
-        else throw Error("unknown feature config field " + k);
+        else if (k == "reach") {
+            // f7 (ballrain/features.py FeatureConfig.reach): the fastreach block has no port here yet
+            if (v.as_bool())
+                throw Error("feature version f7 (the fastreach reach block) is not supported by the native client: "
+                            "it needs a port of ballrain/fastreach.py (docs/native-client.md)");
+        } else throw Error("unknown feature config field " + k);
     }
+    if (c.version == "f7")
+        throw Error("feature version f7 (the fastreach reach block) is not supported by the native client: it needs "
+                    "a port of ballrain/fastreach.py (docs/native-client.md)");
     if (c.version != "f6") throw Error("feature version " + c.version + " is not supported (f6)");
     if (c.fan_rule != "step" && c.fan_rule != "contact") throw Error("unknown fan_rule " + c.fan_rule);
     if (c.camera != "world" && c.camera != "orient_ref" && c.camera != "orient") throw Error("unknown camera " + c.camera);
