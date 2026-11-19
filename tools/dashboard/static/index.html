@@ -52,45 +52,9 @@
     </div>
   </section>
 
-  <section class="sec" id="s-model">
-    <h2 class="plank">模型结构 · r9<span class="rat">r9 起加入多接触点输入</span></h2>
-    <div class="panel">
-      <div class="maptools" id="t-model">显示：<button type="button" class="tbtn on" data-mv="grow">r9（扩容后）</button><button type="button" class="tbtn" data-mv="now">r8（扩容前）</button></div>
-      <div class="mdl" id="mdl" data-mv="grow">
-        <div class="tiles mins">
-          <div class="tile"><div class="k">球的状态</div><div class="v">37</div><div class="s">球型、速度、旋转、最近一个接触点</div></div>
-          <div class="tile"><div class="k">周围地形</div><div class="v">111</div><div class="s">高度图、边缘距离、最近的轨</div></div>
-          <div class="tile"><div class="k">可达性</div><div class="v">59</div><div class="s">未来 1–3 秒能到哪</div></div>
-          <div class="tile"><div class="k">路线</div><div class="v">27</div><div class="s">路线点、进度、参考速度</div></div>
-          <div class="tile"><div class="k">活动机关</div><div class="v">28</div><div class="s">附近会动的物体</div></div>
-          <div class="tile"><div class="k">游戏状态</div><div class="v">5</div><div class="s">生命、分数、小节</div></div>
-          <div class="tile new grow"><div class="k">多接触点 · r9 新增</div><div class="v">49</div><div class="s">按方向分的 4 个接触点（右、下、左、其他：有无、间隙、法向、是否轨道、是否机关）；左右两侧最近的轨；支撑法向与轨道接触数</div></div>
-        </div>
-        <div class="marr">▼</div>
-        <div class="mnode wide"><b>观测 <span class="now">267</span><span class="grow">316（267 + 49）</span> 维</b><span>按滑动均值和方差标准化</span></div>
-        <div class="mcols">
-          <div class="mcol">
-            <div class="marr">▼</div>
-            <div class="mnode act"><b>策略网络主干</b><span><span class="now">267</span><span class="grow">316</span> → 256 → 256，tanh</span></div>
-            <div class="marr">▼</div>
-            <div class="mheads">
-              <div class="mnode act"><b>木球头</b><span>9 个输出</span></div>
-              <div class="mnode act"><b>纸球头</b><span>9 个输出</span></div>
-              <div class="mnode act"><b>石球头</b><span>9 个输出</span></div>
-            </div>
-            <div class="marr">▼</div>
-            <div class="mnode act"><b>按当前球型选一个头</b><span>9 选 1 方向键（含不按），每个动作按住 2 帧</span></div>
-          </div>
-          <div class="mcol">
-            <div class="marr">▼</div>
-            <div class="mnode val"><b>价值网络（独立）</b><span><span class="now">267</span><span class="grow">316</span> → 256 → 256，tanh</span></div>
-            <div class="marr">▼</div>
-            <div class="mnode val"><b>状态价值</b><span>1 个数，只在训练时用</span></div>
-          </div>
-        </div>
-        <p class="note">PPO 训练，约 27.5 万个参数。<span class="now">现在的接触输入只描述离球最近的一个接触点，骑双轨时只能看到一侧的轨。</span><span class="grow">r9 从 r8 的最终模型扩容：在原有 267 维后面追加 49 列，第一层里新列的权重从零开始，所以扩容那一刻行为和 r8 一致（输出只差浮点误差），之后接着训练。骑双轨时左右两根轨都能看到。</span></p>
-      </div>
-    </div>
+  <section class="sec" id="s-model" hidden>
+    <h2 class="plank">模型结构 · <span class="rn"></span><span class="rat" id="m-at"></span></h2>
+    <div class="panel"><div class="mdl" id="mdl"></div></div>
   </section>
 
   <section class="sec" id="s-sr">

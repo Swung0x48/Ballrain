@@ -480,7 +480,68 @@ def run_status(run: Run, off_h: float, L, machines: dict) -> dict:
         st["state"] = "训练中"
     else:
         st["state"] = "暂无新数据"
+    try:
+        mi = model_info(run)
+        if mi:
+            st["model"] = mi
+    except Exception:  # a half-copied checkpoint: show nothing rather than fail the status
+        pass
     return st
+
+
+# observation blocks grouped for the model-structure panel (ballrain.features.make_layout names)
+_MODEL_GROUPS = (
+    ("ball", ("valid", "ball_type", "vel_cam", "vel_path", "speed", "angvel", "cam_yaw_ref", "cam_yaw", "cam_rotating",
+              "pos_world", "geom_contact", "fric_contact", "n_fric", "n_mind", "min_gap", "normal_cam", "surface",
+              "partner_moving", "partner_rail", "rel_vel_partner")),
+    ("terrain", ("edge_mesh", "edge_fan", "rail_dist", "rail_dir", "heights", "height_hit")),
+    ("reach", ("reach",)),
+    ("route", ("path_progress", "path_remaining", "path_lateral", "path_tangent_cam", "waypoints", "far_waypoints",
+               "ref_speed")),
+    ("bodies", ("bodies",)),
+    ("game", ("lives", "points", "sr_s", "sector", "transforming", "ball_nav", "depth_margin", "followers",
+              "follower_sources", "follower_near", "paused", "since_checkpoint")),
+    ("contacts", ("contacts", "contact_agg", "rails_lr")),
+)
+_MODEL_MEMO: dict = {}
+
+
+def model_info(run: Run) -> dict | None:
+    """Network structure of a run's newest checkpoint for the model panel: observation blocks (sizes from the
+    checkpoint's own feature config), hidden sizes, actor heads, parameter count. Cached by checkpoint mtime/size.
+    No paths or other machine details: the payload is public."""
+    cands = [run.path / "latest.pt"] if (run.path / "latest.pt").is_file() else sorted(run.path.glob("ckpt_*.pt"))
+    if not cands:
+        return None
+    ck_path = cands[-1]
+    key = (str(ck_path), ck_path.stat().st_mtime_ns, ck_path.stat().st_size)
+    if _MODEL_MEMO.get(run.name, (None,))[0] == key:
+        return _MODEL_MEMO[run.name][1]
+    import dataclasses
+    import torch
+    from ballrain.features import FeatureConfig, make_layout
+    ck = torch.load(ck_path, weights_only=False, map_location="cpu")
+    a = ck.get("args") or {}
+    f = dict((ck.get("env_config") or {}).get("features") or {})
+    names = {x.name for x in dataclasses.fields(FeatureConfig)}
+    layout = make_layout(FeatureConfig(**{k: v for k, v in f.items() if k in names}))
+    sizes = dict(layout)
+    groups = []
+    for g, members in _MODEL_GROUPS:
+        n = sum(sizes.get(m, 0) for m in members)
+        if n:
+            groups.append({"key": g, "size": int(n)})
+    other = sum(n for m, n in layout if not any(m in mm for _, mm in _MODEL_GROUPS))
+    if other:
+        groups.append({"key": "other", "size": int(other)})
+    params = int(sum(v.numel() for v in (ck.get("model") or {}).values() if hasattr(v, "numel")))
+    info = {"n_obs": int(ck.get("n_obs") or sum(n for _, n in layout)), "n_act": int(ck.get("n_act") or 9),
+            "hidden": [int(x) for x in str(a.get("hidden", "256,256")).split(",") if x.strip()],
+            "activation": str(a.get("activation", "tanh")), "heads": str(a.get("actor_heads") or "single"),
+            "action_repeat": int(a.get("action_repeat") or 1), "features": str(f.get("version") or ""),
+            "groups": groups, "params": params, "init_from": bool(a.get("init_from"))}
+    _MODEL_MEMO[run.name] = (key, info)
+    return info
 
 
 _STEPS_MEMO: dict = {}
