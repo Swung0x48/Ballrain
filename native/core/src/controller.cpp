@@ -21,7 +21,7 @@ static const double RECONNECT_S = 30.0;   // at most one automatic hello per thi
 static const double PROBE_S = 5.0;        // automatic-pause probes
 static const double ME_S = 60.0;          // /pool/me (the totals) while connected
 static const int64_t QUEUE_LIMIT = 256LL << 20;  // queued chunk bytes before the instances wait for the network
-static const int UPLOAD_THREADS = 4;       // parallel uploaders (one task each at a time: its chunks in order)
+static const int UPLOAD_THREADS = 8;       // parallel uploaders (one task each at a time: its chunks in order)
 static const char *PAUSE_PLAYER = "检测到 Ballance（Player.exe）正在运行，已自动暂停；关闭游戏后会自动继续。";
 static const char *PAUSE_BATTERY = "电脑正在使用电池，已自动暂停；接上电源后会自动继续。";
 static const char *PHYSICS_RT_2002_SHA256 = "e72e4afcfa5c33a7d3d27776137f8c997b3c52d89d8a8a4745f1ca21e45893ec";
@@ -907,12 +907,10 @@ std::optional<Task> Controller::fetch_task(Slot *s, bool prefetch, double &wait_
         }
     }
     double t_wait0 = platform::monotonic_s(), t_wait1 = t_wait0;
-    bool near_limit;
-    {
-        std::lock_guard<std::mutex> g(mu_);
-        near_limit = 2 * cfg_.instances > max_instances_;  // the open tasks (playing + uploading) could reach the limit
-    }
-    if (!prefetch && near_limit && !config().prefetch && !s->last_task.empty()) {
+    // task_prefetch_v1 (always declared): the gateway allows 3 open tasks per instance, so the next task is fetched
+    // while the previous one's last chunks still upload. A gateway without the rule refuses with too_many_instances
+    // at its limit (the 10 s wait below); the old wait for the previous upload stays only for --no-overlap tests
+    if (!prefetch && wait_upload && !s->last_task.empty()) {
         // the previous task is open at the gateway until its last chunk (or task_end) arrived: wait for the uploader
         std::string d = dir_ + "/queue/" + s->last_task;
         {
@@ -1036,6 +1034,7 @@ void Controller::play_pending(Slot *s, Pending &p) {
         f.set("start_frame", Json::integer(task.start_frame));
         f.set("ball_order_seed", Json::integer(task.ball_order_seed));
         f.set("prefetched", Json::boolean(p.prefetched));
+        f.set("feature_module", Json::boolean(p.prep && p.prep->module));  // the features from the task's wasm module
         emit("task", f);
     }
     double deadline = p.t_issue + double(task.deadline_s) - std::min(30.0, double(task.deadline_s) / 10);
@@ -1129,6 +1128,8 @@ void Controller::play_pending(Slot *s, Pending &p) {
         ph.set("assets", Json::number(out.assets_s)), ph.set("start", Json::number(out.start_s));
         ph.set("play", Json::number(out.play_s)), ph.set("close", Json::number(out.close_s));
         ph.set("prefetched", Json::boolean(p.prefetched));
+        ph.set("assets_cpu", Json::number(out.assets_cpu)), ph.set("start_cpu", Json::number(out.start_cpu));
+        ph.set("play_cpu", Json::number(out.play_cpu));
         f.set("phases", ph);
         emit("task_end", f);
     }
@@ -1143,6 +1144,7 @@ void Controller::play_pending(Slot *s, Pending &p) {
 
 void Controller::add_phases(double wait, double fetch, const TaskOutcome &out, bool prefetched) {
     std::string line;
+    Json ev;
     {
         std::lock_guard<std::mutex> g(mu_);
         double now = platform::monotonic_s();
@@ -1153,19 +1155,43 @@ void Controller::add_phases(double wait, double fetch, const TaskOutcome &out, b
         if (prefetched) p.wait += wait, p.hidden += fetch + out.assets_s + out.start_s, p.play += out.play_s;
         else p.wait += wait, p.fetch += fetch, p.assets += out.assets_s, p.start += out.start_s, p.play += out.play_s;
         p.close += out.close_s, ++p.tasks, p.steps += out.steps;
-        if (now - phases_t0_ < 300.0) return;
+        // the first summary after a minute (a short run, or a check that the log keeps going), then every interval
+        if (now - phases_t0_ < (phases_n_ == 0 ? std::min(60.0, phase_summary_s) : phase_summary_s)) return;
+        ++phases_n_;
         double tot = p.wait + p.fetch + p.assets + p.start + p.play + p.close;
         auto pc = [&](double x) { return std::to_string(int(100.0 * x / std::max(tot, 1e-9) + 0.5)) + "%"; };
         char head[96];
         std::snprintf(head, sizeof head, "最近 %.0f 秒：%lld 个任务、%lld 步（%.0f 步/秒）；实例时间：", now - phases_t0_,
                       (long long)p.tasks, (long long)p.steps, double(p.steps) / std::max(now - phases_t0_, 1e-9));
+        ev = Json::object();
+        ev.set("seconds", Json::number(now - phases_t0_));
+        ev.set("tasks", Json::integer(p.tasks)), ev.set("steps", Json::integer(p.steps));
+        ev.set("steps_per_s", Json::number(double(p.steps) / std::max(now - phases_t0_, 1e-9)));
+        for (auto kv : {std::make_pair("wait", p.wait), std::make_pair("fetch", p.fetch), std::make_pair("assets", p.assets),
+                        std::make_pair("start", p.start), std::make_pair("play", p.play), std::make_pair("close", p.close),
+                        std::make_pair("hidden", p.hidden)})
+            ev.set(kv.first, Json::number(kv.second));  // instance seconds summed over the tasks
         line = std::string(head) + "等上传 " + pc(p.wait) + "，取任务 " + pc(p.fetch) + "，准备资源 " + pc(p.assets) +
                "，启动引擎和开局 " + pc(p.start) + "，采样 " + pc(p.play) + "，收尾 " + pc(p.close) +
                "（另有 " + std::to_string(int(p.hidden + 0.5)) + " 秒的准备与上一个任务的采样重叠）";
         p = Phases();
         phases_t0_ = now;
     }
-    log_.line(line);
+    if (line.empty()) return;
+    {  // the uploads over the same interval (accepted posts; a slow tunnel shows as seconds per chunk and a growing queue)
+        int64_t n = up_n_.exchange(0), us = up_us_.exchange(0), bytes = up_bytes_.exchange(0), q = queue_bytes();
+        double secs = ev.get_double("seconds", 1.0);
+        ev.set("upload_chunks", Json::integer(n)), ev.set("upload_bytes", Json::integer(bytes));
+        ev.set("upload_s_per_chunk", Json::number(n ? us / 1e6 / double(n) : 0.0));
+        ev.set("upload_threads", Json::integer(UPLOAD_THREADS)), ev.set("queue_bytes", Json::integer(q));
+        char u[200];
+        std::snprintf(u, sizeof u, "；上传 %lld 段（%.0f KB/秒，平均每段 %.2f 秒，%d 个上传线程），待上传约 %.1f MB", (long long)n,
+                      double(bytes) / 1024.0 / std::max(secs, 1e-9), n ? us / 1e6 / double(n) : 0.0, UPLOAD_THREADS,
+                      double(q) / 1048576.0);
+        line += u;
+    }
+    say(line);  // client.log, and the log event (the TUI's log pane; ballrain_coordinator: stderr)
+    emit("phases", ev);
 }
 
 // ---------------------------------------------------------------------------------------------- upload queue
@@ -1232,7 +1258,8 @@ void Controller::upload_loop() {
                 if (!uploading_.insert(t).second) continue;  // another uploader has it
             }
             try {
-                if (upload_task(t)) progress = true;
+                bool did = false;  // a chunk posted or a task closed (else the loop sleeps: no busy re-listing)
+                if (upload_task(t, did)) progress = progress || did;
                 else down = true;
             } catch (const std::exception &e) {  // retried next round (the chunks stay until the task's deadline)
                 log_.line("上传队列：" + t.substr(0, 12) + "：" + e.what());
@@ -1255,12 +1282,13 @@ void Controller::upload_loop() {
 }
 
 // true: progress or nothing to do yet; false: the gateway is out of reach (back off)
-bool Controller::upload_task(const std::string &task_id) {
+bool Controller::upload_task(const std::string &task_id, bool &did) {
     std::string d = dir_ + "/queue/" + task_id;
+    did = true;
     Bytes mb;
     // no meta.json yet: queue_open is between creating the directory and writing it (a directory a crash left
     // that way is cleaned up at the next start, in the constructor)
-    if (!read_file(d + "/meta.json", mb)) return true;
+    if (!read_file(d + "/meta.json", mb)) return did = false, true;
     Json meta;
     try {
         meta = Json::parse(mb, 4);
@@ -1304,7 +1332,7 @@ bool Controller::upload_task(const std::string &task_id) {
         if (!read_file(d + "/" + f, data)) {  // briefly locked (e.g. a virus scanner): next round
             {
                 std::lock_guard<std::mutex> ug(upload_mu_);
-                if (++read_fail_[d + "/" + f] < 60) return true;
+                if (++read_fail_[d + "/" + f] < 60) return did = false, true;
                 read_fail_.erase(d + "/" + f);
             }
             log_.line("上传队列：数据段 " + task_id.substr(0, 8) + "/" + f + " 一直读不出来，丢弃这个任务。");
@@ -1316,8 +1344,11 @@ bool Controller::upload_task(const std::string &task_id) {
             read_fail_.erase(d + "/" + f);
         }
         Json r;
+        double tp = platform::monotonic_s();
         try {
             r = g.chunk(data);
+            up_n_ += 1, up_bytes_ += int64_t(data.size());
+            up_us_ += int64_t(1e6 * (platform::monotonic_s() - tp));
         } catch (const GatewayUnavailable &e) {
             log_.line(std::string("上传失败，稍后重试：") + e.what());
             return false;
@@ -1369,7 +1400,7 @@ bool Controller::upload_task(const std::string &task_id) {
         }
         return true;
     }
-    if (!has_end) return true;  // still being played
+    if (!has_end) return did = false, true;  // still being played
     Bytes eb;
     read_file(d + "/end.json", eb);
     Json e = Json::parse(eb, 4);

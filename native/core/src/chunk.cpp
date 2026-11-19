@@ -99,6 +99,7 @@ Bytes encode_chunk(const ChunkData &c, int zstd_level) {
     if (!c.frames.empty()) need(c.frames.size(), T, "frames"), secs.push_back({"frames", raw_of(c.frames), false});
     if (!c.sr_ms.empty()) need(c.sr_ms.size(), T, "sr_ms"), secs.push_back({"sr_ms", raw_of(c.sr_ms), false});
     if (!c.arc.empty()) need(c.arc.size(), T, "arc"), secs.push_back({"arc", raw_of(c.arc), false});
+    if (!c.rin.empty()) need(c.rin.size(), T * size_t(c.rin_cols), "rin"), secs.push_back({"rin", raw_of(c.rin), true});
 
     Bytes body;
     Json arrays = Json::array();
@@ -138,6 +139,7 @@ Bytes encode_chunk(const ChunkData &c, int zstd_level) {
         st.set("episodes", Json::integer(c.stat_episodes));
         h.set("stats", st);
     }
+    if (c.episodes.is_array() && c.episodes.size()) h.set("episodes", c.episodes);
     h.set("arrays", arrays);
     std::string hj = h.dump(true);
     Bytes out("BRPC", 4);

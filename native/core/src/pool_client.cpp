@@ -1,5 +1,7 @@
 #include "ballrain/pool_client.h"
 
+#include "ballrain/feature_module.h"
+
 #include <algorithm>
 #include <mutex>
 #include <map>
@@ -23,7 +25,15 @@ const char *const CLIENT_VERSION = BALLRAIN_CLIENT_VERSION;
 std::vector<std::string> client_capabilities() {
     std::string reach = "reach_" + reach_version();
     std::replace(reach.begin(), reach.end(), '.', '_');
-    return {"task_format3", "branch_v1", "branch_rules_v1", "multi_branch_v2", reach};
+    // task_prefetch_v1: "may hold up to 3 open tasks per instance" (the gateway's rule: < 3 x hello.instances per
+    // session, < 3 x max_instances per account). Declared always: an instance fetches its next task while its
+    // previous task's last chunks still upload (and prepares it early with the prefetch setting)
+    std::vector<std::string> caps = {"task_format3", "branch_v1", "branch_rules_v1", "multi_branch_v2", "task_prefetch_v1",
+                                     "policy_graph_v1", "actor_ball_type_v1", "reward_inputs_v1", reach};
+    // feature_module_v1: wasmtime present and a module key built in (a client that could not check a module's
+    // signature never asks for one)
+    if (FeatureModule::available() && FeatureModule::has_pubkey()) caps.push_back("feature_module_v1");
+    return caps;
 }
 static const size_t MAX_RESPONSE = 64 * 1024, MAX_MANIFEST = 256 * 1024, MAX_DOWNLOAD = 64 * 1024 * 1024;
 
@@ -121,7 +131,6 @@ Json GatewayClient::hello(const std::string &plat, const Json &engine, const Jso
     f.set("instances", Json::integer(instances));
     Json caps = Json::array();  // what this client can run (ballrain.pool.capabilities; the gateway gates tasks by them)
     for (const std::string &c : client_capabilities()) caps.push(Json::string(c));
-    if (prefetch) caps.push(Json::string("task_prefetch_v1"));  // only a client that prepares its next task
     f.set("capabilities", caps);
     Json r = call("POST", "/pool/hello", {"hello_ok"}, json_body(make_message("hello", f)), JSON_CT, true, false);
     session_id = r.at("session_id").as_string();
@@ -244,6 +253,17 @@ std::string PoolCache::asset(const std::string &sha) {
     std::string p = d + "/" + sha + ".npz";
     if (!verified(p, sha)) put_file(p, api_.download("/pool/assets/" + sha + ".npz", MAX_DOWNLOAD, sha));
     return p;
+}
+
+Bytes PoolCache::module(const std::string &sha, int64_t size) {
+    if (!is_hex64(sha) || size < 8 || size > (64 << 20)) throw Error("feature module sha / size");
+    std::string d = root_ + "/modules";
+    platform::make_dirs(d);
+    std::string p = d + "/" + sha + ".wasm";
+    if (!verified(p, sha)) put_file(p, api_.download("/pool/assets/" + sha + ".wasm", size_t(size), sha));
+    Bytes b;
+    if (!read_file(p, b) || int64_t(b.size()) != size) throw Error("feature module size");
+    return b;
 }
 
 TasStarts PoolCache::starts(const std::string &sha) { return TasStarts::load_pack(asset(sha), sha); }

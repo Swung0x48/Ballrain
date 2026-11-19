@@ -8,7 +8,7 @@
 # Android: -DCMAKE_TOOLCHAIN_FILE=<ndk>/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=28
 cmake_minimum_required(VERSION 3.16)
 # the client version (hello.client_version, the release zip name): the one place to change it
-project(ballrain_native VERSION 0.5.1 LANGUAGES C CXX)
+project(ballrain_native VERSION 0.6.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,11 +18,15 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(BALLRAIN_APPS "build the command-line programs" ON)
-option(BALLRAIN_TUI "build the terminal UI client ballrain_pool (FTXUI)" ON)
+option(BALLRAIN_TUI "build the terminal UI client BallrainCoordinator (FTXUI)" ON)
 # release builds only (never committed): the gateway prefilled in the setup, the signed release manifest, its key
 set(BALLRAIN_DEFAULT_GATEWAY "" CACHE STRING "gateway URL prefilled in the client's setup")
 set(BALLRAIN_UPDATE_URL "" CACHE STRING "https URL of the signed release manifest (release.json)")
 set(BALLRAIN_RELEASE_PUBKEY "" CACHE STRING "hex ed25519 public key of the release manifest signatures")
+# the feature module (feature_module_v1): the wasmtime C API (its release's c-api directory: include/, lib/) and the
+# public key of the module signatures (the gateway's module key)
+set(BALLRAIN_WASMTIME_DIR "" CACHE PATH "wasmtime c-api directory (empty: no feature module support)")
+set(BALLRAIN_MODULE_PUBKEY "" CACHE STRING "hex ed25519 public key of the feature module signatures")
 
 # one static executable per platform: the static C/C++ runtime on Windows
 if(MSVC)
@@ -66,7 +70,7 @@ endif()
 
 add_library(ballrain_core STATIC
     core/src/util.cpp core/src/json.cpp core/src/sha256.cpp core/src/npz.cpp core/src/wire.cpp core/src/state.cpp
-    core/src/geometry.cpp core/src/path.cpp core/src/branch.cpp core/src/features.cpp core/src/policy.cpp core/src/stream.cpp
+    core/src/geometry.cpp core/src/path.cpp core/src/branch.cpp core/src/features.cpp core/src/policy.cpp core/src/graph.cpp core/src/ingest.cpp core/src/stream.cpp
     core/src/engine_chain.cpp core/src/chunk.cpp core/src/starts.cpp core/src/reward.cpp core/src/fastreach.cpp
     core/src/reach_block.cpp)
 target_include_directories(ballrain_core PUBLIC core/include)
@@ -79,7 +83,19 @@ else()
 endif()
 add_library(ballrain_engine STATIC core/src/session.cpp core/src/env.cpp core/src/task_runner.cpp core/src/pool_client.cpp
     core/src/pool_task.cpp core/src/controller.cpp core/src/update.cpp core/src/diagnostics.cpp
-    ${BALLRAIN_PLATFORM_SRC})
+    core/src/feature_module.cpp ${BALLRAIN_PLATFORM_SRC})
+target_compile_definitions(ballrain_engine PRIVATE BALLRAIN_MODULE_PUBKEY="${BALLRAIN_MODULE_PUBKEY}")
+if(BALLRAIN_WASMTIME_DIR)
+    target_include_directories(ballrain_engine PRIVATE "${BALLRAIN_WASMTIME_DIR}/include")
+    target_compile_definitions(ballrain_engine PRIVATE BALLRAIN_HAS_WASMTIME=1)
+    if(WIN32)
+        # delay-loaded: a client without wasmtime.dll still runs (FeatureModule::available)
+        target_link_libraries(ballrain_engine PUBLIC "${BALLRAIN_WASMTIME_DIR}/lib/wasmtime.dll.lib" delayimp)
+        target_link_options(ballrain_engine INTERFACE "/DELAYLOAD:wasmtime.dll")
+    else()
+        target_link_libraries(ballrain_engine PUBLIC "${BALLRAIN_WASMTIME_DIR}/lib/libwasmtime.so")
+    endif()
+endif()
 target_include_directories(ballrain_engine PUBLIC platform)
 target_compile_definitions(ballrain_engine PRIVATE BALLRAIN_CLIENT_VERSION="${PROJECT_VERSION}")
 target_link_libraries(ballrain_engine PUBLIC ballrain_core ballrain_ed25519 ballrain_miniz)
@@ -103,12 +119,14 @@ if(BALLRAIN_APPS)
     target_link_libraries(nc_golden PRIVATE ballrain_engine)
     add_executable(nc_runner apps/nc_runner.cpp)
     target_link_libraries(nc_runner PRIVATE ballrain_engine)
-    add_executable(nc_client apps/nc_client.cpp)
-    target_link_libraries(nc_client PRIVATE ballrain_engine)
+    add_executable(ballrain_coordinator apps/coordinator_cli.cpp)
+    target_link_libraries(ballrain_coordinator PRIVATE ballrain_engine)
     add_executable(nc_task apps/nc_task.cpp)
     target_link_libraries(nc_task PRIVATE ballrain_engine)
     add_executable(nc_branch_diff apps/nc_branch_diff.cpp)
     target_link_libraries(nc_branch_diff PRIVATE ballrain_engine)
+    add_executable(nc_graph_diff apps/nc_graph_diff.cpp)
+    target_link_libraries(nc_graph_diff PRIVATE ballrain_engine)
     add_executable(nc_reach_diff apps/nc_reach_diff.cpp)
     target_link_libraries(nc_reach_diff PRIVATE ballrain_engine)
     # the volunteer client's terminal UI (FTXUI 7.0.3, MIT, vendored in third_party/ftxui)
@@ -116,13 +134,13 @@ if(BALLRAIN_APPS)
         set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
         set(FTXUI_QUIET ON CACHE BOOL "" FORCE)
         add_subdirectory(third_party/ftxui EXCLUDE_FROM_ALL)
-        add_executable(ballrain_pool apps/ballrain_pool.cpp)
-        target_link_libraries(ballrain_pool PRIVATE ballrain_engine ftxui::component ftxui::dom ftxui::screen)
-        target_compile_definitions(ballrain_pool PRIVATE
+        add_executable(BallrainCoordinator apps/coordinator_tui.cpp)
+        target_link_libraries(BallrainCoordinator PRIVATE ballrain_engine ftxui::component ftxui::dom ftxui::screen)
+        target_compile_definitions(BallrainCoordinator PRIVATE
             BALLRAIN_DEFAULT_GATEWAY="${BALLRAIN_DEFAULT_GATEWAY}" BALLRAIN_UPDATE_URL="${BALLRAIN_UPDATE_URL}"
             BALLRAIN_RELEASE_PUBKEY="${BALLRAIN_RELEASE_PUBKEY}")
         if(MSVC)
-            target_sources(ballrain_pool PRIVATE platform/utf8.manifest)
+            target_sources(BallrainCoordinator PRIVATE platform/utf8.manifest)
         endif()
     endif()
     # release signing (keys from the OS random generator: seed.c only here)
@@ -132,7 +150,7 @@ if(BALLRAIN_APPS)
         target_link_libraries(nc_release PRIVATE advapi32)
     endif()
     if(MSVC)  # UTF-8 argv / environment / narrow file APIs (platform/utf8.manifest)
-        foreach(t nc_golden nc_runner nc_client nc_task nc_release)
+        foreach(t nc_golden nc_runner ballrain_coordinator nc_task nc_release)
             target_sources(${t} PRIVATE platform/utf8.manifest)
         endforeach()
     endif()

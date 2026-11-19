@@ -1,5 +1,7 @@
 #include "ballrain/env.h"
 
+#include "ballrain/feature_module.h"
+
 #include <cmath>
 #include <limits>
 
@@ -551,9 +553,23 @@ void BallanceEnv::intro() {
         s.run_until(cfg_.idle_keys, event_mask({Ev::BallNavActive, Ev::GameOver, Ev::LevelFinish}), cfg_.delta);
 }
 
+void BallanceEnv::use_module(FeatureModule *m) {
+    if (sess_) throw Error("use_module before the first start");
+    module_ = m;
+    module_rec_ = std::make_unique<StreamWriter>(m->sink(), rec_);
+    rec_ = module_rec_.get();
+}
+
 std::vector<float> BallanceEnv::features(StepInfo *info) {
     FeatureInfo fi;
-    std::vector<float> v = fx_.compute(sess_->tracker(), &fi);
+    std::vector<float> v;
+    if (module_) {
+        v = module_->compute(&fi);
+        // the route's static data (the members' rules) from the env's own extractor, loaded once
+        if (fx_.config().has_branch() && !fx_.branch()) fx_.reference_path(sess_->tracker());
+    } else {
+        v = fx_.compute(sess_->tracker(), &fi);
+    }
     if (rec_) rec_->put(K_FEAT, v.data(), v.size() * 4);
     if (info) {
         // env._info: the route's branch fields, else (no IVP ball: transforms, finish) the branch's last timing, so
@@ -567,7 +583,10 @@ std::vector<float> BallanceEnv::features(StepInfo *info) {
                 int i = m && !fi.branch_id.empty() ? m->index_of(fi.branch_id) : -1;
                 branch_rules_ = i >= 0 ? m->members[size_t(i)]->rules : BranchRules();
             }
-        } else if (const RouteFollower *b = fx_.branch(); b && b->timing.set) {
+        } else if (module_ && fi.timing_set) {  // the module's follower (the env's own is not stepped then)
+            info->has_branch = true, info->branch = fi.timing_branch;
+            info->ref_elapsed_ms = fi.timing_elapsed_ms, info->ref_remaining_ms = fi.timing_remaining_ms;
+        } else if (const RouteFollower *b = module_ ? nullptr : fx_.branch(); b && b->timing.set) {
             info->has_branch = true, info->branch = b->timing.branch;
             info->ref_elapsed_ms = b->timing.ref_elapsed_ms, info->ref_remaining_ms = b->timing.ref_remaining_ms;
         }
@@ -606,13 +625,19 @@ std::optional<std::vector<float>> BallanceEnv::reset(bool relaunch, StepInfo *in
     }
     ep_steps_ = ep_frames_ = ep_pause_frames_ = 0;
     fx_.reset_episode();
+    if (rec_) rec_->put(K_RESET, Bytes());
     if (!start_.branch_id.empty()) {  // env.reset: the verified rest start's route cursor
         fx_.reference_path(sess_->tracker());
         auto *m = dynamic_cast<MultiFollower *>(fx_.branch_mut());
         if (!m) throw Error("a multi-branch rest start without the multi-branch routes");
         m->restore(start_.branch_id, start_.branch_phase, *start_.branch_s);
+        if (rec_) {  // the module's (and a recording's) follower gets the same cursor
+            Json j = Json::object();
+            j.set("id", Json::string(start_.branch_id)), j.set("phase", Json::integer(start_.branch_phase));
+            j.set("s", Json::number(*start_.branch_s));
+            rec_->put(K_ROUTE, j.dump(true));
+        }
     }
-    if (rec_) rec_->put(K_RESET, Bytes());
     StepInfo tmp;
     StepInfo *pi = info ? info : &tmp;
     std::vector<float> o = features(pi);
@@ -755,6 +780,27 @@ std::vector<float> BallanceEnv::step(int action, bool &terminated, bool &truncat
     const auto &pr = info.feat.path;
     double r = reward_.step(t, pr ? std::optional<double>(pr->s) : std::nullopt, died, finished, terminated,
                             pr && pr->jump, std::optional<bool>(info.feat.supported));
+    {  // reward_inputs_v1: Reward.step's arguments and the tracker fields it (and its sector-3 terms) read
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        auto srv = t.sr_ms();
+        double *q = info.rin;
+        q[RIN_SR] = srv ? *srv : nan;
+        q[RIN_S] = pr ? pr->s : nan;
+        q[RIN_CHECKPOINTS] = double(t.checkpoints), q[RIN_SECTOR] = double(t.sector()), q[RIN_BALL_TYPE] = double(t.ball_type());
+        const FeatureInfo &fi = info.feat;
+        uint32_t f = (died ? RIN_DIED : 0u) | (finished ? RIN_FINISHED : 0u) | (terminated ? RIN_TERMINATED : 0u) |
+                     (pr && pr->jump ? RIN_REBASE : 0u) | (fi.supported ? RIN_SUPPORTED : 0u) | (cam_bad ? RIN_CAM_BAD : 0u) |
+                     (fi.branch || !fi.branch_id.empty() ? RIN_ROUTE_BRANCH : 0u) | (fi.have_ball ? RIN_HAS_POS : 0u) |
+                     (pr ? RIN_HAS_POINT : 0u);
+        q[RIN_FLAGS] = double(f);
+        for (int k = 0; k < 3; ++k) {
+            q[RIN_POS + k] = fi.pos[k];
+            q[RIN_POINT + k] = pr ? pr->point[k] : nan;
+            q[RIN_TANGENT + k] = pr ? pr->tangent[k] : nan;
+        }
+        q[RIN_REF_ELAPSED] = info.has_branch ? info.ref_elapsed_ms : nan;
+        q[RIN_STALL_WIN] = 0;
+    }
     if (cam_bad) {  // no credit for the episode: its return becomes -death_penalty
         double pen = -reward_.total - reward_.cfg.death_penalty;
         r += pen;

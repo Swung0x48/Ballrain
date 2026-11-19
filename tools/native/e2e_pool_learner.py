@@ -2,7 +2,7 @@
 
     python tools/native/e2e_pool_learner.py --dir <scratch dir> --ckpt <learner checkpoint (init weights)> \\
         --record <dataset record dir> --path-asset <L<nn>.npz of that checkpoint's features> \\
-        --engine <x87-soft BallanceMMOSimTool.exe> --game <Ballance folder> --client build/native-Release/nc_client.exe \\
+        --engine <x87-soft BallanceMMOSimTool.exe> --game <Ballance folder> --client build/native-Release/ballrain_coordinator.exe \\
         [--level 1] [--tasks 6] [--max-steps 600] [--batch-steps 512] [--extra "<train_m2 args>"]
 
 1. A fresh learner (scripts/train_m2.py, its own BALLRAIN_RUNTIME under --dir, no workers of its own, --init-from the

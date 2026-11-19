@@ -53,7 +53,8 @@ from .server_store import Store
 class Verifier:
     def __init__(self, store: Store, pool_dir, engines: dict, launcher_factory=None, log=None,
                  retry_s: int = 300, reach_max_row_frac: float = R.REACH_MAX_ROW_FRAC,
-                 reach_max_logp_shift: float = R.REACH_MAX_LOGP_SHIFT):
+                 reach_max_logp_shift: float = R.REACH_MAX_LOGP_SHIFT, cross_wait_s: int = 60, trusted_after: int = 0,
+                 ingest_then_verify: bool = False, shard: tuple | None = None):
         """engines: kind -> object with .binary / .root (server_config.EngineRef); launcher_factory: tests
         (ballrain.fakegame.FakeLauncher), None = the headless engine of HeadlessConfig."""
         self.store = store
@@ -65,6 +66,11 @@ class Verifier:
         # f7 reach block (docs/f7-native-port.md 7): its tolerance bounds; reach_slice overrides the env's (tests)
         self.reach_max_row_frac, self.reach_max_logp_shift = float(reach_max_row_frac), float(reach_max_logp_shift)
         self.reach_slice = None
+        # docs/volunteer-compute.md 4.1 (cross_check.py): the cross-check deadline, the trusted tier, use before
+        # verify (trusted accounts, default off); shard (i, n): this process verifies the tasks whose id falls in i
+        self.cross_wait_s, self.trusted_after = int(cross_wait_s), int(trusted_after)
+        self.ingest_then_verify = bool(ingest_then_verify)
+        self.shard = shard
         self._policies: dict = {}
         self._plock = threading.Lock()
         self._claim_lock = threading.Lock()
@@ -102,8 +108,13 @@ class Verifier:
         for c in rows:
             if c["seq"] > upto:
                 break
-            data = (self.pool_dir / "chunks" / c["file"]).read_bytes()
-            out.append(P.decode_chunk(data, n_act=n_act, n_obs=n_obs))
+            cf = self.pool_dir / "chunks" / c["file"]
+            ch = P.decode_chunk(cf.read_bytes(), n_act=n_act, n_obs=n_obs)
+            from .server_rewards import read_rewards
+            sr = read_rewards(cf, int(ch.header["steps"]))
+            if sr is not None:  # reward_inputs_v1: the replay checks the gateway's rewards, not the client's
+                ch.arrays["rewards"] = sr
+            out.append(ch)
         return out
 
     # ------------------------------------------------------------------------------------------ one task
@@ -119,6 +130,15 @@ class Verifier:
             s.set_task_state(task_id, "done")
             return "skipped"
         top = max((c["seq"] for c in chunks), default=-1)  # the snapshot: a later arrival is not decided here
+        cross = s.cross(row["cross_id"]) if row["cross_id"] else None
+        if cross is not None and cross["state"] in ("waiting", "issued"):  # the peer's play decides (cross_check)
+            if self.ingest_then_verify and self._trusted(row["forum_id"]) and row["cross_role"] == "a":
+                s.release_unverified(task_id)
+            s.defer_verify(task_id, 15)
+            return "deferred"
+        if (self.ingest_then_verify and row["replay"] and row["cross_role"] != "b" and acct is not None
+                and not acct["suspect"] and self._trusted(row["forum_id"])):
+            s.release_unverified(task_id)  # use before verify (trusted, default off): a mismatch quarantines the rest
         if not held:
             s.skip_task(task_id, top)
             return "empty"
@@ -180,6 +200,10 @@ class Verifier:
                 if not r["excess"] and q in files:
                     write_reach_patch(self.pool_dir / "chunks" / files[q], r)
             s.finish_verify(task_id, upto, True, None, None, max_seq=top)
+            s.add_passed(int(row["forum_id"]))
+            if row["cross_role"] == "b":  # an arbitrated replica: verified, but the same trajectory as the original
+                s.q("UPDATE chunks SET status='cross' WHERE task_id=? AND status='released' AND ingested IS NULL",
+                    (task_id,))
             self.log(f"verify {task_id[:8]}: passed up to chunk {upto}"
                      + (f"; reach-deviant rows in chunks {sorted(reach)} (patched)" if reach else "")
                      + (f"; rejected for reach (not flagged): {[(q, reach[q]['excess']) for q in excess]}" if excess else ""))
@@ -202,10 +226,17 @@ class Verifier:
         return "failed"
 
     # ------------------------------------------------------------------------------------------ loop
+    def _trusted(self, forum_id: int) -> bool:
+        return self.trusted_after > 0 and self.store.passed_tasks(forum_id) >= self.trusted_after
+
     def run_once(self, limit: int = 10) -> int:
         self.store.close_expired()
-        n = 0
+        from .cross_check import decide
+        with self._claim_lock:  # one decider at a time (several verifier threads)
+            n = decide(self.store, self.pool_dir, self.log, self.cross_wait_s)
         for row in self.store.tasks_to_verify(limit + len(self._claimed)):
+            if self.shard is not None and int(row["task_id"][:8], 16) % self.shard[1] != self.shard[0]:
+                continue  # another verifier process's share (--shard i/n)
             if self.stop_event.is_set() or n >= limit:
                 break
             with self._claim_lock:

@@ -39,7 +39,7 @@ from .server_verify import policy_consistency, select_task
 TOKEN_PREFIX = "bp1_"
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
 SESSION_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
-SHA_FILE = re.compile(r"/pool/(weights|assets)/([0-9a-f]{64})\.(json|npz|zst)")  # .zst: f7 reach fields
+SHA_FILE = re.compile(r"/pool/(weights|assets)/([0-9a-f]{64})\.(json|npz|zst|wasm)")  # .zst: f7 reach fields, .wasm: the feature module
 COOKIE = "pool_oauth"
 LOGIN_COOKIE = "pool_login"
 USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I
@@ -173,6 +173,12 @@ class PoolApp:
         self._board = (0.0, None)
         self._ref = {}  # engine kind -> reference game-file hashes
         self.chunks_dir = Path(cfg.pool_dir) / "chunks"
+        self.feature_module = None  # modules.FeatureModuleRef: the signed feature module ([task] feature_module)
+        self._rewards = {}  # task_id -> server_rewards.TaskRewards (reward_inputs tasks; rebuilt from disk after a restart)
+        self.reward_stats = {"chunks": 0, "steps": 0, "seconds": 0.0, "differ": 0}
+        if cfg.feature_module:
+            from .modules import load_module
+            self.feature_module = load_module(cfg.feature_module, Path(cfg.pool_dir) / "assets")
 
     def now(self) -> int:
         return int(self.clock())
@@ -550,15 +556,31 @@ class PoolApp:
             return _json("no_task", reason=payload(Reason.NO_TASK), retry_s=max(30, self.cfg.task_poll_s))
         # capability gate: a policy's tasks only for clients that can run them (manifest.requires vs hello.capabilities)
         from .capabilities import missing, refusal
-        lacking = missing(self.policies.current.manifest.get("requires"), json.loads(sess["capabilities"] or "[]"))
+        have = json.loads(sess["capabilities"] or "[]")
+        if self.feature_module is not None and "feature_module_v1" in have:  # what the gateway's module computes
+            have = list(have) + sorted(self.feature_module.grants())
+        lacking = missing(self.policies.current.manifest.get("requires"), have)
         if lacking:
             return _json("no_task", reason=refusal(sess["client_version"], lacking), retry_s=600)
+        from .cross_check import assign, build_key, replica_for
+        rep = replica_for(self.store, sess, acct["forum_id"], self.cfg, self.now())
+        if rep is not None:  # a peer's drawn task waits for a second play by this build (cross-check)
+            d, cross_id = rep
+            self.store.add_task(d, acct["forum_id"], sess["session_id"], replay=False)
+            self.store.set_cross_b(cross_id, d["task_id"])
+            return _json("task", task=d)
         t = self.policies.new_task(sess["engine_kind"], self.now(), self.cfg.max_steps, self.cfg.max_frames,
                                    self.cfg.deadline_s)
+        if self.feature_module is not None and "feature_module_v1" in caps:  # the hot-updated features (modules.py)
+            t.assets = dict(t.assets, feature_module=self.feature_module.asset())
+        if self.cfg.server_rewards and "reward_inputs_v1" in caps:  # the gateway's reward (server_rewards.py)
+            from .server_rewards import refuse_reason
+            t.reward_inputs = refuse_reason(self.policies.current.manifest) is None
         d = t.to_dict()
-        replay = select_task(self.store, acct["forum_id"], self.cfg.probation_chunks * int(t.chunk_steps),
-                             self.cfg.task_sample)
+        _tier, replay, cross = assign(self.store, self.cfg, acct["forum_id"], int(t.chunk_steps))
         self.store.add_task(d, acct["forum_id"], sess["session_id"], replay=replay)
+        if cross:  # verified by a second volunteer's play (our verifier only on a difference)
+            self.store.add_cross(secrets.token_hex(16), d["task_id"], acct["forum_id"], build_key(sess))
         return _json("task", task=d)
 
     def task_end(self, acct, body: bytes) -> Response:
@@ -632,6 +654,7 @@ class PoolApp:
                 raise _err(Reason.CHAIN_BROKEN, task_id=tid, chunk=seq, step=h["step0"])
         if self.store.held_bytes() + len(body) > self.cfg.max_total_bytes:
             raise _err(Reason.SERVER_BUSY)
+        server_r = self._server_rewards(task, tid, c, pub) if task.get("reward_inputs") else None
         rel = f"{tid}/{seq:06d}.brpc"
         dst = self.chunks_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -657,6 +680,11 @@ class PoolApp:
         except BaseException:
             dst.unlink(missing_ok=True)
             raise
+        if server_r is not None:  # the learner gets the gateway's rewards (learner_link.chunk_message)
+            from .server_rewards import write_rewards
+            write_rewards(dst, server_r)
+            if h["final"]:
+                self._rewards.pop(tid, None)
         if flag is not None:  # the cheap check failed: this task in full and the account's next tasks are replayed
             self.store.flag_chunk(tid, seq, flag)
             self.store.set_task_replay(tid)
@@ -665,6 +693,38 @@ class PoolApp:
                      f"{self.cfg.escalate_tasks} tasks go to a full replay")
         self.store.touch_session(sess["session_id"])
         return _json("chunk_result", task_id=tid, seq=seq, status="accepted", verify="pending", steps=steps)
+
+    def _server_rewards(self, task: dict, tid: str, c, pub):
+        """reward_inputs_v1: the chunk's training rewards recomputed from its reward inputs (server_rewards.py)."""
+        from .server_rewards import TaskRewards
+        if "rin" not in c.arrays:
+            raise _err(Reason.BAD_CHUNK, detail="the task asks for the reward inputs (rin)")
+        st = self._rewards.get(tid)
+        try:
+            if st is None:
+                if pub is None:
+                    raise ValueError("the task's policy is no longer published")
+                st = TaskRewards(pub.manifest, pub.starts)
+                for r in self.store.chunks(tid):  # after a gateway restart: the task's earlier chunks first
+                    prev = P.decode_chunk((self.chunks_dir / r["file"]).read_bytes())
+                    st.chunk(int(prev.header["step0"]), prev.arrays["rin"], prev.header.get("episodes") or [])
+                self._rewards[tid] = st
+            t0 = st.seconds
+            out = st.chunk(int(c.header["step0"]), c.arrays["rin"], c.header.get("episodes") or [])
+        except Exception as e:  # noqa: BLE001  any bad input (an inf in an integer column: OverflowError) refuses the chunk
+            self._rewards.pop(tid, None)
+            raise _err(Reason.BAD_CHUNK, detail=f"reward inputs: {type(e).__name__}: {str(e)[:150]}") from None
+        # the upload guard of the client's rewards, on the gateway's own (the learner gets these)
+        bound = float(self.cfg.guard_max_abs_reward)
+        if not np.isfinite(out).all() or float(np.abs(out).max(initial=0.0)) > bound:
+            self._rewards.pop(tid, None)
+            raise _err(Reason.BAD_CHUNK, detail=f"reward inputs give a reward beyond {bound:g}")
+        rs = self.reward_stats
+        rs["chunks"] += 1
+        rs["steps"] += len(out)
+        rs["seconds"] += st.seconds - t0
+        rs["differ"] += int((out.view("<u4") != np.asarray(c.arrays["rewards"], "<f4").view("<u4")).sum())
+        return out
 
     def _consistency(self, c, task: dict):
         """policy_consistency with the task's policy (None when the weights cannot be loaded: the replay decides)."""
@@ -747,7 +807,7 @@ class PoolApp:
     def sha_file(self, path: str) -> Response:
         m = SHA_FILE.fullmatch(path)
         kind, sha, ext = m.groups()
-        if (kind == "assets" and ext not in ("npz", "zst")) or (kind == "weights" and ext == "zst"):
+        if (kind == "assets" and ext not in ("npz", "zst", "wasm")) or (kind == "weights" and ext in ("zst", "wasm")):
             return _error(payload(Reason.BAD_MESSAGE, detail="not found"), 404)
         f = Path(self.cfg.pool_dir) / kind / f"{sha}.{ext}"
         if not f.is_file():

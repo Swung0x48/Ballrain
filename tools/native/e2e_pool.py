@@ -2,7 +2,7 @@
 
 Runs on this machine, all on loopback: the mock forum (tools/pool/mock_forum.py), the gateway (ballrain.pool.server_app)
 with a real policy (a learner checkpoint, exported like the gateway's task source does), the real start record and
-reference line, and the verifier replaying with the x87-soft headless engine; then the native client (nc_client) logs
+reference line, and the verifier replaying with the x87-soft headless engine; then the native client (ballrain_coordinator) logs
 in through the gateway's login flow (the browser part scripted here with the player's cookies, against the mock
 forum's user "eligible"), runs tasks and posts its chunks; the verifier replays every task (probation: every chunk)
 and must pass them all. A forged copy of one of the native chunks (reward changed, resealed) is then replayed offline
@@ -10,7 +10,7 @@ through the verifier's replay_task and must be caught.
 
     python tools/native/e2e_pool.py --dir runtime/nc/e2e --ckpt runtime/nc/ckpt/r7_latest.pt \\
         --record <dataset record dir> --engine <x87-soft BallanceMMOSimTool.exe> --game <Ballance folder> \\
-        --client build/native-Release/nc_client.exe [--tasks 3] [--max-steps 3000]
+        --client build/native-Release/ballrain_coordinator.exe [--tasks 3] [--max-steps 3000]
 
 Everything it writes stays under --dir (gateway state, chunks, the client's data directory). Exit code 0 = passed.
 """
@@ -122,11 +122,20 @@ def main(argv=None) -> int:
     ap.add_argument("--hold", type=float, default=0.0,
                     help="demo: after the login keep the gateway up this many seconds (or until <dir>/stop exists) "
                          "with the verifier running, for the TUI started by hand on <dir>/client; no client run")
-    ap.add_argument("--tui", help="also run the terminal UI (ballrain_pool --snapshot live:25) on the client's data")
+    ap.add_argument("--tui", help="also run the terminal UI (BallrainCoordinator --snapshot live:25) on the client's data")
     ap.add_argument("--kill-after", type=float, default=0.0,
                     help="first hard-kill the client this many seconds into a run (its engines must die with it: the job "
                          "object), then run it again: the killed run's queued chunks are posted and its tasks closed")
     ap.add_argument("--max-steps", type=int, default=3000)
+    ap.add_argument("--phase-summary-s", type=float, default=20.0,
+                    help="the client's phase summary interval: the headless run must append it to <client>/logs/client.log")
+    ap.add_argument("--wait-upload", action="store_true", help="the client's 0.5.0 behaviour (wait for the previous upload)")
+    ap.add_argument("--rate-only", action="store_true", help="a throughput run: the gateway's receive rate, no verification")
+    ap.add_argument("--server-rewards", action="store_true", help="[task] server_rewards: reward_inputs_v1 clients "
+                    "upload the reward inputs, the gateway recomputes the rewards (must equal the client's bit for bit); "
+                    "the forged-chunk check then forges the inputs")
+    ap.add_argument("--feature-module", help="the signed feature module (.wasm + .sig): tasks of feature_module_v1 "
+                    "clients carry it ([task] feature_module); the run checks the client used it")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--latency-ms", type=float, default=0.0, help="delay every gateway response (a tunnel's round trip)")
     ap.add_argument("--heartbeat-s", type=int, default=5, help="the gateway's heartbeat interval (5: heartbeats during tasks)")
@@ -162,7 +171,9 @@ def main(argv=None) -> int:
     cfg = PoolConfig(pool_dir=d / "pool", public_base_url=gateway, forum=ForumConfig(
         base_url=forum.base_url, client_id="ballrain-pool-e2e", client_secret="e2e-secret", redirect_uri=redirect),
         run="r7", datasets_dir=ds, path_dirs=[Path(a.path_dir).resolve()], max_steps=a.max_steps, max_frames=60000,
-        deadline_s=3600, heartbeat_s=a.heartbeat_s, engines={"x87soft": engine}, max_instances=a.max_instances)
+        deadline_s=3600, heartbeat_s=a.heartbeat_s, engines={"x87soft": engine}, max_instances=a.max_instances,
+        feature_module=Path(a.feature_module).resolve() if a.feature_module else None,
+        server_rewards=a.server_rewards)
     from tools_pool_gateway import build  # noqa: E402  (tools/pool/gateway.py, imported by path below)
     app, store, policies, verifier = build(cfg)
     if a.client_engine != a.engine:  # the client runs another build of the x87-soft engine: allow its sha256 too
@@ -226,7 +237,7 @@ def main(argv=None) -> int:
         c.update(gateway_url=gateway, ballance_dir=a.client_game, engine_binary=a.client_engine, instances=a.instances,
                  setup_done=True, auto_pause_player=False, auto_pause_battery=False)
         cfgp.write_text(json.dumps(c, ensure_ascii=False, indent=1), encoding="utf-8")
-        log(f"DEMO READY: ballrain_pool --data-dir {client_dir} (stop: create {d / 'stop'})")
+        log(f"DEMO READY: BallrainCoordinator --data-dir {client_dir} (stop: create {d / 'stop'})")
         end = time.time() + a.hold
         while time.time() < end and not (d / "stop").exists():
             try:
@@ -259,8 +270,11 @@ def main(argv=None) -> int:
         if not engines or alive:
             return 1
     t0 = time.time()
+    client_log = client_dir / "logs" / "client.log"
+    log_before = client_log.stat().st_size if client_log.exists() else 0
     cmd = ([a.client, "run", "--gateway", gateway, "--data-dir", str(client_dir), "--ballance-dir", a.client_game,
-            "--engine", a.client_engine, "--tasks", str(a.tasks), "--instances", str(a.instances)]
+            "--engine", a.client_engine, "--tasks", str(a.tasks), "--instances", str(a.instances),
+            "--phase-summary-s", str(a.phase_summary_s)] + (["--wait-upload"] if a.wait_upload else [])
            + [x for kv in a.client_engine_env for x in ("--engine-env", kv)]
            + (["--auto-pause", "on"] if a.fake_player else [])
            + (["--quiet-file", str(d / "ballrain-quiet")] if a.quiet else []))
@@ -282,7 +296,7 @@ def main(argv=None) -> int:
             plan.append((at, "quiet", dur))
         for at, what, dur in sorted(plan):
             time.sleep(max(0.0, t0 + at - time.time()))
-            if p.poll() is not None:
+            if not hasattr(p, "poll") or p.poll() is not None:  # the client already finished (p is its result)
                 return
             if what == "outage":
                 down.set()
@@ -340,6 +354,28 @@ def main(argv=None) -> int:
         log(f"client exit {p.returncode}: {p.stderr[-2000:]}")
         return 1
     ends = [e for e in events if e["event"] == "task_end"]
+    if a.feature_module:  # every task ran its features in the module (feature_module_v1 declared, signature checked)
+        used = [e.get("feature_module") for e in events if e["event"] == "task"]
+        log(f"feature module: {sum(1 for u in used if u)} of {len(used)} tasks ran it")
+        if not used or not all(used):
+            return 1
+    # the headless run's log: client.log grows after the start (the log lines, the phase summary among them), the log
+    # lines are events too, the summary also a "phases" event
+    run_s = time.time() - t0
+    new_log = (client_log.read_bytes()[log_before:].decode("utf-8", "replace").splitlines()
+               if client_log.exists() else [])
+    summaries = [x for x in new_log if "实例时间" in x]
+    ph_events = [e for e in events if e["event"] == "phases"]
+    log_events = [e for e in events if e["event"] == "log"]
+    want_summary = run_s > a.phase_summary_s + 10
+    log(f"client.log: {len(new_log)} new lines, {len(summaries)} phase summaries; events: {len(log_events)} log, "
+        f"{len(ph_events)} phases" + (f"; last summary: {summaries[-1][:160]}" if summaries else ""))
+    if len(new_log) < 2 or len(log_events) < 2 or (want_summary and not (summaries and ph_events)):
+        log("the headless run did not keep client.log / the log events going")
+        return 1
+    if ph_events:
+        e = ph_events[-1]
+        log("phases: " + ", ".join(f"{k} {e[k]:.1f}" for k in ("wait", "fetch", "assets", "start", "play", "close", "hidden")))
     beats = sum(1 for e in events if e["event"] == "heartbeat")
     other = [e for e in events if e["event"] in ("refused", "task_failed", "error")]
     if a.kill_engine_after > 0:  # the killed engine's task: one task_failed (end "error", its prefix is verified)
@@ -358,7 +394,28 @@ def main(argv=None) -> int:
     if bad or len(ends) != a.tasks or other or (a.heartbeat_s <= 10 and beats == 0):
         log(f"refused chunks / missing tasks: {bad[:3]}")
         return 1
+    # the rate the gateway received (chunks.received, unix s) per minute: the sustained rate, not the start-up burst
+    rec = store.q("SELECT received, steps FROM chunks ORDER BY received")
+    if rec:
+        r0 = rec[0]["received"]
+        buckets = {}
+        for c in rec:
+            k = int((c["received"] - r0) // 60)
+            buckets[k] = buckets.get(k, 0) + c["steps"]
+        span = max(rec[-1]["received"] - r0, 1)
+        log(f"gateway received {sum(c['steps'] for c in rec)} steps in {span} s = {sum(c['steps'] for c in rec) / span:.0f} "
+            f"steps/s; per minute: " + ", ".join(f"{v / 60:.0f}" for k, v in sorted(buckets.items())))
+    if a.rate_only:
+        log("PASSED (rate only: no verification)")
+        return 0
 
+    if a.server_rewards:  # the gateway's rewards from the inputs, against the client's own (the same code, ported)
+        rs = app.reward_stats
+        us = 1e6 * rs["seconds"] / max(rs["steps"], 1)
+        log(f"server rewards: {rs['chunks']} chunks, {rs['steps']} steps recomputed, {rs['differ']} differ from the "
+            f"client's; {us:.1f} us per step (one core: {1e6 / max(us, 1e-9):.0f} steps/s)")
+        if rs["chunks"] == 0 or rs["differ"]:
+            return 1
     # ---- the verifier replays every task (probation: every chunk selected)
     t0 = time.time()
     for _ in range(4 * a.tasks):
@@ -390,7 +447,13 @@ def main(argv=None) -> int:
     c0 = decoded[0]
     h = {k: v for k, v in c0.header.items() if k not in ("arrays", "protocol", "type")}
     arr = {k: v.copy() for k, v in c0.arrays.items()}
-    arr["rewards"][10] += np.float32(0.25)
+    if a.server_rewards and "rin" in arr:  # the reward is the gateway's: forge its input (IGT +100 ms at step 10)
+        from ballrain.pool.server_rewards import TaskRewards, RIN_SR
+        arr["rin"][10, RIN_SR] += 100.0
+        pub = policies.history[task.policy_sha]
+        arr["rewards"] = TaskRewards(pub.manifest, pub.starts).chunk(0, arr["rin"], h.get("episodes") or [])
+    else:
+        arr["rewards"][10] += np.float32(0.25)
     decoded[0] = P.decode_chunk(P.encode_chunk(h, arr))
     m, pol = verifier._policy(task.policy_sha)
     sdir, pdir, bdir = verifier._assets(task, m)

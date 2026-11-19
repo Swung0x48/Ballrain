@@ -42,6 +42,13 @@ double monotonic_s() {
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
+double thread_cpu_s() {
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0.0;
+    auto t = [](const FILETIME &f) { return double((uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime) * 1e-7; };
+    return t(k) + t(u);
+}
+
 int self_pid() { return int(GetCurrentProcessId()); }
 
 std::vector<std::pair<std::string, std::string>> environment() {

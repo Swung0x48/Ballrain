@@ -1,6 +1,7 @@
 # 原生志愿者客户端（native/，C++17）
 
-志愿者算力池的玩家端程序：不需要 Python，直接驱动无头引擎（x87-soft 物理），自己算观测特征、跑策略、按服务器种子抽动作。
+志愿者端程序“Ballrain 协调器”（Coordinator；0.6.0 起改名，以前叫 BallrainPool / nc_client。“池”（pool）专指训练这边汇集算力的服务端：网关、验证器、学习器链接）：
+界面程序 `BallrainCoordinator.exe`，无头程序 `ballrain_coordinator.exe`，包 `BallrainCoordinator-<版本>-windows-x64.zip`；数据目录、`BALLRAIN_WORK_DIR`、能力字符串、协议字段和网关接口不变。不需要 Python，直接驱动无头引擎（x87-soft 物理），自己算观测特征、跑策略、按服务器种子抽动作。
 Python 侧（`ballrain/pool`、`tools/pool`）是训练 / 网关 / 校验方。设计背景见 `volunteer-compute.md`、`pool-prototype.md`。
 
 里程碑：**M1** 核心库 + 回合运行器（§1–4）；**M2** 池协议客户端 + 校验改为跨 CPU 容差（§5）；**M3** Windows 测试版：任务格式 3（§5.0）、
@@ -17,7 +18,7 @@ Python 侧（`ballrain/pool`、`tools/pool`）是训练 / 网关 / 校验方。�
 | 池客户端 | `native/core/src/pool_client.cpp`、`task_runner.cpp`、`pool_task.cpp` | 网关协议、任务（`rollout.py` 的移植）、一个任务从缓存到数据段 |
 | 控制器 | `native/core/src/controller.cpp` | `client_core.py` 的移植，不含界面代码：配置、令牌、游戏目录检查、登录、会话、实例线程、上传队列、自动暂停、日志（§7） |
 | 诊断 / 更新 | `diagnostics.cpp`、`update.cpp` | 脱敏后的诊断 zip；ed25519 签名的发布清单（§8） |
-| 程序 | `native/apps/` | `ballrain_pool`（玩家用的终端界面，FTXUI）、`nc_client`（控制器的命令行驱动，端到端测试用）、`nc_task`（离线任务）、`nc_runner`（在线跑回合）、`nc_golden`（离线黄金对比）、`nc_release`（发布签名）；`native/tests/selftest.cpp`（不需要引擎的单元检查） |
+| 程序 | `native/apps/` | `BallrainCoordinator`（玩家用的终端界面，FTXUI）、`ballrain_coordinator`（控制器的命令行驱动，端到端测试用）、`nc_task`（离线任务）、`nc_runner`（在线跑回合）、`nc_golden`（离线黄金对比）、`nc_release`（发布签名）；`native/tests/selftest.cpp`（不需要引擎的单元检查） |
 | 第三方 | `native/third_party/` | miniz（MIT）、zstd（BSD）、FTXUI 7.0.3（MIT）、orlp/ed25519（zlib），版本和来源见 `third_party/README.md` |
 | Python 工具 | `tools/native/golden.py`、`stream_diff.py` | 录 Python 侧的黄金流；比较两条流 |
 
@@ -153,7 +154,7 @@ Python 同种子跑两次（`policy_s1` / `policy_s1b`），C++ 与 Python 之�
 | env 补齐：TAS 起点（前缀回放、交接检查与重试、按录制恢复按住的键和相机计时）、奖励、相机守卫罚分、引擎摘要 | `core/src/env.cpp`、`session.cpp` | `env.py` |
 | 任务运行：worker 的训练奖励（分段奖励、门、帧上限、stall / stall_terminal / stall_compensate）、任务结束判定、数据段组装、按种子抽样 | `core/src/task_runner.cpp` | `pool/rollout.py`（验证器重放用的那份） |
 | 网关客户端：HTTP（Windows 用 WinHTTP，http / https；POSIX 用 libcurl，见 §2、§11）、消息、sha 寻址缓存、game_files 哈希、引擎信息 | `core/src/pool_client.cpp`、`platform/` | `pool/client_api.py`、`task.py`、`client_game.py` |
-| 命令行客户端：`nc_client login`（login_start / login_poll，存令牌）、`nc_client run`（hello → 领任务 → 下载并校验 → 跑任务 → 每段立即上传，网络错误退避重试；拒收原样打印，`TOKEN_FATAL` 停止） | `apps/nc_client.cpp` | `client_worker.py`、`client_core.py` 的一部分 |
+| 命令行客户端：`ballrain_coordinator login`（login_start / login_poll，存令牌）、`ballrain_coordinator run`（hello → 领任务 → 下载并校验 → 跑任务 → 每段立即上传，网络错误退避重试；拒收原样打印，`TOKEN_FATAL` 停止） | `apps/coordinator_cli.cpp` | `client_worker.py`、`client_core.py` 的一部分 |
 
 ### 5.3 端到端（`tools/native/e2e_pool.py`）
 
@@ -188,7 +189,7 @@ Python 验证器的 `replay_task` 重放它的数据段；强制动作时只跳�
 没有覆盖的：`error`（任务中途引擎崩溃）、`deadline`、`truncated`（引擎自己的截断、相机守卫）。
 
 ```sh
-$PY tools/native/e2e_pool.py --dir runtime/nc/e2e --ckpt runtime/nc/ckpt/r7_latest.pt     --record <main checkout>/runtime/datasets/tas-v1/SR01_1_14_457_264     --engine runtime/nc/engine-x86soft/BallanceMMOSimTool.exe --game runtime/nc/game     --client build/native-Release/nc_client.exe --tasks 2 --max-steps 3000
+$PY tools/native/e2e_pool.py --dir runtime/nc/e2e --ckpt runtime/nc/ckpt/r7_latest.pt     --record <main checkout>/runtime/datasets/tas-v1/SR01_1_14_457_264     --engine runtime/nc/engine-x86soft/BallanceMMOSimTool.exe --game runtime/nc/game     --client build/native-Release/ballrain_coordinator.exe --tasks 2 --max-steps 3000
 ```
 
 另外两项交叉检查：`tools/native/stream_digests.py`（Python）与 `nc_golden --digests`（C++）对同一录制算出的引擎摘要逐行相同（17299 行）；
@@ -213,7 +214,7 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - **`task_end`**（格式 3 新增）：没有最终段就结束的任务（开局失败，或刚切完一段引擎就死了）在数据段都传完后关掉，网关马上空出实例名额，
   不再占到任务期限；客户端被强行结束后，下次启动时上次没跑完的任务也会这样关掉（段数取网关的计数）。
 - **自动暂停**：每 5 秒查一次 Player.exe 是否在运行、是否在用电池（可在配置里关）；暂停时正在跑的任务以 `stopped` 结束。
-  共用的机器可以设暂停开关：`config.json` 的 `quiet_file`（`nc_client run --quiet-file PATH`），这个文件或目录存在时所有实例暂停，
+  共用的机器可以设暂停开关：`config.json` 的 `quiet_file`（`ballrain_coordinator run --quiet-file PATH`），这个文件或目录存在时所有实例暂停，
   删掉后自动继续（实测：出现后 1 秒内暂停，`e2e_pool.py --quiet 5:15` 63 段通过）。
 - **登录**：`login_start` 后在系统浏览器打开网关的确认页（论坛的 client secret 只在网关），每 `poll_s` 秒 `login_poll`；成功后令牌写进数据目录。
 - **横幅**：网关拒收、吊销、刷新会话失败时，横幅原样显示网关的 `reason.message`（FTXUI 的 `text` / `paragraph` 不解析任何标记）。
@@ -224,14 +225,14 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
   连短名都没有时给出中文提示：玩家设环境变量 `BALLRAIN_WORK_DIR` 指向一个纯英文的文件夹，整个数据目录（`engine-work/` 也在其中）就搬到那里。
   实测：数据目录、引擎、游戏目录都放在中文路径下，端到端 12/12 段通过。
 
-### 7.2 终端界面（`native/apps/ballrain_pool.cpp`，FTXUI）
+### 7.2 终端界面（`native/apps/BallrainCoordinator.cpp`，FTXUI）
 只画 `ControllerView`、调用控制器的动作：
 - **首次设置**：网关地址（发布版预填）、Ballance 目录（“查找常见位置”）、开发版没有附带引擎时还有引擎路径；“检查游戏文件”按 x87-soft 版的清单逐项给出中文提示。
 - **登录页**：“在浏览器中登录”，显示登录代码和地址（浏览器没打开时可以手动复制）。
 - **主界面**：开始 / 暂停、实例数 −/＋、上榜开关（网关的状态为准，默认开）、每个实例一行（状态、任务、本任务步数、累计步数、已接收步数、步/秒）、
   待上传段数、网关统计（已接收 / 已验证 / 待验证）、横幅、自动暂停提示、网关通知、新版本提示、最近的日志。
 - **导出诊断**：先列出要打包的文件和 `info.json` 的内容，确认后保存到数据目录（§8.2）。
-- **启动参数**（`BallrainPool --help`）：`--page setup|login|main|diag` 直接打开某一页；`--start` 启动后立即连接并开始采样（没登录时先进登录页）；
+- **启动参数**（`BallrainCoordinator --help`）：`--page setup|login|main|diag` 直接打开某一页；`--start` 启动后立即连接并开始采样（没登录时先进登录页）；
   `--login` 立即开始浏览器登录；`--gateway`、`--ballance-dir`、`--engine`、`--instances`、`--quiet-file`、`--auto-pause on|off` 写进配置并保存
   （检查通过时视为已完成首次设置）；`--data-dir`、`--version`。不认识的选项报错并打印用法。
 - **退出**：“退出”按钮、Ctrl-C、Ctrl-Break、关窗口都走同一条正常收尾：任务以 `stopped` 结束、引擎正常停止、剩下的数据段最多再传 5 秒。
@@ -256,17 +257,17 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 | 断网：第 6 秒起网关对所有请求回 502 HTML（隧道断开时的样子）20 秒（`--outage 6:20`） | 上传失败 4 次后自动重试，恢复后 55 段全部通过 |
 | 任务中途杀掉一个引擎（`--kill-engine-after 6`） | 该任务以 `error` 结束（前缀照常验证），实例退避后继续；33 段通过 |
 | 自动暂停：第 5 秒起一个假的 Player.exe 运行 10 秒（`--fake-player 5:10`） | 自动暂停（任务以 `stopped` 结束）并自动恢复；59 段通过 |
-| 打包出的 zip：用 zip 里的引擎（含 `ENGINE_VERSION`、应用本地的 VC++ 运行库）跑 4 个任务，再用 zip 里的 `BallrainPool.exe` 实时运行 25 秒 | 16 段通过；界面主页显示“采样中” |
-| 诊断导出（`nc_client diag`，离线） | zip 里没有令牌、登录名、家目录、论坛昵称 / 用户名（昵称来自连接时存下的 `user.json`） |
+| 打包出的 zip：用 zip 里的引擎（含 `ENGINE_VERSION`、应用本地的 VC++ 运行库）跑 4 个任务，再用 zip 里的 `BallrainCoordinator.exe` 实时运行 25 秒 | 16 段通过；界面主页显示“采样中” |
+| 诊断导出（`ballrain_coordinator diag`，离线） | zip 里没有令牌、登录名、家目录、论坛昵称 / 用户名（昵称来自连接时存下的 `user.json`） |
 
 ## 8. 打包、发布和更新
 
 ### 8.1 Windows 测试版 zip（`tools/native/package_win.py`）
 - 用发布配置编译（网关地址、更新地址、发布公钥作为 CMake 缓存变量 `BALLRAIN_DEFAULT_GATEWAY` / `BALLRAIN_UPDATE_URL` / `BALLRAIN_RELEASE_PUBKEY`
-  传进去，不进仓库），跑一遍 selftest，组装：`BallrainPool.exe`、`engine/x87soft/windows/`（bin-x86soft 的 `BallanceMMOSimTool.exe`、x86 的
+  传进去，不进仓库），跑一遍 selftest，组装：`BallrainCoordinator.exe`、`engine/x87soft/windows/`（bin-x86soft 的 `BallanceMMOSimTool.exe`、x86 的
   `msvcp140.dll` 和 `vcruntime140.dll` 放在引擎旁边、`ENGINE_VERSION`）、`使用说明.txt`、`LICENSES/`（收录的库加上 `--license` 给的引擎源码许可证）。
   不含任何游戏文件。zip 里的文件顺序和时间固定，同样的输入得到同样的 zip。脚本会打印引擎的 sha256：网关的 `[engines.x87soft]` 白名单要加上它。
-- 实测（占位网关、测试密钥）：zip 6.8 MB；解压后的 `BallrainPool.exe` 认出了随附的引擎，网关地址已预填。
+- 实测（占位网关、测试密钥）：zip 6.8 MB；解压后的 `BallrainCoordinator.exe` 认出了随附的引擎，网关地址已预填。
 - 没有代码签名：第一次运行时 SmartScreen 会拦（“更多信息” → “仍要运行”），测试者指南里写了。
 
 ### 8.2 诊断导出
@@ -381,6 +382,59 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
   - 端到端（`e2e_pool.py --branch-dir L02-multi`，f7）：网关发出东平台和南环的静止开局，客户端装好 v2 分线包，校验端 14 个块全部通过，伪造的块被抓到。
   - v1 回归：石线 f6 8/8、f7 通过，L2 10/10，步数和以前一样。
 
+## 10d. 任务重叠和无头日志（0.5.1 / 0.5.2）
+
+- **能力 `task_prefetch_v1`**：意思是“每个实例最多同时占 3 个未关闭的任务”（正在跑的一个、提前准备的一个、上一个任务还没传完的尾段）。
+  网关（池会话，`server_tasks.py`）对声明它的会话按 hello 的 `instances` 放宽：每个会话未关闭任务少于 3 × `instances`，每个账号少于 3 × `max_instances`；
+  超出时照旧回 `too_many_instances`（参数 `max_instances`、`open_limit`），客户端等 10 秒再取。不声明的会话还是原来的账号级 `max_instances` 规则。
+  不需要别名：0.5.2 起客户端总是声明它，因为实例不再等上一个任务传完就取下一个；0.5.1 只在配置 `prefetch: true` 时声明。
+- **提前准备**（0.5.1，配置 `prefetch`，默认关）：当前任务采样时准备下一个任务（取任务、资源、启动引擎和开局），引擎停在第一帧观测上等交接。
+  实测更慢（8 个实例 681 → 570 步/秒，16 个约 960 → 450）：开局（TAS 前缀）吃 CPU，两个引擎抢同一个核，所以默认关。
+- **不再等上传**（0.5.2）：0.5.0 的实例在开局前等自己上一个任务的最后几段传完（以免碰到账号的实例上限）。H 255 上 16 个实例时这段等待占了
+  约 30% 的实例时间（4 个上传线程共用）。现在直接取下一个任务；上传线程 4 → 8 个（每个任务同一时刻只由一个线程传，段的顺序不变）。
+  `ballrain_coordinator run --wait-upload` 保留旧行为（对照用）。
+- **阶段汇总**：每个任务的 `task_end` 事件带 `phases`（wait、fetch、assets、start、play、close、prefetched）。汇总第一次在 1 分钟后
+  （`--phase-summary-s` 小于 60 时按它），以后每 5 分钟（`ballrain_coordinator run --phase-summary-s S`）：写进 `client.log`、作为 `log` 事件
+  （终端界面的日志栏，`ballrain_coordinator` 的 stderr），另发一个 `phases` 事件（秒数、任务数、步数、步/秒和各阶段的实例秒数之和）。
+- **无头日志**（0.5.2 修复）：`ballrain_coordinator run` 以前只把 `log` 事件打到 stderr，事件流（stdout）里没有；而正常运行时连上网关、开始采样之后
+  就没有别的日志行了，第一条汇总要等 5 分钟，所以 `client.log` 看起来在启动 2 秒后就不动了。现在 `run` 的 stdout 也有 `log` 事件
+  （`login` 的 stdout 不变），汇总 1 分钟后就有。`e2e_pool.py` 检查无头运行时 `<数据目录>/logs/client.log` 新增了日志行和阶段汇总、事件流里有 `log` 和 `phases` 事件。
+- **上传统计**（0.5.2）：汇总里另有这段时间上传了多少段、KB/秒、平均每段几秒、上传线程数和待上传的 MB（`phases` 事件的 `upload_*`、`queue_bytes`）。
+  平均每段的秒数乘上段数接近“上传线程数 × 时长”、待上传的 MB 一直涨，就是上传跟不上（隧道或网关慢）；否则瓶颈在本机。
+- **实测**（本机 i7-14700KF，28 线程，同时还有训练的引擎在跑；`e2e_pool.py --rate-only --latency-ms 200`，每个实例 10 个任务、每个任务最多 2000 步，
+  按网关收到的段计）：
+
+  | 实例 | 0.5.2 | 0.5.0 行为（`--wait-upload`） | 实例时间（0.5.2） |
+  |---|---|---|---|
+  | 8 | 1033 步/秒 | 953 | 启动引擎和开局 74%，采样 23%，取任务 3% |
+  | 12 | 1310 | 1316 | 开局 78%，采样 19% |
+  | 16 | 1746 | 1556 | 开局 79%，采样 18%，每个任务开局 7.7 秒 |
+
+  本机每段上传 0.23 秒，等上传只占 3%，所以去掉等待只多 0–12%。H 255 上 0.5.0 的等上传占约 30%，说明那里每段上传慢得多，0.5.2 的汇总会直接给出每段秒数。
+  不管哪台机器，最大的一块都是开局（TAS 前缀回放，CPU 密集，多个引擎同时开局时互相抢）：每个任务平均只有约 1000 步，开局的时间要摊到这些步上。
+- 验证过的端到端（0.5.2，池代码取 origin/main 的 `task_prefetch_v1` 规则）：16 个实例、200 ms 延迟、第 40 秒起断网 20 秒、48 个任务、L02 石线：206 段全部通过、
+  伪造段查出、`client.log` 新增 39 行（含阶段汇总）；1 个实例 3 个任务 13 段通过；8 个实例在 `max_instances` 8 下 16 个任务没有 `too_many_instances`，74 段通过。
+- **上传线程空转**（0.5.3 修复）：H 255 上 0.5.2 的 ballrain_coordinator 占约 7.5 个核，比 16 个引擎加起来还多。原因是上传线程把“还在采样、还没有数据段”的任务
+  当成有进展，于是不睡眠，一直重新列 `queue/`、重读 `meta.json`（也让杀毒软件一直在扫）。现在只有真的传了一段或关了一个任务才算进展，
+  否则睡 500 毫秒（新数据段会唤醒）。本机 16 个实例 160 个任务：客户端 CPU 780 → 103 CPU 秒（约 7 核 → 1 核）。
+  `task_end` 的 `phases` 另带 `assets_cpu`、`start_cpu`、`play_cpu`（实例线程的 CPU 秒）：16 个实例时实例线程每个任务开局只用 0.06 CPU 秒，采样约 0.5 ms / 步。
+- **开局的代价**（单实例 16 个任务）：0.93 秒 + 0.197 毫秒 × k，k 平均约 15000 时约 3.8 秒，采样约 1200 步只要 1.6 秒；16 个实例抢 CPU 时开局约 7.4 秒。
+  时间在引擎里（客户端在开局期间几乎不用 CPU）。在交接帧存档 / 读档（引擎改动，另立项目）每个任务约 5.4 → 2.7 秒，每份引擎 CPU 的步数约翻倍。
+  `prefix.bin`（k × 8 字节，约 120 KB）每个任务写一次：引擎要正好 k 帧的文件，k 几乎每个任务都不同，缓存省不了写入，所以不改。
+
+## 10e. 现状（2026-11-18，暂停）
+
+用户暂停了志愿者端（“暂时不再用志愿者端”），H 255 回到 Python runner。客户端的工作停在这里：不再出新包，存档项目不开始。
+- **代码**：0.5.3 在 `claude/native-stone-v2`（1eed03f 上传线程空转修复和每阶段 CPU，3be1e22 版本号和文档），没有推送、没有合并。
+  内部包 `BallrainPool-0.5.3-windows-x64.zip（0.6.0 前的名字）`（sha256 `aa355b82…9ecd`）的端到端全部通过；暂停前在 H 255 上短暂跑过（见下）。
+- **H 255 实测**（16 个实例，按网关收到的步数计）：0.5.0 持续约 400 步/秒；0.5.2 持续约 490 步/秒（等上传降到 0%，实例时间约 75% 在开局，
+  nc_client（今天的 ballrain_coordinator）自己占约 7.5 个核，这就是 0.5.3 修掉的空转）；0.5.3 前 3 分钟约 1,018 步/秒，之后到停止约 1,350 步/秒，是 0.5.2 的约 2.5–3 倍，主要靠空转修复。
+  这个速率下网关的 2 个验证进程略跟不上：从收到到入库的中位数从约 9 秒涨到 30–40 秒。
+- **没做的想法**：
+  - 在 H 255 上比较 0.5.3 的 16 和 12 个实例（还没测）；网关验证进程的数目要跟上客户端的速率；看汇总里的开局占比、每段上传秒数和 MsMpEng 的 CPU，再决定要不要跟用户提 Defender 排除目录（安全设置，用户决定）。
+  - 交接帧存档 / 读档（引擎改动，要和引擎的维护者一起做，并证明读档后和回放前缀逐位相同）：估计每份引擎 CPU 的步数约翻倍（§10d）。
+  - 上传线程空闲时等 500 毫秒，新数据段可以立即唤醒它（现在等待带谓词，通知不会提前结束等待）；影响很小。
+
 ## 11. 还没有做 / 限制
 
 - **https 没有对真网关实测过**：Windows 的 WinHTTP https 分支、POSIX 的 libcurl 分支都只编译过（端到端都是本机 http）。Android 仍然只有 http。
@@ -391,3 +445,107 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - 网关响应只做了轻量的结构检查（类型和必需字段），没有照搬 `protocol.MESSAGES` 的完整 schema。
 - 只支持 SR 策略（与网关导出的限制相同）；`route_probes` 只是记账，没有移植。
 - 2002 零售版 Player.exe 版本：以后。
+
+## 12. 0.6.0：协调器、热更新架构、交叉核对（2026-11-18，只在 dev 网关上测过，没有接入训练）
+
+用户的指示：志愿者端改名为“协调器”（Coordinator，“池”专指训练这边的服务端）；训练端常改的逻辑不再随客户端发布；志愿者之间交叉核对。
+每一步都向下兼容：新功能都按能力声明（`capabilities`），网关只给声明了的会话发；不声明的旧客户端、旧网关照常工作。
+
+### 12.1 改名
+界面程序 `BallrainCoordinator.exe`（`apps/coordinator_tui.cpp`）、无头程序 `ballrain_coordinator.exe`（`apps/coordinator_cli.cpp`，以前的
+`nc_client`）、包 `BallrainCoordinator-<版本>-windows-x64.zip`，界面和说明里叫“Ballrain 协调器”。不变：数据目录 `~/.ballrain` 和
+`BALLRAIN_WORK_DIR`、能力字符串、协议字段、网关接口（`/pool/...`）、服务端的 pool 命名，以及“同一数据目录只开一个客户端”的互斥体名
+（旧版和新版在同一目录上仍互相排斥）。
+
+### 12.2 网络结构作为数据（`policy_graph_v1`，`core/src/graph.cpp`，`ballrain/pool/weights.py` build_graph / GraphPolicy）
+- 清单多一个 `graph`：按顺序执行的节点（`linear`、`tanh`、`relu`、`ctx_argmax`（按观测里的球型位选头）、`select_linear`），引用 npz 里的数组。
+  r8 的按球型分开的头（`--actor-heads ball_type`）就是 `ctx_argmax` + `select_linear`。归一化仍是清单的 `obs_norm`。
+- `graph` 不是身份字段（旧客户端的 `policy_sha` 不变、它们忽略这个字段）；为了不被单独改掉，它和身份字段 `arch` 绑定：已有的 arch 种类要求
+  `graph` 恰好等于 `build_graph(arch)`，以后的新结构用 `arch.kind = "graph"` 加 `arch.graph_sha256`。Python 和 C++ 都这样检查。
+- 实测（r8 u49300，267 维，256-256，三个头，4000 行）：原生对 numpy 的 log-prob 最大差 3.4e-5（容差 1e-3）；每步（logits + value）123–139 µs，
+  以前的逐行 double 累加约 300 µs（现在 16 路 float32 部分和，可向量化）。
+- 客户端同时声明 `actor_ball_type_v1`（训练端导出 ball_type 策略时要求它；以前原生客户端没有这个头，拿不到 r8 的任务）。
+
+### 12.3 特征模块（`feature_module_v1`，`wasm/feature_module.cpp`，`core/src/feature_module.cpp`，`ballrain/pool/modules.py`）
+- **模块**：现有的 C++ 特征代码（tracker、特征、参考线、分线、可达性块的包装）原样编成 wasm32-wasip1（wasi-sdk 34，C++ 异常用 exnref），
+  `tools/native/build_module.py` 构建并签名。模块吃会话的记录流（HELLO / OBS / LVL / RESET / 新的 ROUTE：静止开局交给特征提取器的路线游标），
+  和 `nc_golden` 回放录制流完全一样；每步给出特征和特征信息（参考线投影、分线状态、支撑、路线计时等）。
+- **原生接口**：可达性核（fastreach）和它的场数据留在原生层（`br_host_reach_load` / `br_host_reach_perceive`），场在进程里只读一次，所有实例共用
+  （否则每个实例要各拿一份约 100 MB 的场）。
+- **宿主**：wasmtime 50（Cranelift JIT，NaN 规范化，wasm 异常），`wasmtime.dll` 延迟加载：没有这个 DLL 的客户端照常运行，只是不声明能力。
+  缓存目录以只读方式映射成模块里的 `/cache`。同一个模块在进程里只编译一次。
+- **签名**：网关配置 `[task] feature_module`（.wasm 和旁边的 .sig），以 `/pool/assets/<sha>.wasm` 提供；任务的 `assets.feature_module` 带 sha256、
+  大小、签名和 ABI，只发给声明了能力的会话。客户端先核对 sha256，再用编译进去的模块公钥（`BALLRAIN_MODULE_PUBKEY`）验 ed25519 签名，通过才加载；
+  没有编进公钥的客户端不声明能力。
+- **密钥**（0.6.0 发布版）：正式的模块签名私钥在训练这台机器的 `runtime/wasm/keys-release/module-signing.key`（`runtime/` 不进仓库，也不进 zip），
+  公钥在同目录的 `module-signing.pub`，发布构建用 `package_win.py --module-pubkey-file` 把它编进客户端；公钥指纹（公钥 32 字节的 sha256 前 16 位）
+  `91587eb170f7f0ec`。签模块的人是训练协调会话（或用户本人）：`build_module.py --sign-key runtime/wasm/keys-release/module-signing.key`，
+  签好的 `.wasm`、`.wasm.sig`、`.wasm.json` 交给网关的 `[task] feature_module`。私钥不打印、不进日志；丢了就要换密钥并发新客户端，所以要另外备份。
+  dev 密钥（`runtime/wasm/keys/`）只用于本地 dev 构建和测试，发布版里没有它。
+- **一致性**：r8 的 golden 流（f7、s3route 多分线、球型头）上，模块的特征和 Python 逐位相同（TAS 12,198 行、策略 4,004 行，最大差 0，
+  4,000 个动作全部相同）；端到端 6 个任务全部用模块跑，校验端 43/43 段通过。
+- **开销**：特征（含记录流的拷贝）每行 168–234 µs，原生 128–173 µs（+31–35%，约 +40–60 µs/步）。同一步的策略从约 300 µs 降到 123–139 µs，
+  所以客户端每步的计算整体反而少了约 30%；按每步的总 CPU（客户端约 0.4–0.6 ms，引擎含开局约 5 ms）算，模块本身的吞吐损失约 1%，在 5% 目标内。
+  本机端到端的吞吐对比被训练的引擎负载淹没（同样配置两次跑出 1,041 和 2,392 步/秒），所以用离线的逐行计时。
+- **按布局 / 配置驱动**：模块按清单的 `features` 配置建布局（和原生、Python 同一个 `FeatureExtractor`）。加一个新的特征块（例如训练端在做的
+  多接触点块，作为 f8）只要：在 `core/src/features.cpp` 加这个块和它的配置字段（Python 侧同名），重新构建并签名模块，网关换上新模块；客户端不用升级。
+  客户端在用模块时只按“宿主视图”读配置（`FeatureConfig::host_view`：只取它认识的路线、可达性场、路径字段，不认识的字段和特征版本忽略），
+  观测维数用模块自己的 `br_size` 核对。导出时特征版本不是 f6 / f7 的策略（例如 r9 的 f8）要求 `features_<版本>`：
+  只有网关配置的模块声明了这个特征集（构建脚本写的 `<模块>.wasm.json` 的 `feature_versions`）时，声明 `feature_module_v1` 的会话才算有它。
+  现在的模块是 f6 / f7，所以 f8 的任务不会发给任何客户端，直到 f8 块移植进 `core/src/features.cpp`、重建并签名模块。
+  同样，训练端的移动分线开局（`branch_move`）要求 `branch_move_v1`（还没有客户端实现），机关可达性换了 `reach_version`，能力名随之不同，自动挡住。
+- **验证器**：仍用 Python 特征（和模块逐位相同，golden 对比 + 端到端都证实了）。让验证器也跑同一个模块要在 `ballrain/headless` 里拿到原始记录流，
+  那是训练端共用的代码，这次没动（§12.7）。
+
+### 12.4 奖励由服务端重算（`reward_inputs_v1`，`ballrain/pool/server_rewards.py`）
+- 网关配置 `[task] server_rewards = true` 时，声明了能力的会话的任务带 `reward_inputs`：客户端每段多传一个 `rin`（每步 17 列 float64：IGT、参考线
+  进度、检查点、小节、球型、死亡 / 完成 / 终止 / 跳线 / 支撑 / 摄像机惩罚 / 停滞惩罚 / 分线 / 通关等标志、球的位置、投影点和切线、分线参考时间、停滞窗口）
+  和段头里的 `episodes`（每条命开始时的状态）。
+- 网关收到每段就用训练端自己的代码重算：`ballrain.rewards.Reward`（含第 3 小节的新项）、Worker 的分段奖励，加上停滞和摄像机惩罚；结果写在
+  `<段>.rewards.npy`，学习器链接和验证器都用它。验证器不再比对客户端报的奖励，而是拿网关的奖励和回放的奖励比，等于检查了奖励输入。
+- 实测（r8 端到端）：10,355 步重算，和客户端自己算的逐位相同（0 处不同）；每步 5.0 µs，一个核约 20 万步/秒。网关在 1,350 步/秒时约 0.007 核，
+  10 万步/秒时约 0.5 核，不贵，不需要放进 wasm 或推迟到学习器。伪造的输入（第 10 步 IGT +100 ms）被回放抓到（`replay_reward_mismatch`）。
+- 不支持（这些策略照旧用客户端的奖励）：HS 奖励、rollout 的 `gates` / `route_probes` / `zones`。
+- 网关算出的奖励同样过上传守卫（有限、`guard_max_abs_reward`），任何坏输入都拒收这一段。
+- 上传量：`rin` 每步约 61 字节（zstd 后），占数据段的 24%（数据段共约 253 字节 / 步）。以后可以把一部分列改成 float32。
+
+### 12.5 分级抽查和交叉核对（`ballrain/pool/cross_check.py`，`volunteer-compute.md` §4.1）
+- **分级**：试用（试用期内全量）、普通（`task_sample`，15%）、可信（`trusted_after` 个任务通过以后，`trusted_sample`，3%）、可疑（任何一次不一致后全量，
+  只有人工能解除）。`trusted_after` 默认 0（不启用可信级）。客户端不知道自己在哪一级，也不知道哪个任务被抽中。
+- **交叉核对**（`[verify] cross_fraction`，默认 0 即关闭）：普通 / 可信账号被抽中的任务按这个比例不由我们重放，而是把同一个任务（同开局、球序、
+  抽样和每条命的种子、同策略）再发给另一位随机志愿者。只在同一构建之间配对（引擎种类和 sha、平台、客户端版本），同一对账号
+  `cross_cooldown_s` 内不再配对，`cross_wait_s` 内没有配到人就退回我们的验证器。比较的是两次的数据本身（观测、动作、log-prob、价值、奖励和奖励
+  输入等，逐位）：状态链用任务 id 做种子，两个任务的链本来就不同。一致：两边都算验证通过，副本的数据不进训练（同一条轨迹两份）；不一致：两边都交给
+  我们的验证器整段重放仲裁，只有这次重放能把账号标为可疑（同伴的结果本身从不标记任何人）。
+- **可信账号先用后验**（`ingest_then_verify`）：实现了，默认关闭。
+- **延迟**：配到同伴时从发出到判定 10–20 秒；没配到人时等满 `cross_wait_s` 才退回验证器。原任务在判定前不进训练，所以 `cross_wait_s`
+  要小于学习器能接受的滞后（`pool_max_lag` 300 次更新，r8 约 100 秒），默认 60 秒。另外副本被中途停掉（`stopped`、放弃）时两边的数据长度不同，
+  一律交给验证器仲裁。
+- **只在一台机器上测过**：log-prob 和价值也逐位比较，不同 CPU 之间（同一构建）误报的比例还不知道；必要时改成按容差比较这两项。
+- **验证器分片**：`Verifier(shard=(i, n))` 按任务 id 分片，多个进程 / 机器各验一份。
+- **段存档 / 读档**（只抽查一段）：要改引擎，这次不做。接口留在这里：验证器需要的是“从第 s 段开头的状态继续重放”，客户端届时在每段头部带一个
+  存档哈希（新的段头字段，按能力发），验证器在交叉核对或仲裁时顺带记下各段边界的存档。
+- **实测**：见下面的表（`tools/native/e2e_cross.py`，两个账号、两个客户端同时跑，所有任务都抽中并交叉核对；伪造的客户端由测试在上传路上改第二个
+  账号的数据段）。每个客户端 4 个任务（原任务和替别人跑的副本），r8 策略：
+
+  | 模式 | 交叉核对 | 结果 |
+  |---|---|---|
+  | 两个诚实客户端 | 3 次一致、2 次没配到人退回验证器 | 8 个任务全部通过，没有人被标记 |
+  | 伪造观测（第 5 行一个特征 +0.5） | 4 次不一致 → 仲裁 | 伪造的 4 个任务全部被拒，伪造账号被标为可疑，诚实账号没有 |
+  | 伪造动作（第 5 步换一个动作） | 3 次仲裁、1 次退回验证器 | 伪造的 4 个任务全部被拒（100%），同上 |
+  | 伪造 log-prob（第 5 步差 0.3） | 4 次仲裁 | 4/4 被拒，同上 |
+
+### 12.6 兼容性
+- 旧客户端（0.5.x）：不声明新能力，网关照旧给它发任务（没有模块、没有奖励输入、不参与交叉核对的配对，因为构建不同）。
+- 旧网关：不认识的能力被忽略；客户端只在任务要求时才传 `rin`。
+- 新协议字段：任务的 `assets.feature_module`、`reward_inputs`；段的 `rin` 数组和段头的 `episodes`；清单的 `graph`。都是可选的。
+
+### 12.7 还没有做
+- 动作抽取、结束和停滞判定还在原生层（没有放进 wasm 模块）；奖励已经移到服务端，结束判定会影响轨迹本身，要放进模块需要把 `TaskRunner` 的一部分拆进去。
+- 验证器跑同一个 wasm 模块（现在用逐位相同的 Python 特征）；要在 `ballrain/headless` 里接出原始记录流，这是训练端共用的代码，要先和训练会话商量。
+- 预编译的 AOT 模块（wasmtime 的 min 运行时只有 0.7 MB，但没有 WASI 和编译器，要服务端按平台预编译）；现在 zip 里带完整的 `wasmtime.dll`（21 MB）。
+- macOS / Linux 的 wasmtime 构建和打包；Android。
+- 吞吐：本机的 A/B 被训练负载淹没，没有定论；“旧策略约 300 µs”是用和旧代码相同的逐行 double 累加在新执行器里测的，不是旧二进制本身。
+- **发布前**：模块签名用的是 dev 密钥（`runtime/wasm/keys`，不在仓库里）；公开发布前要换成正式密钥并妥善保存，重新打包。
+  引擎二进制（训练端构建，客户端只复制）里带有构建机上的源码和 PDB 路径（不含用户名），公开发布前要由引擎那边去掉。
+epos\...` 的源文件名和 PDB 路径，不含用户名），公开发布前要由引擎那边去掉。

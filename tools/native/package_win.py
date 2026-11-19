@@ -3,15 +3,15 @@
     python tools/native/package_win.py --engine <bin-x86soft BallanceMMOSimTool.exe> --engine-version <string>
         --license BallanceMMO=<its LICENSE file> [--license NAME=FILE ...]
         [--gateway https://...] [--update-url https://.../release.json] [--pubkey-file release-signing.pub]
-        [--sign-key release-signing.key --download-url https://.../BallrainPool-<v>-windows-x64.zip]
+        [--sign-key release-signing.key --download-url https://.../BallrainCoordinator-<v>-windows-x64.zip]
         [--out dist/native]
 
 Builds a release configuration (native/build_win.cmd with the gateway / update URL / public key as CMake cache
 variables: they are build inputs, never committed) and assembles
 
-    BallrainPool-<version>-windows-x64/
-        BallrainPool.exe                      the TUI client (static, no runtime needed)
-        nc_client.exe                         the same controller without a UI (login / run / diag; servers, SSH)
+    BallrainCoordinator-<version>-windows-x64/
+        BallrainCoordinator.exe               the TUI client (static, no runtime needed)
+        ballrain_coordinator.exe              the same controller without a UI (login / run / diag; servers, SSH)
         engine/x87soft/windows/BallanceMMOSimTool.exe, msvcp140.dll, vcruntime140.dll (x86, app-local), ENGINE_VERSION
         使用说明.txt                          the tester quick start (docs/native-client-testers.md is the full guide)
         LICENSES/                             Ballrain's vendored libraries + the engine's licences given by --license
@@ -34,10 +34,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 VCREDIST = ["msvcp140.dll", "vcruntime140.dll"]  # what BallanceMMOSimTool.exe (x86, /MD) imports besides the UCRT
-QUICKSTART = """Ballrain 算力池客户端 {version}（Windows 测试版）
+QUICKSTART = """Ballrain 协调器（Coordinator）{version}（Windows 测试版）
 
 1. 把这个压缩包完整解压到一个文件夹（不要直接在压缩包里运行）。
-2. 双击 BallrainPool.exe。第一次运行时 Windows 可能提示“Windows 已保护你的电脑”（SmartScreen）：
+2. 双击 BallrainCoordinator.exe。第一次运行时 Windows 可能提示“Windows 已保护你的电脑”（SmartScreen）：
    点“更多信息”，再点“仍要运行”。这个测试版还没有代码签名，所以会这样。
 3. 首次设置：填写你自己电脑上的 Ballance 安装目录（含 base.cmo 的文件夹），可以点“查找常见位置”。
    客户端只读取 base.cmo、Database.tdb、3D Entities、Text，不会改动任何游戏文件。
@@ -77,11 +77,12 @@ def vc_redist_x86() -> Path:
     raise SystemExit("the x86 VC++ runtime (VC/Redist/MSVC/<ver>/x86/Microsoft.VC14x.CRT) was not found")
 
 
-def build(gateway: str, update_url: str, pubkey: str) -> Path:
+def build(gateway: str, update_url: str, pubkey: str, wasmtime: str = "", module_pubkey: str = "") -> Path:
     bdir = REPO / "build" / "native-release-pkg"
     env = dict(os.environ, BALLRAIN_BUILD_DIR=str(bdir),
                BALLRAIN_CMAKE_ARGS=f'-DBALLRAIN_DEFAULT_GATEWAY="{gateway}" -DBALLRAIN_UPDATE_URL="{update_url}" '
-                                   f'-DBALLRAIN_RELEASE_PUBKEY="{pubkey}"')
+                                   f'-DBALLRAIN_RELEASE_PUBKEY="{pubkey}" -DBALLRAIN_WASMTIME_DIR="{wasmtime}" '
+                                   f'-DBALLRAIN_MODULE_PUBKEY="{module_pubkey}"')
     r = subprocess.run(["cmd", "/c", str(REPO / "native" / "build_win.cmd"), "Release"], env=env)
     if r.returncode != 0:
         raise SystemExit("build failed")
@@ -112,6 +113,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sign-key", help="release-signing.key: also write release.json + .sig")
     ap.add_argument("--download-url", help="the zip's https URL in the release (for release.json)")
     ap.add_argument("--notes", default="")
+    ap.add_argument("--wasmtime", help="the wasmtime c-api directory (feature_module_v1): wasmtime.dll ships in the zip")
+    ap.add_argument("--module-pubkey-file", help="the gateway's module signing key's .pub (feature_module_v1)")
     ap.add_argument("--out", default=str(REPO / "dist" / "native"))
     ap.add_argument("--no-build", action="store_true", help="use build/native-release-pkg as it is")
     a = ap.parse_args(argv)
@@ -119,17 +122,21 @@ def main(argv=None) -> int:
     pubkey = Path(a.pubkey_file).read_text("utf-8").strip() if a.pubkey_file else ""
     if a.update_url and not pubkey:
         raise SystemExit("--update-url needs --pubkey-file (the client verifies the manifest's signature)")
-    bdir = REPO / "build" / "native-release-pkg" if a.no_build else build(a.gateway, a.update_url, pubkey)
+    mpub = Path(a.module_pubkey_file).read_text("utf-8").strip() if a.module_pubkey_file else ""
+    wt = str(Path(a.wasmtime).resolve()).replace("\\", "/") if a.wasmtime else ""
+    bdir = REPO / "build" / "native-release-pkg" if a.no_build else build(a.gateway, a.update_url, pubkey, wt, mpub)
     out = Path(a.out).resolve()
-    name = f"BallrainPool-{version}-windows-x64"
+    name = f"BallrainCoordinator-{version}-windows-x64"
     stage = out / name
     if stage.exists():
         shutil.rmtree(stage)
     edir = stage / "engine" / "x87soft" / "windows"
     edir.mkdir(parents=True)
-    shutil.copyfile(bdir / "ballrain_pool.exe", stage / "BallrainPool.exe")
-    shutil.copyfile(bdir / "nc_client.exe", stage / "nc_client.exe")  # the headless driver (hosts without a console UI)
+    shutil.copyfile(bdir / "BallrainCoordinator.exe", stage / "BallrainCoordinator.exe")
+    shutil.copyfile(bdir / "ballrain_coordinator.exe", stage / "ballrain_coordinator.exe")  # the headless driver (hosts without a console UI)
     shutil.copyfile(a.engine, edir / "BallanceMMOSimTool.exe")
+    if a.wasmtime:  # delay-loaded by both programs (feature_module_v1); without it they run everything else
+        shutil.copyfile(Path(a.wasmtime) / "lib" / "wasmtime.dll", stage / "wasmtime.dll")
     crt = vc_redist_x86()
     for n in VCREDIST:
         shutil.copyfile(crt / n, edir / n)
@@ -144,6 +151,8 @@ def main(argv=None) -> int:
     zhead = (tp / "zstd" / "zstd.c").read_text("utf-8", errors="replace").split("*/")[0] + "*/\n"
     (lic / "zstd.txt").write_text(zhead, encoding="utf-8")
     (lic / "README.txt").write_text((tp / "README.md").read_text("utf-8"), encoding="utf-8")
+    if a.wasmtime:
+        shutil.copyfile(Path(a.wasmtime) / "LICENSE", lic / "wasmtime.txt")
     for spec in a.license:
         n, _, f = spec.partition("=")
         shutil.copyfile(f, lic / f"{n}.txt")

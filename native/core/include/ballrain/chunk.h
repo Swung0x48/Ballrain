@@ -38,6 +38,10 @@ struct ChunkData {
     std::vector<double> sr_ms;
     std::vector<float> obs;          // (T + 1) x n_obs float32 (converted to float16)
     std::vector<Bytes> obs_hash;     // T + 1 chain values
+    // reward_inputs_v1 (the task's reward_inputs): T x RIN_COLS float64, and the episodes starting in the chunk
+    std::vector<double> rin;
+    int rin_cols = 0;
+    Json episodes;  // array (null: none)
 };
 
 Bytes encode_chunk(const ChunkData &c, int zstd_level = 3);

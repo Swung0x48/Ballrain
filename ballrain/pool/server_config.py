@@ -141,9 +141,19 @@ class PoolConfig:
     max_steps: int = 8192
     max_frames: int = 60000
     deadline_s: int = 3600
+    feature_module: Path | None = None  # [task] feature_module: the signed .wasm (feature_module_v1; modules.py)
+    server_rewards: bool = False  # [task] server_rewards: reward_inputs_v1 sessions' rewards are the gateway's
     probation_chunks: int = 200
     task_sample: float = 0.15  # per-task full-replay probability after the probation (2026-11-18: per task, not per chunk)
     escalate_tasks: int = 20
+    # docs/volunteer-compute.md 4.1 (cross_check.py): tiers and volunteer cross-checks
+    trusted_after: int = 0        # passed tasks (full replay or cross-check) that make an account trusted (0: off)
+    trusted_sample: float = 0.03  # a trusted account's per-task draw (normal: task_sample)
+    cross_fraction: float = 0.0   # of the drawn tasks of normal / trusted accounts: played again by a peer (0: off)
+    cross_cooldown_s: int = 86400  # the same two accounts are not paired again within this
+    cross_wait_s: int = 60        # a cross-check without a peer this long: our verifier replays the original (the
+                                  # original is held until decided: keep it under the learner's pool_max_lag, ~100 s for r8)
+    ingest_then_verify: bool = False  # trusted accounts' data fed before its verification (default off)
     reach_max_row_frac: float = 0.02  # f7 (rollout.REACH_MAX_ROW_FRAC)
     reach_max_logp_shift: float = 1.0  # f7 (rollout.REACH_MAX_LOGP_SHIFT)
     engines: dict = field(default_factory=dict)  # kind -> EngineRef
@@ -238,7 +248,15 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
         refresh_s=int(pl.get("refresh_s", 900)),
         max_steps=int(ta.get("max_steps", 8192)), max_frames=int(ta.get("max_frames", 60000)),
         deadline_s=int(ta.get("deadline_s", 3600)),
+        feature_module=_path(ta["feature_module"], base) if ta.get("feature_module") else None,
+        server_rewards=bool(ta.get("server_rewards", False)),
         probation_chunks=int(ve.get("probation_chunks", 200)),
+        trusted_after=int(ve.get("trusted_after", 0)),
+        trusted_sample=min(max(float(ve.get("trusted_sample", 0.03)), 0.0), 1.0),
+        cross_fraction=min(max(float(ve.get("cross_fraction", 0.0)), 0.0), 1.0),
+        cross_cooldown_s=int(ve.get("cross_cooldown_s", 86400)),
+        cross_wait_s=int(ve.get("cross_wait_s", 60)),
+        ingest_then_verify=bool(ve.get("ingest_then_verify", False)),
         task_sample=min(max(float(ve.get("task_sample", 0.15)), 0.0), 1.0),
         escalate_tasks=max(0, int(ve.get("escalate_tasks", 20))),
         reach_max_row_frac=min(max(float(ve.get("reach_max_row_frac", 0.02)), 0.0), 1.0),

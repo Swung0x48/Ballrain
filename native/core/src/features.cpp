@@ -23,6 +23,22 @@ static V3 to_frame(const V3 &v, const V3 &r, const V3 &f) {
 
 // ---------------------------------------------------------------------------------------------- config
 
+FeatureConfig FeatureConfig::host_view(const Json &j) {
+    Json k = Json::object();
+    for (auto &kv : j.members()) {
+        Json one = Json::object();
+        one.set(kv.first, kv.second);
+        try {
+            from_json(one);  // a field this build parses on its own
+        } catch (const Error &) {
+            continue;  // unknown to this build (a newer feature set's): the module's business
+        }
+        if (kv.first != "version") k.set(kv.first, kv.second);
+    }
+    FeatureConfig c = from_json(k);  // version: f6 / f7 by the reach flag (its layout is not used)
+    return c;
+}
+
 FeatureConfig FeatureConfig::from_json(const Json &j) {
     FeatureConfig c;
     auto tuple = [](const Json &v) {

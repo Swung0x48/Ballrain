@@ -1,19 +1,24 @@
 // The native volunteer client (M2: command line; the TUI, several instances and the browser login are M3).
 //
-//   nc_client login --gateway URL [--data-dir D]
+//   ballrain_coordinator login --gateway URL [--data-dir D]
 //       the controller's login: login_start, shows the login code and the browser link, polls until the gateway hands
 //       out the token, which is saved to <D>/token (D defaults to the client data dir: BALLRAIN_WORK_DIR or ~/.ballrain)
-//   nc_client diag [--data-dir D] [--out F.zip]
+//   ballrain_coordinator diag [--data-dir D] [--out F.zip]
 //       the scrubbed diagnostics zip (default <D>/diagnostics-<time>.zip)
-//   nc_client run [--gateway URL] [--ballance-dir G] [--engine BallanceMMOSimTool[.exe]] [--data-dir D] [--tasks N]
-//                 (options default to the saved config.json; the engine to the one shipped next to nc_client.exe)
+//   ballrain_coordinator run [--gateway URL] [--ballance-dir G] [--engine BallanceMMOSimTool[.exe]] [--data-dir D] [--tasks N]
+//                 (options default to the saved config.json; the engine to the one shipped next to ballrain_coordinator.exe)
 //                 [--instances K] [--engine-kind x87soft|2002] [--engine-env NAME=VALUE ...] [--leaderboard on|off]
-//                 [--auto-pause on|off] [--quiet-file PATH]
+//                 [--auto-pause on|off] [--quiet-file PATH] [--phase-summary-s S] [--wait-upload]
 //       the controller (native/core/src/controller.cpp) without a UI: hello, K instances playing tasks, the upload
 //       queue, heartbeats; with --tasks N it stops after N tasks once their chunks are posted. A refusal is printed
 //       verbatim; a token-fatal one stops the client (exit code 3).
 //
-// Output: one JSON object per line on stdout (events), human-readable notes on stderr.
+//       --phase-summary-s: the phase summary interval (default 300 s; the first one after min(60 s, S));
+//       --wait-upload: the 0.5.0 behaviour (an instance waits for its previous task's upload before the next fetch)
+//
+// Output: one JSON object per line on stdout (events, the log lines among them: "log"), the log lines also on stderr;
+// <D>/logs/client.log gets the log lines too.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -62,10 +67,14 @@ static void sleep_s(double s) {
     while (!g_stop && platform::monotonic_s() < end) std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
 
+// the events on stdout; a log line (the same as client.log's) on stderr, and in `run` also as a "log" event on stdout
+// (the events file of a headless run then has the log lines; login's stdout stays login_started ... login_ok)
+static bool g_log_events = false;
 static void print_event(const std::string &kind, const Json &f) {
     if (kind == "log") {
         std::fprintf(stderr, "%s\n", f.get_string("message", "").c_str());
-        return;
+        std::fflush(stderr);
+        if (!g_log_events) return;
     }
     event(kind, f);
 }
@@ -114,12 +123,13 @@ static int cmd_diag(int argc, char **argv) {
 static int cmd_run(int argc, char **argv) {
     std::string dir = arg(argc, argv, "--data-dir", platform::data_dir().c_str());
     Bytes token;
-    if (!read_file(dir + "/token", token) || token.empty()) throw Error("no token: run `nc_client login` first");
+    if (!read_file(dir + "/token", token) || token.empty()) throw Error("no token: run `ballrain_coordinator login` first");
     bool fatal = false;
+    g_log_events = true;
     Controller ctl(dir, print_event);
     ClientConfig c = ctl.config();
-    // every option falls back to the saved config.json (a scheduled task or an SSH session runs `nc_client run`
-    // after one configured run); --engine absent and none saved: the engine shipped next to nc_client.exe
+    // every option falls back to the saved config.json (a scheduled task or an SSH session runs `ballrain_coordinator run`
+    // after one configured run); --engine absent and none saved: the engine shipped next to ballrain_coordinator.exe
     auto opt = [&](const char *name, const std::string &saved) { return std::string(arg(argc, argv, name, saved.c_str())); };
     c.gateway_url = opt("--gateway", c.gateway_url);
     std::string g = opt("--ballance-dir", c.ballance_dir), e = opt("--engine", c.engine_binary);
@@ -132,6 +142,9 @@ static int cmd_run(int argc, char **argv) {
     c.quiet_file = opt("--quiet-file", c.quiet_file);  // the stop switch (independent of --auto-pause)
     ctl.set_config(c);
     ctl.max_tasks = std::atoll(arg(argc, argv, "--tasks", "0").c_str());
+    ctl.phase_summary_s = std::max(1.0, std::atof(arg(argc, argv, "--phase-summary-s", "300").c_str()));
+    for (int i = 2; i < argc; ++i)
+        if (std::strcmp(argv[i], "--wait-upload") == 0) ctl.wait_upload = true;
     for (auto &kv : args_all(argc, argv, "--engine-env")) {
         size_t eq = kv.find('=');
         if (eq == std::string::npos || kv.compare(0, 9, "BALLRAIN_") != 0 || kv.find("BALL_ORDER") != std::string::npos)
@@ -171,7 +184,7 @@ int main(int argc, char **argv) {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
     if (argc < 2) {
-        std::fprintf(stderr, "usage: nc_client login|run [options] (see the source header)\n");
+        std::fprintf(stderr, "usage: ballrain_coordinator login|run [options] (see the source header)\n");
         return 2;
     }
     try {
@@ -188,7 +201,7 @@ int main(int argc, char **argv) {
         event("refused", f);
         return e.fatal ? 3 : 1;
     } catch (const std::exception &e) {
-        std::fprintf(stderr, "nc_client: %s\n", e.what());
+        std::fprintf(stderr, "ballrain_coordinator: %s\n", e.what());
         Json f = Json::object();
         f.set("error", Json::string(e.what()));
         event("error", f);

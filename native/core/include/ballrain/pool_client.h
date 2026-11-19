@@ -72,6 +72,9 @@ public:
     // f7: the task's reach fields (assets.reach) installed as <root>/fastreach/L<nn>-<key_sha256[:16]>.npz (the
     // ReachBlock's fields directory); each file is downloaded once (zstd, size-capped, sha-checked) and kept
     std::string reach_dir(const std::vector<Task::ReachAsset> &assets, int level);
+    // feature_module_v1: the module's bytes (<root>/modules/<sha>.wasm, downloaded once, sha- and size-checked)
+    Bytes module(const std::string &sha, int64_t size);
+    const std::string &root() const { return root_; }
 
 private:
     std::string root_;

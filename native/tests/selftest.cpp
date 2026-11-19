@@ -42,6 +42,18 @@ int main() {
     double us[] = {0.0, 0.1, 0.29999, 0.3, 0.99999};
     for (int i = 0; i < 5; ++i) CHECK(sample_action(lp, us[i]) == want[i]);
     CHECK(action_consistent(lp, 0.30000001, 1));
+    {  // feature_module_v1: the host's view of a feature set it does not know (the module's layout)
+        Json f = Json::parse(R"({"version": "f8", "contacts_k": 4, "pos_scale": 40, "reach": false})");
+        bool strict = false;
+        try {
+            FeatureConfig::from_json(f);
+        } catch (const Error &) {
+            strict = true;
+        }
+        CHECK(strict);
+        FeatureConfig h = FeatureConfig::host_view(f);
+        CHECK(h.pos_scale == 40 && h.version == "f6");
+    }
     CHECK(!action_consistent(lp, 0.5, 1));
     // protocol.dumps (canonical JSON)
     Json j = Json::parse(R"({"b":[1,2.5,1e-05,1e16,123456789012345.6,0.1,-0.0,3.0],"a":"xé\n","c":null,"d":true})");

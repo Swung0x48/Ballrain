@@ -15,6 +15,8 @@
 
 namespace ballrain {
 
+class FeatureModule;
+
 struct LocalEngine {  // the player's side: the engine binary and the Ballance folder
     std::string binary, root, kind = "x87soft";
     std::vector<std::pair<std::string, std::string>> extra_env;  // BALLRAIN_* only (tests / diagnostics)
@@ -31,6 +33,7 @@ struct TaskOutcome {
     // where the task's wall time went: the assets (policy, starts, line, branch, reach fields: download, checks), the
     // engine (launch, level load, hand-over, the rest start) until the first step, the steps, the close
     double assets_s = 0, start_s = 0, play_s = 0, close_s = 0;
+    double assets_cpu = 0, start_cpu = 0, play_cpu = 0;  // the client thread's CPU seconds in the same phases
 };
 
 // Where the engine's copies and run directories go when the client's own paths are not plain ASCII (the engine
@@ -58,10 +61,11 @@ struct PreparedTask {
     Policy pol;
     TasStarts starts;
     std::string run_dir;
+    std::unique_ptr<FeatureModule> module;  // feature_module_v1 (before env: the env feeds it)
     std::unique_ptr<BallanceEnv> env;
     std::unique_ptr<TaskRunner> runner;
     std::vector<float> obs0;
-    double assets_s = 0, start_s = 0;
+    double assets_s = 0, start_s = 0, assets_cpu = 0, start_cpu = 0;
     PreparedTask() = default;
     PreparedTask(const PreparedTask &) = delete;
     PreparedTask &operator=(const PreparedTask &) = delete;

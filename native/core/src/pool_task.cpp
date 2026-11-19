@@ -1,5 +1,7 @@
 #include "ballrain/pool_task.h"
 
+#include "ballrain/feature_module.h"
+
 #include <cstdlib>
 #include <filesystem>
 
@@ -123,18 +125,27 @@ PreparedTask::~PreparedTask() {
 std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, std::mutex &cache_mu, const LocalEngine &le,
                                            const std::string &run_dir) {
     if (task.engine != le.kind) throw Error("task engine " + task.engine + ", local engine " + le.kind);
-    double ta = platform::monotonic_s();
+    double ta = platform::monotonic_s(), ca = platform::thread_cpu_s();
     auto p = std::make_unique<PreparedTask>();
     p->task = task;
     Policy &pol = p->pol;
     TasStarts &starts = p->starts;
-    std::string path_dir, branch_dir, reach_dir;
+    std::string path_dir, branch_dir, reach_dir, cache_root;
+    Bytes module_bytes;
     {
         std::lock_guard<std::mutex> g(cache_mu);
+        cache_root = cache.root();
+        if (!task.module_sha256.empty()) {  // feature_module_v1: the signed module, checked before anything runs it
+            if (task.module_abi != MODULE_ABI) throw Error("the task's feature module has another ABI version");
+            module_bytes = cache.module(task.module_sha256, task.module_size);
+            if (!FeatureModule::signature_ok(module_bytes, task.module_sig))
+                throw Error("the feature module's signature does not verify: not loaded");
+        }
         pol = cache.policy(task.policy_sha);
         starts = cache.starts(task.asset_starts);
         path_dir = cache.path_dir(task.asset_path, task.level);
-        FeatureConfig pins = FeatureConfig::from_json(pol.manifest.at("features"));
+        const Json &mf = pol.manifest.at("features");
+        FeatureConfig pins = task.module_sha256.empty() ? FeatureConfig::from_json(mf) : FeatureConfig::host_view(mf);
         if (pins.has_branch() != !task.asset_branch.empty())
             throw Error(pins.has_branch() ? "the policy follows a route branch: the task has no branch pack"
                                           : "a branch pack for a policy without a route branch");
@@ -152,7 +163,9 @@ std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, s
         throw Error("the starts pack is not the task's record");
     starts.apply_camera_filter(ec.camera_quarter_tol, ec.camera_turn_grace_ms);
     starts.exclude(ec.exclude_starts);
-    FeatureConfig fc = FeatureConfig::from_json(m.at("features"));
+    // with a feature module the layout is the module's (a feature set this build does not know is fine)
+    FeatureConfig fc = module_bytes.empty() ? FeatureConfig::from_json(m.at("features"))
+                                            : FeatureConfig::host_view(m.at("features"));
     if (fc.path_sha256 != task.asset_path) throw Error("the task's reference line is not the policy's");
     fc.path_dir = path_dir;
     fc.reach_dir = reach_dir;
@@ -183,12 +196,34 @@ std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, s
         eng.extra_env.push_back(kv);
     }
     remove_tree(run_dir);
-    double t0 = platform::monotonic_s();
-    p->assets_s = t0 - ta;
+    double t0 = platform::monotonic_s(), c0 = platform::thread_cpu_s();
+    p->assets_s = t0 - ta, p->assets_cpu = c0 - ca;
     try {
         p->env = std::make_unique<BallanceEnv>(ec, fc, eng, run_dir, nullptr, &starts, task.start_frame,
                                                RewardConfig::from_json(m.at("reward")), task.rest);
-        if (p->env->features().size() != pol.n_obs) throw Error("the env's observation size differs from the policy's");
+        if (!module_bytes.empty()) {  // the features from the module, its paths under the cache root ("/cache")
+            auto guest = [&](const std::string &host) -> Json {
+                if (host.empty()) return Json();
+                std::string a = host, r = cache_root;
+                for (char &c : a)
+                    if (c == '\\') c = '/';
+                for (char &c : r)
+                    if (c == '\\') c = '/';
+                if (a.compare(0, r.size(), r) != 0) throw Error("a feature asset outside the cache: " + host);
+                return Json::string("/cache" + a.substr(r.size()));
+            };
+            Json fx = Json::object();
+            for (auto &kv : m.at("features").members()) fx.set(kv.first, kv.second);
+            fx.set("path_dir", guest(fc.path_dir)), fx.set("branch_dir", guest(fc.branch_dir));
+            fx.set("reach_dir", guest(fc.reach_dir));
+            Json init = Json::object();
+            init.set("level", Json::integer(task.level)), init.set("features", fx);
+            p->module = std::make_unique<FeatureModule>(module_bytes, cache_root, init);
+            if (p->module->size() != pol.n_obs) throw Error("the feature module's observation size differs from the policy's");
+            p->env->use_module(p->module.get());
+        }
+        if (module_bytes.empty() && p->env->features().size() != pol.n_obs)
+            throw Error("the env's observation size differs from the policy's");
         for (size_t i = 0; i < p->env->actions().size(); ++i)
             if (p->env->actions()[i] != pol.action_keys[i]) throw Error("the env's action set differs from the policy's");
         p->runner = std::make_unique<TaskRunner>(*p->env, &starts, task, RolloutSpec::from_json(m.at("rollout")),
@@ -202,15 +237,15 @@ std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, s
         throw;
     }
     p->run_dir = run_dir;
-    p->start_s = platform::monotonic_s() - t0;
+    p->start_s = platform::monotonic_s() - t0, p->start_cpu = platform::thread_cpu_s() - c0;
     return p;
 }
 
 TaskOutcome run_prepared(PreparedTask &p, const std::function<void(int64_t, const Bytes &, bool)> &on_chunk,
                          const std::function<std::string()> &stop, const std::function<void(int64_t)> &on_step) {
     TaskOutcome out;
-    out.assets_s = p.assets_s, out.start_s = p.start_s;
-    double t0 = platform::monotonic_s();
+    out.assets_s = p.assets_s, out.start_s = p.start_s, out.assets_cpu = p.assets_cpu, out.start_cpu = p.start_cpu;
+    double t0 = platform::monotonic_s(), c0 = platform::thread_cpu_s();
     bool failed = false;
     TaskRunner &runner = *p.runner;
     try {
@@ -225,7 +260,7 @@ TaskOutcome run_prepared(PreparedTask &p, const std::function<void(int64_t, cons
                 if (on_step) on_step(runner.steps);
                 return stop ? stop() : "";
             });
-        out.play_s = platform::monotonic_s() - t0;
+        out.play_s = platform::monotonic_s() - t0, out.play_cpu = platform::thread_cpu_s() - c0;
         p.env->close();
         out.steps = runner.steps, out.frames = runner.frames, out.episodes = runner.episodes, out.chunks = seq;
         failed = out.end == "error";

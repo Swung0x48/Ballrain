@@ -131,9 +131,6 @@ Policy Policy::load(const std::string &npz_path, const Json &m, const std::strin
         throw Error("weights file size differs from the manifest");
     if (Sha256::hex(file) != m.at("npz_sha256").as_string()) throw Error("weights file sha256 differs from the manifest");
     const Json &arch = m.at("arch");
-    std::string act = arch.get_string("activation", "");
-    if (arch.get_string("kind", "") != "mlp_actor_critic" || (act != "tanh" && act != "relu"))
-        throw Error("unsupported architecture");
     auto arrays = load_npz_bytes(file);
     const Json &spec = m.at("arrays");
     if (arrays.size() != spec.size()) throw Error("weights file arrays differ from the manifest");
@@ -151,30 +148,20 @@ Policy Policy::load(const std::string &npz_path, const Json &m, const std::strin
     Policy p;
     p.n_obs = int(arch.at("n_obs").as_int());
     p.n_act = int(arch.at("n_act").as_int());
-    std::vector<int> dims{p.n_obs};
-    for (auto &h : arch.at("hidden").items()) dims.push_back(int(h.as_int()));
-    size_t nl = dims.size();
-    for (int head = 0; head < 2; ++head) {
-        std::vector<Layer> &L = head == 0 ? p.pi_ : p.v_;
-        const char *hn = head == 0 ? "pi" : "v";
-        int n_out = head == 0 ? p.n_act : 1;
-        for (size_t i = 0; i < nl; ++i) {
-            int a = dims[i], b = i + 1 < nl ? dims[i + 1] : n_out;
-            std::string wn = std::string(hn) + "." + std::to_string(2 * i) + ".weight";
-            std::string bn = std::string(hn) + "." + std::to_string(2 * i) + ".bias";
-            auto wi = arrays.find(wn), bi = arrays.find(bn);
-            if (wi == arrays.end() || bi == arrays.end() || wi->second.shape != std::vector<int64_t>{b, a} ||
-                bi->second.shape != std::vector<int64_t>{b} || wi->second.descr != "<f4" || bi->second.descr != "<f4")
-                throw Error(std::string(hn) + " layer " + std::to_string(i) + ": expected weight (out, in) and bias");
-            Layer l;
-            l.n_in = a, l.n_out = b;
-            l.w = wi->second.f32();
-            l.b = bi->second.f32();
-            L.push_back(std::move(l));
-        }
+    // policy_graph_v1: the manifest's graph (a layout this client has no code for), else the arch's (format-3 kinds)
+    // the graph is not an identity field: bound by arch (its own graph for a format-3 kind, graph_sha256 for "graph")
+    const Json *g = m.find("graph");
+    Json graph;
+    if (arch.get_string("kind", "") == "graph") {
+        if (!g || Sha256::hex(g->dump(true)) != arch.get_string("graph_sha256", ""))
+            throw Error("unsupported architecture: the graph does not match arch.graph_sha256");
+        graph = *g;
+    } else {
+        graph = PolicyGraph::from_arch(arch);  // throws "unsupported architecture" for another kind / activation
+        if (g && g->dump(true) != graph.dump(true)) throw Error("unsupported architecture: the graph is not the arch's");
     }
-    size_t want = 2 * 2 * nl + 2;
-    if (arrays.size() != want || !arrays.count("rms_mean") || !arrays.count("rms_var"))
+    p.graph_ = PolicyGraph::parse(graph, arrays, p.n_obs, p.n_act);
+    if (arrays.size() != p.graph_.used_arrays().size() + 2 || !arrays.count("rms_mean") || !arrays.count("rms_var"))
         throw Error("array names unexpected / missing");
     auto mean = arrays.at("rms_mean").f64(), var = arrays.at("rms_var").f64();
     if (int(mean.size()) != p.n_obs || int(var.size()) != p.n_obs) throw Error("observation statistics shape");
@@ -187,7 +174,6 @@ Policy Policy::load(const std::string &npz_path, const Json &m, const std::strin
         if (var[i] < 0) throw Error("negative observation variance");
         p.std_[i] = std::sqrt(var[i] + eps);
     }
-    p.tanh_ = act == "tanh";
     std::string sha = policy_sha_of(m, arrays);
     if (sha != m.get_string("policy_sha", "") || (!expect_sha.empty() && sha != expect_sha))
         throw Error("policy_sha does not match the weights");
@@ -211,26 +197,8 @@ std::vector<float> Policy::normalize(const std::vector<float> &raw) const {
     return x;
 }
 
-std::vector<float> Policy::mlp(const std::vector<Layer> &layers, const std::vector<float> &x) const {
-    std::vector<float> h = x, o;
-    for (size_t li = 0; li < layers.size(); ++li) {
-        const Layer &L = layers[li];
-        o.assign(size_t(L.n_out), 0.0f);
-        for (int r = 0; r < L.n_out; ++r) {
-            const float *w = &L.w[size_t(r) * size_t(L.n_in)];
-            double acc = 0.0;
-            for (int c = 0; c < L.n_in; ++c) acc += double(h[size_t(c)]) * double(w[c]);
-            float v = float(acc) + L.b[size_t(r)];  // float32 matmul result + float32 bias
-            if (li + 1 < layers.size()) v = tanh_ ? std::tanh(v) : std::max(v, 0.0f);
-            o[size_t(r)] = v;
-        }
-        h.swap(o);
-    }
-    return h;
-}
-
-std::vector<float> Policy::logits(const std::vector<float> &x) const { return mlp(pi_, x); }
-float Policy::value(const std::vector<float> &x) const { return mlp(v_, x)[0]; }
+std::vector<float> Policy::logits(const std::vector<float> &x) const { return graph_.logits(x); }
+float Policy::value(const std::vector<float> &x) const { return graph_.value(x); }
 
 std::vector<float> Policy::log_softmax(const std::vector<float> &lg) {
     std::vector<double> z(lg.size());

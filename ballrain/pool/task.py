@@ -90,6 +90,7 @@ class Task:
     engine: str  # "2002" | "x87soft"
     assets: dict  # {"starts": sha256, "path": sha256}
     chunk_steps: int = 256
+    reward_inputs: bool = False  # reward_inputs_v1: the chunks carry the reward inputs (server_rewards.py)
     max_steps: int = 4096
     max_frames: int = 60000
     deadline_s: int = 3600
@@ -114,6 +115,8 @@ class Task:
             d["life_seed"] = int(self.life_seed)
         if self.respawn_frontier is not None:
             d["respawn_frontier"] = int(self.respawn_frontier)
+        if self.reward_inputs:
+            d["reward_inputs"] = True
         return P.check(P.TASK, d, "task")
 
     @property

@@ -1,8 +1,8 @@
 // The volunteer client's controller, without any UI (a port of ballrain/pool/client_core.py; docs/native-client.md
 // section 7): configuration and token, the game-folder check, the browser login, the gateway session (hello,
 // heartbeat, "me", the leaderboard switch), up to MAX_INSTANCES sampling instances (threads, one engine child each),
-// the on-disk upload queue, the automatic pause, the log. The TUI (native/apps/ballrain_pool.cpp), the command-line
-// driver (nc_client run) and a later Android app are thin layers over view() and the actions.
+// the on-disk upload queue, the automatic pause, the log. The TUI (native/apps/coordinator_tui.cpp), the command-line
+// driver (ballrain_coordinator run) and a later Android app are thin layers over view() and the actions.
 //
 // Rules (docs/volunteer-compute.md 11): start / pause is the player's; closing the controller ends every instance and
 // engine; a refusal or revocation shows the gateway's reason.message exactly as received (banner); a token-fatal
@@ -172,7 +172,8 @@ private:
     void play_pending(Slot *s, Pending &p);
     void discard_next(Slot *s, const char *why);
     void upload_loop();
-    bool upload_task(const std::string &task_id);  // false: stop this round (network down / waiting)
+    // false: stop this round (network down / waiting); did: something was posted or closed (else nothing to do yet)
+    bool upload_task(const std::string &task_id, bool &did);
     void queue_chunk(const std::string &task_id, int64_t seq, const Bytes &data, bool final);
     void queue_end(const std::string &task_id, int64_t chunks, const std::string &reason);
     void queue_open(const Task &t, int slot);
@@ -207,6 +208,8 @@ private:
     std::map<std::string, std::string> refused_;    // task_id -> why its chunks are refused (the instance stops)
     std::map<std::string, int> read_fail_;          // the uploaders' unreadable chunk files (under upload_mu_)
     std::set<std::string> uploading_;               // the tasks an uploader thread holds (under upload_mu_)
+    // the chunk posts since the last phase summary: count, seconds (summed over the uploaders), bytes
+    std::atomic<int64_t> up_n_{0}, up_us_{0}, up_bytes_{0};
     // where the instances' wall time goes (summed over tasks, logged every 5 minutes): waiting for the previous
     // task's upload, the task fetch, assets, engine start, steps, close; tasks and steps
     struct Phases {
@@ -214,6 +217,11 @@ private:
         int64_t tasks = 0, steps = 0;
     } phases_;
     double phases_t0_ = -1;
+    int phases_n_ = 0;
+public:
+    double phase_summary_s = 300.0;  // the phase summary interval (client.log, the log and "phases" events)
+    bool wait_upload = false;        // the 0.5.0 behaviour: wait for the previous task's upload before the next fetch
+private:
     void add_phases(double wait, double fetch, const TaskOutcome &out, bool prefetched);
     std::mutex upload_mu_;
     double t_start_ = 0;
