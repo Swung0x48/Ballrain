@@ -1,8 +1,8 @@
 // The volunteer client's controller, without any UI (a port of ballrain/pool/client_core.py; docs/native-client.md
 // section 7): configuration and token, the game-folder check, the browser login, the gateway session (hello,
 // heartbeat, "me", the leaderboard switch), up to MAX_INSTANCES sampling instances (threads, one engine child each),
-// the on-disk upload queue, the automatic pause, the log. The TUI (native/apps/ballrain_pool.cpp), the command-line
-// driver (nc_client run) and a later Android app are thin layers over view() and the actions.
+// the on-disk upload queue, the automatic pause, the log. The TUI (native/apps/coordinator_tui.cpp), the command-line
+// driver (ballrain_coordinator run) and a later Android app are thin layers over view() and the actions.
 //
 // Rules (docs/volunteer-compute.md 11): start / pause is the player's; closing the controller ends every instance and
 // engine; a refusal or revocation shows the gateway's reason.message exactly as received (banner); a token-fatal

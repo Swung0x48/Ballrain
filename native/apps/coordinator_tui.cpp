@@ -1,4 +1,4 @@
-// Ballrain 算力池客户端: the volunteer client's terminal UI (FTXUI), a thin layer over ballrain::Controller
+// Ballrain 协调器 (Coordinator): the volunteer client's terminal UI (FTXUI), a thin layer over ballrain::Controller
 // (native/core/src/controller.cpp): every decision and every message to the gateway is the controller's; this file
 // only draws ControllerView and calls the controller's actions. Pages: first-run setup (the Ballance folder, checked),
 // login (the gateway's page in the system browser, then polling), the main screen (start / pause, instances,
@@ -9,7 +9,7 @@
 //   BALLRAIN_UPDATE_URL       the signed release manifest (update.h), e.g. .../releases/latest/download/release.json
 //   BALLRAIN_RELEASE_PUBKEY   the release key's public half (hex; tools: nc_release keygen)
 //
-//   ballrain_pool [options]   (ballrain_pool --help lists them: the start page, start sampling or the browser login
+//   BallrainCoordinator [options]   (BallrainCoordinator --help lists them: the start page, start sampling or the browser login
 //                             at once, configuration values saved to config.json)
 #include <atomic>
 #include <chrono>
@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
-    SetConsoleTitleW(L"Ballrain 算力池");
+    SetConsoleTitleW(L"Ballrain 协调器");
     SetConsoleCtrlHandler(on_console_event, TRUE);
     // the console as it was: restored on exit (restore_console)
     HANDLE con_in = GetStdHandle(STD_INPUT_HANDLE), con_out = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -163,7 +163,7 @@ int main(int argc, char **argv) {
     };
     // ---- command line: where to start, what to do at once, configuration values (saved to config.json)
     static const char *USAGE =
-        "用法：BallrainPool [选项]\n"
+        "用法：BallrainCoordinator [选项]\n"
         "  --page setup|login|main|diag  直接打开这一页\n"
         "  --start                       启动后立即连接网关并开始采样（需要已登录）\n"
         "  --login                       启动后立即在浏览器中开始登录\n"
@@ -218,7 +218,7 @@ int main(int argc, char **argv) {
     }
     platform::make_dirs(data_dir);
     if (!platform::single_instance(data_dir)) {
-        std::fprintf(stderr, "Ballrain 算力池客户端已经在运行了（同一个数据目录只能开一个）。\n");
+        std::fprintf(stderr, "Ballrain 协调器已经在运行了（同一个数据目录只能开一个）。\n");
         return 1;
     }
     Controller ctl(data_dir);
@@ -309,7 +309,7 @@ int main(int argc, char **argv) {
         if (checked && probs.empty()) pl.push_back(text("游戏文件检查通过。") | color(Color::Green));
         for (auto &p : probs) pl.push_back(paragraph("• " + p.message) | color(Color::Red));
         return vbox({
-                   text(first_run ? " Ballrain 算力池 · 首次设置 " : " Ballrain 算力池 · 设置 ") | bold | center,
+                   text(first_run ? " Ballrain 协调器 · 首次设置 " : " Ballrain 协调器 · 设置 ") | bold | center,
                    separator(),
                    paragraph("用你自己电脑上的 Ballance 帮忙采集训练数据。客户端只读取游戏目录里的 base.cmo、Database.tdb、"
                              "3D Entities 和 Text，不会改动任何游戏文件。"),
@@ -384,7 +384,7 @@ int main(int argc, char **argv) {
         ControllerView v = ctl.view();
         std::lock_guard<std::mutex> g(login_mu);
         return vbox({
-                   text(" Ballrain 算力池 · 登录 ") | bold | center,
+                   text(" Ballrain 协调器 · 登录 ") | bold | center,
                    separator(),
                    v.banner ? banner_box(*v.banner) : text(""),
                    paragraph("用 Ballance 论坛（forum.ballance.top）的账号登录。登录在浏览器里完成，客户端不会看到你的论坛密码；"
@@ -449,7 +449,7 @@ int main(int argc, char **argv) {
                             : !v.want_running ? "已暂停"
                             : !v.auto_pause.empty() ? "自动暂停"
                                                     : "采样中";
-        Elements head{text(" Ballrain 算力池 ") | bold, text("  "), text(v.user_name.empty() ? "" : "玩家：" + v.user_name),
+        Elements head{text(" Ballrain 协调器 ") | bold, text("  "), text(v.user_name.empty() ? "" : "玩家：" + v.user_name),
                       text("  状态："), text(state) | bold | color(state == "采样中" ? Color::Green : Color::Yellow),
                       filler(), text("客户端 " + std::string(CLIENT_VERSION) + " ")};
         std::vector<std::vector<std::string>> rows{{"实例", "状态", "任务", "本任务步数", "累计步数", "已接收", "步/秒", "说明"}};

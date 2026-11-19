@@ -1,4 +1,4 @@
-# Ballrain 算力池客户端测试版：使用说明
+# Ballrain 协调器（Coordinator）测试版：使用说明
 
 感谢参与测试！这个程序用你自己电脑上的 Ballance，在后台用无头引擎跑 AI 的训练对局，把数据传给训练服务器。
 不需要安装 Python，也不会改动你的游戏文件。
@@ -9,8 +9,8 @@
 - 一个 Ballance 论坛（forum.ballance.top）账号。网关会检查账号的注册时间、邮箱是否验证、回复数，不满足时登录页会直接说明原因。
 
 ## 2. 安装
-1. 下载 `BallrainPool-<版本>-windows-x64.zip`，**完整解压**到一个文件夹（例如 `D:\BallrainPool`）。不要在压缩包里直接双击运行。
-2. 双击 `BallrainPool.exe`。
+1. 下载 `BallrainCoordinator-<版本>-windows-x64.zip`，**完整解压**到一个文件夹（例如 `D:\BallrainCoordinator`）。不要在压缩包里直接双击运行。
+2. 双击 `BallrainCoordinator.exe`。
 
 **第一次运行时 Windows 可能会拦下来**（蓝色窗口“Windows 已保护你的电脑”，这是 SmartScreen）：
 测试版还没有代码签名，所以会这样。点“**更多信息**”，再点“**仍要运行**”。之后就不会再问。
@@ -40,7 +40,7 @@
 **关闭**：点“退出”、按 Ctrl-C 或直接关窗口都可以，客户端会先停掉所有引擎、把剩下的数据传完再退出。万一程序被强行结束，引擎也会跟着结束；
 没传完的数据留在本机，下次打开时接着传。
 
-**启动参数**（可以写进快捷方式的“目标”里，`BallrainPool.exe --help` 列出全部）：例如 `--start` 打开后直接开始采样，
+**启动参数**（可以写进快捷方式的“目标”里，`BallrainCoordinator.exe --help` 列出全部）：例如 `--start` 打开后直接开始采样，
 `--instances 2` 用两个实例，`--page setup` 直接打开设置页。
 
 ## 6. 横幅提示是什么意思

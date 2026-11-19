@@ -3,15 +3,15 @@
     python tools/native/package_win.py --engine <bin-x86soft BallanceMMOSimTool.exe> --engine-version <string>
         --license BallanceMMO=<its LICENSE file> [--license NAME=FILE ...]
         [--gateway https://...] [--update-url https://.../release.json] [--pubkey-file release-signing.pub]
-        [--sign-key release-signing.key --download-url https://.../BallrainPool-<v>-windows-x64.zip]
+        [--sign-key release-signing.key --download-url https://.../BallrainCoordinator-<v>-windows-x64.zip]
         [--out dist/native]
 
 Builds a release configuration (native/build_win.cmd with the gateway / update URL / public key as CMake cache
 variables: they are build inputs, never committed) and assembles
 
-    BallrainPool-<version>-windows-x64/
-        BallrainPool.exe                      the TUI client (static, no runtime needed)
-        nc_client.exe                         the same controller without a UI (login / run / diag; servers, SSH)
+    BallrainCoordinator-<version>-windows-x64/
+        BallrainCoordinator.exe               the TUI client (static, no runtime needed)
+        ballrain_coordinator.exe              the same controller without a UI (login / run / diag; servers, SSH)
         engine/x87soft/windows/BallanceMMOSimTool.exe, msvcp140.dll, vcruntime140.dll (x86, app-local), ENGINE_VERSION
         使用说明.txt                          the tester quick start (docs/native-client-testers.md is the full guide)
         LICENSES/                             Ballrain's vendored libraries + the engine's licences given by --license
@@ -34,10 +34,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 VCREDIST = ["msvcp140.dll", "vcruntime140.dll"]  # what BallanceMMOSimTool.exe (x86, /MD) imports besides the UCRT
-QUICKSTART = """Ballrain 算力池客户端 {version}（Windows 测试版）
+QUICKSTART = """Ballrain 协调器（Coordinator）{version}（Windows 测试版）
 
 1. 把这个压缩包完整解压到一个文件夹（不要直接在压缩包里运行）。
-2. 双击 BallrainPool.exe。第一次运行时 Windows 可能提示“Windows 已保护你的电脑”（SmartScreen）：
+2. 双击 BallrainCoordinator.exe。第一次运行时 Windows 可能提示“Windows 已保护你的电脑”（SmartScreen）：
    点“更多信息”，再点“仍要运行”。这个测试版还没有代码签名，所以会这样。
 3. 首次设置：填写你自己电脑上的 Ballance 安装目录（含 base.cmo 的文件夹），可以点“查找常见位置”。
    客户端只读取 base.cmo、Database.tdb、3D Entities、Text，不会改动任何游戏文件。
@@ -121,14 +121,14 @@ def main(argv=None) -> int:
         raise SystemExit("--update-url needs --pubkey-file (the client verifies the manifest's signature)")
     bdir = REPO / "build" / "native-release-pkg" if a.no_build else build(a.gateway, a.update_url, pubkey)
     out = Path(a.out).resolve()
-    name = f"BallrainPool-{version}-windows-x64"
+    name = f"BallrainCoordinator-{version}-windows-x64"
     stage = out / name
     if stage.exists():
         shutil.rmtree(stage)
     edir = stage / "engine" / "x87soft" / "windows"
     edir.mkdir(parents=True)
-    shutil.copyfile(bdir / "ballrain_pool.exe", stage / "BallrainPool.exe")
-    shutil.copyfile(bdir / "nc_client.exe", stage / "nc_client.exe")  # the headless driver (hosts without a console UI)
+    shutil.copyfile(bdir / "BallrainCoordinator.exe", stage / "BallrainCoordinator.exe")
+    shutil.copyfile(bdir / "ballrain_coordinator.exe", stage / "ballrain_coordinator.exe")  # the headless driver (hosts without a console UI)
     shutil.copyfile(a.engine, edir / "BallanceMMOSimTool.exe")
     crt = vc_redist_x86()
     for n in VCREDIST:

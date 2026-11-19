@@ -37,13 +37,13 @@ jobs:
         run: python tools/native/ci_goldens.py --nc-golden build/native-Release/nc_golden.exe --out ci-goldens
       - name: TUI renders
         shell: bash
-        run: build/native-Release/ballrain_pool.exe --data-dir ci-tui --snapshot setup | grep -q "Ballance"
+        run: build/native-Release/BallrainCoordinator.exe --data-dir ci-tui --snapshot setup | grep -q "Ballance"
       - uses: actions/upload-artifact@v4
         with:
           name: ballrain-native-windows-x64-dev
           path: |
-            build/native-Release/ballrain_pool.exe
-            build/native-Release/nc_client.exe
+            build/native-Release/BallrainCoordinator.exe
+            build/native-Release/ballrain_coordinator.exe
           retention-days: 14
 
   linux:

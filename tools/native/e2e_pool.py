@@ -2,7 +2,7 @@
 
 Runs on this machine, all on loopback: the mock forum (tools/pool/mock_forum.py), the gateway (ballrain.pool.server_app)
 with a real policy (a learner checkpoint, exported like the gateway's task source does), the real start record and
-reference line, and the verifier replaying with the x87-soft headless engine; then the native client (nc_client) logs
+reference line, and the verifier replaying with the x87-soft headless engine; then the native client (ballrain_coordinator) logs
 in through the gateway's login flow (the browser part scripted here with the player's cookies, against the mock
 forum's user "eligible"), runs tasks and posts its chunks; the verifier replays every task (probation: every chunk)
 and must pass them all. A forged copy of one of the native chunks (reward changed, resealed) is then replayed offline
@@ -10,7 +10,7 @@ through the verifier's replay_task and must be caught.
 
     python tools/native/e2e_pool.py --dir runtime/nc/e2e --ckpt runtime/nc/ckpt/r7_latest.pt \\
         --record <dataset record dir> --engine <x87-soft BallanceMMOSimTool.exe> --game <Ballance folder> \\
-        --client build/native-Release/nc_client.exe [--tasks 3] [--max-steps 3000]
+        --client build/native-Release/ballrain_coordinator.exe [--tasks 3] [--max-steps 3000]
 
 Everything it writes stays under --dir (gateway state, chunks, the client's data directory). Exit code 0 = passed.
 """
@@ -122,7 +122,7 @@ def main(argv=None) -> int:
     ap.add_argument("--hold", type=float, default=0.0,
                     help="demo: after the login keep the gateway up this many seconds (or until <dir>/stop exists) "
                          "with the verifier running, for the TUI started by hand on <dir>/client; no client run")
-    ap.add_argument("--tui", help="also run the terminal UI (ballrain_pool --snapshot live:25) on the client's data")
+    ap.add_argument("--tui", help="also run the terminal UI (BallrainCoordinator --snapshot live:25) on the client's data")
     ap.add_argument("--kill-after", type=float, default=0.0,
                     help="first hard-kill the client this many seconds into a run (its engines must die with it: the job "
                          "object), then run it again: the killed run's queued chunks are posted and its tasks closed")
@@ -230,7 +230,7 @@ def main(argv=None) -> int:
         c.update(gateway_url=gateway, ballance_dir=a.client_game, engine_binary=a.client_engine, instances=a.instances,
                  setup_done=True, auto_pause_player=False, auto_pause_battery=False)
         cfgp.write_text(json.dumps(c, ensure_ascii=False, indent=1), encoding="utf-8")
-        log(f"DEMO READY: ballrain_pool --data-dir {client_dir} (stop: create {d / 'stop'})")
+        log(f"DEMO READY: BallrainCoordinator --data-dir {client_dir} (stop: create {d / 'stop'})")
         end = time.time() + a.hold
         while time.time() < end and not (d / "stop").exists():
             try:

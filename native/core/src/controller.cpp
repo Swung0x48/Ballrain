@@ -1189,7 +1189,7 @@ void Controller::add_phases(double wait, double fetch, const TaskOutcome &out, b
                       double(q) / 1048576.0);
         line += u;
     }
-    say(line);  // client.log, and the log event (the TUI's log pane; nc_client: stderr)
+    say(line);  // client.log, and the log event (the TUI's log pane; ballrain_coordinator: stderr)
     emit("phases", ev);
 }
 
