@@ -19,7 +19,17 @@ python -m ballrain.routescout plan --map custom.nmo --out runs/custom
 
 No start option means the first controllable state at the level's own spawn. Default target: the next checkpoint. A requested start is **physically approached**, not injected: the checkpoint count, requested material and optional position (within 0.5 world units) and camera yaw (degrees, within 2) must match. This can be a moving state. If it cannot be reached the command reports failure, not a substituted start. Preparation consumes search time but is excluded from the split clocks. For custom maps the last command deliberately errors: there is no file-loading agent handshake or validated custom-map collision, ordered reset/checkpoint and mechanism export.
 
-The default budget is two minutes. Allow about 1–2 minutes for a first-sector run, more for later sectors; reaching the target is not guaranteed. A pending engine call, geometry setup and final archive writes can extend wall time. Ctrl+C finalizes the current archive; after a forced stop resume from its last atomic save. Resume adds time, it does not replay a second build. By default, map-hash-matched keys from earlier *engine-only* scouts are proposals; their trajectories and scores are measured afresh. Use `--cold` on a new run for geometry/exploration only. Unknown geometry never gets a stock tape. The guide explores walkable geometry; it is not a proof of support on moving structures.
+The default is two minutes. To measure **cold discovery**, use a new directory and `--cold`; `--resume` is not a cold start. Allow 5 to 10 minutes for an initial coverage run, not as a promise of CP1. Without `--cold`, any matching packaged *engine-only* keys are proposed and measured afresh. On a map without matching keys, the default still has to discover the route. No human reference line is required.
+
+```console
+python -m ballrain.routescout plan --level 11 --instance hlw-91 --cold --budget-s 360 --candidates 8 --out runs/cold-11
+```
+
+Read **cells** as explored 4-unit position bins, separated by checkpoint, material and start tape. **Candidates** in the progress log are retained tradeoffs, not the cell count or a count of routes to CP. `archive.json` keeps the replayable cell prefixes and counts of exact restores, divergences and deaths. A new cell can be farther from the checkpoint; this is useful on switchbacks. If cells grow while every published candidate is partial, the scout found more of the map, **not** a checkpoint route. If coverage stalls, inspect the last supported positions and contacts in the prefixes before increasing the budget. Moving bridges, rail mounts and speed-dependent gaps can defeat a static support guide. Unknown checkpoint coordinates do not imply a checkpoint hit; measured distance is null and coverage still drives exploration.
+
+In seven-minute first-sector trials on x86soft, L2 reached CP1 from cold; L1 and L11 expanded to over 180 cells each but produced only partial routes. These are individual runs, not success-rate estimates.
+
+Field construction, a pending engine request and final writes may extend wall time. The map-key-checked fastreach geometry cache under `runtime/scout-fields/` is safe to reuse for a cold run: it stores geometry, not key proposals. Ctrl+C finalizes the archive; after a forced stop, resume the last atomic save. Resume adds search time; it does not verify against another build.
 
 ### Read the results
 

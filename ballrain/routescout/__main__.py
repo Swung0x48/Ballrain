@@ -4,7 +4,7 @@ import random
 import time
 from pathlib import Path
 import numpy as np
-from . import engine as e
+from . import engine as e, frontier
 from .mechanisms import Rules
 from .contract import atomic, parser, select, order
 
@@ -125,6 +125,8 @@ def search(a):
             cold=a.cold,
         )
         arc = dict(schema=2, config=cfg, episode=0, rows=[], prefix=None)
+    cells = arc.setdefault("cells", {})
+    stats = arc.setdefault("exploration", {"restores": 0, "diverged": 0, "deaths": 0})
     paths = triangles = None
     start = time.monotonic()
     deadline = start + a.budget_s
@@ -148,7 +150,8 @@ def search(a):
                 ):
                     raise ValueError("map or mechanism assets changed")
                 if paths is None:
-                    paths, triangles = e.guide(s, cfg["target"])
+                    paths, triangles, goals, grid = e.guide(s, cfg["target"])
+                field = grid.field
                 if cfg["target"] > len(paths):
                     raise ValueError("target checkpoint outside map")
                 proposals = sorted(
@@ -224,53 +227,135 @@ def search(a):
                 if e.ready(s, cfg):
                     arc["prefix"] = prefix
                     trace = e.Trace(s, rules)
-                    branch = []
                     if tape:
                         trace.proposal = "scout archive"
-                    if not tape and arc["rows"] and rng.random() < 0.7:
-                        peers = [r for r in arc["rows"] if r["start_keys"] == prefix]
-                        if peers:
-                            seed = rng.choice(peers)["keys"]
-                            branch = seed[: rng.randrange(len(seed))]
+                    start_id = e.digest(prefix)[:16]
+                    parent = frontier.choose(cells, rng, start_id) if not tape else None
+                    if parent is not None:
+                        restored = frontier.restore(
+                            trace, cells, parent, lambda: time.monotonic() >= deadline
+                        )
+                        if not restored:
+                            if restored is False:
+                                stats["diverged"] += 1
+                                cells[parent]["diverged"] = True
+                            continue
+                        stats["restores"] += 1
+                    mark = len(trace.keys)
+                    stale = 0
+                    escape = None
+                    until = 0
                     detours = e.Detours(rules, rng)
+                    if detours.commit:
+                        look = rng.uniform(7, 14)
+                        speed = rng.uniform(15, 28)
+                    explore = rng.choice((0.0, 0.5, 3.0, 12.0))
                     best = float("inf")
                     sector = tr.checkpoints
+                    alternate = None
+                    if parent and goals[sector] is not None and rng.random() < 0.5:
+                        hazards = frontier.failed_positions(cells, start_id, sector)
+                        alternate = grid.path(
+                            e.position(s),
+                            goals[sector],
+                            rng.sample(hazards, min(16, len(hazards))),
+                        )
                     for i in range(20000 if tape else 900):
                         if time.monotonic() >= deadline:
                             break
                         if time.monotonic() >= report:
                             print(
-                                f"L{cfg['level']} episode {arc['episode']} archive {len(arc['rows'])} elapsed {time.monotonic() - start:.1f}s",
+                                f"L{cfg['level']} episode {arc['episode']} cells {len(cells)} candidates {len(arc['rows'])} elapsed {time.monotonic() - start:.1f}s",
                                 flush=True,
                             )
                             write(out / "archive.json", arc)
                             report = time.monotonic() + 10
                         path = paths[tr.checkpoints]
+                        if alternate is not None:
+                            path = alternate
+                        # Try a reachable unvisited neighbour when the guide is absent
+                        # or the same patch keeps absorbing the controller's proposals.
+                        if (path is None or stale >= 10) and parent and i >= until:
+                            exits = cells[parent].get("exits", {})
+                            options = [q for k, q in exits.items() if k not in cells]
+                            if options:
+                                escape = rng.choice(options)
+                                until = i + 7
+                        drive = e.ribbon([e.position(s), escape]) if i < until else path
                         proposal = proposed()
-                        k, n = proposal or (
-                            branch[i]
-                            if i < len(branch)
-                            else detours.action(s, path, look, speed, rng, block)
-                        )
+                        if proposal:
+                            k, n = proposal
+                        else:
+                            k, n = detours.action(
+                                s, drive, look, speed, rng, block, field, explore
+                            )
                         if not trace.step(k, n):
+                            if s.obs is not None and s.obs.has_event(
+                                e.Ev.BallOff, e.Ev.GameOver
+                            ):
+                                stats["deaths"] += 1
+                            if parent:
+                                cells[parent]["failures"] += 1
                             break
                         if proposal:
                             advance(trace.keys[-1][1])
                         if not s.obs.ball["found"]:
                             continue
-                        goal = paths[cfg["target"] - 1][0][-1]
-                        dist = np.linalg.norm(e.position(s) - goal)
+                        next_goal = goals[sector]
+                        goal = goals[cfg["target"] - 1]
+                        p = e.position(s)
                         crossed = sector != tr.checkpoints
                         sector = tr.checkpoints
-                        if crossed or (i >= 3 and dist < best - (10 if tape else 0.75)):
-                            admit(arc["rows"], trace.candidate(cfg, prefix, goal))
-                            best = dist
+                        station, lateral = (
+                            e.project(path, p) if path is not None else (0.0, 0.0)
+                        )
+                        dist = (
+                            path[3][-1] - station + lateral if path is not None else 0.0
+                        )
+                        if path is not None and next_goal is not None:
+                            dist += np.linalg.norm(path[0][-1] - next_goal)
+                        supported = (
+                            tr.flags.ball_nav
+                            and bool(len(s.obs.fric["partner"]))
+                            and field.support(p)[2] in (1, 2)
+                        )
+                        new = False
+                        if supported and sector < cfg["target"]:
+                            key = frontier.cell(p, sector, tr.ball_type(), start_id)
+                            new = frontier.store(
+                                cells,
+                                key,
+                                parent,
+                                trace.keys[mark:],
+                                trace.witness.hexdigest(),
+                                float(dist),
+                            )
+                            if new:
+                                cells[key]["exits"] = frontier.exits(
+                                    field, p, sector, tr.ball_type(), start_id
+                                )
+                                parent, mark = key, len(trace.keys)
+                        if crossed:
+                            alternate = None
+                        stale = 0 if new else stale + 1
+                        if crossed or (supported and (new or dist < best - 0.75)):
+                            candidate = trace.candidate(cfg, prefix, goal)
+                            candidate["guide_remaining"] = (
+                                round(float(dist), 3) if path is not None else None
+                            )
+                            admit(arc["rows"], candidate)
+                            best = min(best, dist)
+                        if not tape and stale > 30:
+                            if parent:
+                                cells[parent]["failures"] += 1
+                            break
                         if sector >= cfg["target"] or s.ended:
                             break
             write(out / "archive.json", arc)
             if time.monotonic() >= report:
                 print(
-                    f"episode {arc['episode']} archive {len(arc['rows'])}", flush=True
+                    f"episode {arc['episode']} cells {len(cells)} candidates {len(arc['rows'])}",
+                    flush=True,
                 )
                 report = time.monotonic() + 10
     finally:

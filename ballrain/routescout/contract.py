@@ -102,10 +102,15 @@ def difficulty(keys, balls, rail_fraction):
 
 
 def order(r):
+    remaining = r.get("guide_remaining")
+    if remaining is None:
+        remaining = r["distance_to_goal"]
+    if remaining is None:
+        remaining = -r.get("explored_radius", 0.0)
     return (
         -len(r["checkpoints"]),
         not r["complete"],
-        0 if r["complete"] else r["distance_to_goal"],
+        0 if r["complete"] else remaining,
         r["sr_ms"],
         r["id"],
     )
@@ -139,7 +144,8 @@ def select(rows, count):
             and q.get("start_keys") == r.get("start_keys")
             and (
                 r["complete"]
-                or int(q["distance_to_goal"] // 5) == int(r["distance_to_goal"] // 5)
+                or (q["distance_to_goal"] or 0) // 5
+                == (r["distance_to_goal"] or 0) // 5
             )
         ]
 

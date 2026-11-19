@@ -14,13 +14,11 @@ from ballrain.client import AgentSession, DEFAULT_DELTA, SessionConfig
 from ballrain.env import world_to_camera_keys
 from ballrain.features import level_geometry
 from ballrain.headless import HeadlessLauncher
-from ballrain.path import level_anchors
 from ballrain.protocol import Ev
 from ballrain.reach import KEY_COMBOS
 from ballrain.state import G_RAILS
 from .contract import MATERIALS, UNVERIFIED, difficulty, digest
-from .graph import SurfaceGraph
-from .guidance import ribbon, project, point, local_line
+from .guidance import ribbon, project, point
 
 STOPS = (
     Ev.BallOff,
@@ -83,21 +81,40 @@ def position(s):
     return np.asarray(s.obs.ball["pos"])
 
 
-def guide(s, target):
-    a = level_anchors(s.tracker)
-    pts = [a["start"], *a["checkpoints"]]
-    tris = level_geometry(s.tracker).tris
-    graph = SurfaceGraph(tris)
-    if target >= len(pts):
+def checkpoint_goals(tr, target):
+    """Preserve engine row order: a missing CP1 must not turn CP2 into CP1."""
+    from ballrain.path import _matrix_pos
+
+    count = tr.arrays.rows("Checkpoints")
+    if target > count:
         raise ValueError("target checkpoint outside map")
-    paths = []
-    for x, y in zip(pts[:target], pts[1:]):
-        line = local_line(tris, np.asarray(x), np.asarray(y))
-        paths.append(line or ribbon([x, *graph.corridor(x, y), y]))
+    goals = []
+    for i in range(target):
+        coords = (_matrix_pos(tr.arrays.get("Checkpoints", i, j)) for j in range(2))
+        goals.append(
+            next((q for q in coords if q is not None and np.isfinite(q).all()), None)
+        )
+    return goals
+
+
+def guide(s, target):
+    from ballrain.fastreach import FastReach
+    from .floor import FloorGuide
+
+    tr = s.tracker
+    start = position(s)
+    goals = checkpoint_goals(tr, target)
+    field = FastReach.for_tracker(tr, cache_dir=Path("runtime/scout-fields"))
+    grid = FloorGuide(field)
+    paths = [
+        grid.path(x, y) if x is not None else None
+        for x, y in zip([start, *goals], goals)
+    ]
+    tris = level_geometry(tr).tris
     triangles = np.stack([tris.A, tris.B, tris.C], axis=1)[abs(tris.N[:, 1]) > 0.45][
         :, :, [0, 2]
     ]
-    return paths, triangles
+    return paths, triangles, goals, grid
 
 
 def draw(out, triangles, rows):
@@ -152,8 +169,15 @@ def steer(s, path, look, speed, rng):
     if not s.tracker.flags.ball_nav or not s.obs.ball["found"]:
         return 0
     p = position(s)
+    if path is None:
+        return rng.choice(KEY_COMBOS)
     station, _ = project(path, p)
     target = point(path, station + look)
+    return steer_to(s, target, speed, rng)
+
+
+def steer_to(s, target, speed, rng):
+    p = position(s)
     d = (target - p)[[0, 2]]
     v = (s.obs.ball["speed"] + s.obs.ball["speed_change"])[[0, 2]]
     want = d * min(2.7, speed / max(0.01, np.linalg.norm(d))) - v
@@ -336,7 +360,7 @@ class Trace:
             path.append([frame, position(s).tolist()])
         points = np.array([p for _, p in path])
         # Signed excursion relative to the start-to-goal chord separates geometric lanes.
-        axis = (goal - points[0])[[0, 2]]
+        axis = (goal - points[0])[[0, 2]] if goal is not None else np.array([1.0, 0.0])
         side = np.array([-axis[1], axis[0]]) / max(1, np.linalg.norm(axis))
         offsets = (points - points[0])[:, [0, 2]] @ side
         excursion = offsets[np.argmax(abs(offsets))]
@@ -359,7 +383,10 @@ class Trace:
             ),
             checkpoints=list(self.cp),
             complete=s.tracker.checkpoints >= cfg["target"],
-            distance_to_goal=round(float(np.linalg.norm(points[-1] - goal)), 3),
+            distance_to_goal=round(float(np.linalg.norm(points[-1] - goal)), 3)
+            if goal is not None
+            else None,
+            explored_radius=round(float(np.linalg.norm(points[-1] - points[0])), 3),
             start_keys=list(prefix),
             keys=list(self.keys),
             centre_path=path,
@@ -393,11 +420,12 @@ class Detours:
     def __init__(self, rules, rng):
         self.rules = rules
         self.mode = rng.choice(("direct", "direct", "pickup", "transform"))
+        self.commit = rng.random() < 0.45
         self.visited = set()
         self.target = None
         self.until = self.release = self.pause_start = 0
 
-    def action(self, s, path, look, speed, rng, block):
+    def action(self, s, path, look, speed, rng, block, field, explore):
         tr = s.tracker
         if self.mode == "pickup":
             if self.release:
@@ -443,4 +471,19 @@ class Detours:
                         break
             if self.target is not None:
                 path = ribbon([p, self.target])
-        return steer(s, path, look, speed, rng), block
+        if tr.flags.ball_nav and s.obs.ball["found"] and tr.ball_type() in range(3):
+            from .floor import waypoint
+
+            q = waypoint(
+                field,
+                self.rules,
+                position(s),
+                path,
+                tr.ball_type(),
+                look,
+                rng,
+                explore,
+                self.commit,
+            )
+            return steer_to(s, q, speed, rng), block
+        return 0, block
