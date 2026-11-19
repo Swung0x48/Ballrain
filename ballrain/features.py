@@ -819,6 +819,17 @@ def contact_slots(cl, lat) -> list:
     return out
 
 
+def contact_definition() -> dict:
+    """Everything that defines the f8 blocks' values besides the code of merge_contacts, contact_sector,
+    contact_slots, rail_query, rail_sides, FeatureExtractor._lateral_axis and _contact_block (tests/test_contact_obs.py
+    pins a digest of both to the label CONTACT_FEATURE_VERSION: a change takes a new label)."""
+    return {"version": CONTACT_FEATURE_VERSION, "slots": CONTACT_SLOTS, "slot_fields": list(CONTACT_SLOT_FIELDS),
+            "merge_cos": CONTACT_MERGE_COS, "gap_bucket": CONTACT_GAP_BUCKET, "side_lat": CONTACT_SIDE_LAT,
+            "touch_gap": CONTACT_TOUCH_GAP, "agg_fields": list(CONTACT_AGG_FIELDS),
+            "rail_side_fields": list(RAIL_SIDE_FIELDS), "no_contact_gap": NO_CONTACT_GAP, "up": G.UP_WALKABLE,
+            "rails_group": G_RAILS, "ball_status": IVP_ST_BALL}
+
+
 def rail_query(rails: G.TriangleSet, pos, r: float):
     """(candidate triangles, their closest points to pos, distances) of the rail triangles within r of pos (the
     computation of TriangleSet.closest, kept for rail_sides), or None without candidates."""

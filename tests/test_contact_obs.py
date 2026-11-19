@@ -298,9 +298,12 @@ def _replay_pair(name, limit):
     return np.stack(A), np.stack(B), np.stack(C)
 
 
-# digests of the first 4000 frames' default-configuration vectors (FeatureConfig(): f6, 204 entries) at the commit
-# before f8, on this platform's numpy (float32 bytes)
+# digests of the first 4000 frames' vectors at the commit before f8 (float32 bytes): the default configuration
+# (FeatureConfig(): f6, 204 entries) and the r8 one (f7, 267). Measured with this repository's venv on Windows x64;
+# another numpy / BLAS / platform may round differently: the digest check is skipped off Windows, the f7 / f8 prefix
+# check runs everywhere
 DEFAULT_DIGEST = {"SR01_1_14_457_264": "21dbc2ca7cc843f2", "SR02_1_28_992_264": "8ebbd13e1048f228"}
+R8_DIGEST = {"SR01_1_14_457_264": "44631092a736f00a", "SR02_1_28_992_264": "8c02514a109bba9c"}
 
 
 @pytest.mark.parametrize("name", ["SR01_1_14_457_264", "SR02_1_28_992_264"])
@@ -310,7 +313,10 @@ def test_recorded_f8_starts_with_the_f7_vector(name):
     assert np.array_equal(B[:, :267], A)
     assert np.abs(B[:, 267:]).max() <= 1.0
     assert B[:, 267:].any()
-    assert hashlib.sha256(C.tobytes()).hexdigest()[:16] == DEFAULT_DIGEST[name]
+    import sys
+    if sys.platform == "win32":
+        assert hashlib.sha256(C.tobytes()).hexdigest()[:16] == DEFAULT_DIGEST[name]
+        assert hashlib.sha256(A.tobytes()).hexdigest()[:16] == R8_DIGEST[name]
 
 
 R8_CKPT = instances.runtime_dir() / "m2-train-mac" / "r8" / "latest.pt"
@@ -432,3 +438,60 @@ def test_r9_from_r8_carries_every_argument_and_the_bundle():
     env = train_m2.make_env_config(train_m2.parse(argv), Path("unused"), None, init=ck)
     assert env.branch_assets == ck["branch_assets"]
     assert env.features.branch_sha256 == ck["env_config"]["features"]["branch_sha256"]
+
+
+def _fake_run(tmp_path, record, run, steps, *extra):
+    import os
+    import subprocess
+    import sys
+    repo = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, BALLRAIN_RUNTIME=str(tmp_path / "rt"))
+    args = [sys.executable, str(repo / "scripts" / "train_m2.py"), "--run", run, "--fake", "--workers", "1",
+            "--total-steps", str(steps), "--batch-steps", "512", "--chunk", "64", "--minibatch", "256", "--epochs", "1",
+            "--log-every", "1", "--ckpt-every", "1", "--record", str(record), "--world-actions", "--reach", *extra]
+    p = subprocess.run(args, env=env, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                       encoding="utf-8", timeout=900)
+    assert p.returncode == 0, p.stdout[-3000:]
+    return tmp_path / "rt" / "m2-train" / run, p.stdout
+
+
+def test_fake_r9_start_grows_an_f7_run_into_f8_with_init_full(tmp_path):
+    """The r9 start path end to end (scripts/train_m2.py --fake, toy level, no engine): an f7 run, then a new f8 run
+    with --contacts --init-from <its checkpoint> --init-full: 49 more inputs, policy / optimiser / statistics grown
+    from the f7 checkpoint, curriculum and counters carried on (the update count continues)."""
+    import sys
+    import torch
+    if sys.platform != "win32":
+        pytest.skip("ballrain.fakegame's shared memory needs Windows")
+    if not FR.HAVE_NUMBA:
+        pytest.skip("the reach block needs numba")
+    from ballrain.pool import dev
+    record = dev.fake_record(tmp_path / "record")
+    a_dir, _ = _fake_run(tmp_path, record, "a", 1600)
+    ca = torch.load(a_dir / "latest.pt", weights_only=False)
+    assert ca["env_config"]["features"]["version"] == "f7"
+    b_dir, out = _fake_run(tmp_path, record, "b", int(ca["counters"]["steps"]) + 1100, "--contacts",
+                           "--init-from", str(a_dir / "latest.pt"), "--init-full")
+    assert "policy grown from" in out and f"initialised from {a_dir / 'latest.pt'} (full: update {ca['counters']['update']}" in out
+    cb = torch.load(b_dir / "latest.pt", weights_only=False)
+    assert cb["env_config"]["features"]["version"] == "f8" and cb["n_obs"] == ca["n_obs"] + N_F8
+    assert cb["args"]["contacts"] and cb["counters"]["update"] > ca["counters"]["update"]
+    assert cb["counters"]["episodes"] >= ca["counters"]["episodes"] and cb["model"]["pi.0.weight"].shape[1] == cb["n_obs"]
+    first = min(int(f.stem.split("_")[1]) for f in b_dir.glob("ckpt_*.pt"))
+    assert first == ca["counters"]["update"] + 1  # the new run's first update follows the f7 run's last
+
+
+def _definition_digests():
+    import inspect
+    import json
+    code = "\n".join(inspect.getsource(f) for f in (
+        FX.merge_contacts, FX.contact_sector, FX.contact_slots, FX.rail_query, FX.rail_sides, FX.mind_normals,
+        FX.FeatureExtractor._lateral_axis, FX.FeatureExtractor._contact_block)).replace("\r\n", "\n")
+    return (hashlib.sha256(json.dumps(FX.contact_definition(), sort_keys=True).encode()).hexdigest()[:16],
+            hashlib.sha256(code.encode()).hexdigest()[:16])
+
+
+def test_block_definition_digest_matches_the_f8_label():
+    """The f8 label pins the blocks: constants, field order and the code that computes them. Any change (also to
+    comments in those functions: then just re-pin) must take a new label (CONTACT_FEATURE_VERSION) and this digest."""
+    assert (FX.CONTACT_FEATURE_VERSION, *_definition_digests()) == ("f8", "1f722fdb0b3f8ac1", "387c9aa7a8eb1cbb")
