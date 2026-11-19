@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import glob
+import io
 import json
 import math
 import pickle
@@ -504,23 +505,50 @@ _MODEL_GROUPS = (
     ("contacts", ("contacts", "contact_agg", "rails_lr")),
 )
 _MODEL_MEMO: dict = {}
+_CK_MEMO: dict = {}  # run name -> (checkpoint key, slim checkpoint)
+
+
+def latest_ckpt(run: Run):
+    """(key, slim checkpoint) of a run's newest checkpoint (latest.pt, else the last ckpt_*.pt), or None: only the
+    parts the dashboard reads (args, env_config, n_obs, n_act, parameter count, branch_assets). Cached by mtime/size;
+    a checkpoint that fails to load (half-copied by the pull) keeps the last good one."""
+    cands = [run.path / "latest.pt"] if (run.path / "latest.pt").is_file() else sorted(run.path.glob("ckpt_*.pt"))
+    if not cands:
+        return None
+    ck_path = cands[-1]
+    try:
+        st = ck_path.stat()
+    except OSError:
+        return _CK_MEMO.get(run.name)
+    key = (str(ck_path), st.st_mtime_ns, st.st_size)
+    hit = _CK_MEMO.get(run.name)
+    if hit and hit[0] == key:
+        return hit
+    import torch
+    try:
+        ck = torch.load(ck_path, weights_only=False, map_location="cpu")
+    except Exception:
+        if hit:
+            return hit
+        raise
+    slim = {k: ck.get(k) for k in ("args", "env_config", "n_obs", "n_act", "branch_assets")}
+    slim["params"] = int(sum(v.numel() for v in (ck.get("model") or {}).values() if hasattr(v, "numel")))
+    _CK_MEMO[run.name] = (key, slim)
+    return _CK_MEMO[run.name]
 
 
 def model_info(run: Run) -> dict | None:
     """Network structure of a run's newest checkpoint for the model panel: observation blocks (sizes from the
     checkpoint's own feature config), hidden sizes, actor heads, parameter count. Cached by checkpoint mtime/size.
     No paths or other machine details: the payload is public."""
-    cands = [run.path / "latest.pt"] if (run.path / "latest.pt").is_file() else sorted(run.path.glob("ckpt_*.pt"))
-    if not cands:
+    got = latest_ckpt(run)
+    if got is None:
         return None
-    ck_path = cands[-1]
-    key = (str(ck_path), ck_path.stat().st_mtime_ns, ck_path.stat().st_size)
+    key, ck = got
     if _MODEL_MEMO.get(run.name, (None,))[0] == key:
         return _MODEL_MEMO[run.name][1]
     import dataclasses
-    import torch
     from ballrain.features import FeatureConfig, make_layout
-    ck = torch.load(ck_path, weights_only=False, map_location="cpu")
     a = ck.get("args") or {}
     f = dict((ck.get("env_config") or {}).get("features") or {})
     names = {x.name for x in dataclasses.fields(FeatureConfig)}
@@ -534,7 +562,7 @@ def model_info(run: Run) -> dict | None:
     other = sum(n for m, n in layout if not any(m in mm for _, mm in _MODEL_GROUPS))
     if other:
         groups.append({"key": "other", "size": int(other)})
-    params = int(sum(v.numel() for v in (ck.get("model") or {}).values() if hasattr(v, "numel")))
+    params = int(ck.get("params") or 0)
     info = {"n_obs": int(ck.get("n_obs") or sum(n for _, n in layout)), "n_act": int(ck.get("n_act") or 9),
             "hidden": [int(x) for x in str(a.get("hidden", "256,256")).split(",") if x.strip()],
             "activation": str(a.get("activation", "tanh")), "heads": str(a.get("actor_heads") or "single"),
@@ -542,6 +570,365 @@ def model_info(run: Run) -> dict | None:
             "groups": groups, "params": params, "init_from": bool(a.get("init_from"))}
     _MODEL_MEMO[run.name] = (key, info)
     return info
+
+
+# ------------------------------------------------------------------------------- route bundle
+# The route a run follows comes from its own checkpoint (branch_assets: the learner-owned route bundle, pinned by
+# env_config.features.branch_sha256), never from hardcoded lines. Each member line is a whole-level line that leaves
+# the run's main (TAS) line somewhere and rejoins it; the stretch where it differs is drawn, the TAS stretch it
+# replaces is the part of the TAS line it overrides. Display names only: ids not in the table are shown as they are.
+ROUTE_NAMES = {"east-primary": "东台线", "east-platform": "东台平台线", "back-to-wood": "回木球线",
+               "south-loop": "南侧绕行线", "stone-arrival": "石球到达线"}
+TAS_ROUTE_NAMES = {2: "鬼躲纸变"}  # what the TAS line does where the level's branches override it
+ROUTE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+ROUTE_FAR = 3.0       # world units: a member line farther than this from the main line has left it
+ROUTE_NEAR = 8.0      # a trace point farther than this from a line is not on it
+ROUTE_MARGIN = 2.0    # ... and must be this much closer to it than to the competing line
+ROUTE_MIN_LEN = 10.0  # world units of a life on a fork before the life is classified by that fork
+ROUTE_FAMILY_SHARE = 0.5  # two members whose diverging stretches overlap this much are one route family
+ROUTE_STEP = 1.0      # world units between the points used for classification
+_ROUTE_MEMO: dict = {}
+_PIN_MEMO: dict = {}  # checkpoint path -> (sig, (pin, guidance key))
+
+
+def _nearest(A, B, chunk=256):
+    """Distance from each point of A to the nearest point of B, and that point's index (3D, brute force)."""
+    A = np.asarray(A, np.float32)
+    B = np.asarray(B, np.float32)
+    d = np.full(len(A), np.inf, np.float32)
+    j = np.zeros(len(A), np.int64)
+    if not len(A) or not len(B):
+        return d, j
+    for i in range(0, len(A), chunk):
+        q = ((A[i:i + chunk, None, :] - B[None, :, :]) ** 2).sum(-1)
+        j[i:i + chunk] = q.argmin(1)
+        d[i:i + chunk] = np.sqrt(q[np.arange(len(q)), j[i:i + chunk]])
+    return d, j
+
+
+def _resample(P, step=ROUTE_STEP):
+    """Points of a polyline at least `step` apart (first and last kept)."""
+    P = np.asarray(P, np.float64)
+    if len(P) < 3:
+        return P
+    keep, acc = [0], 0.0
+    for i, di in enumerate(np.linalg.norm(np.diff(P, axis=0), axis=1), start=1):
+        acc += di
+        if acc >= step:
+            keep.append(i)
+            acc = 0.0
+    if keep[-1] != len(P) - 1:
+        keep.append(len(P) - 1)
+    return P[keep]
+
+
+def _runs_of(mask):
+    """[lo, hi) index ranges where mask is True."""
+    m = np.r_[False, np.asarray(mask, bool), False]
+    e = np.flatnonzero(np.diff(m.astype(np.int8)))
+    return list(zip(e[::2], e[1::2]))
+
+
+def _members(bundle):
+    """[(manifest entry, member blobs)] of a route bundle: the v2 members in manifest order, or the single v1 line."""
+    if bundle.get("version") == 2:
+        from ballrain.multi_branch import manifest
+        return list(zip(manifest(bundle["manifest"]), bundle["members"]))
+    return [({"id": "branch"}, bundle)]
+
+
+def _guidance_key(bundle) -> str:
+    """What the bundle tells a life to follow: the manifest entries and each member's line and description. Moving-
+    handover tables (drive data) are left out: an update that only adds them changes no guidance."""
+    import hashlib
+    h = hashlib.sha256()
+    for e, m in _members(bundle):
+        h.update(json.dumps(e, sort_keys=True).encode())
+        for k in ("line_npz", "desc_json"):
+            h.update(hashlib.sha256(m.get(k) or b"").digest())
+    return h.hexdigest()
+
+
+def run_pin(run: Run) -> str | None:
+    """The route-bundle pin of a run's newest checkpoint (None without a bundle). Only used server-side."""
+    try:
+        got = latest_ckpt(run)
+    except Exception:
+        return None
+    if got is None or not got[1].get("branch_assets"):
+        return None
+    pin = (((got[1].get("env_config") or {}).get("features") or {}).get("branch_sha256"))
+    return str(pin) if pin else "unpinned"
+
+
+def run_routes(run: Run) -> dict | None:
+    """The run's route bundle as geometry (server-side; 3D, world units), or None when its checkpoint has none:
+    {"pin", "main" (the run's main line), "families": [{"id", "name", "guidance", "members": [{"id", "name",
+    "guidance", "line", "div" (diverging stretches), "over" (mask of main points it overrides)}], "div", "over"}]}.
+    Members whose diverging stretches overlap are one family (named after its guidance member, else its first)."""
+    try:
+        got = latest_ckpt(run)
+    except Exception:
+        return None
+    if got is None or not got[1].get("branch_assets"):
+        return None
+    bundle = got[1]["branch_assets"]
+    pin = run_pin(run)
+    try:
+        main_p = ref_line(run)
+        msig = (str(main_p), _sig(main_p))
+    except Exception:
+        return None
+    hit = _ROUTE_MEMO.get(run.name)
+    if hit and hit[0] == (pin, msig):
+        return hit[1]
+    try:
+        main = np.asarray(np.load(main_p)["points"], np.float64)
+        members = []
+        for k, (e, m) in enumerate(_members(bundle)):
+            P = np.asarray(np.load(io.BytesIO(m["line_npz"]))["points"], np.float64)
+            far = _nearest(P, main)[0] > ROUTE_FAR
+            over = _nearest(main, P)[0] > ROUTE_FAR
+            if not far.any():
+                continue
+            mid = str(e.get("id") or "")
+            mid = mid if ROUTE_ID_RE.match(mid) else f"branch-{k + 1}"
+            div = [P[a:b] for a, b in _runs_of(far) if b - a >= 2]
+            members.append({"id": mid, "name": ROUTE_NAMES.get(mid, mid), "guidance": e.get("entry_context") == "ordinary",
+                            "line": P, "div": div, "over": over})
+    except Exception:
+        return hit[1] if hit else None
+    # route families: members whose diverging stretches lie on each other's line
+    parent = list(range(len(members)))
+
+    def root(i):
+        while parent[i] != i:
+            i = parent[i]
+        return i
+    for i, a in enumerate(members):
+        for j in range(i + 1, len(members)):
+            b = members[j]
+            da, db = np.vstack(a["div"]), np.vstack(b["div"])
+            sa = float(np.mean(_nearest(da, b["line"])[0] <= ROUTE_FAR)) if len(da) else 0.0
+            sb = float(np.mean(_nearest(db, a["line"])[0] <= ROUTE_FAR)) if len(db) else 0.0
+            if max(sa, sb) >= ROUTE_FAMILY_SHARE:
+                parent[root(j)] = root(i)
+    fams: dict = {}
+    for i, m in enumerate(members):
+        fams.setdefault(root(i), []).append(m)
+    families = []
+    for ms in fams.values():
+        head = next((m for m in ms if m["guidance"]), ms[0])
+        families.append({"id": head["id"], "name": head["name"], "guidance": any(m["guidance"] for m in ms), "members": ms,
+                         "div": np.vstack([np.vstack(m["div"]) for m in ms]),
+                         "over": np.any([m["over"] for m in ms], axis=0)})
+    families.sort(key=lambda f: not f["guidance"])  # the current guidance first
+    for f in families:  # the classification's reference points, ROUTE_STEP apart
+        f["div_r"] = _resample(f["div"])
+        f["over_r"] = _resample(main[f["over"]]) if f["over"].any() else main[:0]
+    region = np.vstack([f["div"] for f in families] + [main[f["over"]] for f in families])
+    res = {"pin": pin, "main": main, "families": families, "level": run_level(run)["level"],
+           "main_r": _resample(main), "region_r": _resample(region, 2.0)}
+    _ROUTE_MEMO[run.name] = ((pin, msig), res)
+    return res
+
+
+def route_classes(R) -> list[dict]:
+    """The route classes of a bundle in display order (public): its families, then the TAS line where a family
+    overrides it, then lives that never reached a fork."""
+    if not R:
+        return []
+    tas = TAS_ROUTE_NAMES.get(int(R.get("level") or 0))
+    return ([{"key": f["id"], "name": f["name"], "guidance": f["guidance"]} for f in R["families"]]
+            + [{"key": "tas", "name": f"TAS 线（{tas}）" if tas else "TAS 线", "guidance": False},
+               {"key": "shared", "name": "未经过分岔段", "guidance": False}])
+
+
+def routes_public(R, L, cur: int | None = None) -> dict | None:
+    """Map layers of a route bundle on level L (public: XZ coordinates, display names, ids only): each family's
+    member lines where they leave the TAS line, the TAS line split into the part no branch overrides and the part a
+    branch overrides, and with `cur` (the curriculum frontier) the covered stretch along the current guidance."""
+    if not R or L is None:
+        return None
+    xz = lambda P: [[round(float(p[0]), 2), round(float(p[2]), 2)] for p in P]  # noqa: E731
+    ok = L.ok[::3]
+    T = L.pos[ok]
+    _, near = _nearest(T, R["main"])
+    over_any = np.zeros(len(T), bool)
+    over_g = np.zeros(len(T), bool)
+    for f in R["families"]:
+        o = f["over"][near]
+        over_any |= o
+        if f["guidance"]:
+            over_g |= o
+    split = lambda mask: [xz(T[a:min(b + 1, len(T))]) for a, b in _runs_of(mask) if b - a >= 1]  # noqa: E731
+    tas = TAS_ROUTE_NAMES.get(int(L.level))
+    out = {"tas_name": f"TAS 参考线（{tas}）" if tas else "TAS 参考线",
+           "tas_main": split(~over_any), "tas_over": split(over_any),
+           "families": [{"id": f["id"], "name": f["name"], "guidance": f["guidance"],
+                         "members": [{"id": m["id"], "name": m["name"], "guidance": m["guidance"],
+                                      "segs": [xz(_resample(d, 2.0)) for d in m["div"]]} for m in f["members"]]}
+                        for f in R["families"]],
+           "classes": route_classes(R)}
+    if cur is not None:
+        # the covered stretch along the current guidance: the TAS line from the frontier on, minus what the guidance
+        # overrides, plus the guidance members' own stretches that lie ahead of the frontier
+        ahead = ok >= cur
+        segs = split(ahead & ~over_g)
+        for f in R["families"]:
+            if not f["guidance"]:
+                continue
+            for m in f["members"]:
+                for d in m["div"]:
+                    j = int(_nearest(d[:1], L.pos[L.ok])[1][0])  # where the stretch leaves the TAS line
+                    if L.ok[j] >= cur:
+                        segs.append(xz(_resample(d, 2.0)))
+        out["covered"] = segs
+    return out
+
+
+def classify_life(tr, R, info=None) -> tuple[str, str]:
+    """(route class, source) of one traced life against a route bundle: the branch member the start state records
+    (rest starts on a branch) when there is one, else where the life went: per point the nearer of a family's own
+    stretch and the main line (by ROUTE_MARGIN, within ROUTE_NEAR), summed as length per family and per overridden TAS
+    stretch. The fork of the current guidance decides first; then the longest; under ROUTE_MIN_LEN: "shared"."""
+    if not R:
+        return "", ""
+    rec = (info or {}).get("branch_id")
+    if rec:
+        for f in R["families"]:
+            if any(m["id"] == rec for m in f["members"]):
+                return f["id"], "recorded"
+    pts, w = tr.get("p3"), tr.get("w3")
+    if pts is None or not len(pts):
+        return "shared", "spatial"
+    pts = np.asarray(pts, np.float64)
+    w = np.asarray(w, np.float64)
+    reg = R["region_r"]
+    box = np.all((pts >= reg.min(0) - ROUTE_NEAR - 2.0) & (pts <= reg.max(0) + ROUTE_NEAR + 2.0), axis=1)
+    pts, w = pts[box], w[box]
+    cand = _nearest(pts, reg)[0] <= ROUTE_NEAR + 2.0
+    if not cand.any():
+        return "shared", "spatial"
+    P, W = pts[cand], w[cand]
+    d_main = _nearest(P, R["main_r"])[0]
+    score: dict = {}
+    for f in R["families"]:
+        d_f = _nearest(P, f["div_r"])[0]
+        on_f = (d_f <= ROUTE_NEAR) & (d_f < d_main - ROUTE_MARGIN)
+        if len(f["over_r"]):
+            d_o = _nearest(P, f["over_r"])[0]
+            on_t = (d_o <= ROUTE_NEAR) & (d_o < d_f - ROUTE_MARGIN)
+        else:
+            on_t = np.zeros(len(P), bool)
+        score[f["id"]] = (float(W[on_f].sum()), float(W[on_t].sum()))
+    for f in R["families"]:  # the current guidance's fork first
+        if f["guidance"]:
+            g, t = score[f["id"]]
+            if max(g, t) >= ROUTE_MIN_LEN:
+                return (f["id"] if g >= t else "tas"), "spatial"
+    best, label = 0.0, "shared"
+    for f in R["families"]:
+        g, t = score[f["id"]]
+        if g > best:
+            best, label = g, f["id"]
+        if t > best:
+            best, label = t, "tas"
+    return (label if best >= ROUTE_MIN_LEN else "shared"), "spatial"
+
+
+def _pin_of_ckpt(p: Path):
+    """(pin, guidance key) of a checkpoint file, memoised by size/mtime; None when it cannot be read."""
+    s = _sig(p)
+    hit = _PIN_MEMO.get(str(p))
+    if hit and hit[0] == s:
+        return hit[1]
+    try:
+        import torch
+        ck = torch.load(p, weights_only=False, map_location="cpu")
+        b = ck.get("branch_assets")
+        pin = (((ck.get("env_config") or {}).get("features") or {}).get("branch_sha256"))
+        res = (str(pin) if pin else None, _guidance_key(b) if b else None)
+    except Exception:
+        return None
+    _PIN_MEMO[str(p)] = (s, res)
+    return res
+
+
+def _pin_keys(run: Run, pins) -> dict:
+    """Guidance keys of route-bundle pins from the run's checkpoints (newest first, stopping once all are found)."""
+    want, out = set(pins), {}
+    try:
+        got = latest_ckpt(run)
+        if got and got[1].get("branch_assets"):
+            out[run_pin(run)] = _guidance_key(got[1]["branch_assets"])
+    except Exception:
+        pass
+    files = sorted(run.path.glob("*.pt"), key=lambda p: (_sig(p) or (0, 0))[1], reverse=True)
+    for p in files:
+        if want <= set(out):
+            break
+        r = _pin_of_ckpt(p)
+        if r and r[0] in want and r[0] not in out and r[1]:
+            out[r[0]] = r[1]
+    return out
+
+
+def _resume_times(run: Run, off_h: float) -> list[int]:
+    out = []
+    for line in log_lines(run):
+        m = LOG_RE.match(line)
+        if m and m.group(2).startswith("resumed from "):
+            out.append(epoch(to_pc(m.group(1), run, off_h)))
+    return out
+
+
+def guidance_since(run: Run, idx: list[dict], off_h: float) -> dict | None:
+    """When the run's route guidance last changed: {"ts" (Unix s), "pins" (server-side only)} or None. The pin
+    sequence is branch-updates.jsonl in the run directory, else the pins its traced lives carry in time order; the
+    last step that changed the guidance (manifest, member lines or descriptions: an update that only adds moving
+    handover tables does not) starts the window. Its time: the trainer's resume between the last life on the old
+    bundle and the first on the new one, else that first life."""
+    seq: list = []
+    try:
+        for line in (run.path / "branch-updates.jsonl").read_text(encoding="utf-8").splitlines():
+            try:
+                j = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(j, dict) or not j.get("to"):
+                continue
+            if not seq and j.get("from"):
+                seq.append(str(j["from"]))
+            seq.append(str(j["to"]))
+    except OSError:
+        pass
+    if not seq:
+        for i in idx:
+            if i.get("pin") and (not seq or seq[-1] != i["pin"]):
+                seq.append(i["pin"])
+    if len(seq) < 2:
+        return None
+    keys = _pin_keys(run, set(seq))
+    at = None
+    for j in range(len(seq) - 1, 0, -1):
+        a, b = keys.get(seq[j - 1]), keys.get(seq[j])
+        if a is None or b is None or a != b:
+            at = j
+            break
+    if at is None:
+        return None
+    post = set(seq[at:])
+    new = [i["t"] for i in idx if i.get("pin") in post and i["t"]]
+    if not new:
+        return None
+    t_first = min(new)
+    old = [i["t"] for i in idx if i.get("pin") not in post and 0 < i["t"] < t_first]
+    t_old = max(old, default=None)
+    res = [t for t in _resume_times(run, off_h) if t <= t_first + 1]
+    t_res = max(res, default=None)
+    ts = t_res if t_res is not None and (t_old is None or t_res >= t_old) else t_first
+    return {"ts": int(ts), "pins": post}
 
 
 _STEPS_MEMO: dict = {}
@@ -679,9 +1066,10 @@ def frontier_history(runs, off_h, record: str | None = None) -> list[dict]:
     return out
 
 
-def frontier_payload(L, runs, off_h, cur_run, cur, show_alt: bool) -> dict:
+def frontier_payload(L, runs, off_h, cur_run, cur, show_alt: bool, routes=None) -> dict:
     """The curriculum map of level L: its TAS line, checkpoints, the frontier moves of the runs on its record and
-    the current frontier of `cur_run` (the level's latest run)."""
+    the current frontier of `cur_run` (the level's latest run); with `routes` (run_routes of cur_run) also its
+    route bundle's lines and the covered stretch along the current guidance ("routes")."""
     pos, ok, n = L.pos, L.ok, L.n
     tas = ok[::3]
     xz = lambda i: [round(float(pos[i, 0]), 2), round(float(pos[i, 2]), 2)]  # noqa: E731
@@ -699,6 +1087,8 @@ def frontier_payload(L, runs, off_h, cur_run, cur, show_alt: bool) -> dict:
         "alt": None, "alt_name": alt_name(L.level),
         "level": L.level, "n": int(n), "end_frame": int(L.clock.end_frame),
     }
+    if routes:
+        out["routes"] = routes_public(routes, L, cur)
     cr = next((r for r in runs if r.name == cur_run), None)
     if show_alt and cr is not None and run_uses_alt(cr):
         try:
@@ -899,7 +1289,7 @@ BALLS = ("Ball_Wood", "Ball_Stone", "Ball_Paper")
 class Traces:
     """Index of traced episodes (small json) + a disk cache of parsed, downsampled agent paths."""
 
-    CACHE_VERSION = 4  # 4: any Ball_* line (level 2 switches to the paper ball), TAS line per record
+    CACHE_VERSION = 5  # 4: any Ball_* line (level 2 switches to the paper ball), TAS line per record; 5: 3D points for routes
 
     def __init__(self, cache_file: Path):
         self.cache_file = cache_file
@@ -952,9 +1342,14 @@ class Traces:
             except Exception:
                 continue
             h = zlib.crc32(p.stem.encode())
+            # the route bundle the life ran with and the branch member a rest start was placed on (server-side only)
+            pin = (d.get("feature_config") or {}).get("branch_sha256")
+            bid = str((d.get("start_state") or {}).get("branch_id") or "")
             info = {"key": j, "id": f"{h:08x}", "run": run.name, "end": OUTCOME.get(d.get("end_reason"), "stopped"),
                     "sr": d.get("sr_ms"), "t": float(d.get("started_at") or 0), "h": h / 2 ** 32,
-                    "backend": BACKEND_LABEL.get(str(d.get("backend")), "其他"), "record": rec}
+                    "backend": BACKEND_LABEL.get(str(d.get("backend")), "其他"), "record": rec,
+                    "pin": str(pin) if isinstance(pin, str) and pin else None,
+                    "branch_id": bid if ROUTE_ID_RE.match(bid) else None}
             self.meta[j] = (s, info)
             out.append(info)
         out.sort(key=lambda r: r["t"])
@@ -987,8 +1382,13 @@ class Traces:
             return None
         cut = np.flatnonzero(np.linalg.norm(np.diff(Q, axis=0), axis=1) > 4) + 1
         segs = [s_[:, [0, 2]].astype(np.float32) for s_ in np.split(Q, cut) if len(s_)]
+        # 3D points ROUTE_STEP apart for the route classification, each weighted by its length along the path
+        # (jumps between lives / respawns count nothing)
+        p3 = np.vstack([_resample(s_) for s_ in np.split(Q, cut) if len(s_)]).astype(np.float32)
+        step = np.linalg.norm(np.diff(p3, axis=0), axis=1)
+        w3 = np.r_[np.where(step > 4, 0.0, step), 0.0].astype(np.float32)
         res = {"k": k, "segs": segs, "deaths": [(float(Q[i - 1, 0]), float(Q[i - 1, 2]), int(F[i - 1])) for i in cut],
-               "start": (float(Q[0, 0]), float(Q[0, 2])), "end_frame": int(F[-1])}
+               "start": (float(Q[0, 0]), float(Q[0, 2])), "end_frame": int(F[-1]), "p3": p3, "w3": w3}
         self.parsed[j] = ((s, rec), res)
         return res
 
@@ -1027,9 +1427,20 @@ def _thin(segs, budget):
     return out
 
 
-def traj_payload(info, tr) -> dict:
+def traj_payload(info, tr, R=None, memo: dict | None = None) -> dict:
+    """One traced life for a map (public); with a route bundle R also its route class ("route") and whether that
+    came from the life's recorded branch member or from where it went ("route_src")."""
     segs = _thin(tr["segs"], MAX_TRAJ_POINTS)
-    return {
+    route = {}
+    if R:
+        k = (info["key"], R["pin"])
+        got = memo.get(k) if memo is not None else None
+        if got is None:
+            got = classify_life(tr, R, info)
+            if memo is not None:
+                memo[k] = got
+        route = {"route": got[0], "route_src": got[1]}
+    return {**route, 
         "id": info["id"], "run": info["run"], "end": info["end"], "backend": info["backend"],
         "t": dt.datetime.fromtimestamp(info["t"]).strftime("%m-%d %H:%M") if info["t"] else None,
         "ts": round(info["t"]), "sr": info["sr"], "k": tr["k"], "end_frame": tr["end_frame"],

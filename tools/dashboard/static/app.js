@@ -436,9 +436,37 @@ function wireRoam(box, id, redraw) {
   box.querySelector(`[data-fs="${id}"]`).onclick = () => toggleFs(id);
 }
 
-function tasSeries(F) {
-  return { type: "lines", name: "TAS 轨迹", coordinateSystem: "geo", polyline: true, silent: true, z: 2, data: [{ coords: F.tas }], lineStyle: { color: "#e9edf7", width: 1, type: "dashed", opacity: 0.7 } };
+/* Route bundle of a run (from its own model checkpoint, sent by the server as "routes"): its route families, the
+   TAS line split into the part no branch overrides and the part one does, and the route classes of the lives. */
+const ROUTE_C = { guide: "#14b89a", tas: "#ff7a1a", shared: "#6f6a5e", other: ["#9b6cf0", "#2f8fe0", "#e0559b", "#c9a227", "#5f9e3a"] };
+function routeClasses(R) {
+  if (!R || !R.classes) return [];
+  let k = 0;
+  return R.classes.map((c) => {
+    const color = c.key === "tas" ? ROUTE_C.tas : c.key === "shared" ? ROUTE_C.shared : c.guidance ? ROUTE_C.guide : ROUTE_C.other[k++ % ROUTE_C.other.length];
+    return { ...c, color, label: c.guidance ? `${c.name}（当前引导）` : c.name };
+  });
 }
+const lineName = (fam) => (fam.guidance ? `当前引导路线（${fam.name}）` : `分支线（${fam.name}）`);
+
+function tasSeries(F, R) {
+  const dashed = (name, coords, opacity) => ({ type: "lines", name, coordinateSystem: "geo", polyline: true, silent: true, z: 2, data: coords.map((c) => ({ coords: c })), lineStyle: { color: "#e9edf7", width: 1, type: "dashed", opacity } });
+  if (!R) return [dashed("TAS 轨迹", [F.tas], 0.7)];
+  const out = [dashed(R.tas_name, R.tas_main, 0.7)];
+  if (R.tas_over && R.tas_over.length) out.push(dashed(R.tas_name, R.tas_over, 0.28));  // less emphasis where a branch overrides it
+  const cls = Object.fromEntries(routeClasses(R).map((c) => [c.key, c]));
+  for (const fam of R.families || []) {
+    const col = (cls[fam.id] || {}).color || ROUTE_C.other[0];
+    for (const m of fam.members) {
+      const main = fam.guidance && m.guidance;  // the member ordinary entries follow: the current guidance
+      out.push({ type: "lines", name: lineName(fam), coordinateSystem: "geo", polyline: true, silent: true, z: main ? 5 : 3,
+        data: m.segs.map((c) => ({ coords: c })),
+        lineStyle: main ? { color: col, width: 3.4, opacity: 0.95, shadowColor: "rgba(0,0,0,.6)", shadowBlur: 3 } : { color: col, width: 1.8, type: "dotted", opacity: 0.9 } });
+    }
+  }
+  return out;
+}
+const legendNames = (series) => [...new Set(series.filter((s) => s.name !== "选中").map((s) => s.name))];
 
 async function renderFrontier(force, full) {
   const lv = LV(), fname = `frontier_l${lv}`;
@@ -452,9 +480,12 @@ async function renderFrontier(force, full) {
   ch._v = key; ch._lv = lv;
   const runs = [...new Set(F.history.map((h) => h.run))];
   const pt = (arr, extra) => arr.map((p) => ({ value: [p[0], p[1]], frame: p[2], label: p[3], ...extra }));
+  const R = F.routes;
+  // with a route bundle the covered stretch follows the current guidance, not the TAS stretch it overrides
+  const covered = R && R.covered ? R.covered : [F.covered];
   const series = [
-    tasSeries(F),
-    { type: "lines", name: "已覆盖段", coordinateSystem: "geo", polyline: true, silent: true, z: 3, data: [{ coords: F.covered }], lineStyle: { color: "#7ed69a", width: 3.2, opacity: 0.9 } },
+    ...tasSeries(F, R),
+    { type: "lines", name: "已覆盖段", coordinateSystem: "geo", polyline: true, silent: true, z: 3, data: covered.map((c) => ({ coords: c })), lineStyle: { color: "#7ed69a", width: 3.2, opacity: R ? 0.55 : 0.9 } },
     { type: "scatter", name: "TAS 帧", coordinateSystem: "geo", z: 4, symbolSize: 5, itemStyle: { color: "rgba(233,237,247,.55)" },
       data: F.tas_pts.map((p) => ({ value: [p[0], p[1]], frame: p[2] })), tooltip: { formatter: (p) => `TAS 第 ${p.data.frame} 帧` } },
     { type: "scatter", name: "盘点", coordinateSystem: "geo", z: 6, symbol: "rect", symbolSize: 11, itemStyle: { color: AMBER, borderColor: "#1b1206", borderWidth: 1.5 },
@@ -473,13 +504,38 @@ async function renderFrontier(force, full) {
       tooltip: { formatter: (p) => `<b>当前（${p.data.run}）</b><br>第 ${p.data.frame} 帧<br>智能体已能接手全程的 ${p.data.covered_pct}%` } },
   ];
   if (F.alt) series.splice(2, 0, { type: "lines", name: `${F.alt_name || "替代路线"}参考线`, coordinateSystem: "geo", polyline: true, silent: true, z: 3, data: [{ coords: F.alt }], lineStyle: { color: "#7ed69a", width: 3, type: "dotted" } });
-  apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: series.map((s) => s.name) }, geo: { ...geoBase(roamOn[id], lv), top: 40 }, series }, full);
+  apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: legendNames(series) }, geo: { ...geoBase(roamOn[id], lv), top: 40 }, series }, full);
+  routeNote("n-frontier", R);
 }
 
 function trajTooltip(d) {
   const o = OUT[d.end] || OUT.stopped;
-  return `<b>${d.run}</b> · <span style="color:${o.c}">${o.n}</span><br>开始 ${d.ts != null ? lt(d.ts) : d.t}（${TZ}）<br>接手帧 ${d.k}，结束帧 ${d.end_frame}` +
-    (d.sr ? `<br>SR ${(d.sr / 1000).toFixed(3)} s` : "") + `<br>死亡 ${d.deaths.length} 次 · ${d.backend}`;
+  return `<b>${esc(d.run)}</b> · <span style="color:${o.c}">${o.n}</span><br>开始 ${d.ts != null ? lt(d.ts) : d.t}（${TZ}）<br>接手帧 ${d.k}，结束帧 ${d.end_frame}` +
+    (d.sr ? `<br>SR ${(d.sr / 1000).toFixed(3)} s` : "") + `<br>死亡 ${d.deaths.length} 次 · ${esc(d.backend)}` +
+    (d._rc ? `<br>路线：<span style="color:${d._rc.color}">${esc(d._rc.label)}</span>（${d.route_src === "recorded" ? "开局记录的分支" : "按轨迹位置判断"}）` : "");
+}
+
+/* route filter / colour controls shared by the two trajectory maps */
+function routeChecks(st, RC, trs) {
+  const n = {};
+  for (const d of trs) n[d.route] = (n[d.route] || 0) + 1;
+  return RC.map((c) => `<label title="显示 / 隐藏这条路线的尝试"><input type="checkbox" data-rt="${esc(c.key)}"${st.hide[c.key] ? "" : " checked"}><span style="color:${c.color}">■</span>${esc(c.label)} ${n[c.key] || 0}</label>`).join("");
+}
+function colorButtons(st, alt) {
+  return `<span>着色：<button type="button" class="tbtn${st.color === "route" ? " on" : ""}" data-cm="route">路线</button><button type="button" class="tbtn${st.color !== "route" ? " on" : ""}" data-cm="${alt[0]}">${alt[1]}</button></span>`;
+}
+function wireRouteControls(box, st, redraw) {
+  box.querySelectorAll("[data-rt]").forEach((c) => (c.onchange = () => { st.hide[c.dataset.rt] = !c.checked; box.dataset.shown = ""; redraw(false); }));
+  box.querySelectorAll("[data-cm]").forEach((b) => (b.onclick = () => { st.color = b.dataset.cm; box.dataset.shown = ""; redraw(true); }));
+}
+function routeNote(elId, R) {
+  const el = $(elId);
+  if (!el) return;
+  el.hidden = !R;
+  if (!R) return;
+  const g = (R.families || []).find((f) => f.guidance);
+  el.textContent = (g ? `粗实线：${lineName(g)}，普通开局按它走；` : "") + ((R.families || []).some((f) => f.members.some((m) => !(f.guidance && m.guidance))) ? "点线：路线包里的其他分支线；" : "") +
+    `白色虚线：${R.tas_name}，被分支覆盖的一段画得更淡。路线来自该 run 最新的模型检查点里的路线包。`;
 }
 
 function plasma(t) {
@@ -489,7 +545,10 @@ function plasma(t) {
   return `rgb(${c[0]},${c[1]},${c[2]})`;
 }
 
-const mapState = { "m-attempts": { picked: null, outcomes: { finish: true, gameover: true, stopped: true } }, "m-history": { picked: null, outcomes: { finish: true, gameover: true, stopped: true }, t0: 0, t1: 1 } };
+// color: "route" (by route class, when the run has a route bundle) or the map's own colouring; hide: route classes
+// switched off; win (history): "since" (since the last route-guidance change) or "all"
+const mapState = { "m-attempts": { picked: null, outcomes: { finish: true, gameover: true, stopped: true }, color: "route", hide: {} },
+  "m-history": { picked: null, outcomes: { finish: true, gameover: true, stopped: true }, t0: 0, t1: 1, color: "route", hide: {}, win: "since" } };
 
 function trajSeries(trs, colorOf, groupOf, groups) {
   const series = [];
@@ -543,16 +602,24 @@ async function renderAttempts(force, full) {
   if (!A || !F || !(await ensureGeo(lv))) { ch.clear(); ch._drawn = false; ch._run = null; box.innerHTML = "<span>这个 run 没有记录轨迹。</span>"; box.dataset.wired = ""; return; }
   if (!force && box.dataset.shown === name + P[name].v + "@" + lv) return;
   box.dataset.shown = name + P[name].v + "@" + lv;
-  box.innerHTML = `<span>最新 ${A.traj.length} 局 / 共记录 ${A.total} 局</span>${outcomeChecks(id)}${roamToggle(id)}`;
+  const R = A.routes, RC = routeClasses(R), byKey = Object.fromEntries(RC.map((c) => [c.key, c]));
+  for (const d of A.traj) d._rc = byKey[d.route] || null;
+  const byRoute = R && st.color === "route";
+  box.innerHTML = `<span>最新 ${A.traj.length} 局 / 共记录 ${A.total} 局</span>${R ? colorButtons(st, ["outcome", "结果"]) : ""}${outcomeChecks(id)}` +
+    (R ? `<span class="rchk">${routeChecks(st, RC, A.traj)}</span>` : "") + roamToggle(id);
   wireRoam(box, id, () => renderAttempts(true, true));
   box.querySelectorAll("[data-o]").forEach((c) => (c.onchange = () => { st.outcomes[c.dataset.o] = c.checked; box.dataset.shown = ""; renderAttempts(true); }));
-  const trs = A.traj.filter((d) => st.outcomes[d.end]);
-  const groups = Object.entries(OUT).filter(([k]) => st.outcomes[k]).map(([k, o]) => [o.n, o.c]);
-  const series = [tasSeries(F), ...trajSeries(trs, (d) => (OUT[d.end] || OUT.stopped).c, (d) => (OUT[d.end] || OUT.stopped).n, groups), pickedSeries(st)];
+  wireRouteControls(box, st, (f) => renderAttempts(true, f));
+  const trs = A.traj.filter((d) => st.outcomes[d.end] && (!R || !st.hide[d.route]));
+  const groups = byRoute ? RC.filter((c) => !st.hide[c.key]).map((c) => [c.label, c.color]) : Object.entries(OUT).filter(([k]) => st.outcomes[k]).map(([k, o]) => [o.n, o.c]);
+  const series = [...tasSeries(F, R),
+    ...(byRoute ? trajSeries(trs, (d) => (d._rc || {}).color || ROUTE_C.shared, (d) => (d._rc || {}).label, groups)
+      : trajSeries(trs, (d) => (OUT[d.end] || OUT.stopped).c, (d) => (OUT[d.end] || OUT.stopped).n, groups)), pickedSeries(st)];
   if (ch._run !== sel) { st.picked = null; $("p-attempts").textContent = "点击轨迹查看详情"; series[series.length - 1] = pickedSeries(st); }
-  apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: series.filter((s) => s.name !== "选中").map((s) => s.name) }, geo: { ...geoBase(roamOn[id], lv), top: 40 }, series }, full || ch._run !== sel);
+  apply(ch, { animation: false, tooltip: TT, legend: { ...LEG, data: legendNames(series) }, geo: { ...geoBase(roamOn[id], lv), top: 40 }, series }, full || ch._run !== sel);
   ch._run = sel;
   wirePick(ch, id, "p-attempts");
+  routeNote("n-attempts", R);
 }
 
 async function renderHistory(force, full) {
@@ -564,30 +631,49 @@ async function renderHistory(force, full) {
   const key = hname + "@" + P[hname].v;
   if (!force && box.dataset.shown === key) return;
   box.dataset.shown = key;
-  if (ch._lv !== lv) { full = true; st.picked = null; $("p-history").textContent = "颜色越亮越新 · 点击轨迹查看详情"; }
+  const R = H.routes, RC = routeClasses(R), byKey = Object.fromEntries(RC.map((c) => [c.key, c]));
+  const byRoute = R && st.color === "route";
+  const hint = (byRoute ? "颜色按路线" : "颜色越亮越新") + " · 点击轨迹查看详情";
+  if (ch._lv !== lv) { full = true; st.picked = null; st.t0 = 0; st.t1 = 1; }
+  if (!st.picked) $("p-history").textContent = hint;
+  $("p-history").dataset.hint = hint;
   ch._lv = lv;
-  const ts = H.traj.map((d) => d.ts);
-  const tmin = Math.min(...ts), tmax = Math.max(...ts), span = Math.max(1, tmax - tmin);
+  // window: since the level's latest run last changed its route guidance (default when known), or the whole sample
+  const since = H.since && H.traj.some((d) => d.w & 2) ? H.since : null;
+  const win = since && st.win === "since" ? "since" : "all";
+  const pool = H.traj.filter((d) => d.w == null || (win === "since" ? d.w & 2 : d.w & 1));
+  for (const d of pool) d._rc = byKey[d.route] || null;
+  const ts = pool.map((d) => d.ts);
+  const tmin = ts.length ? Math.min(...ts) : 0, tmax = ts.length ? Math.max(...ts) : 1, span = Math.max(1, tmax - tmin);
   const hrs = (t) => ((t - tmin) / 3600).toFixed(1);
   const lo = tmin + st.t0 * span, hi = tmin + st.t1 * span;
-  box.innerHTML = `<span>按时间抽 ${H.traj.length} 局 / 共记录 ${H.total} 局</span>${outcomeChecks(id)}
-    <label>时间从 <input type="range" min="0" max="1000" value="${Math.round(st.t0 * 1000)}" data-t="0"> 到 <input type="range" min="0" max="1000" value="${Math.round(st.t1 * 1000)}" data-t="1"></label>
+  const winTxt = win === "since" ? `自路线引导切换以来（${lt(since.ts)} 起，${esc(since.run)}）· 抽 ${pool.length} 局 / 共 ${since.total} 局`
+    : `全部记录（${pool.length ? `${lt(tmin)} 起，约 ${(span / 3600).toFixed(0)} 小时` : "—"}）· 按时间抽 ${pool.length} 局 / 共记录 ${H.total} 局`;
+  box.innerHTML = `<span class="hwin">${winTxt}</span>` +
+    (since ? `<span>时间窗：<button type="button" class="tbtn${win === "since" ? " on" : ""}" data-win="since">路线引导切换以来</button><button type="button" class="tbtn${win === "all" ? " on" : ""}" data-win="all">全部</button></span>` : "") +
+    (R ? colorButtons(st, ["time", "时间"]) : "") + outcomeChecks(id) + (R ? `<span class="rchk">${routeChecks(st, RC, pool)}</span>` : "") +
+    `<label>时间从 <input type="range" min="0" max="1000" value="${Math.round(st.t0 * 1000)}" data-t="0"> 到 <input type="range" min="0" max="1000" value="${Math.round(st.t1 * 1000)}" data-t="1"></label>
     <span id="h-range">${hrs(lo)} – ${hrs(hi)} 小时</span>${roamToggle(id)}`;
   wireRoam(box, id, () => renderHistory(true, true));
   box.querySelectorAll("[data-o]").forEach((c) => (c.onchange = () => { st.outcomes[c.dataset.o] = c.checked; box.dataset.shown = ""; renderHistory(true); }));
+  box.querySelectorAll("[data-win]").forEach((b) => (b.onclick = () => { st.win = b.dataset.win; st.t0 = 0; st.t1 = 1; st.picked = null; box.dataset.shown = ""; renderHistory(true, true); }));
+  wireRouteControls(box, st, (f) => renderHistory(true, f));
   box.querySelectorAll("[data-t]").forEach((c) => {
     c.oninput = () => { const v = c.value / 1000; if (c.dataset.t === "0") st.t0 = Math.min(v, st.t1); else st.t1 = Math.max(v, st.t0); $("h-range").textContent = `${hrs(tmin + st.t0 * span)} – ${hrs(tmin + st.t1 * span)} 小时`; };
     c.onchange = () => { box.dataset.shown = ""; renderHistory(true); };
   });
-  const trs = H.traj.filter((d) => st.outcomes[d.end] && d.ts >= lo - 1 && d.ts <= hi + 1);
-  const groups = H.runs.map((r) => [r, runColor(r)]);
-  const series = [tasSeries(F), ...trajSeries(trs, (d) => plasma((d.ts - tmin) / span), (d) => d.run, groups), pickedSeries(st)];
+  const trs = pool.filter((d) => st.outcomes[d.end] && d.ts >= lo - 1 && d.ts <= hi + 1 && (!R || !st.hide[d.route]));
+  const series = [...tasSeries(F, R),
+    ...(byRoute ? trajSeries(trs, (d) => (d._rc || {}).color || ROUTE_C.shared, (d) => (d._rc || {}).label, RC.filter((c) => !st.hide[c.key]).map((c) => [c.label, c.color]))
+      : trajSeries(trs, (d) => plasma((d.ts - tmin) / span), (d) => d.run, H.runs.map((r) => [r, runColor(r)]))), pickedSeries(st)];
   apply(ch, {
-    animation: false, tooltip: TT, legend: { ...LEG, data: series.filter((s) => s.name !== "选中").map((s) => s.name) }, geo: { ...geoBase(roamOn[id], lv), top: 40 }, series,
-    visualMap: { type: "continuous", show: true, min: 0, max: +(span / 3600).toFixed(1), seriesIndex: [], calculable: false, orient: "horizontal", right: 10, bottom: 6, itemWidth: 10, itemHeight: 120,
+    animation: false, tooltip: TT, legend: { ...LEG, data: legendNames(series) }, geo: { ...geoBase(roamOn[id], lv), top: 40 }, series,
+    visualMap: { type: "continuous", show: !byRoute, min: 0, max: +(span / 3600).toFixed(1), seriesIndex: [], calculable: false, orient: "horizontal", right: 10, bottom: 6, itemWidth: 10, itemHeight: 120,
       text: ["新", "旧（小时）"], textStyle: { color: INK, fontSize: 11 }, inRange: { color: [0, 0.25, 0.5, 0.75, 1].map(plasma) } },
   }, full);
   wirePick(ch, id, "p-history");
+  routeNote("n-history", R);
+  if (R && H.routes_run) $("n-history").textContent += ` 路线按 ${H.routes_run} 的路线包划分。`;
 }
 
 /* ----------------------------------------------------------------------------------- curves */

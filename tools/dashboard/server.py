@@ -233,6 +233,7 @@ class Dashboard:
         self.wake = threading.Event()
         self.levels: dict = {}  # TAS record -> geometry.Level (built in the generation thread only)
         self.traces = D.Traces(CACHE / "traces.pkl")
+        self.route_memo: dict = {}  # (traced life, bundle pin) -> route class
         self.sigs: dict = {}
         self.summary: dict = {}
         self.gen = {"running": False, "last_start": 0.0, "generated_at": None, "seconds": None, "errors": {}}
@@ -344,9 +345,11 @@ class Dashboard:
                     cur = int(cur_st.get("frontier") or L.default_frontier)
                     if name == sel:
                         self.map_frontier = (sel, cur)  # what the charts were built for (status() compares)
+                    routes = D.run_routes(cur_run) if cur_run is not None else None
                     sig = (tuple(D._sig(r.path / "train.log") for r in runs), tuple(D._sig(r.path / "config.json") for r in runs),
-                           cur, name, L.record, self.show_alt)
-                    put(f"frontier_l{lv}", sig, lambda L=L, name=name, cur=cur: D.frontier_payload(L, runs, off, name, cur, self.show_alt))
+                           cur, name, L.record, self.show_alt, routes["pin"] if routes else None)
+                    put(f"frontier_l{lv}", sig, lambda L=L, name=name, cur=cur, routes=routes:
+                        D.frontier_payload(L, runs, off, name, cur, self.show_alt, routes))
             self._section("frontier", errors, frontier)
 
             def curves():
@@ -359,35 +362,73 @@ class Dashboard:
                 keep = set()
                 allidx: dict = {}  # level -> traced episodes of the runs on that level's map record
                 counts = {}
+                by_run: dict = {}
                 for r in mac:
                     idx = self.traces.index(r)
                     counts[r.name] = len(idx)
                     lv = D.run_level(r)
                     if lv["level"] in levels and levels[lv["level"]][0].record == lv["record"]:
                         allidx.setdefault(lv["level"], []).extend(idx)
+                    by_run[r.name] = idx
                     if not idx:
                         continue
                     latest = idx[-ATTEMPTS_N:]
                     keep.update(i["key"] for i in latest)
+                    R = D.run_routes(r)  # the run's own route bundle: its lines and its lives' route classes
+                    L_r = self.levels.get(lv["record"])
 
-                    def build(latest=latest, n=len(idx), run=r.name, level=lv["level"]):
-                        trs = [D.traj_payload(i, t) for i in latest if (t := self.traces.get(i)) is not None]
-                        return {"run": run, "level": level, "total": n, "traj": trs}
-                    put(f"attempts_{r.name}", (len(idx), idx[-1]["key"], lv["record"]), build)
+                    def build(latest=latest, n=len(idx), run=r.name, level=lv["level"], R=R, L_r=L_r):
+                        trs = [D.traj_payload(i, t, R, self.route_memo) for i in latest if (t := self.traces.get(i)) is not None]
+                        out = {"run": run, "level": level, "total": n, "traj": trs}
+                        if R and L_r is not None:
+                            out["routes"] = D.routes_public(R, L_r)
+                        return out
+                    put(f"attempts_{r.name}", (len(idx), idx[-1]["key"], lv["record"], R["pin"] if R else None,
+                                               L_r is not None), build)
                 for lv, ai in allidx.items():
                     ai.sort(key=lambda i: i["t"])
                     sub, thin = D.nested_sample(ai, HISTORY_N)
                     keep.update(i["key"] for i in sub)
                     if ai:
                         runs_lv = {i["run"] for i in ai}
+                        L, cur_run = levels[lv]
+                        # the level's latest run: its bundle classifies every life on the map, and the lives since its
+                        # last route-guidance change are a sample of their own (the default window of the page)
+                        R = D.run_routes(cur_run) if cur_run is not None else None
+                        since = None
+                        if R and cur_run is not None:
+                            try:
+                                since = D.guidance_since(cur_run, by_run.get(cur_run.name) or [], off)
+                            except Exception:
+                                log("guidance window failed:\n" + traceback.format_exc())
+                        s_items = [i for i in ai if since and i["run"] == cur_run.name and i.get("pin") in since["pins"]]
+                        s_sub, s_thin = D.nested_sample(s_items, HISTORY_N) if s_items else ([], [])
+                        keep.update(i["key"] for i in s_sub)
 
-                        def build_h(thin=thin, n=len(ai), runs_lv=runs_lv, lv=lv):
-                            trs = [D.traj_payload(i, t) for i in thin if (t := self.traces.get(i)) is not None]
-                            return {"runs": [r.name for r in mac if counts.get(r.name) and r.name in runs_lv],
-                                    "level": lv, "total": n, "traj": trs}
+                        def build_h(thin=thin, n=len(ai), runs_lv=runs_lv, lv=lv, L=L, R=R, since=since, s_thin=s_thin,
+                                    n_s=len(s_items), cur=cur_run.name if cur_run is not None else None):
+                            # one list for both windows: "w" 1 = the full sample, 2 = the since-change sample, 3 = both
+                            ws: dict = {}
+                            for i in thin:
+                                ws[i["key"]] = ws.get(i["key"], 0) | 1
+                            for i in s_thin:
+                                ws[i["key"]] = ws.get(i["key"], 0) | 2
+                            items = sorted({i["key"]: i for i in [*thin, *s_thin]}.values(), key=lambda i: i["t"])
+                            trs = [dict(D.traj_payload(i, t, R, self.route_memo), w=ws[i["key"]])
+                                   for i in items if (t := self.traces.get(i)) is not None]
+                            out = {"runs": [r.name for r in mac if counts.get(r.name) and r.name in runs_lv],
+                                   "level": lv, "total": n, "traj": trs}
+                            if R:
+                                out["routes"] = D.routes_public(R, L)
+                                out["routes_run"] = cur
+                            if since and s_thin:
+                                out["since"] = {"ts": since["ts"], "run": cur, "total": n_s}
+                            return out
                         put(f"history_l{lv}", (tuple(sorted((k, v) for k, v in counts.items() if k in runs_lv)),
-                                               levels[lv][0].record), build_h)
+                                               L.record, R["pin"] if R else None, since["ts"] if since else None,
+                                               len(s_items)), build_h)
                 self.traces.save(keep)
+                self.route_memo = {k: v for k, v in self.route_memo.items() if k[0] in keep}
                 summary["traced_counts"] = counts
             self._section("traces", errors, traces)
 

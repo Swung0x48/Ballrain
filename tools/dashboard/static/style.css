@@ -118,6 +118,10 @@ body.fs-lock { overflow: hidden; }
 .tbtn { font: inherit; font-size: 12.5px; color: var(--amber); background: #1b140b; border: 1px solid var(--brass); padding: 3px 10px; cursor: pointer; }
 .tbtn.on { background: var(--brass); color: #1b1206; }
 .pick { font-size: 13px; color: var(--muted); margin-top: 6px; min-height: 20px; }
+/* route legend / filter and history window of the trajectory maps */
+.maptools .rchk { display: inline-flex; flex-wrap: wrap; gap: 4px 12px; }
+.maptools .hwin { color: var(--ink); }
+.maptools .tbtn + .tbtn { margin-left: 4px; }
 .pick b { color: var(--amber); }
 .tw { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
