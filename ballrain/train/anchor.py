@@ -351,7 +351,8 @@ def row_weights(row_keys, anchored: dict, weight_of=lambda k: 1.0, min_rows: int
 
 # ------------------------------------------------------------------------------------------------ teachers
 
-def teacher_layout_error(mine: dict, theirs: dict, t_obs: int, n_obs: int, t_act: int, n_act: int) -> str | None:
+def teacher_layout_error(mine: dict, theirs: dict, t_obs: int, n_obs: int, t_act: int, n_act: int,
+                         ignore: frozenset = frozenset()) -> str | None:
     """None when a teacher with features `theirs` (t_obs entries, t_act actions) can read this run's observations
     (features `mine`, n_obs entries), otherwise the reason. The teacher reads the first t_obs entries: a teacher without
     the f7 reach block or the f8 contact blocks (appended at the end) is allowed when its layout is a prefix of this
@@ -363,7 +364,8 @@ def teacher_layout_error(mine: dict, theirs: dict, t_obs: int, n_obs: int, t_act
     tv, mv = theirs.get("reach_version"), mine.get("reach_version")
     if tv and isinstance(mv, str) and mv.startswith(f"{tv}-mech1-"):
         appended.add("reach_version")
-    diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k) and k not in appended)
+    # ignore: keys the caller has validated itself (an append-only branch repin: --teacher-allow-context-append)
+    diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k) and k not in appended | set(ignore))
     if (t_obs != n_obs and not appended) or int(t_act) != n_act or diff:
         return f"observations differ (n_obs {t_obs} vs {n_obs}, features {diff})"
     if appended:

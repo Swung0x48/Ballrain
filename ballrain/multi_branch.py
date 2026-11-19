@@ -43,9 +43,20 @@ def _manifest(doc):
         if (
             not isinstance(phases, list)
             or not phases
-            or set(item) != {"id", "phases", "merge"}
+            or set(item) - {"id", "phases", "merge", "entry_context", "ordinary_exclude"}
+            or "merge" not in item
+            or ("entry_context" in item and item["entry_context"] not in ("ordinary", "drill"))
         ):
             raise RouteError("invalid branch phases")
+        if "ordinary_exclude" in item:
+            exclude = item["ordinary_exclude"]
+            if (item.get("entry_context") != "ordinary" or set(exclude) != {"record_sha256", "ranges"}
+                    or not re.fullmatch(r"[a-f0-9]{64}", exclude["record_sha256"])
+                    or not isinstance(exclude["ranges"], list) or not exclude["ranges"]
+                    or any(not isinstance(pair, list) or len(pair) != 2
+                           or any(type(k) is not int for k in pair) or not 0 < pair[0] < pair[1]
+                           for pair in exclude["ranges"])):
+                raise RouteError("invalid ordinary prefix exclusion")
         prev = None
         for idx, phase in enumerate(phases):
             if "from" in phase:
@@ -97,6 +108,7 @@ def matches(g, pos, sector, ball, arc):
 
 class MultiFollower:
     def __init__(self, main, members):
+        self.entry_context = "ordinary"
         self.main, self.members = main, members
         self.by_id = {e["id"]: (e, f) for e, f in members}
         self.primary = members[0][1].routes[0]
@@ -160,7 +172,7 @@ class MultiFollower:
         if old is None:
             pr = self.primary.update(pos, sector)
             for e, f in self.members:
-                if e["id"] in self.done:
+                if e["id"] in self.done or e.get("entry_context", self.entry_context) != self.entry_context:
                     continue
                 if e.get("legacy"):
                     if sector != f.sector or bt != f.ball_type:

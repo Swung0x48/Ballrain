@@ -55,6 +55,58 @@ def uses_custom_rules(bundle):
     return any(bundle_rules(member) != DEFAULT_RULES for member in members)
 
 
+def uses_entry_context(bundle):
+    if bundle is None or bundle.get("version") != 2:
+        return False
+    from .multi_branch import manifest
+
+    return any("entry_context" in item for item in manifest(bundle["manifest"]))
+
+
+def ordinary_start_frames(starts, bundle):
+    """Filter ordinary prefixes without changing the TAS record seen by explicit drills."""
+    if bundle is None or bundle.get("version") != 2:
+        return starts.valid
+    from .multi_branch import manifest
+
+    mask = None
+    for item in manifest(bundle["manifest"]):
+        spec = item.get("ordinary_exclude")
+        if spec is None:
+            continue
+        if starts.meta.get("record_sha256") != spec["record_sha256"]:
+            raise RouteError("ordinary prefix exclusion is for a different pinned TAS record")
+        if mask is None:
+            mask = np.ones(len(starts.valid), dtype=bool)
+        for lo, hi in spec["ranges"]:
+            mask &= ~((starts.valid >= lo) & (starts.valid < hi))
+    if mask is None:
+        return starts.valid
+    if not mask.any():
+        raise RouteError("ordinary prefix exclusion left no valid starts")
+    return starts.valid[mask]
+
+
+def contextual_append_end(old, new, level, main_sha, old_pin, new_pin):
+    """Return the last affected main station for a strictly append-only contextual change."""
+    from .multi_branch import manifest
+
+    err = RouteError("teacher branch exception requires a validated append-only contextual bundle")
+    if not old or not new or old.get("version") != 2 or new.get("version") != 2:
+        raise err
+    if validate(old, level, main_sha) != old_pin or validate(new, level, main_sha) != new_pin:
+        raise err
+    before, after = manifest(old["manifest"]), manifest(new["manifest"])
+    n = len(before)
+    if (len(after) <= n or after[:n] != before or new["members"][:n] != old["members"]
+            or any(e.get("entry_context") != "ordinary" for e in after[n:])):
+        raise err
+    ends = [float(json.loads(m["desc_json"])["main_s"][1]) for m in new["members"][n:]]
+    if not np.isfinite(ends).all():
+        raise err
+    return max(ends)
+
+
 def rest_member(bundle, key):
     """The unqualified v1 rest syntax can address exactly one legacy member."""
     from .multi_branch import manifest

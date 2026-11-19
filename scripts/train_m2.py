@@ -112,7 +112,7 @@ def parse_rest_starts(spec: str):
     return out or None
 
 
-def gated_curriculum(starts, cfg, finish_gate: float):
+def gated_curriculum(starts, cfg, finish_gate: float, *, valid=None):
     """ReverseCurriculum whose frontier also needs the LevelFinish rate of the band episodes to reach finish_gate:
     with --success cp a frontier in an early sector only has to reach the next checkpoint, and the gate keeps it from
     running ahead of whole-run competence (the band episodes continue to the end of the level after the checkpoint)."""
@@ -120,7 +120,7 @@ def gated_curriculum(starts, cfg, finish_gate: float):
 
     class Gated(ReverseCurriculum):
         def __init__(self):
-            super().__init__(starts, cfg)
+            super().__init__(starts, cfg, valid=valid)
             self.finishes = deque(maxlen=max(cfg.min_episodes, 1))
             self.finish_gate = finish_gate
             self.gate_blocked = 0
@@ -324,6 +324,8 @@ def build_parser() -> argparse.ArgumentParser:
                         'life not started at or after "below" once it reaches route s (WorkerSpec.rail_gate)')
     p.add_argument("--teacher", default="", help="checkpoint of a frozen teacher policy: the PPO loss gets + coef x "
                    "KL(teacher || policy) on batch states whose route s (path_progress x line length) is >= --teacher-s-min")
+    p.add_argument("--teacher-allow-context-append", action="store_true",
+                   help="allow an unchanged teacher beyond a validated appended ordinary-only branch span")
     p.add_argument("--teacher-coef", type=float, default=0.1)
     p.add_argument("--teacher-coef-floor", type=float, default=None,
                    help="decay the coefficient linearly to this floor over --teacher-decay-updates (default: constant)")
@@ -440,7 +442,7 @@ def obs_layout(fc):
 def make_env_config(a, out_root: Path, ck=None, init=None):
     """ck: the checkpoint resumed from (--resume); init: the one a new run starts from (--init-from), whose route
     branch bundle the new run keeps unless --branch-dir names one (it must match that checkpoint's pin)."""
-    from ballrain.branch_assets import read_bundle, validate
+    from ballrain.branch_assets import read_bundle, uses_entry_context, validate
     from ballrain.path import RouteError
     from ballrain.env import EnvConfig
     from ballrain.features import FeatureConfig
@@ -467,6 +469,8 @@ def make_env_config(a, out_root: Path, ck=None, init=None):
         if validate(bundle, a.level, main_sha) != want:
             raise RouteError("--init-from checkpoint: its branch assets do not match its own pin")
     pin = validate(bundle, a.level, main_sha) if bundle is not None else None
+    if getattr(a, "pool_ingest", False) and uses_entry_context(bundle):
+        raise RouteError("contextual branch entrances are Python-only; disable --pool-ingest")
     update = getattr(a, "branch_update", False)
     if update and (not a.branch_dir or saved is None):
         raise RouteError("--branch-update needs --branch-dir and an existing checkpoint bundle")
@@ -601,7 +605,12 @@ def main(argv=None) -> int:
             lo, hi = (int(v) for v in r.split("-"))
             keep &= ~((starts.valid >= lo) & (starts.valid < hi))
         starts.restrict(keep)
-    cu = gated_curriculum(starts, CurriculumConfig(**(env_cfg.curriculum or cu_cfg), seed=a.seed), a.finish_gate)
+    from ballrain.branch_assets import ordinary_start_frames
+    ordinary_valid = ordinary_start_frames(starts, env_cfg.branch_assets)
+    if len(ordinary_valid) != len(starts.valid):
+        log.msg(f"ordinary branch filter: removed {len(starts.valid)-len(ordinary_valid)} prefixes; drills unchanged")
+    cu = gated_curriculum(starts, CurriculumConfig(**(env_cfg.curriculum or cu_cfg), seed=a.seed), a.finish_gate,
+                          valid=ordinary_valid)
     cu.floor = int(a.frontier_floor or 0)
     hidden = tuple(int(x) for x in a.hidden.split(","))
     from ballrain.env import BallanceEnv
@@ -969,16 +978,38 @@ def main(argv=None) -> int:
         watch = (sl.start, lo_s / length, hi_s / length)
         log.msg(f"watch entropy on route s {lo_s:g}-{hi_s:g} (line length {length:.1f})")
 
+    def branch_append_ignore(tck, what, s_min=None):
+        """frozenset({"branch_sha256"}) when a teacher checkpoint's branch pin differs from this run's only by an
+        append-only, context-gated member (--teacher-allow-context-append, ballrain.branch_assets.contextual_append_end);
+        with s_min (the position-based --teacher) the teacher's route mask must also start above the appended span."""
+        mine, theirs = asdict(env_cfg)["features"], tck["env_config"]["features"]
+        if not a.teacher_allow_context_append or mine.get("branch_sha256") == theirs.get("branch_sha256"):
+            return frozenset()
+        from ballrain.branch_assets import contextual_append_end
+        from ballrain.path import RouteError
+        try:
+            end = contextual_append_end(tck.get("branch_assets"), env_cfg.branch_assets, env_cfg.level,
+                                        mine.get("path_sha256"), theirs.get("branch_sha256"), mine.get("branch_sha256"))
+            if s_min is not None and not s_min > end:
+                raise RouteError(f"teacher s-min must be above the appended main span ({end:.6f})")
+        except RouteError as exc:
+            raise SystemExit(f"{what} contextual append refused: {exc}") from None
+        log.msg(f"{what} branch append: appended span ends at {end:.6f}"
+                + (f"; teacher s >= {s_min:g}" if s_min is not None else ""))
+        return frozenset({"branch_sha256"})
+
     teacher = None
     if a.teacher:
         from ballrain.path import ReferencePath, asset_path, resolve_path_dir
         from ballrain.train.anchor import teacher_layout_error
         tck = torch.load(a.teacher, weights_only=False)
         # the teacher reads the first n_obs entries: a teacher without the f7 reach block / the f8 contact blocks
-        # (appended at the end) or on the plain reach block under --reach-mechanisms is allowed (teacher_layout_error)
+        # (appended at the end) or on the plain reach block under --reach-mechanisms is allowed (teacher_layout_error);
+        # an append-only branch repin is allowed with --teacher-allow-context-append (branch_append_ignore)
+        t_ignore = branch_append_ignore(tck, "--teacher", a.teacher_s_min)
         t_obs = int(tck["n_obs"])
         err = teacher_layout_error(asdict(env_cfg)["features"], tck["env_config"]["features"], t_obs, n_obs,
-                                   int(tck["n_act"]), n_act)
+                                   int(tck["n_act"]), n_act, t_ignore)
         if err:
             raise SystemExit(f"--teacher {a.teacher}: {err}")
         ta = tck["args"]
@@ -1014,7 +1045,7 @@ def main(argv=None) -> int:
         if a.anchor_teacher:
             tck = torch.load(a.anchor_teacher, weights_only=False)
             err = AN.teacher_layout_error(mine, tck["env_config"]["features"], int(tck["n_obs"]), n_obs,
-                                          int(tck["n_act"]), n_act)
+                                          int(tck["n_act"]), n_act, branch_append_ignore(tck, "--anchor-teacher"))
             if err:
                 raise SystemExit(f"--anchor-teacher {a.anchor_teacher}: {err}")
             ta = tck["args"]
@@ -1025,7 +1056,9 @@ def main(argv=None) -> int:
         if ck is not None and ck.get("anchor"):
             anchor.load_state_dict(ck["anchor"])
             for sid, pay in list(anchor.snapshots.items()):  # a later observation growth: the --teacher layout rules
-                err = AN.teacher_layout_error(mine, pay["features"], int(pay["n_obs"]), n_obs, n_act, n_act)
+                # a snapshot taken before an append-only repin keeps its old pin (its families keep their guidance)
+                ign = (frozenset({"branch_sha256"}) if a.teacher_allow_context_append else frozenset())
+                err = AN.teacher_layout_error(mine, pay["features"], int(pay["n_obs"]), n_obs, n_act, n_act, ign)
                 if err:
                     anchor.drop_snapshot(sid, f"layout: {err}")
         sm = anchor.summary()

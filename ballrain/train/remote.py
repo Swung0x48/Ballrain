@@ -29,7 +29,7 @@ import time
 import traceback
 from multiprocessing.connection import Client, Listener
 
-from ..branch_assets import uses_custom_rules
+from ..branch_assets import uses_custom_rules, uses_entry_context
 from ..branch_move import uses_branch_move
 
 PROTOCOL = 1
@@ -118,6 +118,9 @@ class RemoteHub:
                 conn.send({"type": "error", "error": f"mechanism reach requires {CAPABILITY}={version}"})
                 return
             assets = getattr(env, "branch_assets", None)
+            if hello.get("branch_entry_context_v1") is not True and uses_entry_context(assets):
+                conn.send({"type": "error", "error": "contextual branches require branch_entry_context_v1"})
+                return
             if assets and assets.get("version") == 2 and hello.get("multi_branch_v2") is not True:
                 conn.send({"type": "error", "error": "multi-branch bundle requires multi_branch_v2"})
                 return
@@ -272,6 +275,7 @@ class RemoteBridge:
                         cc.send({**capabilities, "type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session + 1,
                                  "branch_assets_version": 1, "branch_rules_version": 1, "multi_branch_v2": True,
                                  "actor_ball_type_v1": True, "branch_move_v1": True, "features_f8": True,
+                                 "branch_entry_context_v1": True,
                                  "backend": self.label, "n_workers": len(self.copies)})
                         if not cc.poll(30):
                             raise ConnectionError("no config within 30 s")

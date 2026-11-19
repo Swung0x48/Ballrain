@@ -382,6 +382,7 @@ class FeatureExtractor:
         self.path: ReferencePath | None = None
         self.follower: PathFollower | None = None
         self.branch = None
+        self.branch_entry_context = "ordinary"
         self._path_key = None
         self.reach = None
         if self.cfg.reach:  # cheap: the numba check only; the fields are loaded at the first state with a ball
@@ -435,6 +436,7 @@ class FeatureExtractor:
                     from .branch import load_branch
                     self.branch = load_branch(path, tracker.level_no, self.branch_root, self.cfg.path_dir,
                                               **self.follower.kw)
+                    self.set_branch_entry_context(self.branch_entry_context)
             self.path = path
             self._path_key = key
         return self.path
@@ -451,6 +453,12 @@ class FeatureExtractor:
         if (self.path is None or self.path.source != "tas") and self._needs_asset(tracker):
             raise RouteError(f"level {tracker.level_no}: ball in play without its reference line "
                              f"(path_dir {self.cfg.path_dir!r}); refusing to run without the route")
+
+    def set_branch_entry_context(self, context: str) -> None:
+        """Keep the same sampler context across route reloads and episode resets."""
+        self.branch_entry_context = context
+        if hasattr(self.branch, "by_id"):
+            self.branch.entry_context = context
 
     def reset_episode(self) -> None:
         """Forget the projection state (call at every episode start: new process, respawn, TAS hand-over)."""

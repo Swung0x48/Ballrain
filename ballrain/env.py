@@ -33,7 +33,7 @@ import gymnasium as gym
 import numpy as np
 
 from . import instances, protocol as P, tas
-from .branch_assets import bundle_rules, rest_member
+from .branch_assets import bundle_rules, ordinary_start_frames, rest_member
 from .branch_move import uses_branch_move
 from .branch_rules import DEFAULT_RULES
 from .client import AgentSession, SessionConfig
@@ -303,7 +303,8 @@ class BallanceEnv(gym.Env):
             raise ValueError(f"start record {c.start_record} is level {self.starts.level}, not {c.level}")
         self.curriculum = None
         if self.starts is not None and c.curriculum is not None:
-            self.curriculum = ReverseCurriculum(self.starts, CurriculumConfig(**c.curriculum))
+            self.curriculum = ReverseCurriculum(self.starts, CurriculumConfig(**c.curriculum),
+                                                valid=ordinary_start_frames(self.starts, self.cfg.branch_assets))
         self._start_rng = np.random.default_rng(c.seed)
         self._copies = [c.copy] + ([c.warm_copy] if c.warm_pool else [])
         if c.warm_pool and (not c.warm_copy or c.warm_copy == c.copy):
@@ -311,6 +312,7 @@ class BallanceEnv(gym.Env):
         self._copy_i = 0
         self._warm = None  # (thread, result box) of the pre-launched process
         self._start: dict = {}  # how the current episode started (info["start"])
+        self._entry_context_next = "ordinary"
         self._rest_next = False  # the drawn start is an at-rest start (rest_starts)
         self._source_next = None  # which start list the drawn frame came from (_draw_start)
         self._held = 0  # arrow keys down in the last injected frame (repress_stale_keys)
@@ -334,6 +336,7 @@ class BallanceEnv(gym.Env):
         anchor, scripts/train_m2.py --anchor-mastered). Recording it draws nothing: the draw order is unchanged."""
         self._rest_next = False
         self._source_next = None
+        self._entry_context_next = "ordinary"
         if self.starts is None:
             return None
         c = self.cfg
@@ -346,8 +349,10 @@ class BallanceEnv(gym.Env):
                 lo = max(int(lo), int(self.curriculum.frontier))
             if int(lo) <= int(hi):
                 self._source_next = {"src": "rehearse", "entry": [int(entries[j][0]), int(entries[j][1])]}
+                self._entry_context_next = "drill"
                 return self.starts.nearest_valid(int(self._start_rng.integers(int(lo), int(hi) + 1)))
         if c.rest_starts and c.p_rest and self._start_rng.random() < c.p_rest:
+            self._entry_context_next = "drill"
             e = c.rest_starts[int(self._start_rng.integers(len(c.rest_starts)))]
             lo, hi = e[0], e[1]
             self._source_next = {"src": "rest", "entry": [dict(x) if isinstance(x, dict) else x for x in e]}
@@ -373,6 +378,7 @@ class BallanceEnv(gym.Env):
             self._source_next = {"src": "curriculum"}
             return self.curriculum.sample(self._start_rng)
         if c.start_rest is not None and (c.start_frame or 0) > 0:  # a given at-rest start (pool task): not snapped
+            self._entry_context_next = "drill"
             if c.start_rest.get("branch_s") is not None:  # the stone branch's measured drive (rest_starts lo-hi@branch:s)
                 self._rest_next = {"branch_s": float(c.start_rest["branch_s"])}
                 if c.start_rest.get("branch_id"):  # a multi-branch member (rest_starts lo-hi@branch:<id>:<s>)
@@ -683,6 +689,8 @@ class BallanceEnv(gym.Env):
             prepared = self._prepare(self._copies[self._copy_i], k, self._rest_next)
             if source is not None:
                 prepared["start"]["source"] = source
+            prepared["entry_context"] = self._entry_context_next
+        self.fx.set_branch_entry_context(prepared["entry_context"])
         self.session, self.recorder = prepared["session"], prepared["recorder"]
         self.run_dir = prepared["run_dir"]
         self._start = prepared["start"]
@@ -697,6 +705,8 @@ class BallanceEnv(gym.Env):
         nxt = self._copies[(self._copy_i + 1) % len(self._copies)]
         k = self._draw_start()
         rest, source = self._rest_next, self._source_next
+        rest = self._rest_next
+        context = self._entry_context_next
         box: dict = {}
 
         def run():
@@ -704,6 +714,7 @@ class BallanceEnv(gym.Env):
                 box["prepared"] = self._prepare(nxt, k, rest)
                 if source is not None:
                     box["prepared"]["start"]["source"] = source
+                box["prepared"]["entry_context"] = context
             except BaseException as e:  # re-raised when the process is adopted
                 box["error"] = e
 

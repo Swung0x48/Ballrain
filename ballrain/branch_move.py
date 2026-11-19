@@ -60,6 +60,7 @@ def replay(env, prepared, k, station, key):
     session = prepared['session']
     tracker = session.tracker
     fx = FeatureExtractor(env.cfg.features, branch_root=root)
+    fx.set_branch_entry_context("drill")  # Explicit replay must use the same entrances as the sampler.
     fx.reference_path(tracker)
     follower = fx.branch
     entry, branch = follower.by_id[key]
