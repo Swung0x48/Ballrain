@@ -343,10 +343,9 @@ class LearnerLink:
                 cf = self.pool_dir / "chunks" / r["file"]
                 c = P.decode_chunk(cf.read_bytes())
                 m = chunk_message(c, ver, read_reach_patch(cf))
-                from .server_rewards import read_rewards
-                sr = read_rewards(cf, int(c.header["steps"]))  # reward_inputs_v1: the gateway's rewards
-                if sr is not None:
-                    m["rewards"] = sr
+                from .server_rewards import read_rewards, rewards_path
+                if rewards_path(cf).is_file():  # reward_inputs_v1: the gateway's rewards
+                    m["rewards"] = read_rewards(cf, int(c.header["steps"]))
             except Exception as e:  # noqa: BLE001
                 self.counts["errors"] += 1
                 self.last_error = f"chunk {r['task_id'][:8]}/{r['seq']}: {type(e).__name__}: {str(e)[:120]}"

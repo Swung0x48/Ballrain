@@ -559,6 +559,13 @@ class PoolApp:
         lacking = missing(self.policies.current.manifest.get("requires"), json.loads(sess["capabilities"] or "[]"))
         if lacking:
             return _json("no_task", reason=refusal(sess["client_version"], lacking), retry_s=600)
+        from .cross_check import assign, build_key, replica_for
+        rep = replica_for(self.store, sess, acct["forum_id"], self.cfg, self.now())
+        if rep is not None:  # a peer's drawn task waits for a second play by this build (cross-check)
+            d, cross_id = rep
+            self.store.add_task(d, acct["forum_id"], sess["session_id"], replay=False)
+            self.store.set_cross_b(cross_id, d["task_id"])
+            return _json("task", task=d)
         t = self.policies.new_task(sess["engine_kind"], self.now(), self.cfg.max_steps, self.cfg.max_frames,
                                    self.cfg.deadline_s)
         if self.feature_module is not None and "feature_module_v1" in caps:  # the hot-updated features (modules.py)
@@ -567,9 +574,10 @@ class PoolApp:
             from .server_rewards import refuse_reason
             t.reward_inputs = refuse_reason(self.policies.current.manifest) is None
         d = t.to_dict()
-        replay = select_task(self.store, acct["forum_id"], self.cfg.probation_chunks * int(t.chunk_steps),
-                             self.cfg.task_sample)
+        _tier, replay, cross = assign(self.store, self.cfg, acct["forum_id"], int(t.chunk_steps))
         self.store.add_task(d, acct["forum_id"], sess["session_id"], replay=replay)
+        if cross:  # verified by a second volunteer's play (our verifier only on a difference)
+            self.store.add_cross(secrets.token_hex(16), d["task_id"], acct["forum_id"], build_key(sess))
         return _json("task", task=d)
 
     def task_end(self, acct, body: bytes) -> Response:

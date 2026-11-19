@@ -50,7 +50,18 @@ CREATE TABLE IF NOT EXISTS chunks (
     nbytes INTEGER NOT NULL, file TEXT NOT NULL, received INTEGER NOT NULL, selected INTEGER NOT NULL,
     status TEXT NOT NULL, verify TEXT NOT NULL, reason TEXT, PRIMARY KEY (task_id, seq));
 CREATE INDEX IF NOT EXISTS chunks_by_account ON chunks(forum_id, verify);
+CREATE TABLE IF NOT EXISTS cross_checks (
+    cross_id TEXT PRIMARY KEY, task_a TEXT NOT NULL, forum_a INTEGER NOT NULL, build TEXT NOT NULL,
+    task_b TEXT, forum_b INTEGER, state TEXT NOT NULL, created INTEGER NOT NULL, issued INTEGER, decided INTEGER,
+    result TEXT);
+CREATE INDEX IF NOT EXISTS cross_by_state ON cross_checks(state, build);
 """
+# cross_checks (docs/volunteer-compute.md 4.1, cross_check.py): a drawn task of a normal / trusted account played a
+#   second time by another volunteer (task_b, the replica: same start, seeds and policy) of the same build (engine
+#   kind + sha, platform, client version). state: waiting (no peer yet) | issued | passed | arbitrate (the two differ:
+#   our verifier replays both, only that may flag an account) | fallback (no peer in time: our verifier replays task_a)
+# tasks.cross_id / cross_role ("a" the original, "b" the replica); a replica's chunks are never fed (status 'cross')
+# accounts.passed_tasks: the account's tasks that passed a full replay or a cross-check (the trusted tier)
 # chunks.status: held (stored, not released to anything) | released (verified or sampled out) | rejected (failed the
 #   replay) | quarantined (an unverified chunk of an account revoked for a replay mismatch)
 # chunks.verify: pending | passed | failed | skipped (not selected for the replay) | replay_failed (verifier fault)
@@ -70,11 +81,12 @@ CREATE INDEX IF NOT EXISTS chunks_by_account ON chunks(forum_id, verify);
 # accounts.ingest_span: JSON {first, last, steps} of the learner updates its fed chunks reached (revocation / alert)
 MIGRATIONS = {"logins": {"user_code": "TEXT", "confirm_hash": "TEXT", "browser_hash": "TEXT"},
               "chunks": {"ingested": "INTEGER", "ingested_at": "INTEGER", "flag": "TEXT"},
-              "tasks": {"replay": "INTEGER NOT NULL DEFAULT 0"},
+              "tasks": {"replay": "INTEGER NOT NULL DEFAULT 0", "cross_id": "TEXT", "cross_role": "TEXT"},
               # sessions.capabilities: JSON list of hello.capabilities (absent = none; ballrain.pool.capabilities)
               "sessions": {"capabilities": "TEXT"},
               "accounts": {"escalate": "INTEGER NOT NULL DEFAULT 0", "ingest_span": "TEXT",
-                           "suspect": "INTEGER NOT NULL DEFAULT 0", "suspect_reason": "TEXT", "suspect_at": "INTEGER"}}
+                           "suspect": "INTEGER NOT NULL DEFAULT 0", "suspect_reason": "TEXT", "suspect_at": "INTEGER",
+                           "passed_tasks": "INTEGER NOT NULL DEFAULT 0"}}
 
 
 class ChunkRefused(Exception):
@@ -262,6 +274,73 @@ class Store:
                "VALUES(?,?,?,?,?,?,?,?)",
                (task["task_id"], int(forum_id), session_id, json.dumps(task, sort_keys=True), task["policy_sha"],
                 int(task["issued_at"]), int(task["issued_at"]) + int(task["deadline_s"]), 1 if replay else 0))
+
+    # ------------------------------------------------------------------------------------------ cross-checks
+    def add_cross(self, cross_id: str, task_a: str, forum_a: int, build: str) -> None:
+        def fn(db):
+            db.execute("INSERT INTO cross_checks(cross_id, task_a, forum_a, build, state, created) VALUES(?,?,?,?,?,?)",
+                       (cross_id, task_a, int(forum_a), build, "waiting", self.now()))
+            db.execute("UPDATE tasks SET cross_id=?, cross_role='a' WHERE task_id=?", (cross_id, task_a))
+        self.tx(fn)
+
+    def take_cross(self, build: str, forum_id: int, cooldown_s: int):
+        """A waiting cross-check this account may play the replica of (another account, the same build, not paired
+        with this account within cooldown_s, its original still open or closed), claimed (state issued); or None."""
+        def fn(db):
+            rows = db.execute("SELECT c.* FROM cross_checks c JOIN tasks t ON t.task_id=c.task_a WHERE c.state='waiting' "
+                              "AND c.build=? AND c.forum_a!=? AND t.state IN ('open', 'closed') ORDER BY c.created",
+                              (build, int(forum_id))).fetchall()
+            since = self.now() - int(cooldown_s)
+            for r in rows:
+                pair = db.execute("SELECT 1 FROM cross_checks WHERE issued>=? AND ((forum_a=? AND forum_b=?) OR "
+                                  "(forum_a=? AND forum_b=?)) LIMIT 1",
+                                  (since, r["forum_a"], int(forum_id), int(forum_id), r["forum_a"])).fetchone()
+                if pair:
+                    continue
+                db.execute("UPDATE cross_checks SET state='issued', forum_b=?, issued=? WHERE cross_id=?",
+                           (int(forum_id), self.now(), r["cross_id"]))
+                return dict(r)
+            return None
+        return self.tx(fn)
+
+    def set_cross_b(self, cross_id: str, task_b: str) -> None:
+        def fn(db):
+            db.execute("UPDATE cross_checks SET task_b=? WHERE cross_id=?", (task_b, cross_id))
+            db.execute("UPDATE tasks SET cross_id=?, cross_role='b' WHERE task_id=?", (cross_id, task_b))
+        self.tx(fn)
+
+    def cross(self, cross_id: str):
+        return self.one("SELECT * FROM cross_checks WHERE cross_id=?", (cross_id,))
+
+    def crosses(self, state: str) -> list:
+        return self.q("SELECT * FROM cross_checks WHERE state=? ORDER BY created", (state,))
+
+    def decide_cross(self, cross_id: str, state: str, result: dict | None = None) -> None:
+        self.q("UPDATE cross_checks SET state=?, decided=?, result=? WHERE cross_id=?",
+               (state, self.now(), json.dumps(result or {}, ensure_ascii=False), cross_id))
+
+    def pass_cross_task(self, task_id: str, replica: bool) -> None:
+        """A task whose two plays agreed: its chunks verified (passed); the original's released to the learner, the
+        replica's kept out of training (status 'cross': the same trajectory twice)."""
+        def fn(db):
+            db.execute("UPDATE chunks SET verify='passed', status=? WHERE task_id=? AND status='held'",
+                       ("cross" if replica else "released", task_id))
+            db.execute("UPDATE tasks SET state='done' WHERE task_id=?", (task_id,))
+            db.execute("UPDATE accounts SET passed_tasks=passed_tasks+1 WHERE forum_id=(SELECT forum_id FROM tasks "
+                       "WHERE task_id=?)", (task_id,))
+        self.tx(fn)
+
+    def passed_tasks(self, forum_id: int) -> int:
+        r = self.one("SELECT passed_tasks FROM accounts WHERE forum_id=?", (int(forum_id),))
+        return int(r["passed_tasks"]) if r else 0
+
+    def add_passed(self, forum_id: int) -> None:
+        self.q("UPDATE accounts SET passed_tasks=passed_tasks+1 WHERE forum_id=?", (int(forum_id),))
+
+    def release_unverified(self, task_id: str) -> None:
+        """Use before verify (a trusted account, [verify] ingest_then_verify): the held chunks go to the learner now,
+        the verification follows (a later mismatch quarantines what was not fed yet and records the span fed)."""
+        self.q("UPDATE chunks SET status='released' WHERE task_id=? AND status='held'", (task_id,))
 
     def set_task_replay(self, task_id: str) -> None:
         self.q("UPDATE tasks SET replay=1 WHERE task_id=?", (task_id,))
@@ -456,6 +535,10 @@ class Store:
                 db.execute("UPDATE tasks SET verify_attempts=?, verify_after=? WHERE task_id=?",
                            (n, self.now() + int(delay_s) * n, task_id))
         self.tx(fn)
+
+    def defer_verify(self, task_id: str, delay_s: int) -> None:
+        """Not yet decidable (a cross-check waiting for its peer): look again later (no attempt counted)."""
+        self.q("UPDATE tasks SET verify_after=? WHERE task_id=?", (self.now() + int(delay_s), task_id))
 
     def set_task_state(self, task_id: str, state: str) -> None:
         self.q("UPDATE tasks SET state=? WHERE task_id=?", (state, task_id))

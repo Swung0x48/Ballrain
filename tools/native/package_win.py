@@ -77,11 +77,12 @@ def vc_redist_x86() -> Path:
     raise SystemExit("the x86 VC++ runtime (VC/Redist/MSVC/<ver>/x86/Microsoft.VC14x.CRT) was not found")
 
 
-def build(gateway: str, update_url: str, pubkey: str) -> Path:
+def build(gateway: str, update_url: str, pubkey: str, wasmtime: str = "", module_pubkey: str = "") -> Path:
     bdir = REPO / "build" / "native-release-pkg"
     env = dict(os.environ, BALLRAIN_BUILD_DIR=str(bdir),
                BALLRAIN_CMAKE_ARGS=f'-DBALLRAIN_DEFAULT_GATEWAY="{gateway}" -DBALLRAIN_UPDATE_URL="{update_url}" '
-                                   f'-DBALLRAIN_RELEASE_PUBKEY="{pubkey}"')
+                                   f'-DBALLRAIN_RELEASE_PUBKEY="{pubkey}" -DBALLRAIN_WASMTIME_DIR="{wasmtime}" '
+                                   f'-DBALLRAIN_MODULE_PUBKEY="{module_pubkey}"')
     r = subprocess.run(["cmd", "/c", str(REPO / "native" / "build_win.cmd"), "Release"], env=env)
     if r.returncode != 0:
         raise SystemExit("build failed")
@@ -112,6 +113,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sign-key", help="release-signing.key: also write release.json + .sig")
     ap.add_argument("--download-url", help="the zip's https URL in the release (for release.json)")
     ap.add_argument("--notes", default="")
+    ap.add_argument("--wasmtime", help="the wasmtime c-api directory (feature_module_v1): wasmtime.dll ships in the zip")
+    ap.add_argument("--module-pubkey-file", help="the gateway's module signing key's .pub (feature_module_v1)")
     ap.add_argument("--out", default=str(REPO / "dist" / "native"))
     ap.add_argument("--no-build", action="store_true", help="use build/native-release-pkg as it is")
     a = ap.parse_args(argv)
@@ -119,7 +122,9 @@ def main(argv=None) -> int:
     pubkey = Path(a.pubkey_file).read_text("utf-8").strip() if a.pubkey_file else ""
     if a.update_url and not pubkey:
         raise SystemExit("--update-url needs --pubkey-file (the client verifies the manifest's signature)")
-    bdir = REPO / "build" / "native-release-pkg" if a.no_build else build(a.gateway, a.update_url, pubkey)
+    mpub = Path(a.module_pubkey_file).read_text("utf-8").strip() if a.module_pubkey_file else ""
+    wt = str(Path(a.wasmtime).resolve()).replace("\\", "/") if a.wasmtime else ""
+    bdir = REPO / "build" / "native-release-pkg" if a.no_build else build(a.gateway, a.update_url, pubkey, wt, mpub)
     out = Path(a.out).resolve()
     name = f"BallrainCoordinator-{version}-windows-x64"
     stage = out / name
@@ -130,6 +135,8 @@ def main(argv=None) -> int:
     shutil.copyfile(bdir / "BallrainCoordinator.exe", stage / "BallrainCoordinator.exe")
     shutil.copyfile(bdir / "ballrain_coordinator.exe", stage / "ballrain_coordinator.exe")  # the headless driver (hosts without a console UI)
     shutil.copyfile(a.engine, edir / "BallanceMMOSimTool.exe")
+    if a.wasmtime:  # delay-loaded by both programs (feature_module_v1); without it they run everything else
+        shutil.copyfile(Path(a.wasmtime) / "lib" / "wasmtime.dll", stage / "wasmtime.dll")
     crt = vc_redist_x86()
     for n in VCREDIST:
         shutil.copyfile(crt / n, edir / n)
@@ -144,6 +151,8 @@ def main(argv=None) -> int:
     zhead = (tp / "zstd" / "zstd.c").read_text("utf-8", errors="replace").split("*/")[0] + "*/\n"
     (lic / "zstd.txt").write_text(zhead, encoding="utf-8")
     (lic / "README.txt").write_text((tp / "README.md").read_text("utf-8"), encoding="utf-8")
+    if a.wasmtime:
+        shutil.copyfile(Path(a.wasmtime) / "LICENSE", lic / "wasmtime.txt")
     for spec in a.license:
         n, _, f = spec.partition("=")
         shutil.copyfile(f, lic / f"{n}.txt")
