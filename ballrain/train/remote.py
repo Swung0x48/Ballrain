@@ -111,6 +111,12 @@ class RemoteHub:
                 # f8 contact blocks: a bridge (or the pool's learner link) on older code would compute the f7 layout
                 conn.send({"type": "error", "error": "f8 contact features require features_f8 (update the worker code)"})
                 return
+            from ..reach_features import is_mechanism_version
+            from ..reach_mechanisms import CAPABILITY
+            version = getattr(getattr(env, "features", None), "reach_version", None)
+            if is_mechanism_version(version) and hello.get(CAPABILITY) != version:
+                conn.send({"type": "error", "error": f"mechanism reach requires {CAPABILITY}={version}"})
+                return
             assets = getattr(env, "branch_assets", None)
             if assets and assets.get("version") == 2 and hello.get("multi_branch_v2") is not True:
                 conn.send({"type": "error", "error": "multi-branch bundle requires multi_branch_v2"})
@@ -255,7 +261,15 @@ class RemoteBridge:
                 def attempt():
                     try:
                         cc = Client(self.addr, authkey=self.authkey)
-                        cc.send({"type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session + 1,
+                        from ..reach_features import reach_version, require_numba
+                        from ..reach_mechanisms import CAPABILITY
+                        capabilities = {}
+                        try:
+                            require_numba()
+                            capabilities[CAPABILITY] = reach_version(mechanisms=True)
+                        except (RuntimeError, OSError):
+                            pass  # can still serve runs without this capability
+                        cc.send({**capabilities, "type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session + 1,
                                  "branch_assets_version": 1, "branch_rules_version": 1, "multi_branch_v2": True,
                                  "actor_ball_type_v1": True, "branch_move_v1": True, "features_f8": True,
                                  "backend": self.label, "n_workers": len(self.copies)})

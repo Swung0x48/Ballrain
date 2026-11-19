@@ -87,9 +87,67 @@ def _thread_view(fr: "FR.FastReach") -> "FR.FastReach":
     return view
 
 
-def reach_version() -> str:
+def reach_version(mechanisms: bool = False) -> str:
     """The f7 block version of this code (FeatureConfig.reach_version)."""
-    return f"fastreach{FR.BUILD_VERSION}.{FR.QUERY_VERSION}-block{BLOCK_VERSION}"
+    base = f"fastreach{FR.BUILD_VERSION}.{FR.QUERY_VERSION}-block{BLOCK_VERSION}"
+    if mechanisms:
+        from .reach_mechanisms import asset_pin
+        return f"{base}-mech1-{asset_pin()}"
+    return base
+
+
+def is_mechanism_version(version) -> bool:
+    return isinstance(version, str) and "-mech1-" in version
+
+
+# One bundle per level-data revision per process, with thread-local scratch as for legacy fields.
+_MECH_FIELDS: OrderedDict = OrderedDict()
+
+
+def _mechanism_fields(tracker, cache_dir, version):
+    from pathlib import Path
+    from .reach_mechanisms import add_geometry, fan_layer, layers_for_tracker
+    level = tracker.level
+    ck = (id(level), level.version, tracker.level_no, Path(cache_dir).resolve() if cache_dir else None, version)
+    with _LOCK:
+        hit = _MECH_FIELDS.get(ck)
+        if hit is None:
+            base, key, zones = _shared_fields(tracker, cache_dir)
+            rows = [(base, key + "|" + version)] * 3
+            built = {}
+            geom = None
+            layers, probe = layers_for_tracker(tracker)
+            for k, addition in enumerate(layers):
+                if addition is not None:
+                    if id(addition) not in built:
+                        if geom is None:
+                            geom = FR.FastReach.canonical_geometry(tracker)
+                        augmented = add_geometry(geom, addition)
+                        fr = FR.FastReach.fields_for_tracker(tracker, cache_dir=cache_dir,
+                                                             geometry=augmented, variant=version)
+                        built[id(addition)] = (fr, fr.info["key"])
+                    rows[k] = built[id(addition)]
+            fans, recovered = fan_layer(tracker)
+            hit = (level, tuple(rows), zones, probe, fans if recovered else None)
+            _MECH_FIELDS[ck] = hit
+            while len(_MECH_FIELDS) > _FIELDS_MAX:
+                _MECH_FIELDS.popitem(last=False)
+        _MECH_FIELDS.move_to_end(ck)
+    _, rows, zones, probe, fans = hit
+    suffix = "|fans-" + hashlib.sha256(fans.astype("<f8").tobytes()).hexdigest()[:16] if fans is not None else ""
+    views = {}
+    out = []
+    for fr, key in rows:
+        if id(fr) not in views:
+            view = copy.copy(fr)
+            for attr in _SCRATCH:
+                setattr(view, attr, getattr(fr, attr).copy())
+            view.uzones = zones
+            if fans is not None:
+                view.fans = fans
+            views[id(fr)] = view
+        out.append((views[id(fr)], key + suffix))
+    return tuple(out), probe
 
 
 def require_numba() -> None:
@@ -174,20 +232,40 @@ class ReachBlock:
     def __init__(self, cache_dir=None, body_radius: float = 60.0, expect_version: str | None = None):
         """expect_version: FeatureConfig.reach_version (None: unchecked); another version than this code's is refused
         before anything is computed."""
-        if expect_version is not None and expect_version != reach_version():
+        self.mechanisms = is_mechanism_version(expect_version)
+        self.version = reach_version(self.mechanisms)
+        if expect_version is not None and expect_version != self.version:
             raise ReachVersionError(f"FeatureConfig.reach_version {expect_version!r}: this worker's reach block is "
-                                    f"{reach_version()!r} (ballrain/fastreach.py, ballrain/reach_features.py); the "
+                                    f"{self.version!r} (ballrain/fastreach.py, ballrain/reach_features.py); the "
                                     "policy was trained on another block, update the worker's code")
         require_numba()
         self.cache_dir = cache_dir
         self.body_radius = body_radius
+        self._last_fields = None
+        if self.mechanisms:
+            from .reach_mechanisms import uses_lowered_plate
+            self._uses_lowered_plate = uses_lowered_plate
 
     def compute(self, tracker, pos, vel, quarter: int, ball_type: int):
         """(scaled block (N_REACH,), raw perceive vector (N_REACH,), fields key)."""
         p = np.asarray(pos, np.float64)
         if not (np.isfinite(p).all() and np.isfinite(np.asarray(vel, np.float64)).all()):
             return np.zeros(N_REACH), np.full(N_REACH, np.nan), None  # perceive refuses it; the f6 entries nan_to_num
-        fr, key = fields_for(tracker, self.cache_dir)
+        if self.mechanisms:
+            level = tracker.level
+            cached = self._last_fields
+            if (cached is None or cached[0] is not level or cached[1] != level.version
+                    or cached[2] != tracker.level_no or cached[3] != threading.get_ident()):
+                cached = (level, level.version, tracker.level_no, threading.get_ident(),
+                          _mechanism_fields(tracker, self.cache_dir, self.version))
+                self._last_fields = cached
+            rows, probe = cached[4]
+            k = ball_type if 0 <= ball_type <= 2 else 0
+            if probe is not None and k == probe[0] and self._uses_lowered_plate(tracker, p, probe[2]):
+                k = probe[1]  # change fields, not the true ball type passed to perceive
+            fr, key = rows[k]
+        else:
+            fr, key = fields_for(tracker, self.cache_dir)
         bodies = moving_bodies(tracker, p, self.body_radius)
         raw, _ = fr.perceive(p, vel, int(ball_type), int(quarter), bodies=bodies)
         return scale(raw), raw, key

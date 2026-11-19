@@ -245,6 +245,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hs-block", action="store_true", help="keep the HS feature block (off for SR)")
     p.add_argument("--far-waypoints", default="", help="f6: line points this far ahead in arc units, e.g. 20,30,45")
     p.add_argument("--ref-speed-at", default="", help="f6: reference speed at these arc offsets, e.g. 0,15,30")
+    p.add_argument("--reach-mechanisms", action="store_true",
+                   help="opt into retail mechanism layers for f7; Python workers only, requires --reach")
     p.add_argument("--reach", action="store_true",
                    help="f7: append the fastreach reach block (FeatureConfig.reach, ballrain.reach_features; 59 entries) "
                         "after every other observation entry; a checkpoint without it is grown with zero input weights "
@@ -432,6 +434,19 @@ def make_env_config(a, out_root: Path, ck=None, init=None):
                        far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=path_dir,
                        branch_sha256=pin, path_sha256=main_sha, reach=bool(getattr(a, "reach", False)),
                        version=CONTACT_FEATURE_VERSION if getattr(a, "contacts", False) else FEATURE_VERSION)
+    from ballrain.reach_features import is_mechanism_version, reach_version
+    old_reach = old.get("reach_version")
+    saved_mechanisms = is_mechanism_version(old_reach)
+    if getattr(a, "reach_mechanisms", False) or saved_mechanisms:
+        if not fc.reach:
+            raise RouteError("--reach-mechanisms requires --reach")
+        if getattr(a, "pool_ingest", False):
+            raise RouteError("reach mechanisms require Python workers; disable --pool-ingest")
+        if not 1 <= a.level <= 13:
+            raise RouteError("no retail reach mechanism asset for this level")
+        fc.reach_version = reach_version(mechanisms=True)
+        if saved_mechanisms and old_reach != fc.reach_version:
+            raise RouteError("reach mechanism assets/code differ from the checkpoint pin")
     cu = {"start_back": a.start_back, "step": a.cu_step, "band": a.cu_band, "recent": a.cu_recent,
           "advance_at": a.advance_at, "min_episodes": a.min_episodes, "p_level_start": a.p_level_start}
     hl = None
@@ -501,6 +516,8 @@ def main(argv=None) -> int:
             setattr(a, k, saved.get(k, getattr(a, k)))
         a.reach = bool(a.reach or saved.get("reach"))  # on stays on (the observation never shrinks); off -> on grows it
         a.contacts = bool(a.contacts or saved.get("contacts"))  # likewise for the f8 contact blocks
+        from ballrain.reach_features import is_mechanism_version
+        a.reach_mechanisms = a.reach_mechanisms or is_mechanism_version(saved.get("reach_version"))
     else:
         ck = None
     if a.actor_heads is None:
