@@ -131,6 +131,9 @@ def main(argv=None) -> int:
                     help="the client's phase summary interval: the headless run must append it to <client>/logs/client.log")
     ap.add_argument("--wait-upload", action="store_true", help="the client's 0.5.0 behaviour (wait for the previous upload)")
     ap.add_argument("--rate-only", action="store_true", help="a throughput run: the gateway's receive rate, no verification")
+    ap.add_argument("--server-rewards", action="store_true", help="[task] server_rewards: reward_inputs_v1 clients "
+                    "upload the reward inputs, the gateway recomputes the rewards (must equal the client's bit for bit); "
+                    "the forged-chunk check then forges the inputs")
     ap.add_argument("--feature-module", help="the signed feature module (.wasm + .sig): tasks of feature_module_v1 "
                     "clients carry it ([task] feature_module); the run checks the client used it")
     ap.add_argument("--port", type=int, default=0)
@@ -169,7 +172,8 @@ def main(argv=None) -> int:
         base_url=forum.base_url, client_id="ballrain-pool-e2e", client_secret="e2e-secret", redirect_uri=redirect),
         run="r7", datasets_dir=ds, path_dirs=[Path(a.path_dir).resolve()], max_steps=a.max_steps, max_frames=60000,
         deadline_s=3600, heartbeat_s=a.heartbeat_s, engines={"x87soft": engine}, max_instances=a.max_instances,
-        feature_module=Path(a.feature_module).resolve() if a.feature_module else None)
+        feature_module=Path(a.feature_module).resolve() if a.feature_module else None,
+        server_rewards=a.server_rewards)
     from tools_pool_gateway import build  # noqa: E402  (tools/pool/gateway.py, imported by path below)
     app, store, policies, verifier = build(cfg)
     if a.client_engine != a.engine:  # the client runs another build of the x87-soft engine: allow its sha256 too
@@ -405,6 +409,13 @@ def main(argv=None) -> int:
         log("PASSED (rate only: no verification)")
         return 0
 
+    if a.server_rewards:  # the gateway's rewards from the inputs, against the client's own (the same code, ported)
+        rs = app.reward_stats
+        us = 1e6 * rs["seconds"] / max(rs["steps"], 1)
+        log(f"server rewards: {rs['chunks']} chunks, {rs['steps']} steps recomputed, {rs['differ']} differ from the "
+            f"client's; {us:.1f} us per step (one core: {1e6 / max(us, 1e-9):.0f} steps/s)")
+        if rs["chunks"] == 0 or rs["differ"]:
+            return 1
     # ---- the verifier replays every task (probation: every chunk selected)
     t0 = time.time()
     for _ in range(4 * a.tasks):
@@ -436,7 +447,13 @@ def main(argv=None) -> int:
     c0 = decoded[0]
     h = {k: v for k, v in c0.header.items() if k not in ("arrays", "protocol", "type")}
     arr = {k: v.copy() for k, v in c0.arrays.items()}
-    arr["rewards"][10] += np.float32(0.25)
+    if a.server_rewards and "rin" in arr:  # the reward is the gateway's: forge its input (IGT +100 ms at step 10)
+        from ballrain.pool.server_rewards import TaskRewards, RIN_SR
+        arr["rin"][10, RIN_SR] += 100.0
+        pub = policies.history[task.policy_sha]
+        arr["rewards"] = TaskRewards(pub.manifest, pub.starts).chunk(0, arr["rin"], h.get("episodes") or [])
+    else:
+        arr["rewards"][10] += np.float32(0.25)
     decoded[0] = P.decode_chunk(P.encode_chunk(h, arr))
     m, pol = verifier._policy(task.policy_sha)
     sdir, pdir, bdir = verifier._assets(task, m)

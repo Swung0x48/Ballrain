@@ -34,6 +34,7 @@ struct Task {  // protocol.TASK
     };
     std::vector<ReachAsset> asset_reach;
     // assets.feature_module (feature_module_v1): the signed wasm feature module ("" sha: none)
+    bool reward_inputs = false;  // reward_inputs_v1: the chunks carry the reward inputs (the gateway's reward)
     std::string module_sha256, module_sig;
     int64_t module_size = 0;
     int module_abi = 0;
@@ -98,6 +99,7 @@ struct StepResult {
     std::vector<float> next_obs;
     std::string end;  // "" while the task goes on
     Bytes digest;     // engine digest of the next row
+    double rin[RIN_COLS] = {};  // reward_inputs_v1 (env.h RinCol)
 };
 
 class TaskRunner {
@@ -131,6 +133,18 @@ private:
         bool stall_branch = false;       // the route the stall odometer (mark_s) is measured on (worker ep.stall_branch)
     };
     void new_episode(const StepInfo &info);
+public:
+    // reward_inputs_v1: each episode's start (Reward.begin and the split segment start read it), by task step index
+    struct EpisodeStart {
+        int64_t step = 0;  // the first step of the episode
+        std::string kind;
+        int64_t frame = 0;
+        int sector = 0, checkpoints = 0;
+        double sr_ms = 0;
+        std::optional<double> s, ref_elapsed_ms;
+    };
+    std::vector<EpisodeStart> episode_starts;  // the chunk assembler takes them as they come
+private:
     std::optional<int64_t> cap_frames(const StepInfo &info) const;
     double tas_igt(int64_t k) const;
     std::optional<double> tas_cross(int sector) const;
@@ -179,6 +193,11 @@ private:
     std::vector<uint8_t> actions_, flags_, sector_;
     std::vector<uint16_t> frames_;
     std::vector<double> sr_ms_;
+    std::vector<double> rin_;
+    size_t episodes_taken_ = 0;  // runner episode starts already in a chunk
+public:
+    // the runner's episode starts (TaskRunner::episode_starts): set by sample_task for reward_inputs tasks
+    const void *runner_ = nullptr;
 };
 
 // rollout.sample_task: play the task with the policy (the task's deterministic draws), hand every encoded chunk to

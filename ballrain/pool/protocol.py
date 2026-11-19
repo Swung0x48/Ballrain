@@ -382,6 +382,8 @@ TASK = Obj({
     # the branch line (env._branch_rest; rest_starts lo-hi@branch:s); branch_id (multi-branch policies only, wire v2,
     # docs/pool-prototype.md 15): the manifest member whose drive it is (lo-hi@branch:<id>:s), absent = the unique
     # legacy member
+    # reward_inputs_v1 sessions (the gateway recomputes the reward, server_rewards.py): the chunks carry rin / episodes
+    "reward_inputs": Bool(),
     "rest": Obj({"target": List(Float(-1e6, 1e6), 2, 2, nullable=True)},
                 {"max_frames": Int(1, 10 ** 6), "branch_s": Float(0, 1e6), "branch_id": Str(32, BRANCH_ID_RE, min_len=1)},
                 nullable=True),
@@ -489,6 +491,8 @@ CHUNK_ARRAYS: dict[str, tuple] = {
     "frames": ("<u2", ("T",), ("raw", "zstd"), False),  # game frames the step advanced
     "sr_ms": ("<f8", ("T",), ("raw", "zstd"), False),  # IGT (SR double sum, ms) after the step
     "arc": ("<f4", ("T",), ("raw", "zstd"), False),  # reference-line arc length after the step (nan: none)
+    # reward_inputs_v1 (the task's reward_inputs; server_rewards.RIN_*): what the reward reads per step, NaN = none
+    "rin": ("<f8", ("T", 17), ("raw", "zstd"), False),
 }
 _FINITE = ("rewards", "logp", "values", "obs", "env_rewards", "sr_ms")
 MAX_CHUNK_RAW_BYTES = 32 * 1024 * 1024
@@ -502,7 +506,12 @@ CHUNK_HEADER = Obj({
     "policy_sha": SHA, "chain_prev": SHA, "final": Bool(),
     "end": Str(24, enum=END_REASONS, nullable=True),
     "arrays": List(CHUNK_SECTION, len(CHUNK_ARRAYS), 1),
-}, {"stats": Obj({}, {"frames": Int(0, 10 ** 9), "wall_s": Float(0, 1e7), "episodes": Int(0, MAX_CHUNK_STEPS)})})
+}, {"stats": Obj({}, {"frames": Int(0, 10 ** 9), "wall_s": Float(0, 1e7), "episodes": Int(0, MAX_CHUNK_STEPS)}),
+    # reward_inputs_v1: the episodes starting in this chunk (step: the task's step index of their first step)
+    "episodes": List(Obj({"step": Int(0, MAX_TASK_STEPS), "kind": Str(16, enum=("tas", "tas_rest", "respawn")),
+                          "frame": Int(0, 10 ** 7), "sector": Int(0, 255), "checkpoints": Int(0, 255),
+                          "sr_ms": Float(-1e9, 1e10), "s": Float(-1e7, 1e7, nullable=True),
+                          "ref_elapsed_ms": Float(-1e9, 1e10, nullable=True)}), MAX_CHUNK_STEPS)})
 
 
 @dataclass

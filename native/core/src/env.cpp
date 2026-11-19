@@ -780,6 +780,27 @@ std::vector<float> BallanceEnv::step(int action, bool &terminated, bool &truncat
     const auto &pr = info.feat.path;
     double r = reward_.step(t, pr ? std::optional<double>(pr->s) : std::nullopt, died, finished, terminated,
                             pr && pr->jump, std::optional<bool>(info.feat.supported));
+    {  // reward_inputs_v1: Reward.step's arguments and the tracker fields it (and its sector-3 terms) read
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        auto srv = t.sr_ms();
+        double *q = info.rin;
+        q[RIN_SR] = srv ? *srv : nan;
+        q[RIN_S] = pr ? pr->s : nan;
+        q[RIN_CHECKPOINTS] = double(t.checkpoints), q[RIN_SECTOR] = double(t.sector()), q[RIN_BALL_TYPE] = double(t.ball_type());
+        const FeatureInfo &fi = info.feat;
+        uint32_t f = (died ? RIN_DIED : 0u) | (finished ? RIN_FINISHED : 0u) | (terminated ? RIN_TERMINATED : 0u) |
+                     (pr && pr->jump ? RIN_REBASE : 0u) | (fi.supported ? RIN_SUPPORTED : 0u) | (cam_bad ? RIN_CAM_BAD : 0u) |
+                     (fi.branch || !fi.branch_id.empty() ? RIN_ROUTE_BRANCH : 0u) | (fi.have_ball ? RIN_HAS_POS : 0u) |
+                     (pr ? RIN_HAS_POINT : 0u);
+        q[RIN_FLAGS] = double(f);
+        for (int k = 0; k < 3; ++k) {
+            q[RIN_POS + k] = fi.pos[k];
+            q[RIN_POINT + k] = pr ? pr->point[k] : nan;
+            q[RIN_TANGENT + k] = pr ? pr->tangent[k] : nan;
+        }
+        q[RIN_REF_ELAPSED] = info.has_branch ? info.ref_elapsed_ms : nan;
+        q[RIN_STALL_WIN] = 0;
+    }
     if (cam_bad) {  // no credit for the episode: its return becomes -death_penalty
         double pen = -reward_.total - reward_.cfg.death_penalty;
         r += pen;

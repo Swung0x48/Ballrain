@@ -174,6 +174,8 @@ class PoolApp:
         self._ref = {}  # engine kind -> reference game-file hashes
         self.chunks_dir = Path(cfg.pool_dir) / "chunks"
         self.feature_module = None  # modules.FeatureModuleRef: the signed feature module ([task] feature_module)
+        self._rewards = {}  # task_id -> server_rewards.TaskRewards (reward_inputs tasks; rebuilt from disk after a restart)
+        self.reward_stats = {"chunks": 0, "steps": 0, "seconds": 0.0, "differ": 0}
         if cfg.feature_module:
             from .modules import load_module
             self.feature_module = load_module(cfg.feature_module, Path(cfg.pool_dir) / "assets")
@@ -561,6 +563,9 @@ class PoolApp:
                                    self.cfg.deadline_s)
         if self.feature_module is not None and "feature_module_v1" in caps:  # the hot-updated features (modules.py)
             t.assets = dict(t.assets, feature_module=self.feature_module.asset())
+        if self.cfg.server_rewards and "reward_inputs_v1" in caps:  # the gateway's reward (server_rewards.py)
+            from .server_rewards import refuse_reason
+            t.reward_inputs = refuse_reason(self.policies.current.manifest) is None
         d = t.to_dict()
         replay = select_task(self.store, acct["forum_id"], self.cfg.probation_chunks * int(t.chunk_steps),
                              self.cfg.task_sample)
@@ -638,6 +643,7 @@ class PoolApp:
                 raise _err(Reason.CHAIN_BROKEN, task_id=tid, chunk=seq, step=h["step0"])
         if self.store.held_bytes() + len(body) > self.cfg.max_total_bytes:
             raise _err(Reason.SERVER_BUSY)
+        server_r = self._server_rewards(task, tid, c, pub) if task.get("reward_inputs") else None
         rel = f"{tid}/{seq:06d}.brpc"
         dst = self.chunks_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -663,6 +669,11 @@ class PoolApp:
         except BaseException:
             dst.unlink(missing_ok=True)
             raise
+        if server_r is not None:  # the learner gets the gateway's rewards (learner_link.chunk_message)
+            from .server_rewards import write_rewards
+            write_rewards(dst, server_r)
+            if h["final"]:
+                self._rewards.pop(tid, None)
         if flag is not None:  # the cheap check failed: this task in full and the account's next tasks are replayed
             self.store.flag_chunk(tid, seq, flag)
             self.store.set_task_replay(tid)
@@ -671,6 +682,33 @@ class PoolApp:
                      f"{self.cfg.escalate_tasks} tasks go to a full replay")
         self.store.touch_session(sess["session_id"])
         return _json("chunk_result", task_id=tid, seq=seq, status="accepted", verify="pending", steps=steps)
+
+    def _server_rewards(self, task: dict, tid: str, c, pub):
+        """reward_inputs_v1: the chunk's training rewards recomputed from its reward inputs (server_rewards.py)."""
+        from .server_rewards import TaskRewards
+        if "rin" not in c.arrays:
+            raise _err(Reason.BAD_CHUNK, detail="the task asks for the reward inputs (rin)")
+        st = self._rewards.get(tid)
+        try:
+            if st is None:
+                if pub is None:
+                    raise ValueError("the task's policy is no longer published")
+                st = TaskRewards(pub.manifest, pub.starts)
+                for r in self.store.chunks(tid):  # after a gateway restart: the task's earlier chunks first
+                    prev = P.decode_chunk((self.chunks_dir / r["file"]).read_bytes())
+                    st.chunk(int(prev.header["step0"]), prev.arrays["rin"], prev.header.get("episodes") or [])
+                self._rewards[tid] = st
+            t0 = st.seconds
+            out = st.chunk(int(c.header["step0"]), c.arrays["rin"], c.header.get("episodes") or [])
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+            self._rewards.pop(tid, None)
+            raise _err(Reason.BAD_CHUNK, detail=f"reward inputs: {str(e)[:150]}") from None
+        rs = self.reward_stats
+        rs["chunks"] += 1
+        rs["steps"] += len(out)
+        rs["seconds"] += st.seconds - t0
+        rs["differ"] += int((out.view("<u4") != np.asarray(c.arrays["rewards"], "<f4").view("<u4")).sum())
+        return out
 
     def _consistency(self, c, task: dict):
         """policy_consistency with the task's policy (None when the weights cannot be loaded: the replay decides)."""

@@ -45,6 +45,7 @@ Task Task::from_json(const Json &t) {
         k.module_sha256 = fm->at("sha256").as_string(), k.module_sig = fm->at("sig").as_string();
         k.module_size = fm->at("size").as_int(), k.module_abi = int(fm->at("abi").as_int());
     }
+    if (const Json *ri = t.find("reward_inputs")) k.reward_inputs = ri->as_bool();
     k.rest = RestStart::from_json(t.find("rest"));
     if (const Json *c = t.find("life_seed")) k.life_seed = uint64_t(c->as_int());
     if (const Json *c = t.find("respawn_frontier"); c && !c->is_null()) k.respawn_frontier = c->as_int();
@@ -285,6 +286,15 @@ void TaskRunner::new_episode(const StepInfo &info) {
     if (ep.stall_branch && env_.branch_rules().stall_odometer == "local_s" && info.has_local_s) ep.mark_s = info.local_s;
     ep.max_sector_seen = ep.start_sector;
     split_start(ep, info);
+    {
+        EpisodeStart es;
+        es.step = steps, es.kind = ep.kind, es.frame = ep.start_frame, es.sector = ep.start_sector;
+        es.sr_ms = ep.start_sr_ms;
+        es.checkpoints = env_.session() ? int(env_.session()->tracker().checkpoints) : 0;
+        if (rs) es.s = *rs;
+        if (info.has_branch) es.ref_elapsed_ms = info.ref_elapsed_ms;
+        episode_starts.push_back(std::move(es));
+    }
     ep_ = std::move(ep);
     ++episodes;
 }
@@ -403,6 +413,8 @@ StepResult TaskRunner::step(int a, const std::function<std::string()> &stop) {
                 double pen = -(rc.death_penalty + rc.death_refund * std::max(env_.reward().sector_paid, 0.0) + sp_.stall_extra);
                 if (sp_.stall_compensate) pen /= std::pow(sp_.gamma, double(win) / double(std::max(env_.config().action_repeat, 1)));
                 r += pen;
+                info2.rin[RIN_FLAGS] = double(uint32_t(info2.rin[RIN_FLAGS]) | RIN_STALL_PEN);
+                info2.rin[RIN_STALL_WIN] = double(win);
                 term = true, trunc = false;
             }
         }
@@ -441,7 +453,9 @@ StepResult TaskRunner::step(int a, const std::function<std::string()> &stop) {
             new_episode(in);
         }
     }
+    if (info2.episode_end == "LevelFinish") info2.rin[RIN_FLAGS] = double(uint32_t(info2.rin[RIN_FLAGS]) | RIN_LEVEL_FINISH);
     StepResult res;
+    std::copy(std::begin(info2.rin), std::end(info2.rin), res.rin);
     res.action = a;
     res.reward = float(r);
     res.env_reward = float(env_r);
@@ -482,6 +496,7 @@ void ChunkAssembler::add(float logp, const StepResult &st, float next_value) {
     rows_.push_back(st.next_obs);
     digests_.push_back(st.digest);
     values_.push_back(next_value);
+    if (task_.reward_inputs) rin_.insert(rin_.end(), std::begin(st.rin), std::end(st.rin));
 }
 
 Bytes ChunkAssembler::cut(const std::string &end) {
@@ -497,13 +512,30 @@ Bytes ChunkAssembler::cut(const std::string &end) {
     Bytes h = prev_;
     for (auto &d : digests_) h = chain_next(h, d), c.obs_hash.push_back(h);
     c.env_rewards = env_rewards_, c.sector = sector_, c.frames = frames_, c.sr_ms = sr_ms_, c.arc = arc_;
+    if (task_.reward_inputs) {  // reward_inputs_v1
+        c.rin = rin_, c.rin_cols = RIN_COLS;
+        c.episodes = Json::array();
+        if (runner_) {
+            const auto &es = static_cast<const TaskRunner *>(runner_)->episode_starts;
+            for (; episodes_taken_ < es.size() && es[episodes_taken_].step < step0 + int64_t(T); ++episodes_taken_) {
+                const TaskRunner::EpisodeStart &e = es[episodes_taken_];
+                Json j = Json::object();
+                j.set("step", Json::integer(e.step)), j.set("kind", Json::string(e.kind));
+                j.set("frame", Json::integer(e.frame)), j.set("sector", Json::integer(e.sector));
+                j.set("checkpoints", Json::integer(e.checkpoints)), j.set("sr_ms", Json::number(e.sr_ms));
+                j.set("s", e.s ? Json::number(*e.s) : Json());
+                j.set("ref_elapsed_ms", e.ref_elapsed_ms ? Json::number(*e.ref_elapsed_ms) : Json());
+                c.episodes.push(j);
+            }
+        }
+    }
     Bytes data = encode_chunk(c);
     prev_ = c.obs_hash[c.obs_hash.size() - 2];
     ++seq;
     step0 += int64_t(T);
     rows_ = {rows_.back()}, digests_ = {digests_.back()}, values_ = {values_.back()};
     actions_.clear(), rewards_.clear(), logp_.clear(), flags_.clear(), env_rewards_.clear(), sector_.clear();
-    frames_.clear(), sr_ms_.clear(), arc_.clear();
+    frames_.clear(), sr_ms_.clear(), arc_.clear(), rin_.clear();
     return data;
 }
 
@@ -518,6 +550,7 @@ std::string sample_task_started(TaskRunner &runner, const std::vector<float> &ob
                                 const std::function<std::string()> &stop,
                                 const std::function<int(int64_t, const std::vector<float> &)> &choose) {
     ChunkAssembler asm_(task, policy.n_obs, policy.n_act, policy.sha);
+    asm_.runner_ = &runner;
     std::vector<float> x = policy.normalize(obs);
     asm_.begin(obs, policy.value(x), runner.digest);
     std::string end;

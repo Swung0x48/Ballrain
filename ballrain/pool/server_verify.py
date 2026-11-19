@@ -102,8 +102,13 @@ class Verifier:
         for c in rows:
             if c["seq"] > upto:
                 break
-            data = (self.pool_dir / "chunks" / c["file"]).read_bytes()
-            out.append(P.decode_chunk(data, n_act=n_act, n_obs=n_obs))
+            cf = self.pool_dir / "chunks" / c["file"]
+            ch = P.decode_chunk(cf.read_bytes(), n_act=n_act, n_obs=n_obs)
+            from .server_rewards import read_rewards
+            sr = read_rewards(cf, int(ch.header["steps"]))
+            if sr is not None:  # reward_inputs_v1: the replay checks the gateway's rewards, not the client's
+                ch.arrays["rewards"] = sr
+            out.append(ch)
         return out
 
     # ------------------------------------------------------------------------------------------ one task

@@ -82,8 +82,18 @@ struct StartInfo {
     std::string branch_rest_error;
 };
 
+// reward_inputs_v1 (ballrain/pool/server_rewards.py RIN_*): what the reward and its shaping read, per step, so the
+// gateway recomputes the training reward with the trainer's own code (no client update for a reward change)
+constexpr int RIN_COLS = 17;
+enum RinCol { RIN_SR = 0, RIN_S, RIN_CHECKPOINTS, RIN_SECTOR, RIN_BALL_TYPE, RIN_FLAGS, RIN_POS, RIN_POINT = 9,
+              RIN_TANGENT = 12, RIN_REF_ELAPSED = 15, RIN_STALL_WIN = 16 };
+enum RinFlag : uint32_t { RIN_DIED = 1, RIN_FINISHED = 2, RIN_TERMINATED = 4, RIN_REBASE = 8, RIN_SUPPORTED = 16,
+                          RIN_CAM_BAD = 32, RIN_STALL_PEN = 64, RIN_ROUTE_BRANCH = 128, RIN_LEVEL_FINISH = 256,
+                          RIN_HAS_POS = 512, RIN_HAS_POINT = 1024 };
+
 struct StepInfo {
     uint32_t frames_done = 0;
+    double rin[RIN_COLS] = {};  // env.step: the reward inputs (RinCol); the task runner adds the stall and finish bits
     std::optional<double> sr_ms;
     int sector = 0;
     std::vector<GameTracker::Event> events;

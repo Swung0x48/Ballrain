@@ -29,7 +29,7 @@ std::vector<std::string> client_capabilities() {
     // session, < 3 x max_instances per account). Declared always: an instance fetches its next task while its
     // previous task's last chunks still upload (and prepares it early with the prefetch setting)
     std::vector<std::string> caps = {"task_format3", "branch_v1", "branch_rules_v1", "multi_branch_v2", "task_prefetch_v1",
-                                     "policy_graph_v1", "actor_ball_type_v1", reach};
+                                     "policy_graph_v1", "actor_ball_type_v1", "reward_inputs_v1", reach};
     // feature_module_v1: wasmtime present and a module key built in (a client that could not check a module's
     // signature never asks for one)
     if (FeatureModule::available() && FeatureModule::has_pubkey()) caps.push_back("feature_module_v1");
