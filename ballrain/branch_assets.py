@@ -6,6 +6,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from zipfile import BadZipFile, ZipFile
 
 import numpy as np
 
@@ -87,24 +88,70 @@ def ordinary_start_frames(starts, bundle):
     return starts.valid[mask]
 
 
+def _only_added_moving_metadata(old, new, entry):
+    """A narrow exception: original NPY members (including headers) must be byte-identical."""
+    if (entry.get("legacy") or any(old[k] != new[k] for k in ("level", "desc_json", "line_npz"))):
+        return False
+    extra = {"moving_handover_v1.npy", "moving_replay_step_v1.npy"}
+    try:
+        with ZipFile(io.BytesIO(old["drive_npz"])) as a, ZipFile(io.BytesIO(new["drive_npz"])) as b:
+            keys = set(a.namelist())
+            if (keys & extra or len(keys) != len(a.namelist()) or len(b.namelist()) != len(keys) + len(extra)
+                    or set(b.namelist()) != keys | extra or any(a.read(k) != b.read(k) for k in keys)):
+                return False
+        with np.load(io.BytesIO(new["drive_npz"]), allow_pickle=False) as d:
+            rows = d["moving_handover_v1"]
+            cadence = d["moving_replay_step_v1"].item()
+            if (rows.ndim != 2 or rows.shape[1] != 10 or not len(rows) or rows.dtype.kind != "f"
+                    or not np.isfinite(rows).all() or len(np.unique(rows[:, 0])) != len(rows)
+                    or type(cadence) is not int or not 1 <= cadence <= 16):
+                return False
+            samples, n = d["samples"], len(d["frames"])
+            for r in rows:
+                if not np.equal(r[:4], np.floor(r[:4])).all():
+                    return False
+                offset, phase, ball, sector = map(int, r[:4])
+                if not (0 < offset <= n and 0 <= phase < len(entry["phases"])):
+                    return False
+                valid = samples[samples[:, 0] == offset, 1]
+                p = entry["phases"][phase]
+                if (len(valid) != 1 or not p["local_s"][0] <= valid[0] <= p["local_s"][1]
+                        or np.count_nonzero(samples[:, 1] == valid[0]) != 1 or ball != p["when"]["ball"]
+                        or sector != p["when"].get("sector", json.loads(new["desc_json"])["sector"])):
+                    return False
+    except (BadZipFile, ValueError, TypeError, IndexError, KeyError, OSError):
+        return False
+    return True
+
+
 def contextual_append_end(old, new, level, main_sha, old_pin, new_pin):
-    """Return the last affected main station for a strictly append-only contextual change."""
+    """Validate a contextual append and/or moving-only additions; return its last affected main station.
+
+    None means no guidance change. Existing member order, manifest entries, descriptions, and lines cannot change.
+    """
     from .multi_branch import manifest
 
-    err = RouteError("teacher branch exception requires a validated append-only contextual bundle")
+    err = RouteError("teacher branch exception requires a validated append-only contextual bundle or moving-only addition")
     if not old or not new or old.get("version") != 2 or new.get("version") != 2:
         raise err
     if validate(old, level, main_sha) != old_pin or validate(new, level, main_sha) != new_pin:
         raise err
     before, after = manifest(old["manifest"]), manifest(new["manifest"])
     n = len(before)
-    if (len(after) <= n or after[:n] != before or new["members"][:n] != old["members"]
-            or any(e.get("entry_context") != "ordinary" for e in after[n:])):
+    if len(after) < n or after[:n] != before or any(e.get("entry_context") != "ordinary" for e in after[n:]):
+        raise err
+    moving_added = False
+    for a, b, entry in zip(old["members"], new["members"][:n], before, strict=True):
+        if a != b:
+            if not _only_added_moving_metadata(a, b, entry):
+                raise err
+            moving_added = True
+    if len(after) == n and not moving_added:
         raise err
     ends = [float(json.loads(m["desc_json"])["main_s"][1]) for m in new["members"][n:]]
     if not np.isfinite(ends).all():
         raise err
-    return max(ends)
+    return max(ends, default=None)
 
 
 def rest_member(bundle, key):

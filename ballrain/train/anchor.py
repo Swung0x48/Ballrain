@@ -377,6 +377,21 @@ def teacher_layout_error(mine: dict, theirs: dict, t_obs: int, n_obs: int, t_act
     return None
 
 
+def snapshot_branch_ignore(payload, source_bundles, env_assets, level, features, allow):
+    """Verify old snapshot pins by the same rule as checkpoint teachers, never by flag alone."""
+    old = payload["features"].get("branch_sha256")
+    new = features.get("branch_sha256")
+    source = payload.get("branch_assets") or source_bundles.get(old)
+    if old != new and allow:
+        from ..branch_assets import contextual_append_end
+        contextual_append_end(source, env_assets, level, features.get("path_sha256"), old, new)
+        payload["branch_assets"] = source  # Preserve proof for later resumes.
+        return frozenset({"branch_sha256"})
+    if old == new and env_assets is not None:
+        payload["branch_assets"] = env_assets
+    return frozenset()
+
+
 def actor_payload(model, rms_state: dict, n_obs: int, features: dict, arch: dict, update: int) -> dict:
     """A teacher snapshot of the current policy: the actor's parameters only (the critic is not needed), the
     observation statistics it acts with, its layout and architecture."""

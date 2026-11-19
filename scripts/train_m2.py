@@ -320,12 +320,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--frontier-floor", type=int, default=0,
                    help="the curriculum frontier never moves below this TAS frame (0 = no floor)")
     p.add_argument("--rail-gate", default="",
-                   help='JSON {"s": route arc length, "below": TAS frame}: truncate (bootstrapped, end gate_truncate) a 小节-1 '
+                   help='JSON {"s": route arc length, "below": TAS frame}: truncate (bootstrapped, end gate_truncate) a 灏忚妭-1 '
                         'life not started at or after "below" once it reaches route s (WorkerSpec.rail_gate)')
     p.add_argument("--teacher", default="", help="checkpoint of a frozen teacher policy: the PPO loss gets + coef x "
                    "KL(teacher || policy) on batch states whose route s (path_progress x line length) is >= --teacher-s-min")
     p.add_argument("--teacher-allow-context-append", action="store_true",
-                   help="allow an unchanged teacher beyond a validated appended ordinary-only branch span")
+                   help="allow byte-preserving moving metadata additions or an unchanged teacher beyond an appended ordinary-only branch span")
     p.add_argument("--teacher-coef", type=float, default=0.1)
     p.add_argument("--teacher-coef-floor", type=float, default=None,
                    help="decay the coefficient linearly to this floor over --teacher-decay-updates (default: constant)")
@@ -980,7 +980,7 @@ def main(argv=None) -> int:
 
     def branch_append_ignore(tck, what, s_min=None):
         """frozenset({"branch_sha256"}) when a teacher checkpoint's branch pin differs from this run's only by an
-        append-only, context-gated member (--teacher-allow-context-append, ballrain.branch_assets.contextual_append_end);
+        append-only, context-gated member and/or additive moving metadata, both checked by contextual_append_end;
         with s_min (the position-based --teacher) the teacher's route mask must also start above the appended span."""
         mine, theirs = asdict(env_cfg)["features"], tck["env_config"]["features"]
         if not a.teacher_allow_context_append or mine.get("branch_sha256") == theirs.get("branch_sha256"):
@@ -990,12 +990,15 @@ def main(argv=None) -> int:
         try:
             end = contextual_append_end(tck.get("branch_assets"), env_cfg.branch_assets, env_cfg.level,
                                         mine.get("path_sha256"), theirs.get("branch_sha256"), mine.get("branch_sha256"))
-            if s_min is not None and not s_min > end:
+            if end is not None and s_min is not None and not s_min > end:
                 raise RouteError(f"teacher s-min must be above the appended main span ({end:.6f})")
         except RouteError as exc:
             raise SystemExit(f"{what} contextual append refused: {exc}") from None
-        log.msg(f"{what} branch append: appended span ends at {end:.6f}"
-                + (f"; teacher s >= {s_min:g}" if s_min is not None else ""))
+        if end is None:
+            log.msg(f"{what} branch compatibility: added moving metadata only; guidance unchanged")
+        else:
+            log.msg(f"{what} branch append: appended span ends at {end:.6f}"
+                    + (f"; teacher s >= {s_min:g}" if s_min is not None else ""))
         return frozenset({"branch_sha256"})
 
     teacher = None
@@ -1042,8 +1045,13 @@ def main(argv=None) -> int:
                                    grace=a.anchor_grace, drop_scale=a.anchor_drop_scale,
                                    max_teachers=a.anchor_max_teachers, explicit=bool(a.anchor_teacher),
                                    ratchet=a.anchor_ratchet)
+        snapshot_sources = {}
+        if ck is not None and ck.get("branch_assets") is not None:
+            snapshot_sources[ck["env_config"]["features"].get("branch_sha256")] = ck["branch_assets"]
         if a.anchor_teacher:
             tck = torch.load(a.anchor_teacher, weights_only=False)
+            if tck.get("branch_assets") is not None:
+                snapshot_sources[tck["env_config"]["features"].get("branch_sha256")] = tck["branch_assets"]
             err = AN.teacher_layout_error(mine, tck["env_config"]["features"], int(tck["n_obs"]), n_obs,
                                           int(tck["n_act"]), n_act, branch_append_ignore(tck, "--anchor-teacher"))
             if err:
@@ -1056,8 +1064,16 @@ def main(argv=None) -> int:
         if ck is not None and ck.get("anchor"):
             anchor.load_state_dict(ck["anchor"])
             for sid, pay in list(anchor.snapshots.items()):  # a later observation growth: the --teacher layout rules
-                # a snapshot taken before an append-only repin keeps its old pin (its families keep their guidance)
-                ign = (frozenset({"branch_sha256"}) if a.teacher_allow_context_append else frozenset())
+                from ballrain.path import RouteError
+                try:
+                    ign = AN.snapshot_branch_ignore(pay, snapshot_sources, env_cfg.branch_assets, env_cfg.level,
+                                                    mine, a.teacher_allow_context_append)
+                except RouteError as exc:
+                    anchor.drop_snapshot(sid, f"branch compatibility: {exc}")
+                    log.msg(f"anchor snapshot {sid} refused: branch compatibility: {exc}")
+                    continue
+                if ign:
+                    log.msg(f"anchor snapshot {sid}: validated branch compatibility")
                 err = AN.teacher_layout_error(mine, pay["features"], int(pay["n_obs"]), n_obs, n_act, n_act, ign)
                 if err:
                     anchor.drop_snapshot(sid, f"layout: {err}")
@@ -1075,7 +1091,12 @@ def main(argv=None) -> int:
         """(teacher log-probs, row weights, stats) of the mastered-state anchor on this batch; (None, None, stats) when
         no anchored family has rows in it. New masteries get their teacher snapshot here (the current policy)."""
         u = counters["update"]
-        anchor.refresh(u, lambda: AN.actor_payload(model, rms_before, n_obs, mine, arch, u))
+        def snapshot():
+            payload = AN.actor_payload(model, rms_before, n_obs, mine, arch, u)
+            if env_cfg.branch_assets is not None:
+                payload["branch_assets"] = env_cfg.branch_assets
+            return payload
+        anchor.refresh(u, snapshot)
         if not anchor.explicit:
             for sid in [t for t in anchor_teachers if t not in anchor.snapshots]:
                 del anchor_teachers[sid]
