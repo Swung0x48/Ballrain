@@ -20,7 +20,8 @@ def asset_pin():
     files = tuple(ASSETS / f"L{k:02d}.json" for k in range(1, 14))
     h = hashlib.sha256()
     for path in files:
-        h.update(hashlib.sha256(path.read_bytes()).digest())
+        # line endings normalised: a Windows checkout with core.autocrlf must give the same pin as LF hosts
+        h.update(hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).digest())
     return h.hexdigest()[:16]
 
 
