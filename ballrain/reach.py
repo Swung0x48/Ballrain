@@ -668,7 +668,7 @@ def rollout(smap: SupportMap, pos, vel, ball: BallParams, pushes, cfg: ReachConf
         t_death[void] = steps * n + 1
         alive[void] = False
     return {"alive": alive, "t_death": t_death, "traj": traj, "grounded": gr, "landed_at": landed_at,
-            "land_pos": land_pos, "step_psi": n}
+            "land_pos": land_pos, "step_psi": n, "final_velocity": v}
 
 
 # --------------------------------------------------------------------------------------- path utilities

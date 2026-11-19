@@ -1,0 +1,3 @@
+# Seed provenance
+
+`scout_seeds.json` contains only run-length encoded physical keys and the last sector attempted, indexed by the engine's static geometry digest. It was derived from the earlier route-scout `payoff/inputs` key streams selected in `payoff/families.json` (centered-floor, rail-groove, mechanism and pickup-detour search). No family descriptions, human aggregates, TAS recordings, positions, scores, or certification receipts were imported. A matching tape is just a proposal; its current engine run can fail. The caller can omit all archived proposals with `plan --cold`. The archive is optional for novel maps; mechanism rules are **not** stored here.
