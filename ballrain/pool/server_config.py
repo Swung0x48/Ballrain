@@ -141,6 +141,7 @@ class PoolConfig:
     max_steps: int = 8192
     max_frames: int = 60000
     deadline_s: int = 3600
+    feature_module: Path | None = None  # [task] feature_module: the signed .wasm (feature_module_v1; modules.py)
     probation_chunks: int = 200
     task_sample: float = 0.15  # per-task full-replay probability after the probation (2026-11-18: per task, not per chunk)
     escalate_tasks: int = 20
@@ -238,6 +239,7 @@ def load_config(path=None, pool_dir=None, environ=None) -> PoolConfig:
         refresh_s=int(pl.get("refresh_s", 900)),
         max_steps=int(ta.get("max_steps", 8192)), max_frames=int(ta.get("max_frames", 60000)),
         deadline_s=int(ta.get("deadline_s", 3600)),
+        feature_module=_path(ta["feature_module"], base) if ta.get("feature_module") else None,
         probation_chunks=int(ve.get("probation_chunks", 200)),
         task_sample=min(max(float(ve.get("task_sample", 0.15)), 0.0), 1.0),
         escalate_tasks=max(0, int(ve.get("escalate_tasks", 20))),

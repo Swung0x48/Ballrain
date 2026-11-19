@@ -22,6 +22,7 @@ enum RecKind : uint32_t {
     K_FEAT = 7,      // float32[n_obs]
     K_POLICY = 8,    // u32 step, f64 u, u32 action, f32 value, f32 log_probs[n_act]
     K_NOTE = 9,      // JSON
+    K_ROUTE = 10,    // JSON {"id", "phase", "s"}: a verified rest start's route cursor (MultiFollower::restore), after RESET
 };
 
 struct Record {

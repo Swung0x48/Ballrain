@@ -1,5 +1,7 @@
 #include "ballrain/env.h"
 
+#include "ballrain/feature_module.h"
+
 #include <cmath>
 #include <limits>
 
@@ -551,9 +553,23 @@ void BallanceEnv::intro() {
         s.run_until(cfg_.idle_keys, event_mask({Ev::BallNavActive, Ev::GameOver, Ev::LevelFinish}), cfg_.delta);
 }
 
+void BallanceEnv::use_module(FeatureModule *m) {
+    if (sess_) throw Error("use_module before the first start");
+    module_ = m;
+    module_rec_ = std::make_unique<StreamWriter>(m->sink(), rec_);
+    rec_ = module_rec_.get();
+}
+
 std::vector<float> BallanceEnv::features(StepInfo *info) {
     FeatureInfo fi;
-    std::vector<float> v = fx_.compute(sess_->tracker(), &fi);
+    std::vector<float> v;
+    if (module_) {
+        v = module_->compute(&fi);
+        // the route's static data (the members' rules) from the env's own extractor, loaded once
+        if (fx_.config().has_branch() && !fx_.branch()) fx_.reference_path(sess_->tracker());
+    } else {
+        v = fx_.compute(sess_->tracker(), &fi);
+    }
     if (rec_) rec_->put(K_FEAT, v.data(), v.size() * 4);
     if (info) {
         // env._info: the route's branch fields, else (no IVP ball: transforms, finish) the branch's last timing, so
@@ -567,7 +583,10 @@ std::vector<float> BallanceEnv::features(StepInfo *info) {
                 int i = m && !fi.branch_id.empty() ? m->index_of(fi.branch_id) : -1;
                 branch_rules_ = i >= 0 ? m->members[size_t(i)]->rules : BranchRules();
             }
-        } else if (const RouteFollower *b = fx_.branch(); b && b->timing.set) {
+        } else if (module_ && fi.timing_set) {  // the module's follower (the env's own is not stepped then)
+            info->has_branch = true, info->branch = fi.timing_branch;
+            info->ref_elapsed_ms = fi.timing_elapsed_ms, info->ref_remaining_ms = fi.timing_remaining_ms;
+        } else if (const RouteFollower *b = module_ ? nullptr : fx_.branch(); b && b->timing.set) {
             info->has_branch = true, info->branch = b->timing.branch;
             info->ref_elapsed_ms = b->timing.ref_elapsed_ms, info->ref_remaining_ms = b->timing.ref_remaining_ms;
         }
@@ -606,13 +625,19 @@ std::optional<std::vector<float>> BallanceEnv::reset(bool relaunch, StepInfo *in
     }
     ep_steps_ = ep_frames_ = ep_pause_frames_ = 0;
     fx_.reset_episode();
+    if (rec_) rec_->put(K_RESET, Bytes());
     if (!start_.branch_id.empty()) {  // env.reset: the verified rest start's route cursor
         fx_.reference_path(sess_->tracker());
         auto *m = dynamic_cast<MultiFollower *>(fx_.branch_mut());
         if (!m) throw Error("a multi-branch rest start without the multi-branch routes");
         m->restore(start_.branch_id, start_.branch_phase, *start_.branch_s);
+        if (rec_) {  // the module's (and a recording's) follower gets the same cursor
+            Json j = Json::object();
+            j.set("id", Json::string(start_.branch_id)), j.set("phase", Json::integer(start_.branch_phase));
+            j.set("s", Json::number(*start_.branch_s));
+            rec_->put(K_ROUTE, j.dump(true));
+        }
     }
-    if (rec_) rec_->put(K_RESET, Bytes());
     StepInfo tmp;
     StepInfo *pi = info ? info : &tmp;
     std::vector<float> o = features(pi);

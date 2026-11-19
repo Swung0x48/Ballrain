@@ -176,6 +176,14 @@ int main(int argc, char **argv) {
                     break;
                 }
                 case K_RESET: fx->reset_episode(); break;
+                case K_ROUTE: {  // a verified rest start's route cursor (env.reset)
+                    Json j = Json::parse(r.data, 4);
+                    fx->reference_path(ing->tracker);
+                    auto *mf = dynamic_cast<MultiFollower *>(fx->branch_mut());
+                    if (!mf) throw Error("ROUTE without multi-branch routes");
+                    mf->restore(j.at("id").as_string(), int(j.at("phase").as_int()), j.at("s").as_double());
+                    break;
+                }
                 case K_FEAT: {
                     if (dgf) std::fprintf(dgf, "%s\n", hex(dg.take()).c_str());
                     std::vector<float> py(r.data.size() / 4);

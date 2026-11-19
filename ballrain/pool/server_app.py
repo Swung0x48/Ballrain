@@ -39,7 +39,7 @@ from .server_verify import policy_consistency, select_task
 TOKEN_PREFIX = "bp1_"
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
 SESSION_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
-SHA_FILE = re.compile(r"/pool/(weights|assets)/([0-9a-f]{64})\.(json|npz|zst)")  # .zst: f7 reach fields
+SHA_FILE = re.compile(r"/pool/(weights|assets)/([0-9a-f]{64})\.(json|npz|zst|wasm)")  # .zst: f7 reach fields, .wasm: the feature module
 COOKIE = "pool_oauth"
 LOGIN_COOKIE = "pool_login"
 USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O, 1/I
@@ -173,6 +173,10 @@ class PoolApp:
         self._board = (0.0, None)
         self._ref = {}  # engine kind -> reference game-file hashes
         self.chunks_dir = Path(cfg.pool_dir) / "chunks"
+        self.feature_module = None  # modules.FeatureModuleRef: the signed feature module ([task] feature_module)
+        if cfg.feature_module:
+            from .modules import load_module
+            self.feature_module = load_module(cfg.feature_module, Path(cfg.pool_dir) / "assets")
 
     def now(self) -> int:
         return int(self.clock())
@@ -555,6 +559,8 @@ class PoolApp:
             return _json("no_task", reason=refusal(sess["client_version"], lacking), retry_s=600)
         t = self.policies.new_task(sess["engine_kind"], self.now(), self.cfg.max_steps, self.cfg.max_frames,
                                    self.cfg.deadline_s)
+        if self.feature_module is not None and "feature_module_v1" in caps:  # the hot-updated features (modules.py)
+            t.assets = dict(t.assets, feature_module=self.feature_module.asset())
         d = t.to_dict()
         replay = select_task(self.store, acct["forum_id"], self.cfg.probation_chunks * int(t.chunk_steps),
                              self.cfg.task_sample)
@@ -747,7 +753,7 @@ class PoolApp:
     def sha_file(self, path: str) -> Response:
         m = SHA_FILE.fullmatch(path)
         kind, sha, ext = m.groups()
-        if (kind == "assets" and ext not in ("npz", "zst")) or (kind == "weights" and ext == "zst"):
+        if (kind == "assets" and ext not in ("npz", "zst", "wasm")) or (kind == "weights" and ext in ("zst", "wasm")):
             return _error(payload(Reason.BAD_MESSAGE, detail="not found"), 404)
         f = Path(self.cfg.pool_dir) / kind / f"{sha}.{ext}"
         if not f.is_file():

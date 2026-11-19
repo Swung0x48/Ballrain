@@ -131,6 +131,8 @@ def main(argv=None) -> int:
                     help="the client's phase summary interval: the headless run must append it to <client>/logs/client.log")
     ap.add_argument("--wait-upload", action="store_true", help="the client's 0.5.0 behaviour (wait for the previous upload)")
     ap.add_argument("--rate-only", action="store_true", help="a throughput run: the gateway's receive rate, no verification")
+    ap.add_argument("--feature-module", help="the signed feature module (.wasm + .sig): tasks of feature_module_v1 "
+                    "clients carry it ([task] feature_module); the run checks the client used it")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--latency-ms", type=float, default=0.0, help="delay every gateway response (a tunnel's round trip)")
     ap.add_argument("--heartbeat-s", type=int, default=5, help="the gateway's heartbeat interval (5: heartbeats during tasks)")
@@ -166,7 +168,8 @@ def main(argv=None) -> int:
     cfg = PoolConfig(pool_dir=d / "pool", public_base_url=gateway, forum=ForumConfig(
         base_url=forum.base_url, client_id="ballrain-pool-e2e", client_secret="e2e-secret", redirect_uri=redirect),
         run="r7", datasets_dir=ds, path_dirs=[Path(a.path_dir).resolve()], max_steps=a.max_steps, max_frames=60000,
-        deadline_s=3600, heartbeat_s=a.heartbeat_s, engines={"x87soft": engine}, max_instances=a.max_instances)
+        deadline_s=3600, heartbeat_s=a.heartbeat_s, engines={"x87soft": engine}, max_instances=a.max_instances,
+        feature_module=Path(a.feature_module).resolve() if a.feature_module else None)
     from tools_pool_gateway import build  # noqa: E402  (tools/pool/gateway.py, imported by path below)
     app, store, policies, verifier = build(cfg)
     if a.client_engine != a.engine:  # the client runs another build of the x87-soft engine: allow its sha256 too
@@ -347,6 +350,11 @@ def main(argv=None) -> int:
         log(f"client exit {p.returncode}: {p.stderr[-2000:]}")
         return 1
     ends = [e for e in events if e["event"] == "task_end"]
+    if a.feature_module:  # every task ran its features in the module (feature_module_v1 declared, signature checked)
+        used = [e.get("feature_module") for e in events if e["event"] == "task"]
+        log(f"feature module: {sum(1 for u in used if u)} of {len(used)} tasks ran it")
+        if not used or not all(used):
+            return 1
     # the headless run's log: client.log grows after the start (the log lines, the phase summary among them), the log
     # lines are events too, the summary also a "phases" event
     run_s = time.time() - t0

@@ -33,6 +33,10 @@ struct Task {  // protocol.TASK
         int64_t size = 0, zsize = 0;
     };
     std::vector<ReachAsset> asset_reach;
+    // assets.feature_module (feature_module_v1): the signed wasm feature module ("" sha: none)
+    std::string module_sha256, module_sig;
+    int64_t module_size = 0;
+    int module_abi = 0;
     std::optional<RestStart> rest;  // format 3: an at-rest start after the hand-over (server-drawn)
     uint64_t life_seed = 0;          // format 3: the per-life draws (ballrain/pool/counters.py)
     std::optional<int64_t> respawn_frontier;  // format 3: the curriculum frontier of the early-respawn rule

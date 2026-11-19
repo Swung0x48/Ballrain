@@ -72,6 +72,10 @@ struct FeatureInfo {
     std::optional<double> gap;
     std::string surface = "none";
     std::optional<double> edge_fan_min;
+    // the route follower's last timing (BranchTiming, when set): filled by the feature module (the env reads its own
+    // follower otherwise)
+    bool timing_set = false, timing_branch = false;
+    double timing_elapsed_ms = 0, timing_remaining_ms = 0;
 };
 
 class LevelGeometry {

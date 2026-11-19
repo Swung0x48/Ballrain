@@ -66,7 +66,7 @@ def main() -> int:
     if a.sign_key:
         if not a.nc_release:
             raise SystemExit("--sign-key needs --nc-release")
-        subprocess.run([a.nc_release, "sign", "--key", a.sign_key, "--manifest", str(dst)], check=True)
+        subprocess.run([str(Path(a.nc_release).resolve()), "sign", "--key", a.sign_key, "--manifest", str(dst)], check=True)
         print(f"signed: {dst.name}.sig")
     return 0
 

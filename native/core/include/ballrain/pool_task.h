@@ -15,6 +15,8 @@
 
 namespace ballrain {
 
+class FeatureModule;
+
 struct LocalEngine {  // the player's side: the engine binary and the Ballance folder
     std::string binary, root, kind = "x87soft";
     std::vector<std::pair<std::string, std::string>> extra_env;  // BALLRAIN_* only (tests / diagnostics)
@@ -59,6 +61,7 @@ struct PreparedTask {
     Policy pol;
     TasStarts starts;
     std::string run_dir;
+    std::unique_ptr<FeatureModule> module;  // feature_module_v1 (before env: the env feeds it)
     std::unique_ptr<BallanceEnv> env;
     std::unique_ptr<TaskRunner> runner;
     std::vector<float> obs0;

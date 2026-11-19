@@ -1,5 +1,7 @@
 #include "ballrain/pool_task.h"
 
+#include "ballrain/feature_module.h"
+
 #include <cstdlib>
 #include <filesystem>
 
@@ -128,9 +130,17 @@ std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, s
     p->task = task;
     Policy &pol = p->pol;
     TasStarts &starts = p->starts;
-    std::string path_dir, branch_dir, reach_dir;
+    std::string path_dir, branch_dir, reach_dir, cache_root;
+    Bytes module_bytes;
     {
         std::lock_guard<std::mutex> g(cache_mu);
+        cache_root = cache.root();
+        if (!task.module_sha256.empty()) {  // feature_module_v1: the signed module, checked before anything runs it
+            if (task.module_abi != MODULE_ABI) throw Error("the task's feature module has another ABI version");
+            module_bytes = cache.module(task.module_sha256, task.module_size);
+            if (!FeatureModule::signature_ok(module_bytes, task.module_sig))
+                throw Error("the feature module's signature does not verify: not loaded");
+        }
         pol = cache.policy(task.policy_sha);
         starts = cache.starts(task.asset_starts);
         path_dir = cache.path_dir(task.asset_path, task.level);
@@ -188,6 +198,26 @@ std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, s
     try {
         p->env = std::make_unique<BallanceEnv>(ec, fc, eng, run_dir, nullptr, &starts, task.start_frame,
                                                RewardConfig::from_json(m.at("reward")), task.rest);
+        if (!module_bytes.empty()) {  // the features from the module, its paths under the cache root ("/cache")
+            auto guest = [&](const std::string &host) -> Json {
+                if (host.empty()) return Json();
+                std::string a = host, r = cache_root;
+                for (char &c : a)
+                    if (c == '\\') c = '/';
+                for (char &c : r)
+                    if (c == '\\') c = '/';
+                if (a.compare(0, r.size(), r) != 0) throw Error("a feature asset outside the cache: " + host);
+                return Json::string("/cache" + a.substr(r.size()));
+            };
+            Json fx = Json::object();
+            for (auto &kv : m.at("features").members()) fx.set(kv.first, kv.second);
+            fx.set("path_dir", guest(fc.path_dir)), fx.set("branch_dir", guest(fc.branch_dir));
+            fx.set("reach_dir", guest(fc.reach_dir));
+            Json init = Json::object();
+            init.set("level", Json::integer(task.level)), init.set("features", fx);
+            p->module = std::make_unique<FeatureModule>(module_bytes, cache_root, init);
+            p->env->use_module(p->module.get());
+        }
         if (p->env->features().size() != pol.n_obs) throw Error("the env's observation size differs from the policy's");
         for (size_t i = 0; i < p->env->actions().size(); ++i)
             if (p->env->actions()[i] != pol.action_keys[i]) throw Error("the env's action set differs from the policy's");

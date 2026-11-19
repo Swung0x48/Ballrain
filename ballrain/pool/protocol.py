@@ -346,6 +346,8 @@ STATS = Obj({"steps_accepted": Int(0), "steps_pending": Int(0), "steps_verified"
 # The task (ballrain.pool.task.Task.to_dict); the client never chooses any of it
 REACH_ASSET = Obj({"level": Int(1, 13), "key_sha256": SHA, "sha256": SHA, "size": Int(1, 128 << 20), "zsha256": SHA,
                    "zsize": Int(1, 32 << 20)})  # served at /pool/assets/<zsha256>.zst (no url field)
+FEATURE_MODULE_ASSET = Obj({"sha256": SHA, "size": Int(8, 64 << 20), "sig": Str(128, re.compile(r"[0-9a-f]{128}"), min_len=128),
+                            "abi": Int(1, 1000)})
 TASK = Obj({
     "task_id": TASK_ID,
     "kind": Str(16, enum=TASK_KINDS),
@@ -368,7 +370,10 @@ TASK = Obj({
     # policy follows one (its manifest's features.branch_sha256 pins the pack's files); reach (f7): one entry per
     # fastreach fields file the level can need (docs/f7-native-port.md 8), served zstd-compressed at
     # /pool/assets/<zsha256>.zst; the client picks the entry whose key_sha256 is sha256 of its geometry's fields key
-    "assets": Obj({"starts": SHA, "path": SHA}, {"branch": SHA, "reach": List(REACH_ASSET, 8)}),
+    # feature_module (feature_module_v1 sessions only, ballrain/pool/modules.py): the signed wasm feature module,
+    # served at /pool/assets/<sha256>.wasm; sig: ed25519 over its bytes (hex), checked by the client's built-in key
+    "assets": Obj({"starts": SHA, "path": SHA}, {"branch": SHA, "reach": List(REACH_ASSET, 8),
+                                                 "feature_module": FEATURE_MODULE_ASSET}),
 }, {
     # format 3 (docs/pool-prototype.md 5): an at-rest start after the hand-over at start_frame (the env's rest_starts):
     # drive to target (x, z) within max_frames, then brake; target null = brake only. Drawn by the server

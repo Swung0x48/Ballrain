@@ -28,6 +28,7 @@ public:
     // (BALLRAIN_MODULE_PUBKEY, or set_module_pubkey for tests); false: refuse to load it
     static bool signature_ok(const Bytes &wasm, const std::string &sig_hex);
     static void set_module_pubkey(const std::string &hex);  // tests / dev gateways (the build's key otherwise)
+    static bool has_pubkey();
 
     // wasm: the module bytes (its sha256 already checked by the caller); cache_dir: the host directory the module sees
     // read-only as "/cache"; init: br_init's JSON ({"level", "features"} with paths under "/cache")

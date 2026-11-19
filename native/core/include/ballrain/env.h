@@ -17,6 +17,8 @@
 
 namespace ballrain {
 
+class FeatureModule;
+
 extern const uint32_t ARROWS9[9];
 
 struct EnvConfig {
@@ -111,6 +113,9 @@ public:
 
     const std::vector<uint32_t> &actions() const { return actions_; }
     FeatureExtractor &features() { return fx_; }
+    // feature_module_v1: the features from this module (fed the session's records; before the first start). The env
+    // keeps its own extractor for the static route data (rules, the rest start's drive), not for the features
+    void use_module(FeatureModule *m);
     const BranchRules &branch_rules() const { return branch_rules_; }
     Session *session() { return sess_.get(); }
     bool after_death() const { return after_death_; }
@@ -162,6 +167,8 @@ private:
     std::string run_root_;
     StreamWriter *rec_;
     FeatureExtractor fx_;
+    FeatureModule *module_ = nullptr;
+    std::unique_ptr<StreamWriter> module_rec_;  // the records to the module (and on to the caller's rec_, if any)
     std::vector<uint32_t> actions_;
     std::unique_ptr<Session> sess_;
     bool repress_;

@@ -1,5 +1,7 @@
 #include "ballrain/pool_client.h"
 
+#include "ballrain/feature_module.h"
+
 #include <algorithm>
 #include <mutex>
 #include <map>
@@ -26,8 +28,12 @@ std::vector<std::string> client_capabilities() {
     // task_prefetch_v1: "may hold up to 3 open tasks per instance" (the gateway's rule: < 3 x hello.instances per
     // session, < 3 x max_instances per account). Declared always: an instance fetches its next task while its
     // previous task's last chunks still upload (and prepares it early with the prefetch setting)
-    return {"task_format3", "branch_v1", "branch_rules_v1", "multi_branch_v2", "task_prefetch_v1", "policy_graph_v1",
-            "actor_ball_type_v1", reach};
+    std::vector<std::string> caps = {"task_format3", "branch_v1", "branch_rules_v1", "multi_branch_v2", "task_prefetch_v1",
+                                     "policy_graph_v1", "actor_ball_type_v1", reach};
+    // feature_module_v1: wasmtime present and a module key built in (a client that could not check a module's
+    // signature never asks for one)
+    if (FeatureModule::available() && FeatureModule::has_pubkey()) caps.push_back("feature_module_v1");
+    return caps;
 }
 static const size_t MAX_RESPONSE = 64 * 1024, MAX_MANIFEST = 256 * 1024, MAX_DOWNLOAD = 64 * 1024 * 1024;
 
@@ -247,6 +253,17 @@ std::string PoolCache::asset(const std::string &sha) {
     std::string p = d + "/" + sha + ".npz";
     if (!verified(p, sha)) put_file(p, api_.download("/pool/assets/" + sha + ".npz", MAX_DOWNLOAD, sha));
     return p;
+}
+
+Bytes PoolCache::module(const std::string &sha, int64_t size) {
+    if (!is_hex64(sha) || size < 8 || size > (64 << 20)) throw Error("feature module sha / size");
+    std::string d = root_ + "/modules";
+    platform::make_dirs(d);
+    std::string p = d + "/" + sha + ".wasm";
+    if (!verified(p, sha)) put_file(p, api_.download("/pool/assets/" + sha + ".wasm", size_t(size), sha));
+    Bytes b;
+    if (!read_file(p, b) || int64_t(b.size()) != size) throw Error("feature module size");
+    return b;
 }
 
 TasStarts PoolCache::starts(const std::string &sha) { return TasStarts::load_pack(asset(sha), sha); }

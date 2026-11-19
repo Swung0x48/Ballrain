@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "ballrain/branch.h"
 #include "ballrain/features.h"
 #include "ballrain/session.h"
 #include "ballrain/stream.h"
@@ -86,7 +87,8 @@ Bytes pack_info(const FeatureInfo &fi) {
     Bytes b;
     uint32_t flags = (fi.have_ball ? 1u : 0u) | (fi.path ? 2u : 0u) | (fi.has_branch ? 4u : 0u) | (fi.branch ? 8u : 0u) |
                      (fi.branch_multi ? 16u : 0u) | (fi.supported ? 32u : 0u) | (fi.gap ? 64u : 0u) |
-                     (fi.edge_fan_min ? 128u : 0u) | (fi.path && fi.path->jump ? 256u : 0u);
+                     (fi.edge_fan_min ? 128u : 0u) | (fi.path && fi.path->jump ? 256u : 0u) |
+                     (fi.timing_set ? 512u : 0u) | (fi.timing_branch ? 1024u : 0u);
     put<uint32_t>(b, flags);
     for (double v : fi.pos) put<double>(b, v);
     for (double v : fi.vel) put<double>(b, v);
@@ -104,6 +106,7 @@ Bytes pack_info(const FeatureInfo &fi) {
     put_str(b, fi.surface);
     put<double>(b, fi.edge_fan_min ? *fi.edge_fan_min : 0.0);
     put_str(b, fi.reach_key);
+    put<double>(b, fi.timing_elapsed_ms), put<double>(b, fi.timing_remaining_ms);
     return b;
 }
 
@@ -159,6 +162,16 @@ BR_EXPORT(br_feed) int br_feed(uint32_t kind, const char *p, uint32_t len) {
                 if (!S->fx) throw Error("record stream: RESET before HELLO");
                 S->fx->reset_episode();
                 break;
+            case K_ROUTE: {
+                flush();
+                if (!S->fx) throw Error("record stream: ROUTE before HELLO");
+                Json j = Json::parse(Bytes(p, len), 4);
+                S->fx->reference_path(S->ing->tracker);
+                auto *m = dynamic_cast<MultiFollower *>(S->fx->branch_mut());
+                if (!m) throw Error("a multi-branch rest start without the multi-branch routes");
+                m->restore(j.at("id").as_string(), int(j.at("phase").as_int()), j.at("s").as_double());
+                break;
+            }
             default: break;  // ACT, FEAT, POLICY, NOTE: not the module's
         }
         return 0;
@@ -171,6 +184,10 @@ BR_EXPORT(br_compute) int br_compute() {
         flush();
         FeatureInfo fi;
         S->out = S->fx->compute(S->ing->tracker, &fi);
+        if (const RouteFollower *b = S->fx->branch(); b && b->timing.set) {
+            fi.timing_set = true, fi.timing_branch = b->timing.branch;
+            fi.timing_elapsed_ms = b->timing.ref_elapsed_ms, fi.timing_remaining_ms = b->timing.ref_remaining_ms;
+        }
         S->info = pack_info(fi);
         return int(S->out.size());
     });

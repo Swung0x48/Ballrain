@@ -1034,6 +1034,7 @@ void Controller::play_pending(Slot *s, Pending &p) {
         f.set("start_frame", Json::integer(task.start_frame));
         f.set("ball_order_seed", Json::integer(task.ball_order_seed));
         f.set("prefetched", Json::boolean(p.prefetched));
+        f.set("feature_module", Json::boolean(p.prep && p.prep->module));  // the features from the task's wasm module
         emit("task", f);
     }
     double deadline = p.t_issue + double(task.deadline_s) - std::min(30.0, double(task.deadline_s) / 10);

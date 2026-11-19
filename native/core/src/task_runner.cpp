@@ -41,6 +41,10 @@ Task Task::from_json(const Json &t) {
             a.size = e.at("size").as_int(), a.zsize = e.at("zsize").as_int();
             k.asset_reach.push_back(a);
         }
+    if (const Json *fm = t.at("assets").find("feature_module"); fm && !fm->is_null()) {
+        k.module_sha256 = fm->at("sha256").as_string(), k.module_sig = fm->at("sig").as_string();
+        k.module_size = fm->at("size").as_int(), k.module_abi = int(fm->at("abi").as_int());
+    }
     k.rest = RestStart::from_json(t.find("rest"));
     if (const Json *c = t.find("life_seed")) k.life_seed = uint64_t(c->as_int());
     if (const Json *c = t.find("respawn_frontier"); c && !c->is_null()) k.respawn_frontier = c->as_int();

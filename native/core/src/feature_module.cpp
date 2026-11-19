@@ -30,6 +30,11 @@ void FeatureModule::set_module_pubkey(const std::string &hex) {
     module_pubkey = hex;
 }
 
+bool FeatureModule::has_pubkey() {
+    std::lock_guard<std::mutex> g(key_mu);
+    return module_pubkey.size() == 64;
+}
+
 bool FeatureModule::signature_ok(const Bytes &wasm, const std::string &sig_hex) {
     std::string key;
     {
@@ -76,6 +81,8 @@ FeatureInfo unpack_feature_info(const Bytes &b) {
     double efm = r.f64();
     if (f & 128u) fi.edge_fan_min = efm;
     fi.reach_key = str();
+    fi.timing_set = (f & 512u) != 0, fi.timing_branch = (f & 1024u) != 0;
+    fi.timing_elapsed_ms = r.f64(), fi.timing_remaining_ms = r.f64();
     return fi;
 }
 
