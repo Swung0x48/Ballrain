@@ -30,6 +30,7 @@ import traceback
 from multiprocessing.connection import Client, Listener
 
 from ..branch_assets import uses_custom_rules
+from ..branch_move import uses_branch_move
 
 PROTOCOL = 1
 
@@ -101,7 +102,11 @@ class RemoteHub:
                     and hello.get("actor_ball_type_v1") is not True):
                 conn.send({"type": "error", "error": "gated actor requires actor_ball_type_v1"})
                 return
-            assets = getattr(self.template.get("env"), "branch_assets", None)
+            env = self.template.get("env")
+            if env is not None and uses_branch_move(env) and hello.get("branch_move_v1") is not True:
+                conn.send({"type": "error", "error": "moving branch starts require branch_move_v1"})
+                return
+            assets = getattr(env, "branch_assets", None)
             if assets and assets.get("version") == 2 and hello.get("multi_branch_v2") is not True:
                 conn.send({"type": "error", "error": "multi-branch bundle requires multi_branch_v2"})
                 return
@@ -247,7 +252,7 @@ class RemoteBridge:
                         cc = Client(self.addr, authkey=self.authkey)
                         cc.send({"type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session + 1,
                                  "branch_assets_version": 1, "branch_rules_version": 1, "multi_branch_v2": True,
-                                 "actor_ball_type_v1": True, "backend": self.label, "n_workers": len(self.copies)})
+                                 "actor_ball_type_v1": True, "branch_move_v1": True, "backend": self.label, "n_workers": len(self.copies)})
                         if not cc.poll(30):
                             raise ConnectionError("no config within 30 s")
                         box["conn"], box["msg"] = cc, cc.recv()

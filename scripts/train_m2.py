@@ -71,13 +71,29 @@ def start_record(a) -> str:
 
 def parse_rest_starts(spec: str):
     """--rest-starts: "lo-hi", "lo-hi@x:z:jitter" or "lo-hi@x:z:jitter:max_frames" entries -> [[lo, hi]] /
-    [[lo, hi, x, z, jitter]] / [[lo, hi, x, z, jitter, max_frames]] (None when empty)."""
+    [[lo, hi, x, z, jitter]] / [[lo, hi, x, z, jitter, max_frames]] (None when empty).
+    Branch forms carry a target dict; k-k@branch-move:<member>:<station> requires an exact pinned sample.
+    """
     out = []
     for r in spec.split(","):
         r = r.strip()
         if not r:
             continue
         rng, _, tgt = r.partition("@")
+        if tgt.startswith("branch-move:"):
+            import math
+            import re
+            name, sep, station = tgt.removeprefix("branch-move:").rpartition(":")
+            try:
+                e = [int(v) for v in rng.split("-")]
+                value = float(station)
+                if (len(e) != 2 or not 0 < e[0] == e[1] or not sep or
+                        not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name) or not math.isfinite(value) or value < 0):
+                    raise ValueError
+            except ValueError:
+                raise SystemExit(f"--rest-starts entry {r!r}: k-k@branch-move:<member>:<recorded station>") from None
+            out.append([*e, {"branch_s": value, "id": name, "branch_move": True}])
+            continue
         e = [int(v) for v in rng.split("-")]
         if tgt.startswith("branch:"):
             name, sep, station = tgt.removeprefix("branch:").rpartition(":")
@@ -241,7 +257,7 @@ def parse(argv=None):
     p.add_argument("--stall-speed", type=float, default=None,
                    help="the stall clock pauses while the ball is faster than this (units/s): run-ups are not cut")
     p.add_argument("--stall-max-s", type=float, default=15.0, help="with --stall-speed: max time without new arc progress")
-    p.add_argument("--rest-starts", default="", help="at-rest starts: lo-hi record frame ranges, e.g. 11760-11900,13450-13650; "
+    p.add_argument("--rest-starts", default="", help="at-rest or moving branch starts: lo-hi record frame ranges, e.g. 11760-11900,13450-13650; "
                    "lo-hi@branch:<id>:s uses a measured branch drive (lo-hi@branch:s for legacy); lo-hi@x:z:jitter drives the ball to a target in [x +- jitter] x [z +- jitter] before braking "
                    "(lo-hi@x:z:jitter:max_frames: that entry's drive limit; the hand-over may be an excluded frame)")
     p.add_argument("--counter-rand", default="",
@@ -403,12 +419,16 @@ def make_env_config(a, out_root: Path, ck=None):
     if a.backend == "headless":
         hl = {k: v for k, v in (("binary", a.hl_bin), ("root", a.hl_root), ("socket", a.hl_socket),
                                 ("ball_order", a.hl_ball_order)) if v}
+    rest_starts = parse_rest_starts(a.rest_starts)
+    if getattr(a, "pool_ingest", False) and any(len(e) == 3 and isinstance(e[2], dict) and e[2].get("branch_move")
+                                               for e in rest_starts or ()):
+        raise RouteError("moving branch starts are Python-only; disable --pool-ingest")
     return EnvConfig(branch_assets=bundle, level=a.level, mode="sr", action_repeat=a.action_repeat, out_root=str(out_root),
                      start_record=start_record(a),
                      backend=a.backend, headless=hl,
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
                      per_life=not a.no_respawn,
-                     rest_starts=parse_rest_starts(a.rest_starts),
+                     rest_starts=rest_starts,
                      p_rest=a.p_rest,
                      rehearse_starts=[[int(v) for v in r.split("-")] for r in a.rehearse_starts.split(",") if r.strip()] or None,
                      p_rehearse=a.p_rehearse,
@@ -717,6 +737,10 @@ def main(argv=None) -> int:
         counters["episodes"] += 1
         win_eps.append(e)
         log.row("episodes", e)
+        if e["kind"] in ("branch_moving", "branch_moving_fallback"):
+            log.row("branch-moving", e, cols=["update", "wid", "kind", "start_frame", "branch_move_member",
+                    "branch_move_station", "branch_move_offset", "branch_move_phase", "branch_rest_failures",
+                    "branch_rest_error", "success_cp", "finish"])
         if e["kind"] == "respawn":
             by_rsp_sector[e["start_sector"]].append((e["success_cp"], e["finish"]))
         if e["kind"] == "tas_rest":
