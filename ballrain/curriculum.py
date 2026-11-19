@@ -296,6 +296,17 @@ class ReverseCurriculum:
         hi = max(hi, lo + 1)
         return int(self.valid[rng.integers(lo, hi)])
 
+    def next_frontier(self, target: int) -> int:
+        """The frontier after a move back to target: the first valid frame at or after target (_snap), or, when a gap
+        in the valid starts below the frontier is wider than the step (_snap lands back on the frontier), the last
+        valid frame below the frontier, so the curriculum crosses the gap instead of stalling on it."""
+        new = self._snap(target)
+        if new >= self.frontier:
+            i = int(np.searchsorted(self.valid, self.frontier)) - 1
+            if i >= 0:
+                new = int(self.valid[i])
+        return new
+
     def in_band(self, k: int) -> bool:
         return (k == 0 and self.at_start) or self.frontier <= k <= self.frontier + self.cfg.band
 
@@ -307,7 +318,7 @@ class ReverseCurriculum:
         if len(self.outcomes) >= self.cfg.min_episodes:
             rate = float(np.mean(self.outcomes))
             if rate >= self.cfg.advance_at and not self.at_start:
-                self.frontier = self._snap(self.frontier - self.cfg.step)
+                self.frontier = self.next_frontier(self.frontier - self.cfg.step)
                 self.history.append((self.frontier, rate))
                 self.outcomes.clear()
                 return True

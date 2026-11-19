@@ -167,6 +167,9 @@ class Verifier:
         if mm is None:
             # f7: chunks with too many reach-deviant rows are rejected alone (no suspect flag, the task's other chunks
             # pass); the passed chunks' deviant rows get this replay's reach values for the learner (a patch file)
+            for q, r in reach.items():  # guard: the verifier's own reach values must be finite (else: this chunk
+                if not r["excess"] and not np.isfinite(np.asarray(r["reach"])).all():  # out, never patched in)
+                    r["excess"] = "the verifier's reach values are not finite"
             excess = sorted(q for q, r in reach.items() if r["excess"])
             step0_of = {int(x.header["seq"]): int(x.header["step0"]) for x in decoded}
             for q in excess:
@@ -252,6 +255,8 @@ def write_reach_patch(chunk_file, r: dict) -> None:
     """The verifier's reach values of a passed chunk's deviant rows (rows j of the chunk, row T = the row after the last
     step), for the learner link (learner_link.chunk_message applies it)."""
     from .task import save_npz_deterministic
+    if not np.isfinite(np.asarray(r["reach"], np.float64)).all():
+        raise ValueError("reach patch: non-finite values")
     dst = reach_patch_path(chunk_file)
     tmp = dst.with_name(f".{dst.name}.{secrets.token_hex(4)}.tmp.npz")
     save_npz_deterministic(tmp, {"rows": np.asarray(r["rows"], "<i4"), "reach": np.asarray(r["reach"], "<f4"),

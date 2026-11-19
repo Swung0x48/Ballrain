@@ -241,3 +241,66 @@ def test_tracker_events_arrays_and_hs():
     t.update(o)
     assert t.checkpoints == 1 and t.sector == 2 and t.flags.finished
     assert t.hs_at_finish == 990 + 3 * 200 + 200 and t.levelfinish_frame == 6
+
+
+def test_s3_lane_is_default_off_and_uses_horizontal_cross_track():
+    t = FakeTracker()
+    t.sector = 3
+    t.ball_type = lambda: 0
+    features = {"pos": (916., 48., -352.),
+                "path": {"point": (916., 49., -351.), "tangent": (1., 0., 0.)}}
+    plain = Reward()
+    plain.begin(t, 0.)
+    t.sr_ms = 20.
+    assert plain.step(t, 0., False, False, False, s3_features=features) == (
+        -.02, {"progress": 0., "time": -.02})
+
+    shaped = Reward(RewardConfig(s3_lane_rate=.35))
+    shaped.begin(t, 0.)
+    t.sr_ms += 20.
+    _, terms = shaped.step(t, 0., False, False, False, s3_features=features)
+    assert terms["s3_lane"] == pytest.approx(-.35 * .02 * .75)
+    # Vertical distance alone is not lateral error.
+    no_lateral = dict(features, pos=(916., 45., -351.))
+    t.sr_ms += 20.
+    assert "s3_lane" not in shaped.step(t, 0., False, False, False, s3_features=no_lateral)[1]
+
+
+@pytest.mark.parametrize("sector,material,pos,branch,terminal", [
+    (2, 0, (916, 48, -352), False, False),
+    (3, 1, (916, 48, -352), False, False),
+    (3, 0, (899, 48, -352), False, False),
+    (3, 0, (916, 48, -330), False, False),
+    (3, 0, (916, 42, -352), False, False),
+    (3, 0, (916, 48, -352), True, False),
+    (3, 0, (916, 48, -352), False, True),
+])
+def test_s3_lane_does_not_leak_across_its_gates(sector, material, pos, branch, terminal):
+    t = FakeTracker()
+    t.sector = sector
+    t.ball_type = lambda: material
+    r = Reward(RewardConfig(s3_lane_rate=.35))
+    r.begin(t, 0.)
+    t.sr_ms += 20
+    fi = {"pos": pos, "path": {"point": (916, 49, -351), "tangent": (1, 0, 0), "branch": branch}}
+    assert "s3_lane" not in r.step(t, 0., False, False, terminal, s3_features=fi)[1]
+
+
+def test_s3_paper_cost_is_one_shot_local_and_resets_per_life():
+    t = FakeTracker()
+    t.sector = 3
+    t.ball_type = lambda: 1
+    fi = {"pos": (916.35, 49.76, -346.74)}
+    r = Reward(RewardConfig(s3_paper_cost=2.))
+    r.begin(t, 0.)
+    assert "s3_paper" not in r.step(t, 0., False, False, False, s3_features={"pos": (992, 49, -366)})[1]
+    assert r.step(t, 0., False, False, False, s3_features=fi)[1]["s3_paper"] == -2
+    assert "s3_paper" not in r.step(t, 0., False, False, False, s3_features=fi)[1]
+    r.begin(t, 0.)
+    assert r.step(t, 0., False, False, False, s3_features=fi)[1]["s3_paper"] == -2
+
+
+@pytest.mark.parametrize("kwargs", [{"s3_lane_rate": -1.}, {"s3_paper_cost": float("nan")}])
+def test_s3_costs_reject_bad_values(kwargs):
+    with pytest.raises(ValueError, match="nonnegative"):
+        Reward(RewardConfig(**kwargs))

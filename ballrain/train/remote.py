@@ -97,6 +97,10 @@ class RemoteHub:
             if hello.get("type") != "hello" or hello.get("protocol") != PROTOCOL:
                 conn.send({"type": "error", "error": f"bad hello {hello!r}"})
                 return
+            if ((self.template.get("worker") or {}).get("actor_heads") == "ball_type"
+                    and hello.get("actor_ball_type_v1") is not True):
+                conn.send({"type": "error", "error": "gated actor requires actor_ball_type_v1"})
+                return
             assets = getattr(self.template.get("env"), "branch_assets", None)
             if assets and assets.get("version") == 2 and hello.get("multi_branch_v2") is not True:
                 conn.send({"type": "error", "error": "multi-branch bundle requires multi_branch_v2"})
@@ -242,7 +246,8 @@ class RemoteBridge:
                     try:
                         cc = Client(self.addr, authkey=self.authkey)
                         cc.send({"type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session + 1,
-                                 "branch_assets_version": 1, "branch_rules_version": 1, "multi_branch_v2": True, "backend": self.label, "n_workers": len(self.copies)})
+                                 "branch_assets_version": 1, "branch_rules_version": 1, "multi_branch_v2": True,
+                                 "actor_ball_type_v1": True, "backend": self.label, "n_workers": len(self.copies)})
                         if not cc.poll(30):
                             raise ConnectionError("no config within 30 s")
                         box["conn"], box["msg"] = cc, cc.recv()
@@ -345,6 +350,9 @@ class RemoteBridge:
     def _lost(self, c):
         if self.conn is c:
             self.conn = None
+            # a worker started before the next learner has sent anything must not get the old learner's last
+            # parameters (after the r8 NaN they were non-finite); it waits for the first parameters of the new session
+            self._last_params = None
             try:
                 c.close()
             except Exception:  # noqa: BLE001
@@ -378,6 +386,7 @@ class RemoteBridge:
                 p.join(timeout=5)
                 if p.is_alive():
                     p.terminate()
+                    p.join(timeout=5)  # Windows terminate is asynchronous; do not restart on a live slot.
 
     def check_quiet(self, data_q, restarts: list, now: float | None = None) -> None:
         """Enter / leave the quiet state when the quiet file appeared / went away (at most every quiet_check_s)."""

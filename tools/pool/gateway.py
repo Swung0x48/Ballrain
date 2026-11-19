@@ -177,7 +177,10 @@ def cmd_admin(a):
                                               "GROUP BY verify, status")})
         print("chunks flagged by the cheap check:", {r["flag"]: r["n"] for r in
                                                      q("SELECT flag, COUNT(*) AS n FROM chunks WHERE flag IS NOT NULL GROUP BY flag")})
-        print("chunks fed to a learner:", q("SELECT COUNT(*) AS n FROM chunks WHERE ingested >= 0")[0]["n"])
+        print("chunks fed to a learner:", q("SELECT COUNT(*) AS n FROM chunks WHERE ingested >= 0")[0]["n"],
+              "| marked stale (older than the learner's max lag, not fed):",
+              q("SELECT COUNT(*) AS n FROM chunks WHERE ingested = -2")[0]["n"],
+              "| released, waiting:", q("SELECT COUNT(*) AS n FROM chunks WHERE status='released' AND ingested IS NULL")[0]["n"])
         now = store.now()
         for h in (1, 24):
             r = q("SELECT COUNT(*) AS n, COALESCE(SUM(steps), 0) AS steps FROM chunks WHERE received >= ?", (now - 3600 * h,))[0]

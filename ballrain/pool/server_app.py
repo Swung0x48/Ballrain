@@ -26,6 +26,8 @@ import urllib.parse
 from http.cookies import SimpleCookie
 from pathlib import Path
 
+import numpy as np
+
 from . import protocol as P
 from .reasons import Reason, http_status, payload
 from .server_config import PoolConfig, version_tuple
@@ -152,6 +154,9 @@ DEFAULT_RULES = {
 
 
 # ============================================================================================== the app
+
+PREFETCH_TASKS_PER_INSTANCE = 3  # task_prefetch_v1: open tasks per instance (playing, prepared, uploading tail)
+
 
 class PoolApp:
     def __init__(self, cfg: PoolConfig, store: Store, policies: PolicySource, forum: ForumClient,
@@ -374,9 +379,14 @@ class PoolApp:
             return self._redirect_to_forum(None)
         return self._page("Ballrain 算力池：登录",
                           "<p>用 Ballance 社区论坛账号登录，领取算力池令牌。</p>"
-                          "<p>领取条件：论坛注册满 {d} 天、邮箱已验证、至少 {r} 条回复。网关只保存论坛用户 ID、用户名和昵称，"
+                          "<p>领取条件：{c}。网关只保存论坛用户 ID、用户名和昵称，"
                           "不保存邮箱。</p><p><a href=\"/pool/login?go=1\">用论坛账号登录</a></p>"
-                          .format(d=int(self.cfg.min_account_days), r=int(self.cfg.min_replies)))
+                          .format(c=html.escape(self._rules().describe())))
+
+    def _rules(self):
+        from .server_oauth import EligibilityRules
+        return getattr(self.cfg, "eligibility", None) or EligibilityRules(
+            min_account_days=int(self.cfg.min_account_days), min_replies=int(self.cfg.min_replies))
 
     @staticmethod
     def _cookie(headers: dict, name: str) -> str | None:
@@ -435,7 +445,7 @@ class PoolApp:
         acct = self.store.account(user["forum_id"])
         if acct is not None and acct["revoked"]:
             return refuse(_stored_reason(acct["revoke_reason"], Reason.TOKEN_REVOKED), 403)
-        bad = eligibility(rec, self.clock(), self.cfg.min_account_days, self.cfg.min_replies)
+        bad = eligibility(rec, self.clock(), rules=self._rules())
         if bad is not None:
             return refuse(bad, 403)
         self.store.upsert_account(user)
@@ -521,7 +531,17 @@ class PoolApp:
     def task(self, acct, sess) -> Response:
         self.store.touch_session(sess["session_id"])
         live = max(3 * self.cfg.heartbeat_s, 90)  # a session without heartbeats for this long holds no instances
-        if self.store.open_tasks(acct["forum_id"], live) >= self.cfg.max_instances:
+        caps = json.loads(sess["capabilities"] or "[]")
+        if "task_prefetch_v1" in caps:
+            # prefetch (0.5.1): per instance one task playing, one prepared and the previous one's last chunks still
+            # uploading; bounded per session (its hello.instances) and per account
+            lim_s = PREFETCH_TASKS_PER_INSTANCE * max(1, int(sess["instances"] or 1))
+            lim_a = PREFETCH_TASKS_PER_INSTANCE * int(self.cfg.max_instances)
+            if self.store.open_tasks_of_session(sess["session_id"]) >= lim_s:
+                raise _err(Reason.TOO_MANY_INSTANCES, max_instances=self.cfg.max_instances, open_limit=lim_s)
+            if self.store.open_tasks(acct["forum_id"], live) >= lim_a:
+                raise _err(Reason.TOO_MANY_INSTANCES, max_instances=self.cfg.max_instances, open_limit=lim_a)
+        elif self.store.open_tasks(acct["forum_id"], live) >= self.cfg.max_instances:
             raise _err(Reason.TOO_MANY_INSTANCES, max_instances=self.cfg.max_instances)
         if (self.store.held_bytes(acct["forum_id"]) > self.cfg.max_pending_bytes_per_account
                 or self.store.held_bytes() > self.cfg.max_total_bytes):
@@ -586,6 +606,11 @@ class PoolApp:
         n_obs, n_act = (pub.n_obs, pub.n_act) if pub else self._manifest_dims(task["policy_sha"])
         if h["n_obs"] != n_obs or h["n_act"] != n_act:
             raise _err(Reason.BAD_CHUNK, detail=f"n_obs / n_act differ from the policy ({n_obs} / {n_act})")
+        bad = self._magnitudes(c, pub.manifest if pub else None, task["policy_sha"])
+        if bad is not None:
+            kind, mag, bound = bad
+            self.log(f"chunk {tid[:8]}/{seq}: rejected at upload, {kind} magnitude {mag:.3g} > {bound:g}")
+            raise _err(Reason.BAD_CHUNK, detail=f"{kind} magnitude {mag:.3g} beyond {bound:g}")
         cap = P.max_chunk_bytes(int(task["chunk_steps"]), n_obs)
         if len(body) > cap:  # an honest chunk of this task's dimensions is never this big (padding)
             raise _err(Reason.CHUNK_TOO_LARGE, size=len(body), limit=cap)
@@ -657,6 +682,28 @@ class PoolApp:
                 self._policy_cache.pop(next(iter(self._policy_cache)))
             self._policy_cache[sha] = pol
         return policy_consistency(c, pol, task, int(c.header["step0"]))
+
+    def _magnitudes(self, c, manifest, policy_sha: str):
+        """Upload bounds ([guards]): (kind, magnitude, bound) of the first array beyond them, or None. The format
+        already refuses non-finite values; this catches absurd finite ones (a broken or hostile client)."""
+        if manifest is None:
+            from .weights import read_manifest
+            manifest = read_manifest(Path(self.cfg.pool_dir) / "weights" / f"{policy_sha}.json")
+        A = c.arrays
+        clip = float((manifest.get("features") or {}).get("clip") or 0.0)
+        checks = []
+        if clip > 0:
+            checks.append(("obs", A["obs"], clip + float(getattr(self.cfg, "guard_obs_slack", 0.5))))
+        checks.append(("values", A["values"], float(getattr(self.cfg, "guard_max_abs_value", 1000.0))))
+        for k in ("rewards", "env_rewards"):
+            if k in A:
+                checks.append((k, A[k], float(getattr(self.cfg, "guard_max_abs_reward", 1000.0))))
+        for kind, a, bound in checks:
+            if a.size:
+                mag = float(np.abs(np.asarray(a, np.float64)).max())
+                if mag > bound:
+                    return kind, mag, bound
+        return None
 
     def _manifest_dims(self, sha: str):
         from .weights import read_manifest

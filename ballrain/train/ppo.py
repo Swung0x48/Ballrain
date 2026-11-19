@@ -10,6 +10,8 @@ the proximal policy's, the behaviour policy enters through the truncated importa
 """
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import torch
 from torch import nn
@@ -59,14 +61,42 @@ def _mlp(n_in, hidden, n_out, act, out_gain):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, n_obs: int, n_act: int, hidden=(256, 256), act: str = "tanh"):
+    def __init__(self, n_obs: int, n_act: int, hidden=(256, 256), act: str = "tanh", actor_heads: str = "single"):
         super().__init__()
         a = {"tanh": nn.Tanh, "relu": nn.ReLU}[act]
         self.pi = _mlp(n_obs, hidden, n_act, a, 0.01)
         self.v = _mlp(n_obs, hidden, 1, a, 1.0)
 
+        if actor_heads not in ("single", "ball_type"):
+            raise ValueError(f"unsupported actor_heads {actor_heads!r}")
+        self.actor_heads = actor_heads
+        if actor_heads == "ball_type":
+            if n_obs < 4:
+                raise ValueError("ball_type needs observation columns 1:4")
+            # Head zero stays at its legacy name; append parameters AFTER the critic for Adam migration.
+            self.extra_heads = nn.ModuleList(copy.deepcopy(self.pi[-1]) for _ in range(2))
+
+    @staticmethod
+    def context(x):
+        # make_layout always begins with valid, ball_type[3]. RMS of a binary column
+        # preserves the sign: a present bit is positive, absent bits nonpositive.
+        strength, index = x[..., 1:4].max(dim=-1)
+        return torch.where(strength > 0, index, 0)
+
     def forward(self, x):
-        return self.pi(x), self.v(x).squeeze(-1)
+        if self.actor_heads == "single":
+            logits = self.pi(x)
+        else:
+            ctx = self.context(x)
+            h = self.pi[:-1](x)
+            heads = (self.pi[-1], *self.extra_heads)
+            # Keep the dense GEMM shape identical to legacy. Do not even call unused
+            # heads: grad=None means Adam skips their moments as well as their weights.
+            active = ctx.unique().tolist()
+            logits = heads[active[0] if active else 0](h)
+            for i in active[1:]:
+                logits = torch.where((ctx == i).unsqueeze(-1), heads[i](h), logits)
+        return logits, self.v(x).squeeze(-1)
 
     @torch.no_grad()
     def act(self, x: np.ndarray, temperature: float = 1.0, greedy: bool = False, gen=None):
@@ -152,7 +182,14 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
                teacher_logp=None, teacher_mask=None, teacher_coef: float = 0.0) -> dict:
     """teacher_logp (n, n_act) log-probabilities of a frozen teacher policy on the batch states, teacher_mask (n,) bool:
     the loss gets + teacher_coef * KL(teacher || policy) averaged over the masked states of each minibatch (e.g. keep the
-    back half of a level near a faster earlier policy while the front changes); stats teacher_kl / teacher_n."""
+    back half of a level near a faster earlier policy while the front changes); stats teacher_kl / teacher_n.
+
+    Non-finite guard (gradient clipping does not help: one NaN / inf gradient makes every parameter NaN): a minibatch
+    whose loss or gradient norm is not finite is not stepped, the parameters and the optimiser state of the start of
+    the update are restored (earlier minibatches of this update are undone) and the update ends; the same when a
+    parameter is not finite after the last minibatch. The stats then carry "nonfinite": {"term" (pg_loss, v_loss,
+    entropy, teacher_kl, grad_norm or params), "epoch", "minibatch", "rows" (batch rows of that minibatch), the values
+    of the terms}, and the caller must treat the update as not done. A finite update is unchanged (no extra key)."""
     obs = torch.as_tensor(batch["obs"], device=device)
     act = torch.as_tensor(batch["actions"], dtype=torch.long, device=device)
     old_logp = torch.as_tensor(batch["logp"], device=device)
@@ -165,11 +202,20 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
         t_logp = torch.as_tensor(teacher_logp, dtype=torch.float32, device=device)
         t_mask = torch.as_tensor(teacher_mask, dtype=torch.bool, device=device)
         stats["teacher_kl"] = []
-    stop = False
-    for _ in range(epochs):
+    snap = {k: v.detach().clone() for k, v in model.state_dict().items()}  # restored when the update turns non-finite
+    opt_snap = copy.deepcopy(opt.state_dict())
+    stop, nonfinite, ep = False, None, 0
+    # Minibatch bounds. A batch filled with pool chunks is not a multiple of the minibatch; a short remainder (under
+    # half a minibatch) joins the previous minibatch instead of being stepped on its own: the per-minibatch advantage
+    # normalisation divides by the std of the minibatch, which is NaN for a single row (the r8 NaN at u16870, a batch
+    # of 8193 rows) and noise for a handful. A multiple of the minibatch is split exactly as before.
+    bounds = [(i, min(i + minibatch, n)) for i in range(0, n, minibatch)]
+    if len(bounds) > 1 and bounds[-1][1] - bounds[-1][0] < minibatch // 2:
+        bounds[-2:] = [(bounds[-2][0], n)]
+    for ep in range(epochs):
         perm = torch.randperm(n, generator=gen).to(device)
-        for i in range(0, n, minibatch):
-            idx = perm[i:i + minibatch]
+        for mb, (i, j) in enumerate(bounds):
+            idx = perm[i:j]
             logits, v = model(obs[idx])
             logp_all = torch.log_softmax(logits, -1)
             logp = logp_all.gather(-1, act[idx, None]).squeeze(-1)
@@ -190,6 +236,14 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # total norm before clipping
+            if not (torch.isfinite(loss) and torch.isfinite(gn)):  # no step: back to the start of the update (below)
+                terms = {"pg_loss": pg.item(), "v_loss": vl.item(), "entropy": ent.item()}
+                if use_teacher and bool(m.any()):
+                    terms["teacher_kl"] = kl_t.item()
+                terms["grad_norm"] = float(gn)
+                nonfinite = {"term": next((k for k, x in terms.items() if not np.isfinite(x)), "loss"), "epoch": ep,
+                             "minibatch": mb, "rows": idx.cpu().numpy(), **terms}
+                break
             opt.step()
             with torch.no_grad():
                 lr = logp - old_logp[idx]
@@ -203,10 +257,18 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
             if target_kl is not None and kl > 1.5 * target_kl:
                 stop = True
                 break
-        if stop:
+        if stop or nonfinite is not None:
             break
+    if nonfinite is None and not all(bool(torch.isfinite(p).all()) for p in model.parameters()):
+        nonfinite = {"term": "params", "epoch": ep, "minibatch": -1, "rows": None}
+    if nonfinite is not None:
+        model.load_state_dict(snap)
+        opt.load_state_dict(opt_snap)
+        opt.zero_grad(set_to_none=True)
     out = {k: float(np.mean(v)) if v else float("nan") for k, v in stats.items()}
     out["early_stop"] = float(stop)
+    if nonfinite is not None:
+        out["nonfinite"] = nonfinite
     if use_teacher:
         out["teacher_n"] = float(t_mask.sum().item())
         out["teacher_coef"] = float(teacher_coef)

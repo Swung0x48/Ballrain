@@ -58,7 +58,9 @@ CREATE INDEX IF NOT EXISTS chunks_by_account ON chunks(forum_id, verify);
 # logins: user_code is shown by the controller and on the confirmation page; confirm_hash / browser_hash bind the
 #   "continue to the forum" link to the browser that rendered that page (sha256 of the link nonce / of its cookie)
 # chunks.ingested: the learner update number when the learner link (ballrain.pool.learner_link) fed this released chunk
-#   to the learner (NULL: not fed); a later revocation of the account can then be traced to the updates it reached
+#   to the learner (NULL: not fed); a later revocation of the account can then be traced to the updates it reached.
+#   Negative: never sent, -1 not for this learner (another run, unreadable), -2 stale (INGEST_STALE: older than the
+#   learner's pool_max_lag when it could have been fed); the chunk stays released (the player's verified steps count)
 # tasks.replay: the task is replayed in full (probation, the task_sample draw at issue, or an escalation)
 # chunks.flag: why the cheap policy-consistency check flagged the chunk (escalated to a full replay), NULL if it passed
 # accounts.escalate: how many of the account's next tasks are replayed in full (after a flagged chunk)
@@ -85,6 +87,9 @@ class ChunkRefused(Exception):
 
 def sha_hex(s: str | bytes) -> str:
     return hashlib.sha256(s.encode("utf-8") if isinstance(s, str) else s).hexdigest()
+
+
+INGEST_STALE = -2  # chunks.ingested of a released chunk too old for the learner when it could be fed
 
 
 class Store:
@@ -318,6 +323,12 @@ class Store:
                      (int(forum_id), now, now - int(live_s)))
         return int(r["n"])
 
+    def open_tasks_of_session(self, session_id: str) -> int:
+        """Open, unexpired tasks issued to this session (the task_prefetch_v1 per-session limit)."""
+        r = self.one("SELECT COUNT(*) AS n FROM tasks WHERE session_id=? AND state='open' AND deadline>?",
+                     (str(session_id), self.now()))
+        return int(r["n"])
+
     def add_chunk(self, task_id: str, seq: int, forum_id: int, steps: int, nbytes: int, file: str, selected: bool,
                   final: bool, end: str | None) -> None:
         """Insert a chunk and advance its task, in one IMMEDIATE transaction that re-checks what the gateway checked
@@ -469,6 +480,32 @@ class Store:
                       "JOIN accounts a ON a.forum_id=c.forum_id "
                       "WHERE c.status='released' AND c.ingested IS NULL AND (a.suspect=0 OR c.verify='passed') "
                       "ORDER BY c.received, c.task_id, c.seq LIMIT ?", (int(limit),))
+
+    def releasable_policies(self) -> list:
+        """The policy versions of released chunks not yet fed (what a stale pass looks at)."""
+        return [r["policy_sha"] for r in self.q(
+            "SELECT DISTINCT t.policy_sha AS policy_sha FROM chunks c JOIN tasks t ON t.task_id=c.task_id "
+            "WHERE c.status='released' AND c.ingested IS NULL")]
+
+    def mark_stale_policies(self, policy_shas: list) -> tuple:
+        """Mark every released, unfed chunk of these policy versions stale (ingested = INGEST_STALE); returns (chunks,
+        steps) marked."""
+        shas = list(policy_shas)
+        if not shas:
+            return 0, 0
+
+        def fn(db):
+            n = st = 0
+            for i in range(0, len(shas), 500):
+                part = shas[i:i + 500]
+                marks = ",".join("?" * len(part))
+                where = (f"status='released' AND ingested IS NULL AND task_id IN "
+                         f"(SELECT task_id FROM tasks WHERE policy_sha IN ({marks}))")
+                st += int(db.execute(f"SELECT COALESCE(SUM(steps), 0) FROM chunks WHERE {where}", part).fetchone()[0])
+                n += db.execute(f"UPDATE chunks SET ingested=?, ingested_at=? WHERE {where}",
+                                [INGEST_STALE, self.now(), *part]).rowcount
+            return n, st
+        return self.tx(fn)
 
     def mark_ingested(self, keys: list, update: int) -> int:
         """Mark (task_id, seq) pairs as fed at learner update `update` (only while still released and unmarked: a chunk

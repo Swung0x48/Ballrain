@@ -95,6 +95,7 @@ def make_env(ck: dict, launcher, out_root: Path, k: int, kind: str):
     from ballrain.features import FeatureConfig
     from ballrain.rewards import RewardConfig
     ec = dict(ck["env_config"])
+    ec["branch_assets"] = ck.get("branch_assets")  # the run's route bundle lives beside env_config in the checkpoint
     fc = dict(ec.pop("features"))
     rc = dict(ec.pop("reward"))
     fc["path_dir"] = _local_path(fc.get("path_dir"))
@@ -173,7 +174,8 @@ def env_replay(run, row: dict, meta: dict, frames: np.ndarray, k: int, out: Path
         raise RuntimeError(f"checkpoint env is level {got_level} / {got_rec}, the run is level {want['level']} / "
                            f"{want['record']}")
     hidden = tuple(int(x) for x in str(a.get("hidden", "256,256")).split(",") if x.strip())
-    model = ActorCritic(int(ck["n_obs"]), int(ck["n_act"]), hidden, a.get("activation", "tanh"))
+    model = ActorCritic(int(ck["n_obs"]), int(ck["n_act"]), hidden, a.get("activation", "tanh"),
+                        a.get("actor_heads", "single"))
     model.load_state_dict(ck["model"])
     model.eval()
     rms = ck["rms"]
@@ -190,7 +192,7 @@ def env_replay(run, row: dict, meta: dict, frames: np.ndarray, k: int, out: Path
         launcher = launcher_cls("video-00", srv.path, fps, extra={"BALLRAIN_CAPTURE_TAIL": str(post),
                                                                   "BALLRAIN_PREFIX_EVENTS": "1"})
         env = make_env(ck, launcher, out / "env", k, kind)
-        fx_tas = FeatureExtractor(env.cfg.features)  # TAS frames: features for the panel only (env's own untouched)
+        fx_tas = FeatureExtractor(env.cfg.features, branch_root=env._branch_temp.name if env._branch_temp else None)  # TAS frames: features for the panel only (env's own untouched)
     except BaseException:
         srv.close()
         sink.close()

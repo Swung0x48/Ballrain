@@ -187,6 +187,53 @@ def test_learner_link_publishes_live_policies_and_feeds_only_released_chunks(poo
         assert all(r["ingested"] == 20 for r in rows)
         lo, hi, steps = pool.store.ingested_updates(rows[0]["forum_id"])
         assert lo == hi == 20 and steps == sum(r["steps"] for r in rows)
+        # a stale backlog (the learner ran on without pool ingest): more than pool_max_lag (300 by default) behind,
+        # marked stale in one pass at the session's first feed, never sent; the player's verified steps stay
+        from ballrain.pool.server_store import INGEST_STALE
+        verified_before = pool.store.one("SELECT COALESCE(SUM(steps), 0) AS n FROM chunks WHERE status='released'")["n"]
+        t2 = pl.task()
+        for c in pl.play(t2)[0]:
+            assert pl.send(c).status == 200
+        assert pool.verifier.run_once() == 1
+        link.version, link._stale_pass_done = 20 + 301, False  # a new session's first parameters
+        logs = []
+        link.log = logs.append
+        assert link.feed_once() == 0 and data_q.empty()
+        rows2 = pool.store.chunks(t2.task_id)
+        assert rows2 and all(r["ingested"] == INGEST_STALE and r["status"] == "released" for r in rows2)
+        assert link.counts["stale"] == len(rows2) and any("marked stale" in m for m in logs)
+        assert pool.store.ingested_updates(rows2[0]["forum_id"])[:2] == (20, 20)  # stale chunks reached no update
+        released = pool.store.one("SELECT COALESCE(SUM(steps), 0) AS n FROM chunks WHERE status='released'")["n"]
+        assert released == verified_before + sum(r["steps"] for r in rows2)
+        # within the lag window (the template's pool_max_lag, 400 here): fed as before; per-row check after the pass
+        t3 = pl.task()
+        for c in pl.play(t3)[0]:
+            assert pl.send(c).status == 200
+        assert pool.verifier.run_once() == 1
+        link.template = dict(link.template, pool_max_lag=400)
+        assert link.max_lag() == 400 and link.feed_once() == len(pool.store.chunks(t3.task_id))
+        assert all(r["ingested"] == 321 for r in pool.store.chunks(t3.task_id))
+        # the learner re-pinned (a --branch-update / another reference line): released chunks of the old features are
+        # never fed, whatever their lag; the same features feed as before
+        assert link._learner_identity() == LL.feature_identity(pub.manifest["features"])  # no false positive
+        t4 = pl.task()
+        for c in pl.play(t4)[0]:
+            assert pl.send(c).status == 200
+        assert pool.verifier.run_once() == 1
+        import dataclasses
+        env_new = dataclasses.replace(link.template["env"], features=dataclasses.replace(
+            link.template["env"].features, path_sha256="e" * 64))
+        link.template = dict(link.template, env=env_new)
+        link._stale_pass_done = False
+        logs.clear()
+        time.sleep(0.5)  # the hub thread delivers t3's chunks into data_q: drain them first
+        while not data_q.empty():
+            data_q.get()
+        assert link.feed_once() == 0
+        time.sleep(0.5)
+        assert data_q.empty()
+        assert all(r["ingested"] == INGEST_STALE for r in pool.store.chunks(t4.task_id))
+        assert any("other features" in m for m in logs)
     finally:
         link.close()
         hub.close()
@@ -459,6 +506,70 @@ def test_link_republishes_after_a_learner_rollback_and_on_reconnect():
             link.close()
             hub.close()
     assert published == ["learner-u100", "learner-u110", "learner-u60", "learner-u70", "learner-u71"]
+
+
+def test_feed_marks_what_it_sent_when_the_link_drops_mid_batch():
+    """A send that fails mid-batch drops the link (which forgets the learner version): the chunks already sent are
+    still marked with the version this feed started with, so they are never sent twice."""
+    marked = []
+    rows = [{"task_id": "a" * 32, "seq": i, "file": f"a/{i}", "steps": 256, "policy_sha": "p" * 64} for i in range(3)]
+    store = SimpleNamespace(to_ingest=lambda n: rows, releasable_policies=lambda: [],
+                            mark_stale_policies=lambda s: (0, 0), mark_ingested=lambda k, v: marked.append((list(k), v)))
+    link = LL.LearnerLink(("127.0.0.1", 1), b"k", SimpleNamespace(run="r"), store, ".")
+    link.run, link.learner_ingests, link.version = "r", True, 500
+    link.template = {"run": "r", "pool_ingest": True}
+    sends = []
+
+    class Conn:
+        def send(self, m):
+            if sends:
+                raise OSError("gone")
+            sends.append(m)
+
+        def close(self):
+            pass
+    link.conn = Conn()
+    from unittest import mock
+    with mock.patch.object(LL.LearnerLink, "_version_of", lambda self, sha: ("r", 450)):
+        with mock.patch.object(LL.P, "decode_chunk", lambda b: None):
+            with mock.patch.object(LL, "chunk_message", lambda c, v, p: {}):
+                with mock.patch.object(LL.Path, "read_bytes", lambda self: b""):
+                    assert link.feed_once() == 1
+    assert link.conn is None and link.version is None and marked == [([("a" * 32, 0)], 500)]
+
+
+def test_reconnect_never_publishes_the_previous_sessions_parameters():
+    """The r8 NaN stop (2026-11-18): the old learner's last (non-finite) parameters were still cached at the reconnect
+    and published before the resumed learner sent anything. A drop and a new session both forget them."""
+    published = []
+
+    class Pol:
+        run = "r"
+
+        def publish_state(self, state, source):
+            published.append(source)
+            return SimpleNamespace(policy_sha=f"{len(published):064x}", curriculum=None)
+    link = LL.LearnerLink(("127.0.0.1", 1), b"k", Pol(), None, ".", publish_every=10, publish_min_s=0.0)
+    link.template = {"env": {}, "run": "r", "worker": {}, "pool_ingest": True}
+    from unittest import mock
+    with mock.patch.object(LL, "state_from_params", lambda t, m: {}):
+        link._latest, link.version = {"version": 16870}, 16870  # the old session's last send
+        link.conn = SimpleNamespace(close=lambda: None)
+        link._lost()
+        assert link._latest is None and link.version is None and not link.maybe_publish()
+        link._latest, link.version = {"version": 16870}, 16870  # cached again (a race), then a new session
+        hub, addr = _hub({"env": {}, "run": "r", "worker": {}, "pool_ingest": True})
+        link.addr, link.authkey = addr, b"k" * 16
+        try:
+            assert link.connect()
+            assert link._latest is None and link.version is None and not link.maybe_publish()
+            assert link.feed_once() == 0  # no learner version yet: nothing fed either
+            link._latest = {"version": 16877}  # the new learner's own first parameters
+            assert link.maybe_publish()
+        finally:
+            link.close()
+            hub.close()
+    assert published == ["learner-u16877"]
 
 
 def test_state_from_params_carries_the_learners_branch_bundle():
