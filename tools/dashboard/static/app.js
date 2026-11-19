@@ -689,4 +689,10 @@ async function render() {
   for (const j of jobs) { try { if (hasCharts || j === jobs[0]) await j(); } catch (e) { console.error(e); } }
 }
 
+/* ------------------------------------------------------------------------------------ model structure */
+document.querySelectorAll("#t-model [data-mv]").forEach((b) => b.addEventListener("click", () => {
+  document.getElementById("mdl").dataset.mv = b.dataset.mv;
+  document.querySelectorAll("#t-model [data-mv]").forEach((x) => x.classList.toggle("on", x === b));
+}));
+
 load();
