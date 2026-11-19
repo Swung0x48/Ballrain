@@ -18,6 +18,10 @@ from .state import G_RAILS, G_STOPPER, GameTracker
 
 FEATURE_VERSION = "f6"  # f6: optional look-ahead block (far_waypoints, ref_speed_at; off by default = the f5 layout)
 REACH_FEATURE_VERSION = "f7"  # f7 = f6 + the fastreach "reach" block at the end (FeatureConfig.reach; ballrain.reach_features)
+# f8 = f7 + the contact / rail blocks after the reach block (FeatureConfig(version="f8"), FeatureConfig.contacts): no new
+# config field, so f6 / f7 configurations serialize exactly as before; the label pins the block definition (CONTACT_*
+# below): any change to the blocks' meaning takes a new label
+CONTACT_FEATURE_VERSION = "f8"
 # f5: edge fan referenced to the floor under the ball when airborne / in side contact
 # f4: TAS reference line + continuity projection, arc waypoints, slope-robust edge fan
 # f3: transforming from the ball (un)physicalize events; HS block (followers, pause)
@@ -26,6 +30,19 @@ GEOM_EPS = 0.05  # state-spec.md 3.5: geometric contact threshold on the gap
 NO_CONTACT_GAP = 2.0  # value used for "no mindist"
 SUPPORT_GAP = 1.0  # a floor-facing mindist within this gap is the ball's support (edge-fan reference)
 SURFACE_SLOTS = ("none", "stone", "wood", "metal", "other")
+# f8 contact block (docs/observations.md, f8). MIND entries come one per ledge / triangle pair: a single rail touch is
+# 5-15 entries (the tube's facets around the contact, shared edges twice), so entries are first merged into contacts:
+# same partner and normals within CONTACT_MERGE_COS (~32 degrees; a double rail's two tubes are one entity, with
+# normals ~90 degrees apart). Up to 4 contacts within NO_CONTACT_GAP per frame cover 99.9% of the L1 / L2 TAS frames.
+# The 4 slots are directions (contact_sector): right of the route, below, left, other; each holds its nearest contact.
+CONTACT_SLOTS = 4
+CONTACT_SLOT_FIELDS = ("present", "proximity", "n_x", "n_y", "n_z", "n_lat", "rail", "moving")
+CONTACT_MERGE_COS = 0.85
+CONTACT_GAP_BUCKET = 0.05  # contact order: gap bucket of this width, then partner id (merge_contacts)
+CONTACT_SIDE_LAT = 0.4  # a normal with more than this along the route's right axis is a side contact (contact_sector)
+CONTACT_TOUCH_GAP = 0.1  # touching for the aggregates (touching entries are 0.01-0.04; the next facets 0.05+)
+CONTACT_AGG_FIELDS = ("support_n_x", "support_n_y", "support_n_z", "n_touch", "n_rail_touch")
+RAIL_SIDE_FIELDS = ("present", "proximity", "off_x", "off_y", "off_z", "off_lat")
 
 
 @dataclass
@@ -86,7 +103,8 @@ class FeatureConfig:
 
     def __post_init__(self):
         if self.reach:
-            self.version = REACH_FEATURE_VERSION
+            if self.version != CONTACT_FEATURE_VERSION:  # f8 keeps its label (contacts on top of the reach block)
+                self.version = REACH_FEATURE_VERSION
             if self.reach_version is None:
                 from .reach_features import reach_version
                 self.reach_version = reach_version()
@@ -94,6 +112,19 @@ class FeatureConfig:
             self.reach_version = None
             if self.version == REACH_FEATURE_VERSION:  # an f7 label without the block: the f6 layout
                 self.version = FEATURE_VERSION
+
+    @property
+    def contacts(self) -> bool:
+        """f8: the contact / rail blocks (top-K merged contacts, aggregates, left / right rails) after every other
+        entry. Set by the label: FeatureConfig(version="f8")."""
+        return self.version == CONTACT_FEATURE_VERSION
+
+    def __reduce_ex__(self, protocol):
+        # an f8 configuration unpickles only where this code exists: a worker on older code (which would build the f7
+        # layout from the same fields) fails on the learner's template instead of running with the wrong layout
+        if self.contacts:
+            return _restore_features_f8, (dict(vars(self)),)
+        return super().__reduce_ex__(protocol)
 
     branch_sha256: str | None = None  # digest of the complete learner-distributed bundle
 
@@ -104,6 +135,10 @@ class FeatureConfig:
         if self.branch_sha256 is None:
             del d["branch_sha256"]
         return d
+
+
+def _restore_features_f8(fields: dict) -> FeatureConfig:
+    return FeatureConfig(**fields)
 
 
 # ------------------------------------------------------------------------------- geometry cache
@@ -313,9 +348,12 @@ def make_layout(c: FeatureConfig) -> list:
         L.append(("far_waypoints", 3 * len(c.far_waypoints)))
     if c.ref_speed_at:
         L.append(("ref_speed", len(c.ref_speed_at)))
-    if c.reach:  # f7: always the last block
+    if c.reach:  # f7: after every f6 entry
         from .fastreach import N_FEATURES
         L.append(("reach", N_FEATURES))
+    if c.contacts:  # f8: after the reach block, so an f7 policy grows with zero input weights
+        L += [("contacts", CONTACT_SLOTS * len(CONTACT_SLOT_FIELDS)), ("contact_agg", len(CONTACT_AGG_FIELDS)),
+              ("rails_lr", 2 * len(RAIL_SIDE_FIELDS))]
     return L
 
 
@@ -507,6 +545,8 @@ class FeatureExtractor:
                 q = self.action_quarter(tracker)
                 F["reach"][:], raw, key = self.reach.compute(tracker, pos, vel, q, bt)
                 info["reach_raw"], info["reach_quarter"], info["reach_key"] = raw, q, key
+            if c.contacts:
+                self._contact_block(tracker, F, info, pos, radius, right, fwd)
         if c.counters:
             F["lives"][0] = tracker.lives / 10
             F["points"][0] = tracker.points / 1000
@@ -642,7 +682,12 @@ class FeatureExtractor:
             d = geo.edges.distance(q, 12.0)
             F["edge_mesh"][0] = min(d, 12.0) / 12.0
             info["edge_mesh"] = d
-        rc = geo.rails.closest(pos, c.rail_radius) if len(geo.rails) else None
+        if c.contacts:  # f8: one rail query for rail_dist and rails_lr (the same nearest point as rails.closest)
+            rq = info["rail_query"] = rail_query(geo.rails, pos, c.rail_radius)
+            k = int(np.argmin(rq[2])) if rq is not None else -1
+            rc = {"d": float(rq[2][k]), "q": rq[1][k]} if k >= 0 and rq[2][k] <= c.rail_radius else None
+        else:
+            rc = geo.rails.closest(pos, c.rail_radius) if len(geo.rails) else None
         if rc is not None:
             F["rail_dist"][0] = (rc["d"] - radius) / c.rail_radius
             dv = to_frame(rc["q"] - pos, right, fwd)
@@ -651,6 +696,55 @@ class FeatureExtractor:
                 F["rail_dir"][:] = (dv[0] / h, dv[2] / h)
         else:
             F["rail_dist"][0] = 1.0
+
+    def _lateral_axis(self, info, right) -> np.ndarray:
+        """Horizontal unit vector to the right of the route (the reference line's tangent at the ball, as vel_path);
+        the frame's right axis without a line. The f8 blocks split left / right with it: in the world frame (r8)
+        the frame's right axis is world +x, which cannot tell the two rails of a double rail along x apart."""
+        pr = info.get("path")
+        if pr is not None:
+            t = np.asarray(pr["tangent"], np.float64)
+            h = math.hypot(t[0], t[2])
+            if h > 1e-9:
+                return np.array([t[2] / h, 0.0, -t[0] / h])
+        return np.asarray(right, np.float64)
+
+    def _contact_block(self, tracker, F, info, pos, radius, right, fwd):
+        """f8: "contacts" (CONTACT_SLOTS x CONTACT_SLOT_FIELDS), "contact_agg", "rails_lr" (left, right x
+        RAIL_SIDE_FIELDS); every entry in [-1, 1], empty slots zero (docs/observations.md, f8)."""
+        c = self.cfg
+        lvl = tracker.level
+        mind = tracker.obs.mind
+        lat = self._lateral_axis(info, right)
+        info["lateral_axis"] = lat
+        cl = []
+        if len(mind):
+            N = info.get("mind_normals")
+            cl = merge_contacts(mind, N if N is not None else mind_normals(tracker, pos, mind))
+        slots = contact_slots(cl, lat)
+        info["contacts"], info["contact_slots"] = cl, slots
+        out = F["contacts"].reshape(CONTACT_SLOTS, len(CONTACT_SLOT_FIELDS))
+        rail = {p: float(lvl.in_group(p, G_RAILS)) for _, p, _ in cl}
+        for i, e in enumerate(slots):
+            if e is None:
+                continue
+            g, p, n = e
+            nf = to_frame(n, right, fwd)
+            out[i] = (1.0, 1.0 - min(max(g, 0.0), NO_CONTACT_GAP) / NO_CONTACT_GAP, nf[0], nf[1], nf[2],
+                      float(n @ lat), rail[p], float(not lvl.is_fixed(p)))
+        touch = [(p, n) for g, p, n in cl if g <= CONTACT_TOUCH_GAP]
+        up = [n for _, n in touch if n[1] >= G.UP_WALKABLE]
+        agg = F["contact_agg"]
+        if up:
+            s = np.sum(up, 0)
+            h = np.linalg.norm(s)
+            if h > 1e-9:
+                agg[0:3] = to_frame(s / h, right, fwd)
+        agg[3] = min(len(touch), 4) / 4
+        agg[4] = min(sum(rail[p] > 0 for p, _ in touch), 2) / 2
+        rails = level_geometry(tracker).rails
+        q = info["rail_query"] if "rail_query" in info else rail_query(rails, pos, c.rail_radius)
+        F["rails_lr"][:], info["rails_lr"] = rail_sides(rails, pos, radius, lat, right, fwd, c.rail_radius, q)
 
     def _bodies(self, tracker, F, pos, vel, right, fwd):
         c = self.cfg
@@ -679,6 +773,87 @@ class FeatureExtractor:
                 m = pos[1] - float(hi[1])
                 best = m if best is None else min(best, m)
         return best if best is not None else 20 * self.cfg.pos_scale
+
+
+def merge_contacts(mind, N) -> list:
+    """f8 contacts [(gap, partner, world normal)] from the MIND entries (normals N oriented as mind_normals), nearest
+    first. In gap order (ties: partner id, then entry order), an entry within NO_CONTACT_GAP joins an earlier contact
+    of the same partner whose normal is within CONTACT_MERGE_COS; a contact keeps its nearest entry's gap and normal.
+    The order is then gap bucket (CONTACT_GAP_BUCKET), then partner id."""
+    gap = np.asarray(mind["gap"], np.float64)
+    part = np.asarray(mind["partner"], np.int64)
+    cl = []
+    for j in np.lexsort((np.arange(len(gap)), part, gap)):
+        g = float(gap[j])
+        if not g < NO_CONTACT_GAP:  # sorted: the rest is farther (or nan)
+            break
+        p, n = int(part[j]), np.asarray(N[j], np.float64)
+        if not any(cp == p and float(cn @ n) > CONTACT_MERGE_COS for _, cp, cn in cl):
+            cl.append((g, p, n))
+    cl.sort(key=lambda e: (int(max(e[0], 0.0) // CONTACT_GAP_BUCKET), e[1]))
+    return cl
+
+
+def contact_sector(n, lat) -> int:
+    """Slot of a contact normal n (from the surface to the ball) by direction, the route's right axis lat:
+    0 a surface on the ball's right (n . lat < -CONTACT_SIDE_LAT), 1 below (a floor or a crown: n_y >= UP_WALKABLE
+    otherwise), 2 a surface on the left (n . lat > CONTACT_SIDE_LAT), 3 anything else (ahead, behind, above)."""
+    s = float(n @ lat)
+    if s < -CONTACT_SIDE_LAT:
+        return 0
+    if s > CONTACT_SIDE_LAT:
+        return 2
+    return 1 if n[1] >= G.UP_WALKABLE else 3
+
+
+def contact_slots(cl, lat) -> list:
+    """The nearest contact of each sector (contact_sector) from merge_contacts' list, or None. Slots by direction,
+    not by rank: in a gap order (or any sorted list) the two tubes of a double rail (one entity: partner ids cannot
+    break the tie) swap slots whenever the ball shifts its weight or a third contact comes or goes; here the right
+    tube is always slot 0 and the left one slot 2."""
+    out = [None] * CONTACT_SLOTS
+    for e in cl:
+        k = contact_sector(e[2], lat)
+        if out[k] is None:
+            out[k] = e
+    return out
+
+
+def rail_query(rails: G.TriangleSet, pos, r: float):
+    """(candidate triangles, their closest points to pos, distances) of the rail triangles within r of pos (the
+    computation of TriangleSet.closest, kept for rail_sides), or None without candidates."""
+    idx = rails.candidates(pos, r) if len(rails) else ()
+    if not len(idx):
+        return None
+    Q, _ = G.closest_point_triangles(pos, rails.A[idx], rails.B[idx], rails.C[idx])
+    return idx, Q, np.linalg.norm(np.asarray(pos) - Q, axis=1)
+
+
+def rail_sides(rails: G.TriangleSet, pos, radius: float, lat, right, fwd, rail_radius: float, query=None):
+    """f8 "rails_lr": the nearest rail surface point on each side of the ball (left: offset along lat < 0, right:
+    >= 0) within rail_radius of the centre, from the rail triangles rail_dist uses. Per side RAIL_SIDE_FIELDS:
+    present, proximity 1 - clip((distance - radius) / rail_radius, 0, 1), the offset point - centre in the frame
+    (right, fwd) / rail_radius, and its component along lat / rail_radius. 3D offsets, not a normalised direction:
+    a rail under the ball (crown ride) has no horizontal direction. A crown rail shows on both sides (its two
+    flanks) and moves continuously between them. query: rail_query(rails, pos, rail_radius) when already made.
+    Returns (12 values, [(gap, point, owner) or None] x 2)."""
+    out = np.zeros((2, len(RAIL_SIDE_FIELDS)))
+    sides = [None, None]
+    if query is None:
+        query = rail_query(rails, pos, rail_radius)
+    if query is not None:
+        idx, Q, d = query
+        D = Q - pos
+        lo = D @ lat
+        for s, m in enumerate((lo < 0, lo >= 0)):
+            m &= d <= rail_radius
+            if m.any():
+                k = int(np.flatnonzero(m)[np.argmin(d[m])])
+                off = to_frame(D[k], right, fwd) / rail_radius
+                out[s] = (1.0, 1.0 - min(max((d[k] - radius) / rail_radius, 0.0), 1.0), off[0], off[1], off[2],
+                          lo[k] / rail_radius)
+                sides[s] = (float(d[k] - radius), Q[k], int(rails.owner[idx[k]]))
+    return out.ravel(), sides
 
 
 def fan_edges(y, h_ref: float, steps, cfg: FeatureConfig) -> np.ndarray:

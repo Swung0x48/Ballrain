@@ -1,5 +1,6 @@
 """Growing a checkpoint's observation (scripts/train_m2.py): a policy trained on n_old entries continues on a layout
-with blocks appended at the end (f6 look-ahead, f7 reach).
+with blocks appended at the end (f6 look-ahead, f7 reach, f8 contact / rail blocks: every f8 entry is in [-1, 1], so the
+neutral statistics below leave it unscaled).
 
 The new input columns of the first layers (pi.0.weight, v.0.weight) are zero, so the actions' logits and the value
 are unchanged for any values in the new entries; the Adam first moments of those columns are zero and their second
