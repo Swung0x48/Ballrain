@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,9 @@ struct Record {
 class StreamWriter {
 public:
     explicit StreamWriter(const std::string &path);
+    // records to a callback instead of a file (the feature module's feed; both: tee = a file writer to copy them to)
+    using Sink = std::function<void(uint32_t kind, const void *p, size_t n)>;
+    explicit StreamWriter(Sink sink, StreamWriter *tee = nullptr) : sink_(std::move(sink)), tee_(tee) {}
     ~StreamWriter();
     void put(uint32_t kind, const Bytes &payload);
     void put(uint32_t kind, const void *p, size_t n);
@@ -38,6 +42,8 @@ public:
 
 private:
     std::FILE *f_ = nullptr;
+    Sink sink_;
+    StreamWriter *tee_ = nullptr;
 };
 
 std::vector<Record> read_stream(const std::string &path);

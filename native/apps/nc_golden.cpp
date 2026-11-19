@@ -2,12 +2,15 @@
 // tracker / features / policy and compare with the recorded feature vectors and policy outputs.
 //
 //   nc_golden --manifest <policy>.json --stream <dir>/stream.bin --path-dir <dir of L01.npz> [--tol 1e-4] [--json out]
-//             [--drawn-actions auto|1|0]
+//             [--drawn-actions auto|1|0] [--module feature.wasm --module-root DIR] [--timing]
+// --module: the features from the wasm feature module (feature_module_v1) instead of the native extractor, the module
+// seeing DIR (default: the current directory) as /cache; every path option must lie under DIR
 //
 // A feature value matches when |cpp - py| <= tol or |cpp - py| <= tol * |py|. Log-probs and values are compared with
 // the pool's LOGP_TOL / VALUE_TOL; the sampled action (policy streams) must be the recorded one unless u lies within
 // ACTION_EPS of a cdf boundary. --drawn-actions: whether the recorded actions are the policy's draws (auto: from the
 // stream's meta.json "mode", "policy" = drawn; golden.py's random mode records random sticky actions).
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -16,11 +19,13 @@
 #include <vector>
 
 #include "ballrain/engine_chain.h"
+#include "ballrain/feature_module.h"
 #include "ballrain/features.h"
 #include "ballrain/json.h"
 #include "ballrain/policy.h"
 #include "ballrain/session.h"
 #include "ballrain/stream.h"
+#include "platform.h"
 
 using namespace ballrain;
 
@@ -87,6 +92,34 @@ int main(int argc, char **argv) {
         fc.path_dir = pdir;
         fc.branch_dir = arg(argc, argv, "--branch-dir", "");  // the ball-type diversion (golden.py --branch-dir)
         fc.reach_dir = arg(argc, argv, "--reach-dir", "");  // the f7 fields directory (L<nn>-<sha16 of the key>.npz)
+        std::string mod_path = arg(argc, argv, "--module", "");
+        bool timing = false;
+        for (int i = 1; i < argc; ++i)
+            if (std::strcmp(argv[i], "--timing") == 0) timing = true;
+        std::unique_ptr<FeatureModule> mod;
+        if (!mod_path.empty()) {
+            Bytes w;
+            if (!read_file(mod_path, w)) throw Error("cannot read " + mod_path);
+            std::string root = platform::absolute_path(arg(argc, argv, "--module-root", "."));
+            for (char &c : root)
+                if (c == '\\') c = '/';
+            Json fx = Json::object();
+            for (auto &kv : manifest.at("features").members()) fx.set(kv.first, kv.second);
+            auto gp = [&](const std::string &p) {
+                if (p.empty()) return Json();
+                std::string a = platform::absolute_path(p);
+                for (char &c : a)
+                    if (c == '\\') c = '/';
+                if (a.compare(0, root.size(), root) != 0) throw Error(p + " is not under --module-root");
+                return Json::string("/cache" + a.substr(root.size()));
+            };
+            fx.set("path_dir", gp(fc.path_dir)), fx.set("branch_dir", gp(fc.branch_dir)), fx.set("reach_dir", gp(fc.reach_dir));
+            Json init = Json::object();
+            init.set("level", Json::integer(manifest.at("env").get_int("level", 1)));
+            init.set("features", fx);
+            mod = std::make_unique<FeatureModule>(w, root, init);
+        }
+        double t_feat = 0;
         auto recs = read_stream(spath);
         Cursor cur{recs};
         std::unique_ptr<FeatureExtractor> fx;
@@ -105,6 +138,19 @@ int main(int argc, char **argv) {
         int64_t first_bad_row = -1;
         while (cur.i < recs.size()) {
             const Record &r = recs[cur.i++];
+            if (mod && r.kind != K_FEAT && r.kind != K_POLICY) {
+                if (r.kind == K_HELLO && !n) {
+                    FeatureExtractor probe(fc);
+                    n = probe.size();
+                    names = probe.names();
+                    bad.assign(size_t(n), 0), maxd.assign(size_t(n), 0.0), maxrow.assign(size_t(n), -1);
+                }
+                auto t0 = std::chrono::steady_clock::now();
+                mod->feed(r.kind, r.data.data(), r.data.size());
+                t_feat += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (r.kind == K_OBS) dg.obs(r.data.data() + 24, r.data.size() - 24);
+                continue;
+            }
             switch (r.kind) {
                 case K_HELLO:
                     fx = std::make_unique<FeatureExtractor>(fc);
@@ -134,7 +180,9 @@ int main(int argc, char **argv) {
                     if (dgf) std::fprintf(dgf, "%s\n", hex(dg.take()).c_str());
                     std::vector<float> py(r.data.size() / 4);
                     std::memcpy(py.data(), r.data.data(), r.data.size());
-                    std::vector<float> cc = fx->compute(ing->tracker);
+                    auto t0 = std::chrono::steady_clock::now();
+                    std::vector<float> cc = mod ? mod->compute(nullptr) : fx->compute(ing->tracker);
+                    t_feat += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     if (int(py.size()) != n) throw Error("recorded feature size differs");
                     bool any = false;
                     for (int c = 0; c < n; ++c) {
@@ -188,6 +236,9 @@ int main(int argc, char **argv) {
                             (long long)bad[size_t(c)], maxd[size_t(c)], (long long)maxrow[size_t(c)]);
         }
         std::printf("max |diff| over all features %.3g\n", worst);
+        if (timing)
+            std::printf("features (%s): %.1f us per row (ingest + compute, %lld rows)\n", mod ? "wasm module" : "native",
+                        1e6 * t_feat / double(std::max<int64_t>(rows, 1)), (long long)rows);
         if (n_pol)
             std::printf("policy rows %lld: max |logp diff| %.3g (tol %g), max value diff %.3g (tol %g x max(1,|v|)); "
                         "recorded action = cpp draw %lld, within eps of a boundary %lld, different %lld (first step %lld)\n",

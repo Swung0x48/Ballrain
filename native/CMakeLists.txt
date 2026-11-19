@@ -23,6 +23,10 @@ option(BALLRAIN_TUI "build the terminal UI client BallrainCoordinator (FTXUI)" O
 set(BALLRAIN_DEFAULT_GATEWAY "" CACHE STRING "gateway URL prefilled in the client's setup")
 set(BALLRAIN_UPDATE_URL "" CACHE STRING "https URL of the signed release manifest (release.json)")
 set(BALLRAIN_RELEASE_PUBKEY "" CACHE STRING "hex ed25519 public key of the release manifest signatures")
+# the feature module (feature_module_v1): the wasmtime C API (its release's c-api directory: include/, lib/) and the
+# public key of the module signatures (the gateway's module key)
+set(BALLRAIN_WASMTIME_DIR "" CACHE PATH "wasmtime c-api directory (empty: no feature module support)")
+set(BALLRAIN_MODULE_PUBKEY "" CACHE STRING "hex ed25519 public key of the feature module signatures")
 
 # one static executable per platform: the static C/C++ runtime on Windows
 if(MSVC)
@@ -79,7 +83,19 @@ else()
 endif()
 add_library(ballrain_engine STATIC core/src/session.cpp core/src/env.cpp core/src/task_runner.cpp core/src/pool_client.cpp
     core/src/pool_task.cpp core/src/controller.cpp core/src/update.cpp core/src/diagnostics.cpp
-    ${BALLRAIN_PLATFORM_SRC})
+    core/src/feature_module.cpp ${BALLRAIN_PLATFORM_SRC})
+target_compile_definitions(ballrain_engine PRIVATE BALLRAIN_MODULE_PUBKEY="${BALLRAIN_MODULE_PUBKEY}")
+if(BALLRAIN_WASMTIME_DIR)
+    target_include_directories(ballrain_engine PRIVATE "${BALLRAIN_WASMTIME_DIR}/include")
+    target_compile_definitions(ballrain_engine PRIVATE BALLRAIN_HAS_WASMTIME=1)
+    if(WIN32)
+        # delay-loaded: a client without wasmtime.dll still runs (FeatureModule::available)
+        target_link_libraries(ballrain_engine PUBLIC "${BALLRAIN_WASMTIME_DIR}/lib/wasmtime.dll.lib" delayimp)
+        target_link_options(ballrain_engine INTERFACE "/DELAYLOAD:wasmtime.dll")
+    else()
+        target_link_libraries(ballrain_engine PUBLIC "${BALLRAIN_WASMTIME_DIR}/lib/libwasmtime.so")
+    endif()
+endif()
 target_include_directories(ballrain_engine PUBLIC platform)
 target_compile_definitions(ballrain_engine PRIVATE BALLRAIN_CLIENT_VERSION="${PROJECT_VERSION}")
 target_link_libraries(ballrain_engine PUBLIC ballrain_core ballrain_ed25519 ballrain_miniz)
