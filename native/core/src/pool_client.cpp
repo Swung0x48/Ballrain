@@ -26,7 +26,8 @@ std::vector<std::string> client_capabilities() {
     // task_prefetch_v1: "may hold up to 3 open tasks per instance" (the gateway's rule: < 3 x hello.instances per
     // session, < 3 x max_instances per account). Declared always: an instance fetches its next task while its
     // previous task's last chunks still upload (and prepares it early with the prefetch setting)
-    return {"task_format3", "branch_v1", "branch_rules_v1", "multi_branch_v2", "task_prefetch_v1", reach};
+    return {"task_format3", "branch_v1", "branch_rules_v1", "multi_branch_v2", "task_prefetch_v1", "policy_graph_v1",
+            "actor_ball_type_v1", reach};
 }
 static const size_t MAX_RESPONSE = 64 * 1024, MAX_MANIFEST = 256 * 1024, MAX_DOWNLOAD = 64 * 1024 * 1024;
 

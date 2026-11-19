@@ -260,6 +260,9 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     # nothing new is needed, so every client keeps getting the policy's tasks; not an identity field (policy_sha)
     if requires:
         m["requires"] = requires
+    # policy_graph_v1: the network as data (native/core/include/ballrain/graph.h). Not an identity field: clients
+    # before it ignore it (and keep their policy_sha); the verifier always runs the gateway's own copy
+    m["graph"] = build_graph(m["arch"])
     assert_public(m)
     dumps(m)  # JSON-safe (raises on NaN / non-JSON values)
     sha = policy_sha(m, arrays)
@@ -343,8 +346,7 @@ def load_policy(npz_path, manifest, expect_sha: str | None = None) -> "NumpyPoli
     if _file_sha(p) != m["npz_sha256"]:
         raise ValueError("weights file sha256 differs from the manifest")
     arch = m["arch"]
-    if arch.get("kind") not in ("mlp_actor_critic", "mlp_actor_critic_ball_type") or arch.get("activation") not in ("tanh", "relu"):
-        raise ValueError(f"unsupported architecture {arch!r}")
+    graph = graph_of(m)
     arrays = {}
     with np.load(p, allow_pickle=False) as z:
         if set(z.files) != set(m["arrays"]):
@@ -359,12 +361,147 @@ def load_policy(npz_path, manifest, expect_sha: str | None = None) -> "NumpyPoli
             if not np.isfinite(a).all():
                 raise ValueError(f"{k}: non-finite values")
             arrays[k] = _c(a)
-    _check_arch(arrays, int(arch["n_obs"]), int(arch["n_act"]), [int(h) for h in arch["hidden"]],
-                "ball_type" if arch["kind"] == "mlp_actor_critic_ball_type" else "single")
+    if graph is not None:  # policy_graph_v1: the network as data (any layout of the graph's ops)
+        used = check_graph(graph, arrays, int(arch["n_obs"]), int(arch["n_act"]))
+        if set(arrays) != set(used) | {"rms_mean", "rms_var"}:
+            raise ValueError("array names unexpected / missing")
+        if arrays["rms_mean"].shape != (int(arch["n_obs"]),) or (arrays["rms_var"] < 0).any():
+            raise ValueError("observation statistics")
+    else:
+        _check_arch(arrays, int(arch["n_obs"]), int(arch["n_act"]), [int(h) for h in arch["hidden"]],
+                    "ball_type" if arch["kind"] == "mlp_actor_critic_ball_type" else "single")
     sha = policy_sha(m, arrays)
     if sha != m.get("policy_sha") or (expect_sha is not None and sha != expect_sha):
         raise ValueError("policy_sha does not match the weights")
     return NumpyPolicy(arrays, m)
+
+
+# ============================================================================================== policy graph
+
+GRAPH_VERSION = 1
+GRAPH_OPS = ("linear", "tanh", "relu", "ctx_argmax", "select_linear")
+
+
+def build_graph(arch: dict) -> dict:
+    """The policy graph of a format-3 arch (mlp_actor_critic, mlp_actor_critic_ball_type): the same node list as
+    native PolicyGraph::from_arch."""
+    kind, act = arch.get("kind"), arch.get("activation")
+    if kind not in ("mlp_actor_critic", "mlp_actor_critic_ball_type") or act not in ("tanh", "relu"):
+        raise ValueError(f"unsupported architecture {arch!r}")
+    nl = len(arch["hidden"]) + 1
+    nodes = []
+    for hn in ("pi", "v"):
+        h = "x"
+        for i in range(nl):
+            pre, last = f"{hn}.{2 * i}", i + 1 == nl
+            if last and kind == "mlp_actor_critic_ball_type" and hn == "pi":
+                nodes.append({"op": "ctx_argmax", "in": "x", "out": "ctx", "lo": 1, "hi": 4})
+                nodes.append({"op": "select_linear", "in": h, "out": "logits", "index": "ctx",
+                              "heads": [{"w": f"{p}.weight", "b": f"{p}.bias"}
+                                        for p in (pre, "extra_heads.0", "extra_heads.1")]})
+                break
+            out = ("logits" if hn == "pi" else "value") if last else f"{hn}{i}"
+            nodes.append({"op": "linear", "in": h, "out": out, "w": f"{pre}.weight", "b": f"{pre}.bias"})
+            h = out
+            if not last:
+                nodes.append({"op": act, "in": h, "out": h})
+    return {"version": GRAPH_VERSION, "input": "x", "nodes": nodes, "logits": "logits", "value": "value"}
+
+
+def graph_of(manifest: dict) -> dict | None:
+    """The manifest's graph, bound to its identity: the graph is not an identity field (clients before
+    policy_graph_v1 keep their policy_sha), so for a format-3 arch kind it must be build_graph(arch) exactly, and an
+    arch of kind "graph" pins it by graph_sha256 (an identity field). None: no graph (the arch path)."""
+    arch, graph = manifest["arch"], manifest.get("graph")
+    if arch.get("kind") == "graph":
+        if graph is None or hashlib.sha256(dumps(graph)).hexdigest() != arch.get("graph_sha256"):
+            raise ValueError("unsupported architecture: the graph does not match arch.graph_sha256")
+        return graph
+    if arch.get("kind") not in ("mlp_actor_critic", "mlp_actor_critic_ball_type")             or arch.get("activation") not in ("tanh", "relu"):
+        raise ValueError(f"unsupported architecture {arch!r}")
+    if graph is not None and dumps(graph) != dumps(build_graph(arch)):
+        raise ValueError("unsupported architecture: the graph is not the arch's")
+    return graph
+
+
+def check_graph(graph: dict, arrays: dict, n_obs: int, n_act: int) -> list:
+    """The graph's structure against the arrays (as native PolicyGraph::parse); returns the array names it uses."""
+    if not isinstance(graph, dict) or graph.get("version") != GRAPH_VERSION:
+        raise ValueError("policy graph: unsupported version")
+    width = {graph["input"]: n_obs}
+    used = []
+
+    def lin(w, b, n_in):
+        if w not in arrays or b not in arrays:
+            raise ValueError(f"policy graph: array {w} / {b} missing")
+        W, B = arrays[w], arrays[b]
+        if W.dtype.str != "<f4" or B.dtype.str != "<f4" or W.ndim != 2 or B.ndim != 1 or W.shape[1] != n_in                 or B.shape[0] != W.shape[0]:
+            raise ValueError(f"policy graph: {w} has the wrong dtype / shape for its input")
+        used.extend(k for k in (w, b) if k not in used)
+        return W.shape[0]
+
+    for n in graph.get("nodes") or []:
+        op = n.get("op")
+        if op not in GRAPH_OPS:
+            raise ValueError(f"policy graph: unknown op {op!r}")
+        if n["in"] not in width:
+            raise ValueError(f"policy graph: {n['in']} used before defined")
+        win = width[n["in"]]
+        if op == "ctx_argmax":
+            if win is None or not 0 <= n["lo"] < n["hi"] <= win:
+                raise ValueError("policy graph: ctx_argmax range")
+            w = None
+        elif win is None:
+            raise ValueError(f"policy graph: {op} of an index")
+        elif op == "linear":
+            w = lin(n["w"], n["b"], win)
+        elif op in ("tanh", "relu"):
+            w = win
+        else:
+            if width.get(n["index"], 0) is not None:
+                raise ValueError("policy graph: select_linear index is not an index")
+            outs = {lin(h["w"], h["b"], win) for h in n["heads"]}
+            if len(outs) != 1:
+                raise ValueError("policy graph: heads of different sizes")
+            w = outs.pop()
+        if n["out"] in width and width[n["out"]] != w:
+            raise ValueError(f"policy graph: {n['out']} redefined with another shape")
+        width[n["out"]] = w
+    if width.get(graph["logits"]) != n_act or width.get(graph["value"]) != 1:
+        raise ValueError("policy graph: logits / value output missing or of the wrong size")
+    return used
+
+
+def graph_forward(graph: dict, arrays: dict, x, want: str) -> np.ndarray:
+    """Run the graph on normalised observations x ((n_obs,) or (B, n_obs)); want: "logits" or "value"."""
+    x = np.asarray(x, np.float32)
+    v = {graph["input"]: x}
+    for n in graph["nodes"]:
+        op, h = n["op"], v[n["in"]]
+        if op == "linear":
+            o = (h @ arrays[n["w"]].T + arrays[n["b"]]).astype(np.float32, copy=False)
+        elif op == "tanh":
+            o = np.tanh(h)
+        elif op == "relu":
+            o = np.maximum(h, np.float32(0))
+        elif op == "ctx_argmax":
+            bits = h[..., n["lo"]:n["hi"]]
+            o = np.where(bits.max(axis=-1) > 0, bits.argmax(axis=-1), 0)
+        else:
+            ctx = np.asarray(v[n["index"]])
+            heads = n["heads"]
+            out = np.empty((*h.shape[:-1], arrays[heads[0]["w"]].shape[0]), np.float32)
+            if ctx.ndim == 0:
+                hd = heads[int(ctx)]
+                out = (h @ arrays[hd["w"]].T + arrays[hd["b"]]).astype(np.float32, copy=False)
+            else:
+                for i in np.unique(ctx):
+                    m = ctx == i
+                    hd = heads[int(i)]
+                    out[m] = h[m] @ arrays[hd["w"]].T + arrays[hd["b"]]
+            o = out
+        v[n["out"]] = o
+    return v[graph[want]]
 
 
 class NumpyPolicy:
@@ -375,15 +512,19 @@ class NumpyPolicy:
         self.sha = manifest.get("policy_sha")
         arch = manifest["arch"]
         self.n_obs, self.n_act = int(arch["n_obs"]), int(arch["n_act"])
+        self.mean = arrays["rms_mean"].astype(np.float64)
+        self.std = np.sqrt(arrays["rms_var"].astype(np.float64) + manifest["obs_norm"]["eps"])
+        self.clip = float(manifest["obs_norm"]["clip"])
+        self.graph = manifest.get("graph")
+        if self.graph is not None:  # policy_graph_v1 (the same results as the arch path below: build_graph)
+            self.arrays = arrays
+            return
         nl = len(arch["hidden"]) + 1
         self.pi = [(arrays[f"pi.{2 * i}.weight"].T.copy(), arrays[f"pi.{2 * i}.bias"]) for i in range(nl)]
         self.v = [(arrays[f"v.{2 * i}.weight"].T.copy(), arrays[f"v.{2 * i}.bias"]) for i in range(nl)]
         self.heads = ([self.pi[-1]] + [(arrays[f"extra_heads.{i}.weight"].T.copy(), arrays[f"extra_heads.{i}.bias"])
                                       for i in range(2)] if arch.get("kind") == "mlp_actor_critic_ball_type" else None)
         self.act_fn = np.tanh if arch["activation"] == "tanh" else (lambda x: np.maximum(x, np.float32(0)))
-        self.mean = arrays["rms_mean"].astype(np.float64)
-        self.std = np.sqrt(arrays["rms_var"].astype(np.float64) + manifest["obs_norm"]["eps"])
-        self.clip = float(manifest["obs_norm"]["clip"])
 
     def normalize(self, raw) -> np.ndarray:
         """ppo.normalize: float64 statistics, clip, float32."""
@@ -399,6 +540,8 @@ class NumpyPolicy:
 
     def logits(self, x) -> np.ndarray:
         """Policy logits of normalised observations x ((n_obs,) or (B, n_obs))."""
+        if self.graph is not None:
+            return graph_forward(self.graph, self.arrays, x, "logits")
         if self.heads is None:
             return self._mlp(self.pi, x)
         h = np.asarray(x, np.float32)
@@ -415,6 +558,8 @@ class NumpyPolicy:
 
     def value(self, x) -> np.ndarray:
         """Value of normalised observations: scalar array for (n_obs,), (B,) for a batch."""
+        if self.graph is not None:
+            return graph_forward(self.graph, self.arrays, x, "value")[..., 0]
         return self._mlp(self.v, x)[..., 0]
 
     @staticmethod

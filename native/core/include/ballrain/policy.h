@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "ballrain/graph.h"
 #include "ballrain/json.h"
 
 namespace ballrain {
@@ -48,9 +49,7 @@ public:
     static std::vector<float> log_softmax(const std::vector<float> &logits);
 
 private:
-    std::vector<float> mlp(const std::vector<Layer> &layers, const std::vector<float> &x) const;
-    std::vector<Layer> pi_, v_;
-    bool tanh_ = true;
+    PolicyGraph graph_;  // the manifest's graph, or the one of its arch (format-3 kinds)
     std::vector<double> mean_, std_;
     double clip_ = 10.0;
 };
