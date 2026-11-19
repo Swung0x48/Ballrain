@@ -869,7 +869,8 @@ class BallanceEnv(gym.Env):
         obs, finfo = self.fx.compute(s.tracker)
         p = finfo.get("path")
         r, terms = self.reward.step(s.tracker, self._arc(finfo), died, finished, terminated,
-                                    rebase=bool(p and p.get("jump")), supported=finfo.get("supported", False))
+                                    rebase=bool(p and p.get("jump")), supported=finfo.get("supported", False),
+                                    s3_features=finfo if self.cfg.level == 2 else None)
         if cam_bad:  # no credit for the episode: its return becomes -death_penalty
             pen = -self.reward.total - self.reward.cfg.death_penalty
             terms = dict(terms, camera_off_quarter=pen)

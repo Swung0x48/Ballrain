@@ -19,6 +19,7 @@ Time always comes from the TIME section's SR double sum (the BML+ 0.3.12 timer),
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from math import isfinite
 
 from .state import SMALL_BALL_POINTS, GameTracker
 
@@ -50,6 +51,10 @@ class RewardConfig:
     # pays the pending small balls when they start following, takes it back when they are lost
     hs_follower_shaping: float = 0.0
 
+    # Optional L2 sector-3 interventions (raw SR reward units).
+    s3_lane_rate: float = 0.0  # per metre per second, excess distance over the 0.25 m deadband
+    s3_paper_cost: float = 0.0  # one-time cost for taking the approach transformer
+
     def to_dict(self):
         return asdict(self)
 
@@ -61,6 +66,8 @@ class Reward:
         self.cfg = config or RewardConfig()
         if self.cfg.mode not in ("sr", "hs"):
             raise ValueError(f"unknown reward mode {self.cfg.mode!r}")
+        if any(not isfinite(x) or x < 0 for x in (self.cfg.s3_lane_rate, self.cfg.s3_paper_cost)):
+            raise ValueError("sector-3 costs must be finite and nonnegative")
         self.reset_state()
 
     def reset_state(self):
@@ -73,6 +80,7 @@ class Reward:
         self.followers = 0
         self.total = 0.0
         self.terms: dict = {}
+        self.s3_paper_paid = False
 
     def begin(self, tracker: GameTracker, s: float | None):
         """Call at the start of the episode (after the reset observation)."""
@@ -87,8 +95,31 @@ class Reward:
         self.terms[name] = self.terms.get(name, 0.0) + v
         return v
 
+    def _s3_terms(self, tracker, features, dt_s):
+        c = self.cfg
+        if not features or tracker.sector != 3 or features.get("pos") is None:
+            return {}
+        x, y, z = features["pos"]
+        bt = tracker.ball_type()
+        route = features.get("path") or {}
+        if (c.s3_lane_rate and bt == 0 and 900 <= x <= 930 and -360 <= z <= -342
+                and y >= 43 and not (route.get("branch") or route.get("branch_id"))
+                and route.get("point") is not None and route.get("tangent") is not None):
+            px, _, pz = route["point"]
+            tx, _, tz = route["tangent"]
+            lateral = abs((x - px) * tz - (z - pz) * tx)
+            excess = min(2.0, max(0.0, lateral - 0.25))
+            if excess and dt_s > 0:
+                return {"s3_lane": -c.s3_lane_rate * dt_s * excess}
+        # Charge only activations near the wood-route transformer, not all paper play.
+        if (c.s3_paper_cost and not self.s3_paper_paid and bt == 1
+                and 914 <= x <= 919 and 46 <= y <= 52 and -349 <= z <= -344):
+            self.s3_paper_paid = True
+            return {"s3_paper": -c.s3_paper_cost}
+        return {}
+
     def step(self, tracker: GameTracker, s: float | None, died: bool, finished: bool, terminal: bool,
-             rebase: bool = False, supported: bool | None = None) -> tuple[float, dict]:
+             rebase: bool = False, supported: bool | None = None, s3_features: dict | None = None) -> tuple[float, dict]:
         """s: arc length of the ball's projection (None when unknown). rebase: the projection was re-acquired
         this step (ballrain.path, jump=True): paid like any step when pay_jumps (default), otherwise no progress
         reward for it and s only moves the reference.
@@ -148,6 +179,8 @@ class Reward:
                 phi1 = 0.0 if terminal else c.hs_follower_shaping * c.score_scale * SMALL_BALL_POINTS * followers
                 terms["follower_shaping"] = c.gamma * phi1 - phi0
             self.followers = followers
+        if c.mode == "sr" and not terminal and (c.s3_lane_rate or c.s3_paper_cost):
+            terms.update(self._s3_terms(tracker, s3_features, dt_s))
         for k, v in terms.items():
             r += self._add(k, v)
         self.sr = sr
