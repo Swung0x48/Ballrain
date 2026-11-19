@@ -106,6 +106,11 @@ class RemoteHub:
             if env is not None and uses_branch_move(env) and hello.get("branch_move_v1") is not True:
                 conn.send({"type": "error", "error": "moving branch starts require branch_move_v1"})
                 return
+            feats = getattr(env, "features", None)
+            if getattr(feats, "contacts", False) and hello.get("features_f8") is not True:
+                # f8 contact blocks: a bridge (or the pool's learner link) on older code would compute the f7 layout
+                conn.send({"type": "error", "error": "f8 contact features require features_f8 (update the worker code)"})
+                return
             assets = getattr(env, "branch_assets", None)
             if assets and assets.get("version") == 2 and hello.get("multi_branch_v2") is not True:
                 conn.send({"type": "error", "error": "multi-branch bundle requires multi_branch_v2"})
@@ -252,7 +257,8 @@ class RemoteBridge:
                         cc = Client(self.addr, authkey=self.authkey)
                         cc.send({"type": "hello", "protocol": PROTOCOL, "host": self.host, "session": self.session + 1,
                                  "branch_assets_version": 1, "branch_rules_version": 1, "multi_branch_v2": True,
-                                 "actor_ball_type_v1": True, "branch_move_v1": True, "backend": self.label, "n_workers": len(self.copies)})
+                                 "actor_ball_type_v1": True, "branch_move_v1": True, "features_f8": True,
+                                 "backend": self.label, "n_workers": len(self.copies)})
                         if not cc.poll(30):
                             raise ConnectionError("no config within 30 s")
                         box["conn"], box["msg"] = cc, cc.recv()
