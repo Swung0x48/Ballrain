@@ -925,6 +925,11 @@ def main(argv=None) -> int:
         # ... and one without the f8 contact blocks likewise (they follow the reach block; check_prefix below checks)
         if mine.get("version") == "f8" and theirs.get("version") != "f8":
             appended.add("version")
+        # ... and a teacher on the plain reach block under a mechanism-aware run (--reach-mechanisms): same 59-value
+        # layout, only the values near mechanisms differ (the teacher reads the student's values there)
+        tv, mv = theirs.get("reach_version"), mine.get("reach_version")
+        if tv and isinstance(mv, str) and mv.startswith(f"{tv}-mech1-"):
+            appended.add("reach_version")
         diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k) and k not in appended)
         t_obs = int(tck["n_obs"])
         if (t_obs != n_obs and not appended) or int(tck["n_act"]) != n_act or diff:
@@ -1328,4 +1333,11 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        rc = main()
+    except SystemExit as e:  # a refusal after the hub / workers started must not leave a learner hanging
+        import os as _os
+        print(e, file=sys.stderr, flush=True) if e.code not in (None, 0) and not isinstance(e.code, int) else None
+        sys.stdout.flush()
+        _os._exit(e.code if isinstance(e.code, int) else 1)
+    raise SystemExit(rc)
