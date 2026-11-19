@@ -62,6 +62,11 @@ def main() -> int:
         sha = hashlib.sha256(data).hexdigest()
         dst = out / f"feature-{sha[:16]}.wasm"
         shutil.copyfile(wasm, dst)
+    # the feature sets this module computes (the gateway grants features_<v> for them, modules.py): the versions
+    # core/src/features.cpp implements
+    import json
+    (out / f"{dst.name}.json").write_text(json.dumps({"abi": 1, "feature_versions": ["f6", "f7"]}) + "\n",
+                                          encoding="utf-8")
     print(f"{dst.name}: {len(data)} bytes, sha256 {sha}")
     if a.sign_key:
         if not a.nc_release:

@@ -476,7 +476,12 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
   缓存目录以只读方式映射成模块里的 `/cache`。同一个模块在进程里只编译一次。
 - **签名**：网关配置 `[task] feature_module`（.wasm 和旁边的 .sig），以 `/pool/assets/<sha>.wasm` 提供；任务的 `assets.feature_module` 带 sha256、
   大小、签名和 ABI，只发给声明了能力的会话。客户端先核对 sha256，再用编译进去的模块公钥（`BALLRAIN_MODULE_PUBKEY`）验 ed25519 签名，通过才加载；
-  没有编进公钥的客户端不声明能力。签名私钥只在网关一侧（dev 密钥在 `runtime/wasm/keys`，不进仓库）。
+  没有编进公钥的客户端不声明能力。
+- **密钥**（0.6.0 发布版）：正式的模块签名私钥在训练这台机器的 `runtime/wasm/keys-release/module-signing.key`（`runtime/` 不进仓库，也不进 zip），
+  公钥在同目录的 `module-signing.pub`，发布构建用 `package_win.py --module-pubkey-file` 把它编进客户端；公钥指纹（公钥 32 字节的 sha256 前 16 位）
+  `91587eb170f7f0ec`。签模块的人是训练协调会话（或用户本人）：`build_module.py --sign-key runtime/wasm/keys-release/module-signing.key`，
+  签好的 `.wasm`、`.wasm.sig`、`.wasm.json` 交给网关的 `[task] feature_module`。私钥不打印、不进日志；丢了就要换密钥并发新客户端，所以要另外备份。
+  dev 密钥（`runtime/wasm/keys/`）只用于本地 dev 构建和测试，发布版里没有它。
 - **一致性**：r8 的 golden 流（f7、s3route 多分线、球型头）上，模块的特征和 Python 逐位相同（TAS 12,198 行、策略 4,004 行，最大差 0，
   4,000 个动作全部相同）；端到端 6 个任务全部用模块跑，校验端 43/43 段通过。
 - **开销**：特征（含记录流的拷贝）每行 168–234 µs，原生 128–173 µs（+31–35%，约 +40–60 µs/步）。同一步的策略从约 300 µs 降到 123–139 µs，
@@ -485,8 +490,10 @@ Python 两次运行、C++ 在线运行、`bin-x86soft` 构建的摘要也都相�
 - **按布局 / 配置驱动**：模块按清单的 `features` 配置建布局（和原生、Python 同一个 `FeatureExtractor`）。加一个新的特征块（例如训练端在做的
   多接触点块，作为 f8）只要：在 `core/src/features.cpp` 加这个块和它的配置字段（Python 侧同名），重新构建并签名模块，网关换上新模块；客户端不用升级。
   客户端在用模块时只按“宿主视图”读配置（`FeatureConfig::host_view`：只取它认识的路线、可达性场、路径字段，不认识的字段和特征版本忽略），
-  观测维数用模块自己的 `br_size` 核对。导出时特征版本不是 f6 / f7 的策略自动要求 `feature_module_v1`（只用内置提取器的客户端拿不到它的任务），
-  网关没配模块时不发这种任务。
+  观测维数用模块自己的 `br_size` 核对。导出时特征版本不是 f6 / f7 的策略（例如 r9 的 f8）要求 `features_<版本>`：
+  只有网关配置的模块声明了这个特征集（构建脚本写的 `<模块>.wasm.json` 的 `feature_versions`）时，声明 `feature_module_v1` 的会话才算有它。
+  现在的模块是 f6 / f7，所以 f8 的任务不会发给任何客户端，直到 f8 块移植进 `core/src/features.cpp`、重建并签名模块。
+  同样，训练端的移动分线开局（`branch_move`）要求 `branch_move_v1`（还没有客户端实现），机关可达性换了 `reach_version`，能力名随之不同，自动挡住。
 - **验证器**：仍用 Python 特征（和模块逐位相同，golden 对比 + 端到端都证实了）。让验证器也跑同一个模块要在 `ballrain/headless` 里拿到原始记录流，
   那是训练端共用的代码，这次没动（§12.7）。
 

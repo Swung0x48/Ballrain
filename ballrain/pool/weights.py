@@ -263,9 +263,17 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     # policy_graph_v1: the network as data (native/core/include/ballrain/graph.h). Not an identity field: clients
     # before it ignore it (and keep their policy_sha); the verifier always runs the gateway's own copy
     m["graph"] = build_graph(m["arch"])
-    # a feature set newer than the clients' built-in extractors (f6 / f7): only feature-module clients can run it
+    # a feature set newer than the clients' built-in extractors (f6 / f7, e.g. f8): "features_<version>", which a
+    # session gets only from the gateway's feature module when that module computes the set (modules.py)
     if feats.get("version") not in (None, "f6", "f7"):
-        m["requires"] = list(m.get("requires") or []) + ["feature_module_v1"]
+        m["requires"] = list(m.get("requires") or []) + [f"features_{feats['version']}"]
+    # moving branch rest starts (ballrain.branch_move: the pinned drive to an exact hand-over, no brake): no client
+    # has them yet; the gateway would otherwise hand out braking rest starts the learner does not train on
+    rs = list(ec.get("rest_starts") or []) + ([ec["start_rest"]] if isinstance(ec.get("start_rest"), dict) else [])
+    if any((isinstance(e, dict) and e.get("branch_move")) or (isinstance(e, (list, tuple)) and len(e) == 3
+                                                             and isinstance(e[2], dict) and e[2].get("branch_move"))
+           for e in rs):
+        m["requires"] = list(m.get("requires") or []) + ["branch_move_v1"]
     assert_public(m)
     dumps(m)  # JSON-safe (raises on NaN / non-JSON values)
     sha = policy_sha(m, arrays)

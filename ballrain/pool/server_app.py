@@ -556,12 +556,12 @@ class PoolApp:
             return _json("no_task", reason=payload(Reason.NO_TASK), retry_s=max(30, self.cfg.task_poll_s))
         # capability gate: a policy's tasks only for clients that can run them (manifest.requires vs hello.capabilities)
         from .capabilities import missing, refusal
-        lacking = missing(self.policies.current.manifest.get("requires"), json.loads(sess["capabilities"] or "[]"))
+        have = json.loads(sess["capabilities"] or "[]")
+        if self.feature_module is not None and "feature_module_v1" in have:  # what the gateway's module computes
+            have = list(have) + sorted(self.feature_module.grants())
+        lacking = missing(self.policies.current.manifest.get("requires"), have)
         if lacking:
             return _json("no_task", reason=refusal(sess["client_version"], lacking), retry_s=600)
-        if "feature_module_v1" in (self.policies.current.manifest.get("requires") or ()) and self.feature_module is None:
-            self.log("task: the policy needs the feature module, none configured ([task] feature_module)")
-            return _json("no_task", reason=payload(Reason.NO_TASK), retry_s=max(30, self.cfg.task_poll_s))
         from .cross_check import assign, build_key, replica_for
         rep = replica_for(self.store, sess, acct["forum_id"], self.cfg, self.now())
         if rep is not None:  # a peer's drawn task waits for a second play by this build (cross-check)

@@ -20,6 +20,7 @@ CAPABILITIES = {
     "branch_rules_v1": ("0.4.0", "石头分支的规则（停滞判定，静止开局的驱动和制动参数）改为随训练策略下发：客户端要按下发的规则跑任务"),
     "task_prefetch_v1": ("0.5.1", "预取下一个任务：当前任务运行时提前领取并启动下一个任务的引擎，减少等待"),
     "actor_ball_type_v1": ("0.6.0", "按球种分开的动作头：策略网络最后一层按纸球、木球、石球各用一套权重"),
+    "branch_move_v1": ("0.7.0", "移动中的分线开局：按记录的驱动到精确的交接帧、不刹车（客户端还没有这个开局方式）"),
     "feature_module_v1": ("0.6.0", "特征提取随策略热更新：客户端加载服务端签名的 wasm 特征模块来算观测，训练端改特征不用升级客户端"),
     "reward_inputs_v1": ("0.6.0", "奖励由服务端计算：客户端上传每步的奖励输入（进度、计时、死亡和完成等），服务端用训练端的代码算奖励"),
     "policy_graph_v1": ("0.6.0", "网络结构随策略下发：客户端按下发的结构描述（线性层、激活、按条件选头）执行网络，换结构不用升级"),
@@ -29,6 +30,7 @@ CAPABILITIES = {
 # versioned capabilities, described by prefix: "reach_" + reach_version (weights.reach_capability(), e.g.
 # reach_fastreach5_2-block1): a later fastreach / block version is a new name, so old clients are gated with this text
 PREFIXED = {
+    "features_": ("0.6.0", "新的特征集 {v}：要由服务端下发的特征模块来算（客户端内置的只有 f6 / f7），这个网关的模块还不支持它"),
     "reach_fastreach": ("0.4.0", "f7 观测（版本 {v}）：特征末尾多了一块“可达性”信息（球往各个方向能不能停住、会不会掉下去、能落到哪里），"
                                  "客户端要用和训练器相同的算法、同一版本和服务端下发的场数据把它算出来"),
 }
@@ -40,7 +42,7 @@ def describe(name: str):
         return CAPABILITIES[name]
     for pre, (ver, text) in PREFIXED.items():
         if name.startswith(pre):
-            return ver, text.format(v=name[len("reach_"):].replace("_", "."))
+            return ver, text.format(v=name[len(pre):] if pre == "features_" else name[len("reach_"):].replace("_", "."))
     return None
 WHY = ("当前运行的主控程序不认识这些新内容：它仍会按旧规则跑任务，算出的观测和奖励与训练器不一致，验证不会通过，"
        "所以服务端暂时不给它发这个训练策略的任务。已经交上来的数据和你的令牌都不受影响。")

@@ -27,6 +27,11 @@ class FeatureModuleRef:
     size: int
     sig: str  # hex ed25519 signature of the module bytes
     abi: int = MODULE_ABI
+    feature_versions: tuple = ("f6", "f7")  # the feature sets it computes (<module>.wasm.json, build_module.py)
+
+    def grants(self) -> set:
+        """The capabilities a feature_module_v1 session has through this module (features_<version> beyond f6 / f7)."""
+        return {f"features_{v}" for v in self.feature_versions if v not in ("f6", "f7")}
 
     def asset(self) -> dict:
         """The task's assets.feature_module entry (protocol.TASK)."""
@@ -49,4 +54,9 @@ def load_module(path, assets_dir) -> FeatureModuleRef:
         tmp = dst.with_suffix(".wasm.tmp")
         shutil.copyfile(p, tmp)
         tmp.replace(dst)
-    return FeatureModuleRef(sha256=sha, size=len(data), sig=sig)
+    meta = Path(str(p) + ".json")
+    fv = ("f6", "f7")
+    if meta.is_file():
+        import json
+        fv = tuple(str(v) for v in json.loads(meta.read_text(encoding="utf-8")).get("feature_versions") or fv)
+    return FeatureModuleRef(sha256=sha, size=len(data), sig=sig, feature_versions=fv)
