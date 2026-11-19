@@ -6,7 +6,8 @@ Start families (family_key): every --rest-starts entry ("rest:<entry>", identica
 rehearsal range ("rehearse:lo-hi"), curriculum TAS starts by bins of record frames ("band:lo-hi", "band:k0" for
 level-load draws), respawn lives by sector ("respawn:s<n>") and plain level-load lives ("level", runs without TAS
 starts). The worker tags each life with its start (WorkerSpec.start_tags; ballrain.env BallanceEnv._draw_start records
-which list the frame came from), each chunk row with its life (row_families).
+which list the frame came from), each chunk row with its life (row_families). All rows of a life in a mastered family
+are anchored (--anchor-rows life, default), or only those before it reached its next checkpoint (first-cp).
 
 Mastery (MasteredAnchor): rolling success over the last `window` lives of a family (success as the learner defines it:
 the next checkpoint, or LevelFinish with --success finish). A family is mastered once it has >= min_lives lives in the
@@ -221,7 +222,11 @@ class MasteredAnchor:
             elif (self.ratchet and f.anchored and not f.pending and f.teacher in self.snapshots and f.below == 0
                   and len(f.outcomes) == self.window and self.healthy(f) and f.rate >= f.teacher_rate
                   and all(v is not None and v > f.teacher for _, v in f.outcomes)):
-                f.pending = True
+                # only into a stored snapshot inside the window or a free slot: a ratchet never forces the cap
+                # (which could drop the snapshot of a family in its grace)
+                lo = min(v for _, v in f.outcomes)
+                if len(self.snapshots) < self.max_teachers or any(lo <= s <= update for s in self.snapshots):
+                    f.pending = True
         pending = [k for k, f in self.families.items() if f.anchored and f.pending]
         if not pending:
             return

@@ -355,6 +355,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--anchor-min-rows", type=int, default=16,
                    help="a family with fewer rows in the batch gets rows / this of a full share")
     p.add_argument("--anchor-max-teachers", type=int, default=8, help="policy snapshots kept (automatic teachers)")
+    p.add_argument("--anchor-rows", choices=("life", "first-cp"), default="life",
+                   help="rows of a life in a mastered family that are anchored: life = all of them (also after it reached "
+                        "later checkpoints); first-cp = only those before it reached its next checkpoint (the stretch "
+                        "its success measures; with --success finish both are the whole life)")
     p.add_argument("--anchor-ratchet", action="store_true",
                    help="automatic teachers: a family whose last --anchor-window lives were all played by policies newer "
                         "than its snapshot, at >= the rate it had then, moves to a newer snapshot (follows improvements)")
@@ -1048,7 +1052,7 @@ def main(argv=None) -> int:
         for what, who, detail in anchor.drain_events():
             log.msg(f"anchor: {what} {who} ({detail})")
         anchored = anchor.anchored()
-        keys = AN.row_families(chunks, anchor_key, past_cp_counts=a.success == "finish")
+        keys = AN.row_families(chunks, anchor_key, past_cp_counts=a.anchor_rows == "life" or a.success == "finish")
         w, groups = AN.row_weights(keys, anchored, anchor.weight, a.anchor_min_rows)
         st = {**anchor.summary(), "batch_families": len(groups), "rows": int(sum(len(g) for g in groups.values())),
               "tagged_rows": sum(k is not None for k in keys)}

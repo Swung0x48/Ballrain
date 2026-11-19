@@ -398,6 +398,7 @@ def test_options_and_saved_args():
     a = train_m2.parse(["--run", "x"])
     assert not a.anchor_mastered and a.anchor_teacher == "" and a.anchor_threshold == 0.9 and a.anchor_window == 40
     assert a.anchor_min_lives == 40 and a.anchor_grace == 80 and a.anchor_coef == 0.1 and a.anchor_max_teachers == 8
+    assert a.anchor_rows == "life" and not a.anchor_ratchet
     d = train_m2.saved_args(a)
     assert not any(k.startswith("anchor_") for k in d) and set(d) == {k for k in vars(a) if not k.startswith("anchor_")}
     a = train_m2.parse(["--run", "x", "--anchor-mastered", "--anchor-threshold", "0.85"])
