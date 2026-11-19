@@ -34,6 +34,7 @@ import numpy as np
 
 from . import instances, protocol as P, tas
 from .branch_assets import bundle_rules, rest_member
+from .branch_move import uses_branch_move
 from .branch_rules import DEFAULT_RULES
 from .client import AgentSession, SessionConfig
 from .curriculum import CurriculumConfig, ReverseCurriculum, TasStarts
@@ -154,6 +155,8 @@ class EnvConfig:
     branch_assets: dict | None = None
 
     def __reduce_ex__(self, protocol):
+        if uses_branch_move(self):
+            return _restore_branch_move_env_v1, (vars(self),)
         if self.branch_assets is not None:
             # An older spawned worker must not silently drop an unfamiliar dataclass field.
             if self.branch_assets.get("version") == 2:
@@ -165,6 +168,10 @@ class EnvConfig:
 
     def reward_config(self) -> RewardConfig:
         return self.reward if self.reward is not None else RewardConfig(mode=self.mode)
+
+
+def _restore_branch_move_env_v1(fields):
+    return EnvConfig(**fields)
 
 
 def _restore_branch_env_v2(fields):
@@ -249,6 +256,14 @@ class BallanceEnv(gym.Env):
             for start in self.cfg.rest_starts or []:
                 if len(start) == 3 and isinstance(start[2], dict):
                     rest_member(self.cfg.branch_assets, start[2].get("id"))
+        if uses_branch_move(self.cfg):
+            if (not self.cfg.start_check or not self.cfg.start_record or self.cfg.branch_assets is None
+                    or self.cfg.branch_assets.get("version") != 2):
+                raise ValueError("moving branch starts require a TAS record, start_check and pinned v2 branch assets")
+            fixed = self.cfg.start_rest or {}
+            if (fixed.get("branch_move") and (not fixed.get("branch_id") or fixed.get("branch_s") is None
+                    or not self.cfg.start_frame or self.cfg.start_frame <= 0)):
+                raise ValueError("fixed moving start requires a branch member, station and positive prefix")
         self.fx = FeatureExtractor(fc, branch_root=self._branch_temp.name if self._branch_temp else None)
         self.reward = Reward(self.cfg.reward_config())
         if self.cfg.esc_frames < 3:
@@ -331,6 +346,10 @@ class BallanceEnv(gym.Env):
             lo, hi = e[0], e[1]
             if len(e) == 3 and isinstance(e[2], dict):
                 self._rest_next = e[2]
+                if e[2].get("branch_move"):
+                    if lo != hi or int(lo) != lo or lo <= 0 or not e[2].get("id"):
+                        raise ValueError("moving start requires an exact positive prefix and a branch member")
+                    return int(lo)  # never snap a pinned replay prefix
                 return self.starts.nearest_any(int(self._start_rng.integers(int(lo), int(hi)+1)))
             self._rest_next = True
             if len(e) >= 5:  # drive to a target first: (x, z) drawn in the jitter box
@@ -350,6 +369,10 @@ class BallanceEnv(gym.Env):
                 self._rest_next = {"branch_s": float(c.start_rest["branch_s"])}
                 if c.start_rest.get("branch_id"):  # a multi-branch member (rest_starts lo-hi@branch:<id>:<s>)
                     self._rest_next["id"] = str(c.start_rest["branch_id"])
+                if c.start_rest.get("branch_move"):
+                    if not self._rest_next.get("id") or int(c.start_frame) != c.start_frame:
+                        raise ValueError("moving start requires an exact positive prefix and a branch member")
+                    self._rest_next["branch_move"] = True
                 return int(c.start_frame)
             t = c.start_rest.get("target")
             mf = c.start_rest.get("max_frames")
@@ -437,7 +460,11 @@ class BallanceEnv(gym.Env):
         if rest and k:
             if isinstance(rest, dict):
                 try:
-                    self._branch_rest(p, k, rest["branch_s"], key=rest.get("id"))
+                    if rest.get("branch_move"):
+                        from .branch_move import replay
+                        replay(self, p, k, rest["branch_s"], rest.get("id"))
+                    else:
+                        self._branch_rest(p, k, rest["branch_s"], key=rest.get("id"))
                 except Exception as exc:
                     # The failed simulation is not a valid handover. Launch once without
                     # the drive, preserving the requested TAS frame (and curriculum band).
@@ -448,6 +475,9 @@ class BallanceEnv(gym.Env):
                     p = self._prepare(copy, k, rest=False)
                     failure = dict(branch_rest_failures=self.branch_rest_failures,
                                    branch_rest_target=rest["branch_s"], branch_rest_error=str(exc))
+                    if rest.get("branch_move"):
+                        failure.update(kind="branch_moving_fallback", branch_move_fallback=True,
+                                       branch_move_member=rest.get("id"), branch_move_station=rest["branch_s"])
                     p["start"].update(failure)
                     p["recorder"].meta.start_state.update(failure)
                 except BaseException:
@@ -952,7 +982,10 @@ class BallanceEnv(gym.Env):
         self._held, self._press_q = 0, {}
         self._ms_since_turn = float("inf")
         k = int(start.get("frame") or 0)
-        if start.get("kind") != "tas" or k <= 0 or self.starts is None:
+        if start.get("kind") == "branch_moving":
+            self._set_held(start["branch_move_keys"])
+            return
+        if start.get("kind") not in ("tas", "branch_moving_fallback") or k <= 0 or self.starts is None:
             return
         fr = self.starts.frames[:k]
         turn = ((fr["keys"] & tas.KEY_SHIFT) != 0) & ((fr["keys"] & (tas.KEY_LEFT | tas.KEY_RIGHT)) != 0)

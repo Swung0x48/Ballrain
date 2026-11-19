@@ -245,6 +245,11 @@ class _Episode:
             self.mark_s = info["local_s"]
         if "branch_rest_failures" in st:
             self.d["branch_rest_failures"] = st["branch_rest_failures"]
+        if st.get("kind") in ("branch_moving", "branch_moving_fallback"):
+            self.d.update(branch_move_member=st.get("branch_id", st.get("branch_move_member")),
+                          branch_move_phase=st.get("phase"), branch_move_station=st.get("branch_move_station"),
+                          branch_move_offset=st.get("branch_move_offset"),
+                          branch_rest_error=st.get("branch_rest_error"))
         self.move_frame = 0
         self.actions = np.zeros(env.action_space.n, np.int64)
         self.probes_seen: set = set()

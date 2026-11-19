@@ -154,3 +154,20 @@ tr.dim td { color: #8a8574; }
 
 #sr-note summary { cursor: pointer; color: var(--brass-hi); }
 #sr-note details[open] summary { margin-bottom: 4px; }
+
+/* model structure */
+.mdl[data-mv="now"] .grow, .mdl[data-mv="grow"] .now { display: none; }
+.mins .tile .v { font-size: 18px; min-height: 22px; }
+.tile.new { outline: 2px dashed var(--amber2); outline-offset: -3px; background-image: none; background-color: #e6c98a; }
+.marr { text-align: center; color: var(--brass-hi); font-size: 13px; line-height: 1; margin: 6px 0; }
+.mnode { border: 1px solid var(--brass); background: rgba(27, 20, 11, .78); padding: 7px 10px; text-align: center;
+  box-shadow: inset 0 0 0 1px rgba(233, 196, 106, .15); min-width: 0; overflow-wrap: anywhere; }
+.mnode b { display: block; color: var(--amber); font: 700 14.5px/1.4 "Noto Serif SC", serif; }
+.mnode > span { display: block; color: var(--ink); font-size: 12.5px; }
+.mnode.wide { max-width: 560px; margin: 0 auto; }
+.mnode.act { border-color: #c79a4a; }
+.mnode.val { border-color: #5f8f86; }
+.mnode.val b { color: #9fd8c8; }
+.mcols { display: grid; grid-template-columns: 3fr 2fr; gap: 0 18px; }
+.mheads { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+@media (max-width: 560px) { .mcols { grid-template-columns: 1fr; } }

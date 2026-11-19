@@ -2721,7 +2721,7 @@ class FastReach:
 
     @classmethod
     def fields_for_tracker(cls, tracker, cache_dir=None, lock_timeout_s: float = 25.0, geometry=None,
-                           verbose: bool = False) -> "FastReach":
+                           verbose: bool = False, variant: str | None = None) -> "FastReach":
         """Static fields of the tracker's current geometry, built from canonical_geometry (identical on every engine
         and host for the same geometry) and cached content-addressed in <cache_dir>/L<nn>-<sha16 of fields_key>.npz
         (default <runtime>/fastreach, i.e. $BALLRAIN_RUNTIME/fastreach), with no unknown zones (set them with
@@ -2734,6 +2734,8 @@ class FastReach:
         from . import geometry as G
         geom = geometry if geometry is not None else cls.canonical_geometry(tracker)
         key = cls.fields_key(tracker, geom)
+        if variant is not None:
+            key += "|" + variant
         if cache_dir is None:
             from . import instances
             cache_dir = instances.runtime_dir() / "fastreach"

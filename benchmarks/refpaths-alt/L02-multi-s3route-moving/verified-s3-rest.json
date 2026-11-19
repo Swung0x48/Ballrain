@@ -1,0 +1,40 @@
+{
+  "paper": {
+    "spec": "10557-10557@branch:east-platform:1115.4429291260442",
+    "stage": 2,
+    "waypoints": {
+      "2": [
+        989,
+        -346.74
+      ]
+    }
+  },
+  "fan-skirt": {
+    "spec": "10557-10557@branch:east-platform:1220.2261294648288",
+    "stage": 4
+  },
+  "fan-base": {
+    "spec": "10557-10557@branch:east-platform:1227.9678178806375",
+    "stage": 4
+  },
+  "stone": {
+    "spec": "10557-10557@branch:east-platform:1294.4020191620239",
+    "stage": 7
+  },
+  "before-wippe": {
+    "spec": "10557-10557@branch:east-platform:1355.552990093326",
+    "stage": 9
+  },
+  "rail-top": {
+    "spec": "10557-10557@branch:east-platform:1383.9358608551386",
+    "stage": 9
+  },
+  "before-plate": {
+    "spec": "10557-10557@branch:east-platform:1434.0317398946486",
+    "stage": 12,
+    "controller": {
+      "plate_release": -329,
+      "plate_speed": 27
+    }
+  }
+}

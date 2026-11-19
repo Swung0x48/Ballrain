@@ -85,7 +85,7 @@ def _eval_summary(ev: Path) -> str:
 
 def is_f7(ck: dict) -> bool:
     fc = (ck.get("env_config") or {}).get("features") or {}
-    return bool(fc.get("reach")) or fc.get("version") == "f7"
+    return bool(fc.get("reach")) or fc.get("version") in ("f7", "f8")  # f8 (contact blocks): no plain/ export either
 
 
 def main(argv=None) -> None:

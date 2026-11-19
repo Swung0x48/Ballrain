@@ -535,7 +535,7 @@ def plan_pushes(push1, push2, switch_psi, steps: int, step_psi: int) -> np.ndarr
 
 
 def rollout(smap: SupportMap, pos, vel, ball: BallParams, pushes, cfg: ReachConfig, grounded=None,
-            step_psi: int | None = None):
+            step_psi: int | None = None, fan=None):
     """Simulate P plans. pos, vel: (3,) one PSI state for all plans (BALL.pos, BALL.speed + speed_change), or (P,3)
     one state per plan (batching several states in one call); grounded: None (from the support map), a bool, or (P,).
     pushes (P, steps, 2) world key push per step (key_push; |push| = 1 or sqrt 2); a step is step_psi PSIs
@@ -587,13 +587,28 @@ def rollout(smap: SupportMap, pos, vel, ball: BallParams, pushes, cfg: ReachConf
         a_g = ball.ground_accel * u + (g_psi / ROLL_INERTIA) * sna[:, 1:2] * sna[:, [0, 2]]
         vg, dg = _lin_step(hv, a_g, lam_g, n)
         # air: full key force, gravity, linear damping on all three components
-        a_air = np.c_[ball.air_accel * u[:, 0], np.full(len(a), -g_psi), ball.air_accel * u[:, 1]]
+        lift = None
+        vertical = np.full(len(a), -g_psi)
+        if fan is not None:
+            boxes, impulse, radius = fan
+            # Same oriented volumes and nominal centre distance as fastreach.
+            # Reference rollout samples force once per integration step (one PSI
+            # with ReachConfig(step_psi=1)); it does not share the envelope scan.
+            d = pa[:, None, :] - boxes[None, :, :3]
+            local = np.einsum("pfi,fji->pfj", d, boxes[:, 6:15].reshape(-1, 3, 3))
+            delta = np.maximum(np.abs(local) - boxes[None, :, 3:6], 0.0)
+            inside = np.any(np.sum(delta * delta, axis=2) <= radius**2, axis=1)
+            vertical[inside] += impulse
+            if impulse > g_psi:
+                lift = inside & (va[:, 1] >= 0.0)
+                ga = ga & ~inside
+        a_air = np.c_[ball.air_accel * u[:, 0], vertical, ball.air_accel * u[:, 1]]
         vair, dair = _lin_step(va, a_air, lam_a, n)
         new_h = np.where(ga[:, None], dg, dair[:, [0, 2]])
         new_vh = np.where(ga[:, None], vg, vair[:, [0, 2]])
         xz = pa[:, [0, 2]] + new_h
         # ballistic height after the step (also for a grounded ball the floor may drop away from)
-        vyb_n, dyb = _lin_step(va[:, 1], -g_psi, lam_a, n)
+        vyb_n, dyb = _lin_step(va[:, 1], vertical if fan is not None else -g_psi, lam_a, n)
         y_ball = pa[:, 1] + dyb
         y_ref = np.maximum(pa[:, 1], y_ball)
         step_len = np.linalg.norm(new_h, axis=1)
@@ -619,6 +634,8 @@ def rollout(smap: SupportMap, pos, vel, ball: BallParams, pushes, cfg: ReachConf
         # a grounded ball follows its support down to ground_tol below the ballistic height (else it takes off); an
         # airborne one lands only on a support that reaches its ballistic height
         on = has & (rest >= y_ball - np.where(ga, cfg.ground_tol, 0.0))
+        if lift is not None:
+            on &= ~lift  # permit the first upward impulse even before position moves
         y_new = np.where(on, rest, y_ball)
         # on the ground the vertical speed follows the support; upwards it is capped at what the support plane gives
         # for this horizontal velocity (a mounted step or sampling noise must not turn into a launch)
@@ -778,20 +795,47 @@ class ReachEstimator:
 
     def __init__(self, smap: SupportMap, config: ReachConfig | None = None):
         self.smap = smap
+        self._mechanism_maps = {}
+        self._plate_probe = None
+        self._paper_regions = np.empty((0, 2, 3))
+        self._fans = None
         self.cfg = config or ReachConfig()
         self._plans = _plans(self.cfg)
         steps = int(math.ceil(self.cfg.horizon_s * GAME_PSI_HZ / self.cfg.step_psi))
         self._pushes = plan_pushes(self._plans[0], self._plans[1], self._plans[2], steps, self.cfg.step_psi)
 
+    def _ball_at(self, ball_type, pos):
+        ball = BALLS.get(int(ball_type))
+        if ball is not None and not ball.supported and len(self._paper_regions):
+            # The legacy estimator does not model paper. Enable its reference
+            # probe/rollout near mapped plates/fans, not for untouched remote states.
+            p = np.asarray(pos, float).reshape(-1, 1, 3)
+            lo, hi = self._paper_regions[:, 0], self._paper_regions[:, 1]
+            radius = max(self.cfg.probe_dist, self.cfg.horizon_s * ball.top_speed(2)) + ball.radius
+            if np.all(np.any(np.all((p >= lo - radius) & (p <= hi + radius), axis=2), axis=1)):
+                from dataclasses import replace
+                return replace(ball, supported=True)
+        return ball
+
+    def _map_at(self, ball_type, pos):
+        k = int(ball_type)
+        if self._plate_probe is not None and k == self._plate_probe[0]:
+            from .reach_mechanisms import uses_lowered_plate
+            pts = np.asarray(pos, float).reshape(-1, 3)
+            if all(uses_lowered_plate(self._mechanism_tracker, p, self._plate_probe[2]) for p in pts):
+                k = self._plate_probe[1]
+        return self._mechanism_maps.get(k, self.smap)
+
     def estimate(self, pos, vel, ball_type: int = 0, quarter: int = 0, path=None, s0: float | None = None,
                  grounded=None) -> dict:
-        ball = BALLS.get(int(ball_type))
+        ball = self._ball_at(ball_type, pos)
+        smap = self._map_at(ball_type, pos)
         if ball is None or not ball.supported:
             return {"supported": False, "ball": None if ball is None else ball.name}
         c = self.cfg
         p1, p2, sw, idx = self._plans
         # world pushes of the plans are fixed; key combos per direction depend on the camera quarter
-        R = rollout(self.smap, pos, vel, ball, self._pushes, c, grounded)
+        R = rollout(smap, pos, vel, ball, self._pushes, c, grounded, fan=self._fans if ball_type == 1 else None)
         alive, traj, n = R["alive"], R["traj"], R["step_psi"]
         out = {"supported": True, "ball": ball.name, "doomed": not bool(alive.any()),
                "n_alive": int(alive.sum()), "n_plans": len(alive), "alive": alive, "t_death": R["t_death"],
@@ -813,7 +857,7 @@ class ReachEstimator:
         out["keys"] = per
         if c.probe:
             # blocked = cannot be mounted even at the two-key flat-road top speed
-            pr = probe_directions(self.smap, pos, dirs, ball.radius, c.climb_max, c.probe_dist,
+            pr = probe_directions(smap, pos, dirs, ball.radius, c.climb_max, c.probe_dist,
                                   speed=ball.top_speed(2, ground=True))
             for j, k in enumerate(per):
                 k["blocked_at"] = float(pr["blocked_at"][j])
@@ -857,7 +901,7 @@ class ReachEstimator:
             seg = np.where(tt <= np.where(np.isfinite(R["t_death"]), R["t_death"], np.inf)[:, None], seg, 0.0)
             travel = float(seg.sum(1).max())
             out["travel"] = travel
-            feats = next_features(self.smap, path, s0, c, ball.radius)
+            feats = next_features(smap, path, s0, c, ball.radius)
             for name in ("gap", "turn"):
                 f = feats[name]
                 out[name] = f
@@ -872,20 +916,49 @@ class ReachEstimator:
 
     def estimate_batch(self, pos, vel, ball_type: int = 0, grounded=None) -> dict:
         """Physics part only, for N states in one rollout call: doomed (N,), n_alive (N,), alive (N, plans)."""
-        ball = BALLS.get(int(ball_type))
+        ball = self._ball_at(ball_type, pos)
+        smap = self._map_at(ball_type, pos)
         if ball is None or not ball.supported:
             raise ValueError("unsupported ball type")
         pos = np.asarray(pos, np.float64).reshape(-1, 3)
         vel = np.asarray(vel, np.float64).reshape(-1, 3)
         N, P = len(pos), len(self._pushes)
         g = None if grounded is None else np.repeat(np.broadcast_to(np.asarray(grounded, bool).reshape(-1), (N,)), P)
-        R = rollout(self.smap, np.repeat(pos, P, axis=0), np.repeat(vel, P, axis=0), ball,
-                    np.tile(self._pushes, (N, 1, 1)), self.cfg, g)
+        R = rollout(smap, np.repeat(pos, P, axis=0), np.repeat(vel, P, axis=0), ball,
+                    np.tile(self._pushes, (N, 1, 1)), self.cfg, g, fan=self._fans if ball_type == 1 else None)
         alive = R["alive"].reshape(N, P)
         return {"doomed": ~alive.any(1), "n_alive": alive.sum(1), "alive": alive}
 
 
-def estimator_for_tracker(tracker, config: ReachConfig | None = None, **kw) -> ReachEstimator:
+def estimator_for_tracker(tracker, config: ReachConfig | None = None, *, mechanisms=False, **kw) -> ReachEstimator:
     from .features import level_geometry
-    smap = SupportMap.from_level(level_geometry(tracker), tracker.level.depth, **kw)
-    return ReachEstimator(smap, config)
+    geo = level_geometry(tracker)
+    depth = tracker.level.depth
+    result = ReachEstimator(SupportMap.from_level(geo, depth, **kw), config)
+    if mechanisms:
+        from types import SimpleNamespace
+        from .reach_mechanisms import add_geometry, fan_layer, layers_for_tracker
+        T = geo.tris
+        geom = (T.A, T.B, T.C, T.owner, np.zeros(len(T.A), dtype=bool))
+        maps = {}
+        layers, result._plate_probe = layers_for_tracker(tracker)
+        result._mechanism_tracker = tracker
+        for k, addition in enumerate(layers):
+            if addition is None:
+                continue
+            if id(addition) not in maps:
+                A, B, C, _, _ = add_geometry(geom, addition)
+                maps[id(addition)] = SupportMap.from_level(SimpleNamespace(tris=SimpleNamespace(A=A, B=B, C=C)),
+                                                           depth, **kw)
+            result._mechanism_maps[k] = maps[id(addition)]
+        if layers[1] is not None:
+            t = layers[1]  # per-triangle AABBs for the reference-only locality bound
+            result._paper_regions = np.stack((t.min(1), t.max(1)), axis=1)
+        from .fastreach import FAN_R_NOM, fan_dv
+        boxes, _ = fan_layer(tracker)
+        if len(boxes):
+            result._fans = (boxes, fan_dv(BALLS[1]), FAN_R_NOM)
+            ctr, extent = boxes[:, :3], boxes[:, 15:18] + FAN_R_NOM
+            result._paper_regions = np.concatenate((result._paper_regions,
+                                                    np.stack((ctr - extent, ctr + extent), axis=1)))
+    return result

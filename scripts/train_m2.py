@@ -71,13 +71,29 @@ def start_record(a) -> str:
 
 def parse_rest_starts(spec: str):
     """--rest-starts: "lo-hi", "lo-hi@x:z:jitter" or "lo-hi@x:z:jitter:max_frames" entries -> [[lo, hi]] /
-    [[lo, hi, x, z, jitter]] / [[lo, hi, x, z, jitter, max_frames]] (None when empty)."""
+    [[lo, hi, x, z, jitter]] / [[lo, hi, x, z, jitter, max_frames]] (None when empty).
+    Branch forms carry a target dict; k-k@branch-move:<member>:<station> requires an exact pinned sample.
+    """
     out = []
     for r in spec.split(","):
         r = r.strip()
         if not r:
             continue
         rng, _, tgt = r.partition("@")
+        if tgt.startswith("branch-move:"):
+            import math
+            import re
+            name, sep, station = tgt.removeprefix("branch-move:").rpartition(":")
+            try:
+                e = [int(v) for v in rng.split("-")]
+                value = float(station)
+                if (len(e) != 2 or not 0 < e[0] == e[1] or not sep or
+                        not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name) or not math.isfinite(value) or value < 0):
+                    raise ValueError
+            except ValueError:
+                raise SystemExit(f"--rest-starts entry {r!r}: k-k@branch-move:<member>:<recorded station>") from None
+            out.append([*e, {"branch_s": value, "id": name, "branch_move": True}])
+            continue
         e = [int(v) for v in rng.split("-")]
         if tgt.startswith("branch:"):
             name, sep, station = tgt.removeprefix("branch:").rpartition(":")
@@ -140,6 +156,10 @@ def gated_curriculum(starts, cfg, finish_gate: float):
 
 
 def parse(argv=None):
+    return build_parser().parse_args(argv)
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True)
     p.add_argument("--level", type=int)
@@ -225,10 +245,17 @@ def parse(argv=None):
     p.add_argument("--hs-block", action="store_true", help="keep the HS feature block (off for SR)")
     p.add_argument("--far-waypoints", default="", help="f6: line points this far ahead in arc units, e.g. 20,30,45")
     p.add_argument("--ref-speed-at", default="", help="f6: reference speed at these arc offsets, e.g. 0,15,30")
+    p.add_argument("--reach-mechanisms", action="store_true",
+                   help="opt into retail mechanism layers for f7; Python workers only, requires --reach")
     p.add_argument("--reach", action="store_true",
                    help="f7: append the fastreach reach block (FeatureConfig.reach, ballrain.reach_features; 59 entries) "
                         "after every other observation entry; a checkpoint without it is grown with zero input weights "
                         "(--resume / --init-from). Sticky: a run resumed from a reach checkpoint keeps it. Needs numba")
+    p.add_argument("--contacts", action="store_true",
+                   help="f8: append the contact / rail blocks (FeatureConfig(version='f8'): top-4 merged contacts, "
+                        "aggregates, left / right rails; 49 entries) after the reach block; an f7 checkpoint is grown "
+                        "with zero input weights (--resume / --init-from). Sticky like --reach. Workers on older code "
+                        "cannot unpickle the f8 template and refuse it")
     p.add_argument("--world-actions", action="store_true",
                    help="world-frame directional features (FeatureConfig camera=world) and world-direction actions")
     p.add_argument("--reward", default="{}", help="RewardConfig overrides as JSON")
@@ -241,7 +268,7 @@ def parse(argv=None):
     p.add_argument("--stall-speed", type=float, default=None,
                    help="the stall clock pauses while the ball is faster than this (units/s): run-ups are not cut")
     p.add_argument("--stall-max-s", type=float, default=15.0, help="with --stall-speed: max time without new arc progress")
-    p.add_argument("--rest-starts", default="", help="at-rest starts: lo-hi record frame ranges, e.g. 11760-11900,13450-13650; "
+    p.add_argument("--rest-starts", default="", help="at-rest or moving branch starts: lo-hi record frame ranges, e.g. 11760-11900,13450-13650; "
                    "lo-hi@branch:<id>:s uses a measured branch drive (lo-hi@branch:s for legacy); lo-hi@x:z:jitter drives the ball to a target in [x +- jitter] x [z +- jitter] before braking "
                    "(lo-hi@x:z:jitter:max_frames: that entry's drive limit; the hand-over may be an excluded frame)")
     p.add_argument("--counter-rand", default="",
@@ -306,7 +333,7 @@ def parse(argv=None):
     p.add_argument("--prune", default="finish")
     p.add_argument("--trace-sample", type=float, default=0.0,
                    help="fraction of game processes traced and kept for export spot-checks (scripts/sim2real_m2.py)")
-    return p.parse_args(argv)
+    return p
 
 
 class Logger:
@@ -365,7 +392,9 @@ def obs_layout(fc):
     return layout_size(fc), layout_slices(fc)
 
 
-def make_env_config(a, out_root: Path, ck=None):
+def make_env_config(a, out_root: Path, ck=None, init=None):
+    """ck: the checkpoint resumed from (--resume); init: the one a new run starts from (--init-from), whose route
+    branch bundle the new run keeps unless --branch-dir names one (it must match that checkpoint's pin)."""
     from ballrain.branch_assets import read_bundle, validate
     from ballrain.path import RouteError
     from ballrain.env import EnvConfig
@@ -386,6 +415,12 @@ def make_env_config(a, out_root: Path, ck=None):
     if saved is None and (old.get("branch_sha256") or (old.get("branch_dir") and not a.branch_dir)):
         raise RouteError("checkpoint lacks branch assets (legacy runs require explicit --branch-dir)")
     bundle = read_bundle(a.level, a.branch_dir) if a.branch_dir else saved
+    if ck is None and init is not None and init.get("branch_assets") is not None and not a.branch_dir:
+        # --init-from a branch run: the new run follows the same bundle (before, it silently dropped the branch)
+        bundle = init["branch_assets"]
+        want = ((init.get("env_config") or {}).get("features") or {}).get("branch_sha256")
+        if validate(bundle, a.level, main_sha) != want:
+            raise RouteError("--init-from checkpoint: its branch assets do not match its own pin")
     pin = validate(bundle, a.level, main_sha) if bundle is not None else None
     update = getattr(a, "branch_update", False)
     if update and (not a.branch_dir or saved is None):
@@ -394,21 +429,40 @@ def make_env_config(a, out_root: Path, ck=None):
         if not update or validate(saved, a.level, main_sha) != old.get("branch_sha256"):
             raise RouteError("branch assets differ from checkpoint pin")
         print(f"branch-update: {old['branch_sha256']} -> {pin}", flush=True)
+    from ballrain.features import CONTACT_FEATURE_VERSION, FEATURE_VERSION
     fc = FeatureConfig(hs_block=a.hs_block, camera="world" if a.world_actions else "orient_ref",
                        far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=path_dir,
-                       branch_sha256=pin, path_sha256=main_sha, reach=bool(getattr(a, "reach", False)))
+                       branch_sha256=pin, path_sha256=main_sha, reach=bool(getattr(a, "reach", False)),
+                       version=CONTACT_FEATURE_VERSION if getattr(a, "contacts", False) else FEATURE_VERSION)
+    from ballrain.reach_features import is_mechanism_version, reach_version
+    old_reach = old.get("reach_version")
+    saved_mechanisms = is_mechanism_version(old_reach)
+    if getattr(a, "reach_mechanisms", False) or saved_mechanisms:
+        if not fc.reach:
+            raise RouteError("--reach-mechanisms requires --reach")
+        if getattr(a, "pool_ingest", False):
+            raise RouteError("reach mechanisms require Python workers; disable --pool-ingest")
+        if not 1 <= a.level <= 13:
+            raise RouteError("no retail reach mechanism asset for this level")
+        fc.reach_version = reach_version(mechanisms=True)
+        if saved_mechanisms and old_reach != fc.reach_version:
+            raise RouteError("reach mechanism assets/code differ from the checkpoint pin")
     cu = {"start_back": a.start_back, "step": a.cu_step, "band": a.cu_band, "recent": a.cu_recent,
           "advance_at": a.advance_at, "min_episodes": a.min_episodes, "p_level_start": a.p_level_start}
     hl = None
     if a.backend == "headless":
         hl = {k: v for k, v in (("binary", a.hl_bin), ("root", a.hl_root), ("socket", a.hl_socket),
                                 ("ball_order", a.hl_ball_order)) if v}
+    rest_starts = parse_rest_starts(a.rest_starts)
+    if getattr(a, "pool_ingest", False) and any(len(e) == 3 and isinstance(e[2], dict) and e[2].get("branch_move")
+                                               for e in rest_starts or ()):
+        raise RouteError("moving branch starts are Python-only; disable --pool-ingest")
     return EnvConfig(branch_assets=bundle, level=a.level, mode="sr", action_repeat=a.action_repeat, out_root=str(out_root),
                      start_record=start_record(a),
                      backend=a.backend, headless=hl,
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
                      per_life=not a.no_respawn,
-                     rest_starts=parse_rest_starts(a.rest_starts),
+                     rest_starts=rest_starts,
                      p_rest=a.p_rest,
                      rehearse_starts=[[int(v) for v in r.split("-")] for r in a.rehearse_starts.split(",") if r.strip()] or None,
                      p_rehearse=a.p_rehearse,
@@ -461,6 +515,9 @@ def main(argv=None) -> int:
         for k in ("hidden", "activation", "action_repeat", "hs_block", "world_actions"):  # architecture / observation: keep
             setattr(a, k, saved.get(k, getattr(a, k)))
         a.reach = bool(a.reach or saved.get("reach"))  # on stays on (the observation never shrinks); off -> on grows it
+        a.contacts = bool(a.contacts or saved.get("contacts"))  # likewise for the f8 contact blocks
+        from ballrain.reach_features import is_mechanism_version
+        a.reach_mechanisms = a.reach_mechanisms or is_mechanism_version(saved.get("reach_version"))
     else:
         ck = None
     if a.actor_heads is None:
@@ -469,6 +526,10 @@ def main(argv=None) -> int:
         a.level = (ck or {}).get("env_config", {}).get("level", 1)
     if ck and ck.get("branch_assets") and a.path_dir is None:
         a.path_dir = ck["env_config"]["features"].get("path_dir")
+    # --init-from: loaded once (its branch bundle carries over into the new run's config, its policy is loaded below)
+    ck0 = torch.load(a.init_from, weights_only=False) if (ck is None and a.init_from) else None
+    if ck0 is not None and ck0.get("branch_assets") and a.path_dir is None and not a.branch_dir:
+        a.path_dir = ck0["env_config"]["features"].get("path_dir")
     (run_dir / ("config.json" if not a.resume else f"config.resume-{time.strftime('%Y%m%d-%H%M%S')}.json")).write_text(
         json.dumps(vars(a), indent=1), encoding="utf-8")
     log = Logger(run_dir, a.resume)
@@ -479,7 +540,7 @@ def main(argv=None) -> int:
     np.random.seed(a.seed)
     gen = torch.Generator().manual_seed(a.seed)
 
-    env_cfg = make_env_config(a, run_dir / "episodes", ck)
+    env_cfg = make_env_config(a, run_dir / "episodes", ck, init=ck0)
     if getattr(a, "branch_update", False):
         change = {"from": ck["env_config"]["features"]["branch_sha256"], "to": env_cfg.features.branch_sha256}
         with (run_dir / "branch-updates.jsonl").open("a", encoding="utf8") as audit:
@@ -540,7 +601,6 @@ def main(argv=None) -> int:
         best.update(ck.get("best", {}))
         log.msg(f"resumed from {ckpt_path} at update {counters['update']}, frontier {cu.frontier}")
     elif a.init_from:
-        ck0 = torch.load(a.init_from, weights_only=False)
         load_policy(ck0, load_opt=a.init_full)
         if a.init_full:
             for g in opt.param_groups:
@@ -717,6 +777,10 @@ def main(argv=None) -> int:
         counters["episodes"] += 1
         win_eps.append(e)
         log.row("episodes", e)
+        if e["kind"] in ("branch_moving", "branch_moving_fallback"):
+            log.row("branch-moving", e, cols=["update", "wid", "kind", "start_frame", "branch_move_member",
+                    "branch_move_station", "branch_move_offset", "branch_move_phase", "branch_rest_failures",
+                    "branch_rest_error", "success_cp", "finish"])
         if e["kind"] == "respawn":
             by_rsp_sector[e["start_sector"]].append((e["success_cp"], e["finish"]))
         if e["kind"] == "tas_rest":
@@ -858,6 +922,9 @@ def main(argv=None) -> int:
         # a teacher without the f7 reach block reads the first n_obs entries (the block is appended at the end)
         appended = ({"reach", "reach_version", "version"} if (mine.get("reach") and not theirs.get("reach"))
                     else set())
+        # ... and one without the f8 contact blocks likewise (they follow the reach block; check_prefix below checks)
+        if mine.get("version") == "f8" and theirs.get("version") != "f8":
+            appended.add("version")
         diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k) and k not in appended)
         t_obs = int(tck["n_obs"])
         if (t_obs != n_obs and not appended) or int(tck["n_act"]) != n_act or diff:
