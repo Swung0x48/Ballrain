@@ -156,7 +156,6 @@ tr.dim td { color: #8a8574; }
 #sr-note details[open] summary { margin-bottom: 4px; }
 
 /* model structure */
-.mdl[data-mv="now"] .grow, .mdl[data-mv="grow"] .now { display: none; }
 .mins .tile .v { font-size: 18px; min-height: 22px; }
 .tile.new { outline: 2px dashed var(--amber2); outline-offset: -3px; background-image: none; background-color: #e6c98a; }
 .marr { text-align: center; color: var(--brass-hi); font-size: 13px; line-height: 1; margin: 6px 0; }

@@ -681,7 +681,7 @@ function zoomCurves(mode) {
 /* ------------------------------------------------------------------------------------ render */
 const hasCharts = typeof window.echarts !== "undefined";
 async function render() {
-  for (const f of [renderHeader, renderReport, renderHighlight, renderStatus]) { try { f(); } catch (e) { console.error(e); } }
+  for (const f of [renderHeader, renderReport, renderHighlight, renderStatus, renderModel]) { try { f(); } catch (e) { console.error(e); } }
   if (!hasCharts) {
     document.querySelectorAll(".map, .chart").forEach((el) => { el.style.height = "auto"; el.innerHTML = '<p class="note" style="padding:12px">图表库没能加载（需要能访问 cdn.jsdelivr.net），只显示文字与表格。</p>'; });
   }
@@ -689,10 +689,48 @@ async function render() {
   for (const j of jobs) { try { if (hasCharts || j === jobs[0]) await j(); } catch (e) { console.error(e); } }
 }
 
+
 /* ------------------------------------------------------------------------------------ model structure */
-document.querySelectorAll("#t-model [data-mv]").forEach((b) => b.addEventListener("click", () => {
-  document.getElementById("mdl").dataset.mv = b.dataset.mv;
-  document.querySelectorAll("#t-model [data-mv]").forEach((x) => x.classList.toggle("on", x === b));
-}));
+const MODEL_GROUPS = {
+  ball: ["球的状态", "球型、速度、旋转、最近一个接触点"],
+  terrain: ["周围地形", "高度图、边缘距离、最近的轨"],
+  reach: ["可达性", "未来 1–3 秒能到哪"],
+  route: ["路线", "路线点、进度、参考速度"],
+  bodies: ["活动机关", "附近会动的物体"],
+  game: ["游戏状态", "生命、分数、小节、计时"],
+  contacts: ["多接触点", "按方向分的 4 个接触点（右、下、左、其他）；左右两侧最近的轨；支撑法向与轨道接触数"],
+  other: ["其他", ""],
+};
+const MODEL_NOTE = {
+  f6: "基础输入：球的状态、周围地形、路线、活动机关和游戏状态。",
+  f7: "在基础输入后加了可达性（未来 1–3 秒能到哪）。",
+  f8: "在可达性后加了多接触点（49 列）：骑双轨时左右两根轨都能看到。从上一个 run 的模型扩容而来，新列权重从零开始。",
+};
+function renderModel() {
+  const m = (S.status[sel] || {}).model;
+  $("s-model").hidden = !m;
+  if (!m) return;
+  document.querySelectorAll("#s-model .rn").forEach((el) => { el.textContent = sel; });
+  $("m-at").textContent = m.features ? `输入版本 ${m.features}` : "";
+  const tiles = m.groups.map((g) => {
+    const [k, d] = MODEL_GROUPS[g.key] || [g.key, ""];
+    return `<div class="tile"><div class="k">${esc(k)}</div><div class="v">${esc(String(g.size))}</div><div class="s">${esc(d)}</div></div>`;
+  }).join("");
+  const hid = m.hidden.join(" → ");
+  const act = m.activation;
+  const heads = m.heads === "ball_type"
+    ? `<div class="marr">▼</div><div class="mheads">${["木球头", "纸球头", "石球头"].map((h) => `<div class="mnode act"><b>${h}</b><span>${m.n_act} 个输出</span></div>`).join("")}</div>
+       <div class="marr">▼</div><div class="mnode act"><b>按当前球型选一个头</b><span>${m.n_act} 选 1 方向键（含不按），每个动作按住 ${m.action_repeat} 帧</span></div>`
+    : `<div class="marr">▼</div><div class="mnode act"><b>策略输出</b><span>${m.n_act} 选 1 方向键（含不按），每个动作按住 ${m.action_repeat} 帧</span></div>`;
+  $("mdl").innerHTML = `<div class="tiles mins">${tiles}</div>
+    <div class="marr">▼</div>
+    <div class="mnode wide"><b>观测 ${m.n_obs} 维</b><span>按滑动均值和方差标准化</span></div>
+    <div class="mcols">
+      <div class="mcol"><div class="marr">▼</div><div class="mnode act"><b>策略网络主干</b><span>${m.n_obs} → ${hid}，${esc(act)}</span></div>${heads}</div>
+      <div class="mcol"><div class="marr">▼</div><div class="mnode val"><b>价值网络（独立）</b><span>${m.n_obs} → ${hid}，${esc(act)}</span></div>
+        <div class="marr">▼</div><div class="mnode val"><b>状态价值</b><span>1 个数，只在训练时用</span></div></div>
+    </div>
+    <p class="note">PPO 训练，约 ${(m.params / 1e4).toFixed(1)} 万个参数。${esc(MODEL_NOTE[m.features] || "")}</p>`;
+}
 
 load();
