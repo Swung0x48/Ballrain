@@ -243,6 +243,8 @@ class _Episode:
         self.terms: dict = {}
         self.jumps = 0
         self.s0 = env.reward.s
+        self.end_branch = (bool(info.get("branch")), info.get("branch_id"))
+        self.last_branch_s = info.get("branch_progress_sample")
         self.best_s = env.reward.s if env.reward.s is not None else -np.inf
         self.mark_s, self.mark_frame = self.best_s, 0
         self.stall_branch = bool(info.get("branch"))
@@ -273,6 +275,13 @@ class _Episode:
         self.max_sector = max(self.max_sector, int(info.get("sector") or 0))
         for k, v in (info.get("reward_terms") or {}).items():
             self.terms[k] = self.terms.get(k, 0.0) + float(v)
+        if "branch" in info:
+            branch = (bool(info["branch"]), info.get("branch_id"))
+            if branch != self.end_branch:
+                self.last_branch_s = None
+                self.end_branch = branch
+        if "branch_progress_sample" in info and info.get("episode_end") != "BallOff":
+            self.last_branch_s = info["branch_progress_sample"]
         p = (finfo or {}).get("path")
         if p and p.get("jump"):
             self.jumps += 1
@@ -307,10 +316,15 @@ class _Episode:
 
     def finish(self, info: dict, end: str, env, frames: int) -> dict:
         d = self.d
+        # A branch window always returns a nearest point, even far below the route.
+        # If no usable branch sample existed, leave s_end blank rather than invent one.
+        s_end = self.last_branch_s if self.end_branch[0] else env.reward.s
+        x, y, z = info.get("ball_pos", (None, None, None))
         d.update(end=end, ret=self.ret, steps=self.steps, frames=frames, max_sector=self.max_sector,
                  end_sector=int(info.get("sector") or 0), sr_ms_end=float(info.get("sr_ms") or 0.0),
                  finish=end == "LevelFinish", terms=self.terms, jumps=self.jumps,
-                 s_start=self.s0, s_end=env.reward.s, t_wall=time.time() - d.pop("t_wall_start"),
+                 s_start=self.s0, s_end=s_end, t_wall=time.time() - d.pop("t_wall_start"),
+                 end_x=x, end_y=y, end_z=z,
                  actions=self.actions.tolist())
         d["success_cp"] = bool(d["finish"] or self.max_sector > d["start_sector"])
         d["probes"] = sorted(self.probes_seen | {f"gate:{g}" for g in self.gates_hit})

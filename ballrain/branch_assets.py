@@ -90,15 +90,17 @@ def ordinary_start_frames(starts, bundle):
 
 HANDOVER_TABLE = "moving_handover_v1"
 HANDOVER_APPEND_TABLE = "moving_handover_append_v1"
+HANDOVER_DENSE_TABLE = "moving_handover_append_v2"
 HANDOVER_CADENCE = "moving_replay_step_v1"
 
 
 def moving_handover_rows(drive):
     if HANDOVER_TABLE not in drive:
         raise ValueError("branch drive has no pinned moving handovers")
-    tables = [drive[HANDOVER_TABLE]]
-    if HANDOVER_APPEND_TABLE in drive:
-        tables.append(drive[HANDOVER_APPEND_TABLE])
+    if HANDOVER_DENSE_TABLE in drive and HANDOVER_APPEND_TABLE not in drive:
+        raise ValueError("moving handover append chain has a missing table")
+    tables = [drive[name] for name in (HANDOVER_TABLE, HANDOVER_APPEND_TABLE, HANDOVER_DENSE_TABLE)
+              if name in drive]
     if any(a.ndim != 2 or a.shape[1] != 10 or not len(a) or a.dtype.kind != "f"
            or not np.isfinite(a).all() for a in tables):
         raise ValueError("invalid moving handover table")
@@ -114,14 +116,18 @@ def _only_added_moving_metadata(old, new, entry):
         return False
     base = {f"{name}.npy" for name in (HANDOVER_TABLE, HANDOVER_CADENCE)}
     extra = {f"{HANDOVER_APPEND_TABLE}.npy"}
+    dense = {f"{HANDOVER_DENSE_TABLE}.npy"}
+    stages = (set(), base, base | extra, base | extra | dense)
     try:
         with ZipFile(io.BytesIO(old["drive_npz"])) as a, ZipFile(io.BytesIO(new["drive_npz"])) as b:
             keys = set(a.namelist())
             next_keys = set(b.namelist())
-            additions = (extra,) if base <= keys else (base, base | extra)
+            metadata = base | extra | dense
+            old_stage = keys & metadata
+            new_stage = next_keys & metadata
             if (len(keys) != len(a.namelist()) or len(next_keys) != len(b.namelist())
-                    or (keys & base and not base <= keys) or keys & extra
-                    or not keys <= next_keys or next_keys - keys not in additions
+                    or old_stage not in stages or new_stage not in stages
+                    or not old_stage < new_stage or keys - metadata != next_keys - metadata
                     or any(a.read(k) != b.read(k) for k in keys)):
                 return False
         with np.load(io.BytesIO(new["drive_npz"]), allow_pickle=False) as d:

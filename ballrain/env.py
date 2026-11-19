@@ -1093,12 +1093,21 @@ class BallanceEnv(gym.Env):
                 "life": len(self.recorder.lives) - 1 if self.recorder else None,
                 "run_id": self.recorder.meta.run_id if self.recorder else None, "start": self._start}
         route = finfo.get("path") or {}
+        key = route.get("branch_id")
         if "branch_id" in route:
-            key = route["branch_id"]
             self.branch_rules = self.fx.branch.by_id[key][1].rules if key else DEFAULT_RULES
             info.update(branch_id=key, phase=route["phase"])
+        if "pos" in finfo:
+            info["ball_pos"] = tuple(map(float, finfo["pos"]))
         if "branch" in route:
             info.update({key: route[key] for key in ("branch", "local_s", "ref_elapsed_ms", "ref_remaining_ms")})
+            if (route["branch"] and t.flags.ball_nav and not t.flags.ball_off and not t.flags.finished
+                    and route["dist"] <= self.branch_rules.rest_position_tolerance):
+                # Log the physical projection in curriculum coordinates, not credited progress
+                # (a high-water mark that can advance while the ball is falling).
+                follower = self.fx.branch.by_id[key][1] if key else self.fx.branch
+                main_s, member_s = follower.stations
+                info["branch_progress_sample"] = float(np.interp(route["local_s"], member_s, main_s))
         elif self.fx.branch is not None:
             # No IVP ball during transforms / finish: never compare the route clock to absolute TAS IGT.
             info.update(self.fx.branch.timing)
