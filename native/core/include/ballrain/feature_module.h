@@ -39,6 +39,7 @@ public:
 
     void feed(uint32_t kind, const void *p, size_t n);
     std::vector<float> compute(FeatureInfo *info);
+    int size();  // the module's observation size for its config (br_size)
     // a record sink for the session (StreamWriter(Sink)): every record goes to feed()
     StreamWriter::Sink sink();
     // the path the module sees for a host path under cache_dir ("" when it is not under it)

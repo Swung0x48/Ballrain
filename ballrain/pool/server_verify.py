@@ -53,7 +53,7 @@ from .server_store import Store
 class Verifier:
     def __init__(self, store: Store, pool_dir, engines: dict, launcher_factory=None, log=None,
                  retry_s: int = 300, reach_max_row_frac: float = R.REACH_MAX_ROW_FRAC,
-                 reach_max_logp_shift: float = R.REACH_MAX_LOGP_SHIFT, cross_wait_s: int = 900, trusted_after: int = 0,
+                 reach_max_logp_shift: float = R.REACH_MAX_LOGP_SHIFT, cross_wait_s: int = 60, trusted_after: int = 0,
                  ingest_then_verify: bool = False, shard: tuple | None = None):
         """engines: kind -> object with .binary / .root (server_config.EngineRef); launcher_factory: tests
         (ballrain.fakegame.FakeLauncher), None = the headless engine of HeadlessConfig."""

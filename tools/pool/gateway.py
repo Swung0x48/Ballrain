@@ -67,7 +67,7 @@ def build(cfg: PoolConfig, launcher_factory=None, clock=time.time):
     verifier = Verifier(store, cfg.pool_dir, cfg.engines, launcher_factory=launcher_factory, log=log,
                         reach_max_row_frac=getattr(cfg, "reach_max_row_frac", 0.02),
                         reach_max_logp_shift=getattr(cfg, "reach_max_logp_shift", 1.0),
-                        cross_wait_s=getattr(cfg, "cross_wait_s", 900), trusted_after=getattr(cfg, "trusted_after", 0),
+                        cross_wait_s=getattr(cfg, "cross_wait_s", 60), trusted_after=getattr(cfg, "trusted_after", 0),
                         ingest_then_verify=getattr(cfg, "ingest_then_verify", False))
     return app, store, policies, verifier
 

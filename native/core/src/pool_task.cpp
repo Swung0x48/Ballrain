@@ -144,7 +144,8 @@ std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, s
         pol = cache.policy(task.policy_sha);
         starts = cache.starts(task.asset_starts);
         path_dir = cache.path_dir(task.asset_path, task.level);
-        FeatureConfig pins = FeatureConfig::from_json(pol.manifest.at("features"));
+        const Json &mf = pol.manifest.at("features");
+        FeatureConfig pins = task.module_sha256.empty() ? FeatureConfig::from_json(mf) : FeatureConfig::host_view(mf);
         if (pins.has_branch() != !task.asset_branch.empty())
             throw Error(pins.has_branch() ? "the policy follows a route branch: the task has no branch pack"
                                           : "a branch pack for a policy without a route branch");
@@ -162,7 +163,9 @@ std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, s
         throw Error("the starts pack is not the task's record");
     starts.apply_camera_filter(ec.camera_quarter_tol, ec.camera_turn_grace_ms);
     starts.exclude(ec.exclude_starts);
-    FeatureConfig fc = FeatureConfig::from_json(m.at("features"));
+    // with a feature module the layout is the module's (a feature set this build does not know is fine)
+    FeatureConfig fc = module_bytes.empty() ? FeatureConfig::from_json(m.at("features"))
+                                            : FeatureConfig::host_view(m.at("features"));
     if (fc.path_sha256 != task.asset_path) throw Error("the task's reference line is not the policy's");
     fc.path_dir = path_dir;
     fc.reach_dir = reach_dir;
@@ -216,9 +219,11 @@ std::unique_ptr<PreparedTask> prepare_task(const Task &task, PoolCache &cache, s
             Json init = Json::object();
             init.set("level", Json::integer(task.level)), init.set("features", fx);
             p->module = std::make_unique<FeatureModule>(module_bytes, cache_root, init);
+            if (p->module->size() != pol.n_obs) throw Error("the feature module's observation size differs from the policy's");
             p->env->use_module(p->module.get());
         }
-        if (p->env->features().size() != pol.n_obs) throw Error("the env's observation size differs from the policy's");
+        if (module_bytes.empty() && p->env->features().size() != pol.n_obs)
+            throw Error("the env's observation size differs from the policy's");
         for (size_t i = 0; i < p->env->actions().size(); ++i)
             if (p->env->actions()[i] != pol.action_keys[i]) throw Error("the env's action set differs from the policy's");
         p->runner = std::make_unique<TaskRunner>(*p->env, &starts, task, RolloutSpec::from_json(m.at("rollout")),

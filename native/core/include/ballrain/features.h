@@ -53,6 +53,9 @@ struct FeatureConfig {
     std::string reach_dir;      // where the fields files are (the client's install of the task's reach assets)
 
     static FeatureConfig from_json(const Json &j);  // the manifest's "features" (unknown keys: Error)
+    // the host's view when a feature module computes the features (feature_module_v1): the fields this build knows
+    // (the route, the reach fields, the paths), unknown fields and feature versions ignored (the layout is the module's)
+    static FeatureConfig host_view(const Json &j);
 };
 
 // What compute() learned besides the vector (the parts of the Python info dict the env / rewards read)

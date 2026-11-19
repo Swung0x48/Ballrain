@@ -559,6 +559,9 @@ class PoolApp:
         lacking = missing(self.policies.current.manifest.get("requires"), json.loads(sess["capabilities"] or "[]"))
         if lacking:
             return _json("no_task", reason=refusal(sess["client_version"], lacking), retry_s=600)
+        if "feature_module_v1" in (self.policies.current.manifest.get("requires") or ()) and self.feature_module is None:
+            self.log("task: the policy needs the feature module, none configured ([task] feature_module)")
+            return _json("no_task", reason=payload(Reason.NO_TASK), retry_s=max(30, self.cfg.task_poll_s))
         from .cross_check import assign, build_key, replica_for
         rep = replica_for(self.store, sess, acct["forum_id"], self.cfg, self.now())
         if rep is not None:  # a peer's drawn task waits for a second play by this build (cross-check)
@@ -708,9 +711,14 @@ class PoolApp:
                 self._rewards[tid] = st
             t0 = st.seconds
             out = st.chunk(int(c.header["step0"]), c.arrays["rin"], c.header.get("episodes") or [])
-        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+        except Exception as e:  # noqa: BLE001  any bad input (an inf in an integer column: OverflowError) refuses the chunk
             self._rewards.pop(tid, None)
-            raise _err(Reason.BAD_CHUNK, detail=f"reward inputs: {str(e)[:150]}") from None
+            raise _err(Reason.BAD_CHUNK, detail=f"reward inputs: {type(e).__name__}: {str(e)[:150]}") from None
+        # the upload guard of the client's rewards, on the gateway's own (the learner gets these)
+        bound = float(self.cfg.guard_max_abs_reward)
+        if not np.isfinite(out).all() or float(np.abs(out).max(initial=0.0)) > bound:
+            self._rewards.pop(tid, None)
+            raise _err(Reason.BAD_CHUNK, detail=f"reward inputs give a reward beyond {bound:g}")
         rs = self.reward_stats
         rs["chunks"] += 1
         rs["steps"] += len(out)

@@ -99,6 +99,7 @@ FeatureModule::FeatureModule(const Bytes &, const std::string &, const Json &) {
 FeatureModule::~FeatureModule() = default;
 void FeatureModule::feed(uint32_t, const void *, size_t) {}
 std::vector<float> FeatureModule::compute(FeatureInfo *) { return {}; }
+int FeatureModule::size() { return 0; }
 StreamWriter::Sink FeatureModule::sink() { return nullptr; }
 std::string FeatureModule::guest_path(const std::string &) const { return ""; }
 
@@ -356,6 +357,18 @@ std::vector<float> FeatureModule::compute(FeatureInfo *info) {
         *info = unpack_feature_info(b);
     }
     return v;
+}
+
+int FeatureModule::size() {
+    Impl &I = *impl_;
+    wasmtime_func_t f;
+    wasmtime_extern_t x;
+    if (!wasmtime_instance_export_get(I.ctx, &I.inst, "br_size", 7, &x) || x.kind != WASMTIME_EXTERN_FUNC)
+        throw Error("feature module: no export br_size");
+    f = x.of.func;
+    int64_t n = I.call(f, {});
+    if (n < 0) throw Error("feature module: " + I.error());
+    return int(n);
 }
 
 StreamWriter::Sink FeatureModule::sink() {

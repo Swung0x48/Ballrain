@@ -22,8 +22,10 @@ from . import task as T
 
 
 def build_key(sess) -> str:
-    """Two clients that must agree bit for bit: the same engine (kind, sha256), platform and client version."""
-    return json.dumps([sess["engine_kind"], sess["engine_sha"], sess["platform"], sess["client_version"]])
+    """Two clients that must agree bit for bit and can run the same task body: the same engine (kind, sha256),
+    platform, client version and capabilities (a peer without wasmtime.dll must not get a replica with the module)."""
+    caps = sorted(json.loads(sess["capabilities"] or "[]")) if "capabilities" in sess.keys() else []
+    return json.dumps([sess["engine_kind"], sess["engine_sha"], sess["platform"], sess["client_version"], caps])
 
 
 def _draw(p: float) -> bool:

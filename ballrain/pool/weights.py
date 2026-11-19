@@ -263,6 +263,9 @@ def export_state(state: dict, out_dir, run: str) -> dict:
     # policy_graph_v1: the network as data (native/core/include/ballrain/graph.h). Not an identity field: clients
     # before it ignore it (and keep their policy_sha); the verifier always runs the gateway's own copy
     m["graph"] = build_graph(m["arch"])
+    # a feature set newer than the clients' built-in extractors (f6 / f7): only feature-module clients can run it
+    if feats.get("version") not in (None, "f6", "f7"):
+        m["requires"] = list(m.get("requires") or []) + ["feature_module_v1"]
     assert_public(m)
     dumps(m)  # JSON-safe (raises on NaN / non-JSON values)
     sha = policy_sha(m, arrays)
