@@ -48,8 +48,8 @@ def _npz(**kw) -> bytes:
     return b.getvalue()
 
 
-def _member(level, P, drive=b"drive"):
-    return {"level": level, "line_npz": _npz(points=P), "desc_json": json.dumps({"level": level}).encode(),
+def _member(level, sector, P, drive=b"drive"):
+    return {"level": level, "line_npz": _npz(points=P), "desc_json": json.dumps({"level": level, "sector": sector}).encode(),
             "drive_npz": drive, "sha256": {}}
 
 
@@ -62,7 +62,7 @@ def _entry(mid, ordinary=False):
 
 def _bundle(with_east=True, drive=b"drive"):
     entries = [_entry("south-loop")] + ([_entry("east-primary", True)] if with_east else [])
-    members = [_member(2, _line([(150, 170, -30.0)]))] + ([_member(2, _line([(80, 120, 30.0)]), drive)] if with_east else [])
+    members = [_member(2, 4, _line([(150, 170, -30.0)]))] + ([_member(2, 3, _line([(80, 120, 30.0)]), drive)] if with_east else [])
     return {"version": 2, "level": 2, "manifest": json.dumps({"version": 2, "branches": entries}).encode(), "members": members}
 
 
@@ -100,8 +100,9 @@ def test_routes_from_checkpoint(run):
     assert [(f["id"], f["name"], f["guidance"]) for f in R["families"]] == [("east-primary", "东台线", True),
                                                                              ("south-loop", "南侧绕行线", False)]
     keys = [c["key"] for c in D.route_classes(R)]
-    assert keys == ["east-primary", "south-loop", "tas", "shared"]
-    assert D.route_classes(R)[2]["name"] == "TAS 线（鬼躲纸变）"
+    assert keys == ["east-primary", "south-loop", "tas-east-primary", "tas-south-loop", "shared"]
+    names = {c["key"]: c["name"] for c in D.route_classes(R)}
+    assert names["tas-east-primary"] == "TAS 线（鬼躲纸变）" and names["tas-south-loop"] == "TAS 线（未走南侧绕行线）"
     main = _line()
     L = types.SimpleNamespace(ok=np.arange(len(main)), pos=main, level=2)
     pub = D.routes_public(R, L, cur=0)
@@ -122,8 +123,10 @@ def test_classify_lives(run):
     east = _line([(80, 120, 30.0)])
     assert D.classify_life(_life(east[east[:, 0] > 60]), R) == ("east-primary", "spatial")
     tas = _line()
-    assert D.classify_life(_life(tas[(tas[:, 0] > 60) & (tas[:, 0] < 140)]), R) == ("tas", "spatial")
+    assert D.classify_life(_life(tas[(tas[:, 0] > 60) & (tas[:, 0] < 140)]), R) == ("tas-east-primary", "spatial")
     assert D.classify_life(_life(tas[tas[:, 0] < 50]), R) == ("shared", "spatial")
+    # a life on the TAS stretch another fork overrides is that fork's TAS class, not the guidance fork's dodge
+    assert D.classify_life(_life(tas[tas[:, 0] > 140]), R) == ("tas-south-loop", "spatial")
     south = _line([(150, 170, -30.0)])
     assert D.classify_life(_life(south[south[:, 0] > 130]), R) == ("south-loop", "spatial")
     # the life's recorded branch member (a rest start placed on it) wins over where it went

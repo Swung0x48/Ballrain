@@ -438,12 +438,14 @@ function wireRoam(box, id, redraw) {
 
 /* Route bundle of a run (from its own model checkpoint, sent by the server as "routes"): its route families, the
    TAS line split into the part no branch overrides and the part one does, and the route classes of the lives. */
-const ROUTE_C = { guide: "#14b89a", tas: "#ff7a1a", shared: "#6f6a5e", other: ["#9b6cf0", "#2f8fe0", "#e0559b", "#c9a227", "#5f9e3a"] };
+// TAS classes: the TAS stretch a fork overrides (orange for the current guidance's fork, paler for the others)
+const ROUTE_C = { guide: "#14b89a", tas: "#ff7a1a", tasOther: ["#ffb067", "#c8662e", "#ffd2a0"], shared: "#6f6a5e", other: ["#9b6cf0", "#2f8fe0", "#e0559b", "#c9a227", "#5f9e3a"] };
 function routeClasses(R) {
   if (!R || !R.classes) return [];
-  let k = 0;
+  let k = 0, t = 0;
   return R.classes.map((c) => {
-    const color = c.key === "tas" ? ROUTE_C.tas : c.key === "shared" ? ROUTE_C.shared : c.guidance ? ROUTE_C.guide : ROUTE_C.other[k++ % ROUTE_C.other.length];
+    const color = c.tas ? (c.fork_guidance ? ROUTE_C.tas : ROUTE_C.tasOther[t++ % ROUTE_C.tasOther.length])
+      : c.key === "shared" ? ROUTE_C.shared : c.guidance ? ROUTE_C.guide : ROUTE_C.other[k++ % ROUTE_C.other.length];
     return { ...c, color, label: c.guidance ? `${c.name}（当前引导）` : c.name };
   });
 }

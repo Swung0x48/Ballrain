@@ -579,7 +579,8 @@ def model_info(run: Run) -> dict | None:
 # replaces is the part of the TAS line it overrides. Display names only: ids not in the table are shown as they are.
 ROUTE_NAMES = {"east-primary": "东台线", "east-platform": "东台平台线", "back-to-wood": "回木球线",
                "south-loop": "南侧绕行线", "stone-arrival": "石球到达线"}
-TAS_ROUTE_NAMES = {2: "鬼躲纸变"}  # what the TAS line does where the level's branches override it
+# what the TAS line does in (level, sector) where a branch of that sector overrides it
+TAS_ROUTE_NAMES = {(2, 3): "鬼躲纸变"}
 ROUTE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 ROUTE_FAR = 3.0       # world units: a member line farther than this from the main line has left it
 ROUTE_NEAR = 8.0      # a trace point farther than this from a line is not on it
@@ -694,8 +695,12 @@ def run_routes(run: Run) -> dict | None:
             mid = str(e.get("id") or "")
             mid = mid if ROUTE_ID_RE.match(mid) else f"branch-{k + 1}"
             div = [P[a:b] for a, b in _runs_of(far) if b - a >= 2]
+            try:
+                sector = int(json.loads(m["desc_json"]).get("sector"))
+            except (TypeError, ValueError):
+                sector = None
             members.append({"id": mid, "name": ROUTE_NAMES.get(mid, mid), "guidance": e.get("entry_context") == "ordinary",
-                            "line": P, "div": div, "over": over})
+                            "line": P, "div": div, "over": over, "sector": sector})
     except Exception:
         return hit[1] if hit else None
     # route families: members whose diverging stretches lie on each other's line
@@ -720,6 +725,7 @@ def run_routes(run: Run) -> dict | None:
     for ms in fams.values():
         head = next((m for m in ms if m["guidance"]), ms[0])
         families.append({"id": head["id"], "name": head["name"], "guidance": any(m["guidance"] for m in ms), "members": ms,
+                         "sector": head["sector"],
                          "div": np.vstack([np.vstack(m["div"]) for m in ms]),
                          "over": np.any([m["over"] for m in ms], axis=0)})
     families.sort(key=lambda f: not f["guidance"])  # the current guidance first
@@ -733,15 +739,21 @@ def run_routes(run: Run) -> dict | None:
     return res
 
 
+def tas_class_name(R, f) -> str:
+    """Name of the TAS stretch family f overrides: the level's name for it when the table has one, else generic."""
+    tas = TAS_ROUTE_NAMES.get((int(R.get("level") or 0), f.get("sector")))
+    return f"TAS 线（{tas}）" if tas else f"TAS 线（未走{f['name']}）"
+
+
 def route_classes(R) -> list[dict]:
-    """The route classes of a bundle in display order (public): its families, then the TAS line where a family
-    overrides it, then lives that never reached a fork."""
+    """The route classes of a bundle in display order (public): its families, then per family the TAS line where
+    that family overrides it ("tas-<family id>"), then lives that never reached a fork."""
     if not R:
         return []
-    tas = TAS_ROUTE_NAMES.get(int(R.get("level") or 0))
     return ([{"key": f["id"], "name": f["name"], "guidance": f["guidance"]} for f in R["families"]]
-            + [{"key": "tas", "name": f"TAS 线（{tas}）" if tas else "TAS 线", "guidance": False},
-               {"key": "shared", "name": "未经过分岔段", "guidance": False}])
+            + [{"key": f"tas-{f['id']}", "name": tas_class_name(R, f), "guidance": False, "tas": True,
+                "fork_guidance": f["guidance"]} for f in R["families"] if f["over"].any()]
+            + [{"key": "shared", "name": "未经过分岔段", "guidance": False}])
 
 
 def routes_public(R, L, cur: int | None = None) -> dict | None:
@@ -762,8 +774,9 @@ def routes_public(R, L, cur: int | None = None) -> dict | None:
         if f["guidance"]:
             over_g |= o
     split = lambda mask: [xz(T[a:min(b + 1, len(T))]) for a, b in _runs_of(mask) if b - a >= 1]  # noqa: E731
-    tas = TAS_ROUTE_NAMES.get(int(L.level))
-    out = {"tas_name": f"TAS 参考线（{tas}）" if tas else "TAS 参考线",
+    tas = [TAS_ROUTE_NAMES[(int(L.level), f["sector"])] for f in R["families"]
+           if (int(L.level), f["sector"]) in TAS_ROUTE_NAMES and f["over"].any()]
+    out = {"tas_name": f"TAS 参考线（{tas[0]}）" if tas else "TAS 参考线",
            "tas_main": split(~over_any), "tas_over": split(over_any),
            "families": [{"id": f["id"], "name": f["name"], "guidance": f["guidance"],
                          "members": [{"id": m["id"], "name": m["name"], "guidance": m["guidance"],
@@ -791,7 +804,8 @@ def classify_life(tr, R, info=None) -> tuple[str, str]:
     """(route class, source) of one traced life against a route bundle: the branch member the start state records
     (rest starts on a branch) when there is one, else where the life went: per point the nearer of a family's own
     stretch and the main line (by ROUTE_MARGIN, within ROUTE_NEAR), summed as length per family and per overridden TAS
-    stretch. The fork of the current guidance decides first; then the longest; under ROUTE_MIN_LEN: "shared"."""
+    stretch ("tas-<family>"). The fork of the current guidance decides first; then the longest; under ROUTE_MIN_LEN:
+    "shared"."""
     if not R:
         return "", ""
     rec = (info or {}).get("branch_id")
@@ -826,14 +840,14 @@ def classify_life(tr, R, info=None) -> tuple[str, str]:
         if f["guidance"]:
             g, t = score[f["id"]]
             if max(g, t) >= ROUTE_MIN_LEN:
-                return (f["id"] if g >= t else "tas"), "spatial"
+                return (f["id"] if g >= t else f"tas-{f['id']}"), "spatial"
     best, label = 0.0, "shared"
     for f in R["families"]:
         g, t = score[f["id"]]
         if g > best:
             best, label = g, f["id"]
         if t > best:
-            best, label = t, "tas"
+            best, label = t, f"tas-{f['id']}"
     return (label if best >= ROUTE_MIN_LEN else "shared"), "spatial"
 
 
