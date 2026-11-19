@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 
 from . import tas
-from .branch_assets import rest_member
+from .branch_assets import HANDOVER_CADENCE, HANDOVER_TABLE, moving_handover_rows, rest_member
 from .features import FeatureExtractor, yaw_of
 from .protocol import Ev
 
@@ -12,7 +12,6 @@ from .protocol import Ev
 POSITION_TOLERANCE = 0.10
 VELOCITY_TOLERANCE = 0.20
 CURSOR_TOLERANCE = 2.0
-HANDOVER_TABLE = 'moving_handover_v1'
 
 
 def uses_branch_move(cfg):
@@ -26,16 +25,12 @@ def select_handover(drive, k, station, record_sha, branch_sha):
     if (k != int(drive['prefix_frame']) or str(drive['record_sha256']) != record_sha
             or str(drive['branch_sha256']) != branch_sha):
         raise ValueError('moving replay does not match the prefix, recording or branch line')
-    if HANDOVER_TABLE not in drive:
-        raise ValueError('branch drive has no pinned moving handovers')
     samples = drive['samples']
     ix = np.flatnonzero(samples[:, 1] == station)
     if len(ix) != 1:
         raise ValueError('moving start needs a unique exact recorded station (no snapping)')
     offset = samples[ix[0], 0]
-    table = drive[HANDOVER_TABLE]
-    if table.ndim != 2 or table.shape[1] != 10 or not np.isfinite(table).all():
-        raise ValueError('invalid moving handover table')
+    table = moving_handover_rows(drive)
     rows = table[table[:, 0] == offset]
     frames = drive['frames']
     if len(rows) != 1 or not 0 < offset <= len(frames) or int(offset) != offset:
@@ -43,7 +38,7 @@ def select_handover(drive, k, station, record_sha, branch_sha):
     expected = rows[0]
     if np.any(expected[:4] != expected[:4].astype(int)):
         raise ValueError('non-integral moving handover metadata')
-    step = drive['moving_replay_step_v1'].item()
+    step = drive[HANDOVER_CADENCE].item()
     if type(step) is not int or not 1 <= step <= 16:
         raise ValueError('invalid moving replay observation cadence')
     return frames[:int(offset)], expected, step

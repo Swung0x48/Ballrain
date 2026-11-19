@@ -7,7 +7,8 @@ import json
 import numpy as np
 import pytest
 
-from ballrain.branch_assets import contextual_append_end, read_bundle, validate
+from ballrain.branch_assets import HANDOVER_APPEND_TABLE, HANDOVER_TABLE, contextual_append_end, read_bundle, validate
+from ballrain.branch_move import select_handover
 from ballrain.path import REFPATH_DIR, RouteError, file_sha256
 from ballrain.train.anchor import snapshot_branch_ignore
 
@@ -79,3 +80,50 @@ def test_scope_changes_and_unvalidated_pins_refused(bundles):
     new['manifest']=json.dumps(doc).encode()
     with pytest.raises(RouteError):
         contextual_append_end(old,new,2,MAIN,pin(old),pin(new))
+
+
+def test_append_preserves_prior_handovers_and_accepts_both_source_pins(bundles):
+    teacher, plain, old, arrays = bundles
+    new = copy.deepcopy(old)
+    sample = arrays['samples'][(arrays['samples'][:, 1] > 1386) & (arrays['samples'][:, 1] < 1387)][0]
+    row = arrays[HANDOVER_TABLE][0].copy()
+    row[0] = sample[0]
+    drive = {**arrays, HANDOVER_APPEND_TABLE: row[None, :]}
+    update(new['members'][1], drive)
+    for original in (plain, old, teacher):
+        expected = pytest.approx(1157.924316740663) if original is teacher else None
+        assert contextual_append_end(original, new, 2, MAIN, pin(original), pin(new)) == expected
+    for table in (HANDOVER_TABLE, HANDOVER_APPEND_TABLE):
+        row = drive[table][0]
+        station, = drive['samples'][drive['samples'][:, 0] == row[0], 1]
+        frames, expected, step = select_handover(drive, int(drive['prefix_frame']), station,
+                                                str(drive['record_sha256']), str(drive['branch_sha256']))
+        np.testing.assert_array_equal(expected, row)
+        assert len(frames) == int(row[0]) and step == 6
+
+
+@pytest.mark.parametrize('problem', ['overlap', 'cadence', 'base_table', 'phase', 'orphan'])
+def test_bad_supplement_refused(bundles, problem):
+    _, plain, old, arrays = bundles
+    new = copy.deepcopy(old)
+    row = arrays[HANDOVER_TABLE][0].copy()
+    sample = arrays['samples'][(arrays['samples'][:, 1] > 1386) & (arrays['samples'][:, 1] < 1387)][0]
+    if problem != 'overlap':
+        row[0] = sample[0]
+    drive = {**arrays, HANDOVER_APPEND_TABLE: row[None, :]}
+    if problem == 'cadence':
+        drive['moving_replay_step_v1'] = np.asarray(3)
+    if problem == 'base_table':
+        drive[HANDOVER_TABLE] = arrays[HANDOVER_TABLE] + np.array([0, 0, 0, 0, 1, 0, 0, 0, 0, 0])
+    if problem == 'phase':
+        row[1] = 0
+    if problem == 'orphan':
+        old = plain
+        del drive[HANDOVER_TABLE], drive['moving_replay_step_v1']
+    update(new['members'][1], drive)
+    with pytest.raises(RouteError, match='moving-only'):
+        contextual_append_end(old, new, 2, MAIN, pin(old), pin(new))
+    if problem == 'overlap':
+        with pytest.raises(ValueError, match='duplicate moving handover offsets'):
+            select_handover(drive, int(drive['prefix_frame']), sample[1],
+                            str(drive['record_sha256']), str(drive['branch_sha256']))

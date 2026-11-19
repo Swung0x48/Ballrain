@@ -88,23 +88,46 @@ def ordinary_start_frames(starts, bundle):
     return starts.valid[mask]
 
 
+HANDOVER_TABLE = "moving_handover_v1"
+HANDOVER_APPEND_TABLE = "moving_handover_append_v1"
+HANDOVER_CADENCE = "moving_replay_step_v1"
+
+
+def moving_handover_rows(drive):
+    if HANDOVER_TABLE not in drive:
+        raise ValueError("branch drive has no pinned moving handovers")
+    tables = [drive[HANDOVER_TABLE]]
+    if HANDOVER_APPEND_TABLE in drive:
+        tables.append(drive[HANDOVER_APPEND_TABLE])
+    if any(a.ndim != 2 or a.shape[1] != 10 or not len(a) or a.dtype.kind != "f"
+           or not np.isfinite(a).all() for a in tables):
+        raise ValueError("invalid moving handover table")
+    rows = np.concatenate(tables) if len(tables) > 1 else tables[0]
+    if len(np.unique(rows[:, 0])) != len(rows):
+        raise ValueError("duplicate moving handover offsets")
+    return rows
+
+
 def _only_added_moving_metadata(old, new, entry):
     """A narrow exception: original NPY members (including headers) must be byte-identical."""
     if (entry.get("legacy") or any(old[k] != new[k] for k in ("level", "desc_json", "line_npz"))):
         return False
-    extra = {"moving_handover_v1.npy", "moving_replay_step_v1.npy"}
+    base = {f"{name}.npy" for name in (HANDOVER_TABLE, HANDOVER_CADENCE)}
+    extra = {f"{HANDOVER_APPEND_TABLE}.npy"}
     try:
         with ZipFile(io.BytesIO(old["drive_npz"])) as a, ZipFile(io.BytesIO(new["drive_npz"])) as b:
             keys = set(a.namelist())
-            if (keys & extra or len(keys) != len(a.namelist()) or len(b.namelist()) != len(keys) + len(extra)
-                    or set(b.namelist()) != keys | extra or any(a.read(k) != b.read(k) for k in keys)):
+            next_keys = set(b.namelist())
+            additions = (extra,) if base <= keys else (base, base | extra)
+            if (len(keys) != len(a.namelist()) or len(next_keys) != len(b.namelist())
+                    or (keys & base and not base <= keys) or keys & extra
+                    or not keys <= next_keys or next_keys - keys not in additions
+                    or any(a.read(k) != b.read(k) for k in keys)):
                 return False
         with np.load(io.BytesIO(new["drive_npz"]), allow_pickle=False) as d:
-            rows = d["moving_handover_v1"]
-            cadence = d["moving_replay_step_v1"].item()
-            if (rows.ndim != 2 or rows.shape[1] != 10 or not len(rows) or rows.dtype.kind != "f"
-                    or not np.isfinite(rows).all() or len(np.unique(rows[:, 0])) != len(rows)
-                    or type(cadence) is not int or not 1 <= cadence <= 16):
+            rows = moving_handover_rows(d)
+            cadence = d[HANDOVER_CADENCE].item()
+            if type(cadence) is not int or not 1 <= cadence <= 16:
                 return False
             samples, n = d["samples"], len(d["frames"])
             for r in rows:
