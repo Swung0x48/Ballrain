@@ -179,10 +179,17 @@ def vtrace(chunk: dict, logp_cur, v_cur, v_last: float, gamma: float, lam: float
 
 def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int, clip: float, vf_coef: float,
                ent_coef: float, max_grad_norm: float, device="cpu", gen=None, target_kl: float | None = None,
-               teacher_logp=None, teacher_mask=None, teacher_coef: float = 0.0) -> dict:
+               teacher_logp=None, teacher_mask=None, teacher_coef: float = 0.0,
+               anchor_logp=None, anchor_weight=None, anchor_coef: float = 0.0) -> dict:
     """teacher_logp (n, n_act) log-probabilities of a frozen teacher policy on the batch states, teacher_mask (n,) bool:
     the loss gets + teacher_coef * KL(teacher || policy) averaged over the masked states of each minibatch (e.g. keep the
     back half of a level near a faster earlier policy while the front changes); stats teacher_kl / teacher_n.
+
+    anchor_logp (n, n_act) teacher log-probabilities and anchor_weight (n,) row weights summing to 1 (the mastered-state
+    anchor, ballrain.train.anchor.row_weights; 0 = not anchored): the loss gets + anchor_coef * sum_r w_r KL_r over the
+    rows of each minibatch, scaled by n / minibatch rows, so that over an epoch it is the weighted batch sum (a weighted
+    mean over families, not over rows); stats anchor_kl (that term) / anchor_n (rows with w > 0) / anchor_coef.
+    Independent of the teacher term (both can be on).
 
     Non-finite guard (gradient clipping does not help: one NaN / inf gradient makes every parameter NaN): a minibatch
     whose loss or gradient norm is not finite is not stepped, the parameters and the optimiser state of the start of
@@ -202,6 +209,13 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
         t_logp = torch.as_tensor(teacher_logp, dtype=torch.float32, device=device)
         t_mask = torch.as_tensor(teacher_mask, dtype=torch.bool, device=device)
         stats["teacher_kl"] = []
+    use_anchor = anchor_logp is not None and anchor_weight is not None and anchor_coef > 0
+    if use_anchor:
+        a_logp = torch.as_tensor(anchor_logp, dtype=torch.float32, device=device)
+        a_w = torch.as_tensor(anchor_weight, dtype=torch.float32, device=device)
+        use_anchor = bool((a_w > 0).any())
+        if use_anchor:
+            stats["anchor_kl"] = []
     snap = {k: v.detach().clone() for k, v in model.state_dict().items()}  # restored when the update turns non-finite
     opt_snap = copy.deepcopy(opt.state_dict())
     stop, nonfinite, ep = False, None, 0
@@ -233,6 +247,14 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
                     kl_t = (lt.exp() * (lt - logp_all[m])).sum(-1).mean()
                     loss = loss + teacher_coef * kl_t
                     stats["teacher_kl"].append(kl_t.item())
+            if use_anchor:
+                wa = a_w[idx]
+                ma = wa > 0
+                if bool(ma.any()):
+                    la = a_logp[idx][ma]
+                    kl_a = (wa[ma] * (la.exp() * (la - logp_all[ma])).sum(-1)).sum() * (n / len(idx))
+                    loss = loss + anchor_coef * kl_a
+                    stats["anchor_kl"].append(kl_a.item())
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)  # total norm before clipping
@@ -240,6 +262,8 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
                 terms = {"pg_loss": pg.item(), "v_loss": vl.item(), "entropy": ent.item()}
                 if use_teacher and bool(m.any()):
                     terms["teacher_kl"] = kl_t.item()
+                if use_anchor and bool(ma.any()):
+                    terms["anchor_kl"] = kl_a.item()
                 terms["grad_norm"] = float(gn)
                 nonfinite = {"term": next((k for k, x in terms.items() if not np.isfinite(x)), "loss"), "epoch": ep,
                              "minibatch": mb, "rows": idx.cpu().numpy(), **terms}
@@ -272,6 +296,9 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
     if use_teacher:
         out["teacher_n"] = float(t_mask.sum().item())
         out["teacher_coef"] = float(teacher_coef)
+    if use_anchor:
+        out["anchor_n"] = float((a_w > 0).sum().item())
+        out["anchor_coef"] = float(anchor_coef)
     return out
 
 

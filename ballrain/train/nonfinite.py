@@ -129,7 +129,8 @@ class NonFiniteGuard:
         (the old values). Returns its stats, or None when update number `update` was skipped: a non-finite batch
         (nothing was run) or a non-finite loss / gradient / parameter inside (ppo_update restored the parameters and
         the optimiser state); either way the model and the optimiser are as before the call."""
-        arrays = {**batch, **extra, **{k: kw[k] for k in ("teacher_logp", "teacher_mask") if kw.get(k) is not None}}
+        arrays = {**batch, **extra, **{k: kw[k] for k in ("teacher_logp", "teacher_mask", "anchor_logp", "anchor_weight")
+                                   if kw.get(k) is not None}}
         if self.check(update, chunks, arrays, model, opt):
             return None
         stats = ppo_update(model, opt, batch, *args, **kw)

@@ -71,6 +71,11 @@ class WorkerSpec:
     #                            (export spot-checks of an approximate backend: scripts/sim2real_m2.py spotcheck)
     launcher_factory: object = None  # tests (ballrain.fakegame.FakeLauncher)
     max_reset_failures: int = 6
+    # start_tags (the learner's mastered-state anchor, scripts/train_m2.py --anchor-mastered): every episode carries
+    # "start_tag" {kind, frame, sector, source} and every chunk "start_tags" (the tags of the lives it holds), "start_ref"
+    # (per row: index into start_tags, -1 = none) and "past_cp" (per row: the life had already reached a later sector
+    # than it started in when the row was observed). Off: chunks and episodes exactly as before
+    start_tags: bool = False
     extra: dict = field(default_factory=dict)
     # route probes: {name: [xmin, xmax, zmin, zmax]} world boxes; every episode records which boxes the ball entered and in
     # which box (if any) it was last seen before a BallOff (e.g. a TAS shortcut vs the detour around it)
@@ -665,6 +670,25 @@ class Worker:
         except queue.Empty:
             pass
 
+    def _episode(self, info) -> _Episode:
+        ep = _Episode(info, self.env, self.version, self._cap_frames(info))
+        if self.spec.start_tags:  # how this life started, for the learner's start families (WorkerSpec.start_tags)
+            st = info.get("start") or {}
+            ep.d["start_tag"] = {"kind": ep.d["kind"], "frame": ep.d["start_frame"], "sector": ep.d["start_sector"],
+                                 "source": st.get("source")}
+        return ep
+
+    @staticmethod
+    def _tag_row(buf: dict, t: int, ep: _Episode, past_cp: bool) -> None:
+        """Row t of the chunk belongs to life ep (WorkerSpec.start_tags)."""
+        tags = buf["start_tags"]
+        ref = getattr(ep, "_tag_ref", None)
+        if ref is None or ref[0] is not tags:
+            tags.append(ep.d["start_tag"])
+            ref = ep._tag_ref = (tags, len(tags) - 1)
+        buf["start_ref"][t] = ref[1]
+        buf["past_cp"][t] = past_cp
+
     # ---------------------------------------------------------------------------------------- loop
     def run(self):
         from .ppo import normalize
@@ -675,7 +699,7 @@ class Worker:
             return
         n_obs = self.env.observation_space.shape[0]
         obs, info = self._reset()
-        ep = _Episode(info, self.env, self.version, self._cap_frames(info))
+        ep = self._episode(info)
         self._split_start(ep, info)
         stall_all = int(1000 * sp.stall_s / sp.env.delta_ms)
         stall_rsp = int(1000 * (sp.respawn_stall_s or sp.stall_s) / sp.env.delta_ms)
@@ -686,6 +710,8 @@ class Worker:
                    "actions": np.zeros(T, np.int64), "logp": np.zeros(T, np.float32), "values": np.zeros(T, np.float32),
                    "rewards": np.zeros(T, np.float32), "terminated": np.zeros(T, bool), "truncated": np.zeros(T, bool),
                    "trunc_values": np.zeros(T, np.float32)}
+            if sp.start_tags:
+                buf.update(start_tags=[], start_ref=np.full(T, -1, np.int16), past_cp=np.zeros(T, bool))
             episodes = []
             version = self.version
             t0 = time.perf_counter()
@@ -715,10 +741,11 @@ class Worker:
                     tr = time.perf_counter()
                     obs, info = self._reset()
                     t_reset += time.perf_counter() - tr
-                    ep = _Episode(info, self.env, self.version, self._cap_frames(info))
+                    ep = self._episode(info)
                     self._split_start(ep, info)
                     continue
                 frames += int(info2.get("frames_done", f0)) - f0
+                past_cp = ep.max_sector > ep.d["start_sector"]  # before this step: the sector the row was observed in
                 ep.step(a, r, info2, self.fx_info)
                 if (sp.zones or sp.wall_push_rate) and not term and self.env.session is not None:
                     sh = self._zone_wall(ep, a, s_before, int(info2.get("frames_done", f0)) - f0)
@@ -779,6 +806,8 @@ class Worker:
                             ep.terms["stall_penalty"] = ep.terms.get("stall_penalty", 0.0) + pen
                             term, trunc = True, False
                 buf["obs"][t], buf["raw"][t] = x, obs
+                if sp.start_tags:
+                    self._tag_row(buf, t, ep, past_cp)
                 buf["actions"][t], buf["logp"][t], buf["values"][t] = a, logp, v
                 buf["rewards"][t], buf["terminated"][t] = r, term
                 buf["truncated"][t] = trunc and not term
@@ -793,7 +822,7 @@ class Worker:
                     tr = time.perf_counter()
                     obs, info = self._reset(new_process=skip)
                     t_reset += time.perf_counter() - tr
-                    ep = _Episode(info, self.env, self.version, self._cap_frames(info))
+                    ep = self._episode(info)
                     self._split_start(ep, info)
                 else:
                     obs, info = obs2, info2

@@ -9,7 +9,8 @@ train-<copy_offset> .. ). Outputs in <runtime>/m2-train/<run>/: config.json, upd
 episodes.csv (one row per RL episode), runs.csv (one row per game process), tb/ (tensorboard), ckpt_*.pt and
 latest.pt (model, optimiser, observation statistics, curriculum state, counters), episodes/<copy>/<run_id>/ (kept
 runs: finishing processes, .json + .tas), pids.json, train.log, nonfinite-u<update>.npz (the batch of a skipped
-non-finite update, ballrain.train.nonfinite; at most 5).
+non-finite update, ballrain.train.nonfinite; at most 5), anchor.csv (--anchor-mastered: one row per update; the
+mastered-state anchor, ballrain.train.anchor; its family statistics and teacher snapshots are in the checkpoints).
 
 Stop: create the file <run>/STOP (the learner stops the workers, which close their game processes; any game
 process still running in the copies used is then stopped by path, never by image name).
@@ -56,6 +57,9 @@ UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_pe
                + [f"u_{k}" for k in ("pg_loss", "v_loss", "entropy", "approx_kl", "clip_frac", "early_stop",
                                      "explained_var", "adv_std", "ret_mean", "grad_norm", "watch_entropy", "watch_n",
                                      "teacher_kl", "teacher_n", "teacher_coef")])
+ANCHOR_COLS = ["update", "steps", "families", "mastered", "in_grace", "teachers", "batch_families", "rows", "tagged_rows",
+               "kl_pre", "kl", "n", "coef", "terms_s", "ppo_s", "n_mastered", "n_released", "n_retired", "n_dropped",
+               "top"]
 RUN_COLS = ["update", "t", "copy", "run_id", "end_reason", "sr_ms", "start_frame", "frames", "lives", "deaths",
             "framelog_match", "handover_mismatches", "invalid", "ball_order", "dir"]
 
@@ -326,6 +330,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--teacher-decay-updates", type=int, default=0)
     p.add_argument("--teacher-s-min", type=float, default=331.4,
                    help="route arc length from which the teacher term applies (L1 refpaths-alt: 331.4 = TAS frame 4460)")
+    p.add_argument("--anchor-mastered", action="store_true",
+                   help="mastered-state anchor (ballrain.train.anchor): + coef x KL(teacher || policy) on the batch rows of "
+                        "lives that started in a start family (--rest-starts entry, rehearsal range, curriculum band, respawn "
+                        "sector) whose rolling success (the learner's: next checkpoint, or finish with --success finish) "
+                        "is >= --anchor-threshold; a mean over families of the mean KL within each. Off: unchanged")
+    p.add_argument("--anchor-teacher", default="",
+                   help="with --anchor-mastered: one explicit teacher checkpoint for every family (the --teacher layout "
+                        "rules); default: per family the snapshot of the policy that mastered it")
+    p.add_argument("--anchor-coef", type=float, default=0.1,
+                   help="coefficient of the anchor term (a mean over families: each family's pull is coef / families "
+                        "present, not comparable to --teacher-coef, a mean over rows)")
+    p.add_argument("--anchor-window", type=int, default=40, help="lives per family in the rolling success")
+    p.add_argument("--anchor-min-lives", type=int, default=40, help="lives in the window before a family can be mastered")
+    p.add_argument("--anchor-threshold", type=float, default=0.9, help="rolling success at which a family is mastered")
+    p.add_argument("--anchor-grace", type=int, default=80,
+                   help="lives in a row below the threshold before a mastered family is released (hysteresis)")
+    p.add_argument("--anchor-drop-scale", type=float, default=0.0,
+                   help="family weight 1 + this x (peak rate - current rate)+: a slipping family is pulled harder (0 = equal)")
+    p.add_argument("--anchor-families", default="rest,rehearse,band,respawn,level",
+                   help="start family kinds that can be anchored (ballrain.train.anchor.KINDS)")
+    p.add_argument("--anchor-band-frames", type=int, default=0,
+                   help="record frames per curriculum band family (0 = --cu-bin-frames)")
+    p.add_argument("--anchor-min-rows", type=int, default=16,
+                   help="a family with fewer rows in the batch gets rows / this of a full share")
+    p.add_argument("--anchor-max-teachers", type=int, default=8, help="policy snapshots kept (automatic teachers)")
+    p.add_argument("--anchor-ratchet", action="store_true",
+                   help="automatic teachers: a family whose last --anchor-window lives were all played by policies newer "
+                        "than its snapshot, at >= the rate it had then, moves to a newer snapshot (follows improvements)")
     p.add_argument("--watch-s", default="",
                    help="LO,HI: also log the behaviour policy's entropy on batch states whose route position (feature "
                         "path_progress x line length) is in [LO, HI] (u_watch_entropy, u_watch_n; L1 r6: 300,400, the exit)")
@@ -379,6 +411,15 @@ class Logger:
         print(line, flush=True)
         self.log.write(line + "\n")
         self.log.flush()
+
+
+def saved_args(a) -> dict:
+    """vars(a) as config.json / the checkpoint store them: without the --anchor-* options while --anchor-mastered is off
+    (a run that does not use the anchor writes exactly what it wrote before the option existed)."""
+    d = dict(vars(a))
+    if not d.get("anchor_mastered"):
+        d = {k: v for k, v in d.items() if not k.startswith("anchor_")}
+    return d
 
 
 def checkpoint_config(env):
@@ -531,9 +572,9 @@ def main(argv=None) -> int:
     if ck0 is not None and ck0.get("branch_assets") and a.path_dir is None and not a.branch_dir:
         a.path_dir = ck0["env_config"]["features"].get("path_dir")
     (run_dir / ("config.json" if not a.resume else f"config.resume-{time.strftime('%Y%m%d-%H%M%S')}.json")).write_text(
-        json.dumps(vars(a), indent=1), encoding="utf-8")
+        json.dumps(saved_args(a), indent=1), encoding="utf-8")
     log = Logger(run_dir, a.resume)
-    log.tb.add_text("config", "    " + json.dumps(vars(a), indent=1).replace("\n", "\n    "),
+    log.tb.add_text("config", "    " + json.dumps(saved_args(a), indent=1).replace("\n", "\n    "),
                     global_step=int(ck["counters"]["steps"]) if ck is not None else 0)
     torch.set_num_threads(a.torch_threads)
     torch.manual_seed(a.seed)
@@ -676,7 +717,8 @@ def main(argv=None) -> int:
                           zone_stall_exempt=a.zone_stall_exempt, rail_gate=json.loads(a.rail_gate) if a.rail_gate else {},
                           respawn_level_starts=a.respawn_level_starts,
                           counter_rand=json.loads(a.counter_rand) if a.counter_rand else {},
-                          launcher_factory=FakeLauncher if a.fake else None)
+                          launcher_factory=FakeLauncher if a.fake else None,
+                          **({"start_tags": True} if a.anchor_mastered else {}))
 
     hub = None
     cu_bins = defaultdict(lambda: deque(maxlen=100))
@@ -732,6 +774,8 @@ def main(argv=None) -> int:
                                "counter_rand": json.loads(a.counter_rand) if a.counter_rand else {}}}
         if a.actor_heads != "single":
             template["worker"]["actor_heads"] = a.actor_heads
+        if a.anchor_mastered:  # (only then: the template, and its id, stay as before with the anchor off)
+            template["worker"]["start_tags"] = True
         if getattr(env_cfg, "branch_assets", None):
             # the same raw bytes the checkpoint holds ({level, line_npz, desc_json, drive_npz, sha256}); the pool's
             # learner link carries them into the exported policy state
@@ -787,6 +831,11 @@ def main(argv=None) -> int:
             by_rest[e["start_sector"]].append((e["success_cp"], e["finish"]))
         if guard is not None:
             guard.add(e["kind"], e["start_frame"], e.get("version_start"), e["success_cp"])
+        if anchor is not None and e.get("start_tag") is not None and e.get("end") not in AN.INVALID_ENDS:
+            fam = anchor_key(e["start_tag"])  # lives of workers without start tags (older code) are not counted
+            if fam is not None:
+                anchor.add_life(fam, bool(e["finish"] if a.success == "finish" else e["success_cp"]),
+                                e.get("version_start"), counters["update"])
         if e["kind"] == "tas":
             k = e["start_frame"]
             succ = e["finish"] if a.success == "finish" else e["success_cp"]
@@ -829,7 +878,9 @@ def main(argv=None) -> int:
         require_finite("save", learner_state())  # latest.pt stays the last finite checkpoint
         state = {"model": model.state_dict(), "opt": opt.state_dict(), "rms": rms.state_dict(),
                  "curriculum": cu.state_dict(), "counters": dict(counters, wall_s=counters["wall_s"] + time.time() - t_start),
-                 "best": best, "args": vars(a), "n_obs": n_obs, "n_act": n_act, **checkpoint_config(env_cfg)}
+                 "best": best, "args": saved_args(a), "n_obs": n_obs, "n_act": n_act, **checkpoint_config(env_cfg)}
+        if anchor is not None:  # family statistics and teacher snapshots (--resume continues them)
+            state["anchor"] = anchor.state_dict()
         f = run_dir / f"ckpt_{counters['update']:06d}.pt"
         torch.save(state, f)
         tmp = run_dir / "latest.pt.tmp"
@@ -917,29 +968,15 @@ def main(argv=None) -> int:
     teacher = None
     if a.teacher:
         from ballrain.path import ReferencePath, asset_path, resolve_path_dir
+        from ballrain.train.anchor import teacher_layout_error
         tck = torch.load(a.teacher, weights_only=False)
-        mine, theirs = asdict(env_cfg)["features"], tck["env_config"]["features"]
-        # a teacher without the f7 reach block reads the first n_obs entries (the block is appended at the end)
-        appended = ({"reach", "reach_version", "version"} if (mine.get("reach") and not theirs.get("reach"))
-                    else set())
-        # ... and one without the f8 contact blocks likewise (they follow the reach block; check_prefix below checks)
-        if mine.get("version") == "f8" and theirs.get("version") != "f8":
-            appended.add("version")
-        # ... and a teacher on the plain reach block under a mechanism-aware run (--reach-mechanisms): same 59-value
-        # layout, only the values near mechanisms differ (the teacher reads the student's values there)
-        tv, mv = theirs.get("reach_version"), mine.get("reach_version")
-        if tv and isinstance(mv, str) and mv.startswith(f"{tv}-mech1-"):
-            appended.add("reach_version")
-        diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k) and k not in appended)
+        # the teacher reads the first n_obs entries: a teacher without the f7 reach block / the f8 contact blocks
+        # (appended at the end) or on the plain reach block under --reach-mechanisms is allowed (teacher_layout_error)
         t_obs = int(tck["n_obs"])
-        if (t_obs != n_obs and not appended) or int(tck["n_act"]) != n_act or diff:
-            raise SystemExit(f"--teacher {a.teacher}: observations differ (n_obs {tck['n_obs']} vs {n_obs}, features {diff})")
-        if appended:
-            try:
-                from ballrain.train.grow import check_prefix
-                check_prefix(theirs, mine, t_obs, n_obs)
-            except GrowError as e:
-                raise SystemExit(f"--teacher {a.teacher}: {e}")
+        err = teacher_layout_error(asdict(env_cfg)["features"], tck["env_config"]["features"], t_obs, n_obs,
+                                   int(tck["n_act"]), n_act)
+        if err:
+            raise SystemExit(f"--teacher {a.teacher}: {err}")
         ta = tck["args"]
         tmodel = ActorCritic(t_obs, n_act, tuple(int(x) for x in ta["hidden"].split(",")), ta["activation"],
                              ta.get("actor_heads", "single")).to(a.device)
@@ -952,6 +989,77 @@ def main(argv=None) -> int:
         log.msg(f"teacher {a.teacher} (update {tck['counters']['update']}): KL coef {a.teacher_coef}"
                 + (f" -> {a.teacher_coef_floor} over {a.teacher_decay_updates} updates" if a.teacher_decay_updates else "")
                 + f" on route s >= {a.teacher_s_min:g} (line length {length:.1f})")
+
+    anchor, anchor_teachers, AN = None, {}, None
+    if a.anchor_mastered:
+        from ballrain.train import anchor as AN
+        kinds = tuple(k.strip() for k in a.anchor_families.split(",") if k.strip())
+        if not kinds or set(kinds) - set(AN.KINDS):
+            raise SystemExit(f"--anchor-families {a.anchor_families}: kinds from {','.join(AN.KINDS)}")
+        band_frames, base_frame = int(a.anchor_band_frames or a.cu_bin_frames), int(starts.valid[0])
+        mine = asdict(env_cfg)["features"]
+        arch = {"hidden": a.hidden, "activation": a.activation, "actor_heads": a.actor_heads}
+
+        def anchor_key(tag):
+            return AN.family_key(tag, band_frames=band_frames, base_frame=base_frame, kinds=kinds)
+
+        anchor = AN.MasteredAnchor(window=a.anchor_window, min_lives=a.anchor_min_lives, threshold=a.anchor_threshold,
+                                   grace=a.anchor_grace, drop_scale=a.anchor_drop_scale,
+                                   max_teachers=a.anchor_max_teachers, explicit=bool(a.anchor_teacher),
+                                   ratchet=a.anchor_ratchet)
+        if a.anchor_teacher:
+            tck = torch.load(a.anchor_teacher, weights_only=False)
+            err = AN.teacher_layout_error(mine, tck["env_config"]["features"], int(tck["n_obs"]), n_obs,
+                                          int(tck["n_act"]), n_act)
+            if err:
+                raise SystemExit(f"--anchor-teacher {a.anchor_teacher}: {err}")
+            ta = tck["args"]
+            anchor_teachers["explicit"] = AN.build_teacher(
+                {"actor": tck["model"], "rms": tck["rms"], "n_obs": int(tck["n_obs"]),
+                 "arch": {"hidden": ta["hidden"], "activation": ta["activation"],
+                          "actor_heads": ta.get("actor_heads", "single")}}, n_act, a.device)
+        if ck is not None and ck.get("anchor"):
+            anchor.load_state_dict(ck["anchor"])
+            for sid, pay in list(anchor.snapshots.items()):  # a later observation growth: the --teacher layout rules
+                err = AN.teacher_layout_error(mine, pay["features"], int(pay["n_obs"]), n_obs, n_act, n_act)
+                if err:
+                    anchor.drop_snapshot(sid, f"layout: {err}")
+        sm = anchor.summary()
+        log.msg(f"mastered-state anchor: coef {a.anchor_coef}, families {','.join(kinds)} (bands of {band_frames} "
+                f"frames), mastered at >= {a.anchor_threshold:g} over {a.anchor_min_lives} of the last "
+                f"{a.anchor_window} lives, grace {a.anchor_grace} lives, teacher "
+                + (a.anchor_teacher if a.anchor_teacher else f"per-family snapshots (<= {a.anchor_max_teachers})")
+                + (f"; resumed: {sm['families']} families, {sm['mastered']} mastered, {sm['teachers']} snapshots"
+                   if ck is not None and ck.get("anchor") else ""))
+    elif ck is not None and ck.get("anchor"):
+        log.msg("the checkpoint holds mastered-anchor state; --anchor-mastered is off: it is not carried on")
+
+    def anchor_terms(chunks, raw, obs_n, rms_before) -> tuple:
+        """(teacher log-probs, row weights, stats) of the mastered-state anchor on this batch; (None, None, stats) when
+        no anchored family has rows in it. New masteries get their teacher snapshot here (the current policy)."""
+        u = counters["update"]
+        anchor.refresh(u, lambda: AN.actor_payload(model, rms_before, n_obs, mine, arch, u))
+        if not anchor.explicit:
+            for sid in [t for t in anchor_teachers if t not in anchor.snapshots]:
+                del anchor_teachers[sid]
+            for sid, pay in anchor.snapshots.items():
+                if sid not in anchor_teachers:
+                    anchor_teachers[sid] = AN.build_teacher(pay, n_act, a.device)
+        for what, who, detail in anchor.drain_events():
+            log.msg(f"anchor: {what} {who} ({detail})")
+        anchored = anchor.anchored()
+        keys = AN.row_families(chunks, anchor_key, past_cp_counts=a.success == "finish")
+        w, groups = AN.row_weights(keys, anchored, anchor.weight, a.anchor_min_rows)
+        st = {**anchor.summary(), "batch_families": len(groups), "rows": int(sum(len(g) for g in groups.values())),
+              "tagged_rows": sum(k is not None for k in keys)}
+        if not groups:
+            return None, None, st
+        lt = AN.teacher_logp(anchor_teachers, groups, anchored, raw, n_act, a.device)
+        if (u + 1) % a.log_every == 0:  # per-family KL before the update (logging only: on the logged updates)
+            fk = AN.family_kl(model, obs_n, lt, groups, a.device)
+            st["kl_pre"] = float(np.mean(list(fk.values())))
+            st["top"] = sorted(((v, k, len(groups[k])) for k, v in fk.items()), reverse=True)[:5]
+        return lt, w, st
 
     def teacher_terms(raw):
         """Teacher log-probabilities on the batch (the teacher's own observation statistics), the route mask, the
@@ -1101,7 +1209,7 @@ def main(argv=None) -> int:
                 rms.update(raw)
             counters["steps"] += len(raw)
             tu = time.perf_counter()
-            ustats = {}
+            ustats, astats = {}, {}
             if skipped:
                 pass
             elif first:  # the first batch only fits the observation statistics
@@ -1123,9 +1231,21 @@ def main(argv=None) -> int:
                 wstats = watch_entropy(batch["obs"], raw) if watch is not None else {}
                 model.train()
                 tl, tm, tc = teacher_terms(raw) if teacher is not None else (None, None, 0.0)
+                akw = {}
+                if anchor is not None:
+                    ta0 = time.perf_counter()
+                    al, aw, astats = anchor_terms(chunks, raw, batch["obs"], rms_prev)
+                    astats["terms_s"] = time.perf_counter() - ta0
+                    if al is not None:
+                        akw = {"anchor_logp": al, "anchor_weight": aw, "anchor_coef": a.anchor_coef}
+                tu_ppo = time.perf_counter()
                 ustats = nf_guard.update(u_next, chunks, {"values": np.concatenate(vals)}, model, opt, batch, a.epochs,
                                          a.minibatch, a.clip, a.vf_coef, a.ent_coef, a.max_grad_norm, a.device, gen,
-                                         a.target_kl, teacher_logp=tl, teacher_mask=tm, teacher_coef=tc)
+                                         a.target_kl, teacher_logp=tl, teacher_mask=tm, teacher_coef=tc, **akw)
+                if anchor is not None:
+                    astats["ppo_s"] = time.perf_counter() - tu_ppo
+                    for k in [k for k in (ustats or {}) if k.startswith("anchor_")]:  # not in updates.csv (new columns
+                        astats[k.removeprefix("anchor_")] = ustats.pop(k)  # would start updates.<i>.csv): anchor.csv
                 model.eval()
                 if ustats is None:  # skipped (logged, dumped): model and optimiser are the pre-update ones
                     skipped, ustats = True, {}
@@ -1146,6 +1266,21 @@ def main(argv=None) -> int:
             u = counters["update"]
             for k, v in ustats.items():
                 log.tb.add_scalar(f"loss/{k}", v, counters["steps"])
+            if anchor is not None and astats:
+                for k, v in astats.items():
+                    if isinstance(v, (int, float)) and np.isfinite(v):
+                        log.tb.add_scalar(f"anchor/{k}", v, counters["steps"])
+                top = astats.get("top") or []
+                log.row("anchor", {**{k: (round(v, 6) if isinstance(v, float) else v) for k, v in astats.items()
+                                      if k != "top"}, "update": u, "steps": counters["steps"], "coef": a.anchor_coef,
+                                   "top": "; ".join(f"{k}={v:.4f}/{n}" for v, k, n in top)}, cols=ANCHOR_COLS)
+                if u % a.log_every == 0:
+                    log.msg(f"anchor u{u}: mastered {astats['mastered']}/{astats['families']} (grace "
+                            f"{astats['in_grace']}), teachers {astats['teachers']}, batch families "
+                            f"{astats['batch_families']} rows {astats['rows']}/{astats['tagged_rows']}, kl_pre "
+                            f"{astats.get('kl_pre', float('nan')):.4f} kl {astats.get('kl', float('nan')):.4f} coef "
+                            f"{a.anchor_coef}" + (" top " + ", ".join(f"{k} {v:.4f} ({n})" for v, k, n in top[:3])
+                                                  if top else ""))
             if u % a.log_every == 0:
                 now = time.time()
                 dt = now - t_last_log
