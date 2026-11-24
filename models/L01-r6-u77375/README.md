@@ -17,3 +17,4 @@
 
 - `L01-r6-u77375.pt`：PyTorch 检查点（网络、观测归一化、训练参数、环境配置；无优化器状态，路径为仓库相对路径），可直接用于 `scripts/eval_m2.py --ckpt`。
 - `plain/<sha>.npz` + `.json`：不用 pickle 的纯数组导出（`ballrain/pool/weights.py`），文件名是策略的 sha256。
+- `refpaths/L01.npz`：模型观测里用到的参考线（sha256 `9915be29acf2`），检查点的 path_dir 已指向这里，所以这个目录本身就能运行。第 1 小节的一段捷径取自 BallanceMMO 公测里人类玩家最快 5 次成功通过的平均几何（只用形状，匿名数据）。
