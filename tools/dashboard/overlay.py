@@ -482,9 +482,17 @@ class Panel:
                             outline=col, width=2)
         d.text((x0 + 62, 24), mode, font=self.fb[16], fill=col, anchor="mm")
         lv = f"第 {self.pub['level']} 关 · " if self.pub.get("level") else ""
-        d.text((PANEL_W - 14, 16), f"{self.pub['run']} · {lv}第 {self.pub['update']} 次更新", font=self.f[12],
-               fill=MUTED, anchor="ra")
-        d.text((PANEL_W - 14, 31), f"从 TAS 第 {self.k} 帧接手", font=self.f[12], fill=MUTED, anchor="ra")
+        # the title stays right of the mode badge: when the one-line form does not fit, the run name gets a line
+        # of its own (three smaller lines above the tick row)
+        room = PANEL_W - 14 - (x0 + 128 + 10)
+        title = f"{self.pub['run']} · {lv}第 {self.pub['update']} 次更新"
+        start = f"从 TAS 第 {self.k} 帧接手"
+        if d.textlength(title, font=self.f[12]) <= room:
+            lines, font, ys = [title, start], self.f[12], (16, 31)
+        else:
+            lines, font, ys = [str(self.pub["run"]), f"{lv}第 {self.pub['update']} 次更新", start], self.f[11], (7, 20, 33)
+        for text, yy in zip(lines, ys):
+            d.text((PANEL_W - 14, yy), text, font=font, fill=MUTED, anchor="ra")
         # tick / step / SR
         y = 48
         d.text((x0, y + 4), "第", font=self.fb[16], fill=INK)
