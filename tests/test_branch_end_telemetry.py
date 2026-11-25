@@ -55,15 +55,15 @@ def test_info_qualifies_branch_samples(multi, off, dist, expected):
 def test_episode_csv_appends_columns_without_rewriting_old_header(tmp_path):
     import csv
 
-    fields = ['end_x', 'end_y', 'end_z']
-    assert EP_COLS[-3:] == fields
+    assert EP_COLS.index('end_x') + 2 == EP_COLS.index('end_z')  # end_x / end_y / end_z stay together
+    fields = EP_COLS[-3:]  # the newest columns (appended after an existing file's header)
     old = tmp_path / 'episodes.csv'
     header = ','.join(EP_COLS[:-3]) + '\n'
     old.write_text(header)
     # Exercise the writer without starting TensorBoard.
     log = Logger.__new__(Logger)
     log.dir, log.files, log.writers, log.cols = tmp_path, {}, {}, {'episodes': EP_COLS}
-    log.row('episodes', dict(end='BallOff', end_x=1, end_y=2, end_z=3))
+    log.row('episodes', dict(end='BallOff', **dict(zip(fields, (1, 2, 3)))))
     log.files['episodes'].close()
     assert old.read_text() == header
     with (tmp_path / 'episodes.1.csv').open(newline='') as f:

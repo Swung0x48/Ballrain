@@ -41,10 +41,10 @@ import numpy as np  # noqa: E402
 RECORD = "SR01_1_14_457_264"
 RECORDS = {1: RECORD, 2: "SR02_1_28_992_264"}  # default start record per level (--record overrides)
 TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "checkpoint", "stall_penalty", "gate_bonus", "split_bonus",
-         "camera_off_quarter", "zone_penalty", "wall_push", "pickup", "pickup_followers_finish", "pickup_death_life")
+         "camera_off_quarter", "zone_penalty", "wall_push", "pickup", "pickup_followers_finish", "pickup_death_life", "pickup_shaping")
 EP_COLS = ["update", "t", "wid", "backend", "host", "copy", "kind", "probes", "death_probe", "splits", "start_frame", "start_sector", "end", "end_sector", "max_sector",
            "success_cp", "finish", "ret", "steps", "frames", "sr_ms_end", "start_sr_ms", "agent_s", "s_start", "s_end",
-           "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id", "ball_order", "respawn_skipped", "zone_entries", "zones"] + [f"r_{k}" for k in TERMS] + ["actions", "end_x", "end_y", "end_z", "points_end", "lives_end"]
+           "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id", "ball_order", "respawn_skipped", "zone_entries", "zones"] + [f"r_{k}" for k in TERMS] + ["actions", "end_x", "end_y", "end_z", "points_end", "lives_end", "pickups_missed"]
 UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_per_s", "frontier", "frontier_sector",
                 "band_success", "band_n", "band_finish", "gate_blocked", "episodes", "ret_mean", "ret_tas", "ret_respawn", "success_cp_tas", "finish_tas",
                 "deaths", "finishes", "stalls", "caps", "camera_off_quarter", "invalid_runs", "speed_mean", "runs", "finish_runs", "sr_ms_min", "sr_ms_k0_min",
@@ -249,6 +249,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hs-block", action="store_true", help="keep the HS feature block (off for SR)")
     p.add_argument("--value-warmup", type=int, default=0,
                    help="the first N updates of this process train the value head only (the policy is frozen): after a reward change, e.g. --init-from an SR policy for HS")
+    p.add_argument("--pickups", action="store_true",
+                   help="the pickup block (FeatureConfig.pickups: nearest score / life balls still present in the sector, "
+                        "after every other entry; a checkpoint without it is grown with zero input weights)")
+    p.add_argument("--pickups-success", action="store_true",
+                   help="for the failure-weighted starts a finish that left a score / life ball behind is a failure")
     p.add_argument("--auto-collect", action="store_true",
                    help="the harness collects small score balls (Esc, wait, Esc) after any step that leaves some following (EnvConfig.auto_collect); with --reward pickup_weight for HS training without an Esc action")
     p.add_argument("--far-waypoints", default="", help="f6: line points this far ahead in arc units, e.g. 20,30,45")
@@ -486,7 +491,8 @@ def make_env_config(a, out_root: Path, ck=None, init=None):
     fc = FeatureConfig(hs_block=a.hs_block, camera="world" if a.world_actions else "orient_ref",
                        far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=path_dir,
                        branch_sha256=pin, path_sha256=main_sha, reach=bool(getattr(a, "reach", False)),
-                       version=CONTACT_FEATURE_VERSION if getattr(a, "contacts", False) else FEATURE_VERSION)
+                       version=CONTACT_FEATURE_VERSION if getattr(a, "contacts", False) else FEATURE_VERSION,
+                       pickups=bool(getattr(a, "pickups", False)))
     from ballrain.reach_features import is_mechanism_version, reach_version
     old_reach = old.get("reach_version")
     saved_mechanisms = is_mechanism_version(old_reach)
@@ -571,6 +577,7 @@ def main(argv=None) -> int:
         a.reach = bool(a.reach or saved.get("reach"))  # on stays on (the observation never shrinks); off -> on grows it
         a.contacts = bool(a.contacts or saved.get("contacts"))  # likewise for the f8 contact blocks
         a.auto_collect = bool(a.auto_collect or saved.get("auto_collect"))  # the harness keeps collecting on resume
+        a.pickups = bool(a.pickups or saved.get("pickups"))  # on stays on (the observation never shrinks)
         from ballrain.reach_features import is_mechanism_version
         a.reach_mechanisms = a.reach_mechanisms or is_mechanism_version(saved.get("reach_version"))
     else:
@@ -868,7 +875,9 @@ def main(argv=None) -> int:
             b = 0 if k == 0 else 1 + (k - 936) // 2000
             by_bin[b].append((e["success_cp"], e["finish"]))
             if k:
-                cu_bins[cu.bin_of(k)].append(bool(e["finish"]))
+                # a finish that left a score / life ball behind counts as a failure of its bin (HS: failure-weighted
+                # starts then go where balls are missed, not only where lives end)
+                cu_bins[cu.bin_of(k)].append(bool(e["finish"]) and not (a.pickups_success and e.get("pickups_missed")))
             by_sector[e["start_sector"]].append((e["success_cp"], e["finish"]))
 
     def handle_run(r):

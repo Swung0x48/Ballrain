@@ -22,6 +22,7 @@ REACH_FEATURE_VERSION = "f7"  # f7 = f6 + the fastreach "reach" block at the end
 # config field, so f6 / f7 configurations serialize exactly as before; the label pins the block definition (CONTACT_*
 # below): any change to the blocks' meaning takes a new label
 CONTACT_FEATURE_VERSION = "f8"
+PICKUP_SLOTS = 2  # FeatureConfig.pickups: nearest score / life balls still present in the sector
 # f5: edge fan referenced to the floor under the ball when airborne / in side contact
 # f4: TAS reference line + continuity projection, arc waypoints, slope-robust edge fan
 # f3: transforming from the ball (un)physicalize events; HS block (followers, pause)
@@ -100,7 +101,6 @@ class FeatureConfig:
     # (the learner's config then pins it for every worker); a worker whose fastreach computes another version refuses
     # to build the extractor (as path_sha256 for the reference line). None without the block.
     reach_version: str | None = None
-
     def __post_init__(self):
         if self.reach:
             if self.version != CONTACT_FEATURE_VERSION:  # f8 keeps its label (contacts on top of the reach block)
@@ -127,6 +127,12 @@ class FeatureConfig:
         return super().__reduce_ex__(protocol)
 
     branch_sha256: str | None = None  # digest of the complete learner-distributed bundle
+    # the pickup block, after every other entry (an f8 policy grows with zero input weights): the PICKUP_SLOTS nearest
+    # score / life balls still present in the current sector (ballrain.pickups, tracker.pickups set by the env):
+    # present, is_life, offset in the action frame / pickup_scale (3), distance / pickup_scale; then how many are left
+    # in the sector / 5 and in the level / 15. Needs benchmarks/placements/L<nn>.json for the level.
+    pickups: bool = False
+    pickup_scale: float = 20.0
 
     def to_dict(self):
         d = asdict(self)
@@ -134,6 +140,8 @@ class FeatureConfig:
             del d["branch_dir"]  # preserve serialized configurations when off
         if self.branch_sha256 is None:
             del d["branch_sha256"]
+        if not self.pickups:  # preserve serialized configurations when off
+            del d["pickups"], d["pickup_scale"]
         return d
 
 
@@ -354,6 +362,8 @@ def make_layout(c: FeatureConfig) -> list:
     if c.contacts:  # f8: after the reach block, so an f7 policy grows with zero input weights
         L += [("contacts", CONTACT_SLOTS * len(CONTACT_SLOT_FIELDS)), ("contact_agg", len(CONTACT_AGG_FIELDS)),
               ("rails_lr", 2 * len(RAIL_SIDE_FIELDS))]
+    if c.pickups:  # after everything else, so an f8 policy grows with zero input weights
+        L += [("pickups", PICKUP_SLOTS * 6), ("pickups_left", 2)]
     return L
 
 
@@ -555,6 +565,8 @@ class FeatureExtractor:
                 info["reach_raw"], info["reach_quarter"], info["reach_key"] = raw, q, key
             if c.contacts:
                 self._contact_block(tracker, F, info, pos, radius, right, fwd)
+        if c.pickups:
+            self._pickup_block(tracker, F, info, info.get("pos") if have_ball else None, right, fwd)
         if c.counters:
             F["lives"][0] = tracker.lives / 10
             F["points"][0] = tracker.points / 1000
@@ -716,6 +728,26 @@ class FeatureExtractor:
             if h > 1e-9:
                 return np.array([t[2] / h, 0.0, -t[0] / h])
         return np.asarray(right, np.float64)
+
+    def _pickup_block(self, tracker, F, info, pos, right, fwd):
+        pk = getattr(tracker, "pickups", None)
+        info["pickup_dist"] = None
+        if not pk:
+            return
+        sc = self.cfg.pickup_scale
+        F["pickups_left"][0] = len(pk.present(tracker.sector)) / 5
+        F["pickups_left"][1] = len(pk.present()) / 15
+        if pos is None:
+            return
+        out = F["pickups"].reshape(PICKUP_SLOTS, 6)
+        near = pk.nearest(pos, tracker.sector, PICKUP_SLOTS)
+        for j, (d, kind, p) in enumerate(near):
+            out[j, 0] = 1.0
+            out[j, 1] = float(kind == "life")
+            out[j, 2:5] = np.clip(to_frame(np.asarray(p, np.float64) - pos, right, fwd) / sc, -3, 3)
+            out[j, 5] = min(d / sc, 3.0)
+        if near:
+            info["pickup_dist"] = near[0][0]
 
     def _contact_block(self, tracker, F, info, pos, radius, right, fwd):
         """f8: "contacts" (CONTACT_SLOTS x CONTACT_SLOT_FIELDS), "contact_agg", "rails_lr" (left, right x

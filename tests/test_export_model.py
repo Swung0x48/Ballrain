@@ -41,7 +41,8 @@ def test_f7_checkpoint_exports_without_plain(tmp_path, monkeypatch):
     checkpoint(ck, FeatureConfig(camera="world", reach=True))
     m.main([str(ck), "m7", "--run", "r-test", "--update", "1"])
     out = tmp_path / "repo" / "models" / "m7"
-    assert sorted(p.name for p in out.iterdir()) == ["README.md", "m7.pt"]
+    # plus the reference line the model observes when its path_dir resolves here (bundled since the refpaths change)
+    assert sorted(p.name for p in out.iterdir() if p.name != "refpaths") == ["README.md", "m7.pt"]
     readme = (out / "README.md").read_text(encoding="utf-8")
     assert "plain/" in readme and "f7" in readme and FeatureConfig(reach=True).reach_version in readme
     saved = torch.load(out / "m7.pt", weights_only=False)

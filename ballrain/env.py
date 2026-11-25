@@ -269,6 +269,12 @@ class BallanceEnv(gym.Env):
                     or not self.cfg.start_frame or self.cfg.start_frame <= 0)):
                 raise ValueError("fixed moving start requires a branch member, station and positive prefix")
         self.fx = FeatureExtractor(fc, branch_root=self._branch_temp.name if self._branch_temp else None)
+        from .pickups import PickupState
+        # score / life balls still present: tracked only where something reads them (the pickup block, the pickup
+        # shaping); otherwise empty, so other runs never need the start record's level data
+        rc = self.cfg.reward
+        want = bool(fc.pickups or (rc is not None and getattr(rc, "pickup_shaping", 0.0)))
+        self.pickups = PickupState(self.cfg.level if want else 0)
         self.reward = Reward(self.cfg.reward_config())
         if self.cfg.esc_frames < 3:
             raise ValueError("esc_frames must be >= 3 (Esc must be released, the toggle lands 2 frames later)")
@@ -675,6 +681,32 @@ class BallanceEnv(gym.Env):
                      copy=copy, timing=timing)
         return {"session": sess, "recorder": rec, "run_dir": run_dir, "start": start}
 
+    def _pickups_start(self, start: dict) -> None:
+        """A new process: what the start record's prefix collected before the hand-over frame is gone already."""
+        pk = self.pickups
+        if not pk or self.session is None:
+            return
+        k = int(start.get("frame") or 0)
+        got = []
+        if k > 0 and self.starts is not None and start.get("record") == self.starts.record:
+            from .pickups import record_pickups
+            got = [n for f, n in record_pickups(self.starts.dir, self.cfg.level) if f <= k]
+        pk.start(self.session.tracker, got)
+        self.session.tracker.pickups = pk
+
+    def _pickup_dist(self):
+        """Distance to the nearest score / life ball still present in the current sector (None: none / no ball)."""
+        pos = self._ball_pos()
+        if not self.pickups or pos is None:
+            return None
+        near = self.pickups.nearest(pos, self.session.tracker.sector, 1)
+        return near[0][0] if near else None
+
+    def _ball_pos(self):
+        o = self.session.tracker.obs if self.session is not None else None
+        b = o.ball if o is not None else None
+        return np.asarray(b["pos"], np.float64) if b is not None and b["found"] else None
+
     def _start_process(self):
         c = self.cfg
         if self._warm is not None:
@@ -700,6 +732,7 @@ class BallanceEnv(gym.Env):
         self._start = prepared["start"]
         self._copy_i = self._copies.index(prepared["start"]["copy"])
         self._init_held(prepared["start"])
+        self._pickups_start(prepared["start"])
         if c.warm_pool:
             self._launch_warm()
 
@@ -826,6 +859,8 @@ class BallanceEnv(gym.Env):
                 raise RuntimeError(f"run ended before the player got control ({self.session.end_reason_name})")
         else:  # a respawn in the same process (per-life episodes)
             prev = self._start
+            if self.pickups:
+                self.pickups.respawn(self.session.tracker)
             self._start = {"kind": "respawn", "frame": int(self.session.frames_done),
                            "sr_ms": self.session.tracker.sr_ms, "new_process": False, "copy": prev.get("copy"),
                            "record": prev.get("record"), "process_start_frame": prev.get("process_start_frame")}
@@ -840,7 +875,7 @@ class BallanceEnv(gym.Env):
             self.fx.reference_path(s.tracker)
             self.fx.branch.restore(self._start["branch_id"], self._start["phase"], self._start["branch_s"])
         obs, finfo = self.fx.compute(s.tracker)
-        self.reward.begin(s.tracker, self._arc(finfo))
+        self.reward.begin(s.tracker, self._arc(finfo), pickup_dist=self._pickup_dist())
         info = self._info(finfo, [])
         return obs, info
 
@@ -931,10 +966,13 @@ class BallanceEnv(gym.Env):
         cam_bad = not terminated and not s.ended and self._camera_off_quarter()
         if cam_bad:
             terminated, truncated = True, False
+        if self.pickups:
+            extra["pickups_new"] = self.pickups.update(s.tracker, self._ball_pos())
         obs, finfo = self.fx.compute(s.tracker)
         p = finfo.get("path")
         r, terms = self.reward.step(s.tracker, self._arc(finfo), died, finished, terminated,
                                     rebase=bool(p and p.get("jump")), supported=finfo.get("supported", False),
+                                    pickup_dist=self._pickup_dist(),
                                     s3_features=finfo if self.cfg.level == 2 else None)
         if cam_bad:  # no credit for the episode: its return becomes -death_penalty
             pen = -self.reward.total - self.reward.cfg.death_penalty

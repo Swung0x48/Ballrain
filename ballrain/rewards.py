@@ -59,6 +59,14 @@ class RewardConfig:
     # charged twice. pickup_death_life: a death also costs one LifeBonus (the game takes the life after the episode).
     pickup_weight: float = 0.0
     pickup_death_life: bool = True
+    # potential-based shaping toward the score / life balls still present in the current sector (ballrain.pickups):
+    # Phi = pickup_shaping * (1 - min(d, pickup_shaping_range) / pickup_shaping_range), d = distance to the nearest one
+    # (Phi = 0 beyond the range, when none is left in the sector and at the end of the episode); F = gamma * Phi' - Phi.
+    # It pays for closing in and takes it back when a collected ball's place is taken by a farther one, so it leaves the
+    # best policy unchanged and only guides the search (set gamma to the learner's). Phi >= 0: with gamma < 1 a
+    # negative Phi would pay (1 - gamma) |Phi| per step far from the balls, about the size of the time cost
+    pickup_shaping: float = 0.0
+    pickup_shaping_range: float = 30.0
 
     # Optional L2 sector-3 interventions (raw SR reward units).
     s3_lane_rate: float = 0.0  # per metre per second, excess distance over the 0.25 m deadband
@@ -89,13 +97,21 @@ class Reward:
         self.followers = 0
         self.points = None
         self.lives = None
+        self.pk_phi = 0.0
         self.total = 0.0
         self.terms: dict = {}
         self.s3_paper_paid = False
 
-    def begin(self, tracker: GameTracker, s: float | None):
+    def _pk_phi(self, d) -> float:
+        c = self.cfg
+        if not c.pickup_shaping or d is None:
+            return 0.0
+        return c.pickup_shaping * (1.0 - min(float(d), c.pickup_shaping_range) / c.pickup_shaping_range)
+
+    def begin(self, tracker: GameTracker, s: float | None, pickup_dist=None):
         """Call at the start of the episode (after the reset observation)."""
         self.reset_state()
+        self.pk_phi = self._pk_phi(pickup_dist)
         self.s = s
         self.sr = tracker.sr_ms or 0.0
         self.score = tracker.hs_partial()
@@ -155,7 +171,8 @@ class Reward:
         return {}
 
     def step(self, tracker: GameTracker, s: float | None, died: bool, finished: bool, terminal: bool,
-             rebase: bool = False, supported: bool | None = None, s3_features: dict | None = None) -> tuple[float, dict]:
+             rebase: bool = False, supported: bool | None = None, s3_features: dict | None = None,
+             pickup_dist=None) -> tuple[float, dict]:
         """s: arc length of the ball's projection (None when unknown). rebase: the projection was re-acquired
         this step (ballrain.path, jump=True): paid like any step when pay_jumps (default), otherwise no progress
         reward for it and s only moves the reference.
@@ -197,6 +214,10 @@ class Reward:
                     terms["death_refund"] = -c.death_refund * max(self.sector_paid, 0.0)
             if c.pickup_weight:
                 terms.update(self._pickup_terms(tracker, died, finished))
+            if c.pickup_shaping:
+                phi1 = 0.0 if terminal else self._pk_phi(pickup_dist)
+                terms["pickup_shaping"] = c.gamma * phi1 - self.pk_phi
+                self.pk_phi = phi1
         else:
             score = tracker.hs_partial()
             terms["score"] = c.score_scale * (score - self.score)

@@ -66,15 +66,29 @@ def compare_env(ck: dict, argv: list) -> list:
     new = train_m2.checkpoint_config(env)
     old = {"branch_assets": ck.get("branch_assets"), "env_config": ck["env_config"]}
     diffs = []
+    from dataclasses import asdict
+    from ballrain.env import EnvConfig
+    from ballrain.features import FeatureConfig
+    from ballrain.rewards import RewardConfig
+    # fields added to the configurations after ck was written: equal when the new run keeps them at their defaults
+    dflt = asdict(EnvConfig())
+    dflt["features"], dflt["reward"] = asdict(FeatureConfig()), asdict(RewardConfig())
+
+    def same(o, n, d, missing):
+        if missing:
+            return _norm(n) == _norm(d)
+        if isinstance(o, dict) and isinstance(n, dict) and isinstance(d, dict):
+            return all(same(o.get(x), n.get(x), d.get(x), x not in o) for x in set(o) | set(n))
+        return _norm(o) == _norm(n)
     if new["branch_assets"] != old["branch_assets"]:
         diffs.append(("branch_assets", "...", "..."))
     for k in sorted(set(new["env_config"]) | set(old["env_config"])):
         if k == "features":
             fo, fn = old["env_config"].get(k) or {}, new["env_config"].get(k) or {}
             for f in sorted(set(fo) | set(fn)):
-                if _norm(fo.get(f)) != _norm(fn.get(f)):
+                if not same(fo.get(f), fn.get(f), dflt["features"].get(f), f not in fo):
                     diffs.append((f"features.{f}", fo.get(f), fn.get(f)))
-        elif _norm(old["env_config"].get(k)) != _norm(new["env_config"].get(k)):
+        elif not same(old["env_config"].get(k), new["env_config"].get(k), dflt.get(k), k not in old["env_config"]):
             diffs.append((k, old["env_config"].get(k), new["env_config"].get(k)))
     return diffs
 

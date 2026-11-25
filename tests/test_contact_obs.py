@@ -27,7 +27,7 @@ FIELDS = ["version", "camera", "pos_scale", "vel_scale", "angvel_scale", "absolu
           "fan_drop", "fan_up", "mesh_edge", "rail_radius", "path_source", "path_dir", "path_sha256", "branch_dir",
           "path_lateral_scale", "path_back", "path_ahead", "path_margin", "path_reacquire", "waypoints",
           "waypoint_spacing", "far_waypoints", "ref_speed_at", "bodies", "body_radius", "dynamic_geometry", "counters",
-          "hs_block", "follower_sources", "checkpoint_frames_scale", "clip", "reach", "reach_version", "branch_sha256"]
+          "hs_block", "follower_sources", "checkpoint_frames_scale", "clip", "reach", "reach_version", "branch_sha256", "pickups", "pickup_scale"]
 N_F8 = FX.CONTACT_SLOTS * len(FX.CONTACT_SLOT_FIELDS) + len(FX.CONTACT_AGG_FIELDS) + 2 * len(FX.RAIL_SIDE_FIELDS)
 
 
@@ -47,7 +47,7 @@ def test_f6_f7_unchanged_and_f8_appends_after_the_reach_block():
     assert FX.FeatureConfig(**asdict(f8)).version == "f8" and FX.FeatureConfig(**asdict(f7)).version == "f7"
     assert FX.FeatureConfig(**dict(asdict(f7), reach=False)).version == "f6"
     assert FX.FeatureConfig().to_dict() == {k: v for k, v in asdict(FX.FeatureConfig()).items()
-                                            if k not in ("branch_dir", "branch_sha256")}
+                                            if k not in ("branch_dir", "branch_sha256", "pickups", "pickup_scale")}
 
 
 class _OldCode(pickle.Unpickler):
@@ -427,7 +427,10 @@ def test_r9_from_r8_carries_every_argument_and_the_bundle():
     argv, unknown = D.r9_argv(ck, "r9", "r8/latest.pt", contacts=True, no_pool=True)
     assert not unknown
     a = vars(train_m2.parse(argv))
-    changed = {k for k in a if a[k] != ck["args"].get(k)}
+    # options added after r8 are not in its args: they must be at their defaults (off)
+    defaults = vars(train_m2.parse(["--run", "x"]))
+    assert {k for k in a if k not in ck["args"] and a[k] != defaults[k]} <= {"contacts", "pool_ingest"}
+    changed = {k for k in a if k in ck["args"] and a[k] != ck["args"][k]}
     assert changed <= {"run", "resume", "init_from", "init_full", "contacts", "pool_ingest"}, changed
     assert a["init_full"] and a["contacts"] and not a["pool_ingest"] and not a["resume"]
     for k in ("rest_starts", "rehearse_starts", "rehearse_always", "p_rest", "p_rehearse", "counter_rand", "reward",

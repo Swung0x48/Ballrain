@@ -212,7 +212,11 @@ def test_env_from_task_matches_the_learner_config(tmp_path):
     ec, c = state["env_config"], asdict(cfg)
     norm = lambda v: [norm(x) for x in v] if isinstance(v, (list, tuple)) else v  # noqa: E731
     assert {k for k in ec["features"] if norm(ec["features"][k]) != norm(c["features"][k])} == {"path_dir"}
-    assert ec["reward"] == c["reward"]
+    # the checkpoint's reward fields as the learner ran them; fields added since then at their defaults
+    from ballrain.rewards import RewardConfig
+    assert {k: c["reward"][k] for k in ec["reward"]} == ec["reward"]
+    assert {k: v for k, v in c["reward"].items() if k not in ec["reward"]} == {
+        k: v for k, v in asdict(RewardConfig(mode=c["reward"]["mode"])).items() if k not in ec["reward"]}
     assert {k for k in W.ENV_FIELDS if k in ec and norm(ec[k]) != norm(c[k])} == {"start_record"}
     assert c["start_frame"] == t.start_frame and c["curriculum"] is None and c["p_rest"] == c["p_rehearse"] == 0
     assert c["headless"]["ball_order"] == "retail:99" and c["backend"] == "headless"

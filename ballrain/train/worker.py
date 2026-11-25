@@ -327,6 +327,14 @@ class _Episode:
                  end_x=x, end_y=y, end_z=z, points_end=info.get("points"), lives_end=info.get("lives"),
                  actions=self.actions.tolist())
         d["success_cp"] = bool(d["finish"] or self.max_sector > d["start_sector"])
+        # score / life balls the life left behind: everything still present after a finish, else in the sectors it
+        # passed (from its start sector up to the last one it left); None without placements for the level
+        pk = getattr(env, "pickups", None)
+        if pk:
+            hi = len({it[2] for it in pk.items}) if d["finish"] else self.max_sector - 1
+            d["pickups_missed"] = pk.missed(range(d["start_sector"], hi + 1))
+        else:
+            d["pickups_missed"] = None
         d["probes"] = sorted(self.probes_seen | {f"gate:{g}" for g in self.gates_hit})
         d["splits"] = [[int(a), round(b, 3), round(c, 3), round(e, 3)] for a, b, c, e in self.splits]
         d["death_probe"] = self.last_probe if end == "BallOff" else None
