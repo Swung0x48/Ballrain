@@ -180,7 +180,7 @@ def vtrace(chunk: dict, logp_cur, v_cur, v_last: float, gamma: float, lam: float
 def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int, clip: float, vf_coef: float,
                ent_coef: float, max_grad_norm: float, device="cpu", gen=None, target_kl: float | None = None,
                teacher_logp=None, teacher_mask=None, teacher_coef: float = 0.0,
-               anchor_logp=None, anchor_weight=None, anchor_coef: float = 0.0) -> dict:
+               anchor_logp=None, anchor_weight=None, anchor_coef: float = 0.0, value_only: bool = False) -> dict:
     """teacher_logp (n, n_act) log-probabilities of a frozen teacher policy on the batch states, teacher_mask (n,) bool:
     the loss gets + teacher_coef * KL(teacher || policy) averaged over the masked states of each minibatch (e.g. keep the
     back half of a level near a faster earlier policy while the front changes); stats teacher_kl / teacher_n.
@@ -239,15 +239,17 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
             ratio = (logp - old_logp[idx]).exp()
             pg = -torch.min(ratio * a, ratio.clamp(1 - clip, 1 + clip) * a).mean()
             vl = 0.5 * ((v - ret[idx]) ** 2).mean()
-            loss = pg + vf_coef * vl - ent_coef * ent
-            if use_teacher:
+            # value_only (a value warm-up after a reward change): the actor gets no gradient (its .grad stays None, so
+            # Adam leaves it and its moments untouched); the policy terms below are skipped too
+            loss = vf_coef * vl if value_only else pg + vf_coef * vl - ent_coef * ent
+            if use_teacher and not value_only:
                 m = t_mask[idx]
                 if bool(m.any()):
                     lt = t_logp[idx][m]
                     kl_t = (lt.exp() * (lt - logp_all[m])).sum(-1).mean()
                     loss = loss + teacher_coef * kl_t
                     stats["teacher_kl"].append(kl_t.item())
-            if use_anchor:
+            if use_anchor and not value_only:
                 wa = a_w[idx]
                 ma = wa > 0
                 if bool(ma.any()):

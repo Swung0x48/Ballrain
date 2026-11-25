@@ -51,6 +51,15 @@ class RewardConfig:
     # pays the pending small balls when they start following, takes it back when they are lost
     hs_follower_shaping: float = 0.0
 
+    # SR mode with score pickups (HS training on the SR reward: the SR time term is the continuous form of the
+    # time decay, 2 points per IGT second): pickup_weight per point picked up -- a score ball's core (+100) and each
+    # small ball reaching the player (+20, all of them at once under the harness's collect macro), a life ball
+    # (+LifeBonus), and at LevelFinish the small balls still following (they count in the readout). Points
+    # increments are read as whole multiples of 20 (ceil), so a time decrement falling in the same step is not
+    # charged twice. pickup_death_life: a death also costs one LifeBonus (the game takes the life after the episode).
+    pickup_weight: float = 0.0
+    pickup_death_life: bool = True
+
     # Optional L2 sector-3 interventions (raw SR reward units).
     s3_lane_rate: float = 0.0  # per metre per second, excess distance over the 0.25 m deadband
     s3_paper_cost: float = 0.0  # one-time cost for taking the approach transformer
@@ -78,6 +87,8 @@ class Reward:
         self.score = None
         self.checkpoints = None
         self.followers = 0
+        self.points = None
+        self.lives = None
         self.total = 0.0
         self.terms: dict = {}
         self.s3_paper_paid = False
@@ -90,6 +101,31 @@ class Reward:
         self.score = tracker.hs_partial()
         self.checkpoints = tracker.checkpoints
         self.followers = tracker.followers()
+        self.points = tracker.points
+        self.lives = tracker.lives
+
+    def _pickup_terms(self, tracker: GameTracker, died: bool, finished: bool) -> dict:
+        c = self.cfg
+        out = {}
+        pts, lives = tracker.points, tracker.lives
+        if finished and tracker.points_at_finish is not None:  # the readout frame (small balls pending counted below)
+            pts, lives = tracker.points_at_finish, tracker.lives_at_finish
+        if self.points is not None:
+            dp = pts - self.points
+            picked = SMALL_BALL_POINTS * -(-dp // SMALL_BALL_POINTS) if dp > 0 else 0
+            dl = max(0, lives - self.lives) * tracker.life_bonus if self.lives is not None else 0
+            if picked or dl:
+                out["pickup"] = c.pickup_weight * (picked + dl)
+        if finished:
+            pending = tracker.followers_at_finish
+            if pending is None:
+                pending = tracker.followers()
+            if pending:
+                out["pickup_followers_finish"] = c.pickup_weight * SMALL_BALL_POINTS * pending
+        if died and c.pickup_death_life:
+            out["pickup_death_life"] = -c.pickup_weight * tracker.life_bonus
+        self.points, self.lives = pts, lives
+        return out
 
     def _add(self, name, v):
         self.terms[name] = self.terms.get(name, 0.0) + v
@@ -159,6 +195,8 @@ class Reward:
                 terms["death"] = -c.death_penalty
                 if c.death_refund:
                     terms["death_refund"] = -c.death_refund * max(self.sector_paid, 0.0)
+            if c.pickup_weight:
+                terms.update(self._pickup_terms(tracker, died, finished))
         else:
             score = tracker.hs_partial()
             terms["score"] = c.score_scale * (score - self.score)

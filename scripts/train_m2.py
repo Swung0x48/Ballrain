@@ -41,10 +41,10 @@ import numpy as np  # noqa: E402
 RECORD = "SR01_1_14_457_264"
 RECORDS = {1: RECORD, 2: "SR02_1_28_992_264"}  # default start record per level (--record overrides)
 TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "checkpoint", "stall_penalty", "gate_bonus", "split_bonus",
-         "camera_off_quarter", "zone_penalty", "wall_push")
+         "camera_off_quarter", "zone_penalty", "wall_push", "pickup", "pickup_followers_finish", "pickup_death_life")
 EP_COLS = ["update", "t", "wid", "backend", "host", "copy", "kind", "probes", "death_probe", "splits", "start_frame", "start_sector", "end", "end_sector", "max_sector",
            "success_cp", "finish", "ret", "steps", "frames", "sr_ms_end", "start_sr_ms", "agent_s", "s_start", "s_end",
-           "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id", "ball_order", "respawn_skipped", "zone_entries", "zones"] + [f"r_{k}" for k in TERMS] + ["actions", "end_x", "end_y", "end_z"]
+           "speed", "jumps", "cap_frames", "version_start", "new_process", "run_id", "ball_order", "respawn_skipped", "zone_entries", "zones"] + [f"r_{k}" for k in TERMS] + ["actions", "end_x", "end_y", "end_z", "points_end", "lives_end"]
 UPDATE_COLS = (["update", "steps", "frames", "wall_s", "steps_per_s", "frames_per_s", "frontier", "frontier_sector",
                 "band_success", "band_n", "band_finish", "gate_blocked", "episodes", "ret_mean", "ret_tas", "ret_respawn", "success_cp_tas", "finish_tas",
                 "deaths", "finishes", "stalls", "caps", "camera_off_quarter", "invalid_runs", "speed_mean", "runs", "finish_runs", "sr_ms_min", "sr_ms_k0_min",
@@ -247,6 +247,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cpu")
     p.add_argument("--action-repeat", type=int, default=4)
     p.add_argument("--hs-block", action="store_true", help="keep the HS feature block (off for SR)")
+    p.add_argument("--value-warmup", type=int, default=0,
+                   help="the first N updates of this process train the value head only (the policy is frozen): after a reward change, e.g. --init-from an SR policy for HS")
+    p.add_argument("--auto-collect", action="store_true",
+                   help="the harness collects small score balls (Esc, wait, Esc) after any step that leaves some following (EnvConfig.auto_collect); with --reward pickup_weight for HS training without an Esc action")
     p.add_argument("--far-waypoints", default="", help="f6: line points this far ahead in arc units, e.g. 20,30,45")
     p.add_argument("--ref-speed-at", default="", help="f6: reference speed at these arc offsets, e.g. 0,15,30")
     p.add_argument("--reach-mechanisms", action="store_true",
@@ -510,6 +514,7 @@ def make_env_config(a, out_root: Path, ck=None, init=None):
                      start_record=start_record(a),
                      backend=a.backend, headless=hl,
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
+                     auto_collect=a.auto_collect,
                      per_life=not a.no_respawn,
                      rest_starts=rest_starts,
                      p_rest=a.p_rest,
@@ -565,6 +570,7 @@ def main(argv=None) -> int:
             setattr(a, k, saved.get(k, getattr(a, k)))
         a.reach = bool(a.reach or saved.get("reach"))  # on stays on (the observation never shrinks); off -> on grows it
         a.contacts = bool(a.contacts or saved.get("contacts"))  # likewise for the f8 contact blocks
+        a.auto_collect = bool(a.auto_collect or saved.get("auto_collect"))  # the harness keeps collecting on resume
         from ballrain.reach_features import is_mechanism_version
         a.reach_mechanisms = a.reach_mechanisms or is_mechanism_version(saved.get("reach_version"))
     else:
@@ -816,6 +822,7 @@ def main(argv=None) -> int:
     steps_last_log = counters["steps"]
     frames_last_log = counters["frames"]
     stop = False
+    updates_this_process = 0  # --value-warmup counts these
     update_times = deque(maxlen=50)
     remote_last = [time.time()]  # last remote chunk (watchdog)
     remote_chunks = [0]
@@ -1299,7 +1306,9 @@ def main(argv=None) -> int:
                 tu_ppo = time.perf_counter()
                 ustats = nf_guard.update(u_next, chunks, {"values": np.concatenate(vals)}, model, opt, batch, a.epochs,
                                          a.minibatch, a.clip, a.vf_coef, a.ent_coef, a.max_grad_norm, a.device, gen,
-                                         a.target_kl, teacher_logp=tl, teacher_mask=tm, teacher_coef=tc, **akw)
+                                         a.target_kl, teacher_logp=tl, teacher_mask=tm, teacher_coef=tc,
+                                         value_only=updates_this_process < a.value_warmup, **akw)
+                updates_this_process += 1
                 if anchor is not None:
                     astats["ppo_s"] = time.perf_counter() - tu_ppo
                     for k in [k for k in (ustats or {}) if k.startswith("anchor_")]:  # not in updates.csv (new columns

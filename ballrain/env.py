@@ -79,6 +79,10 @@ class EnvConfig:
     camera_turn_grace_ms: float = 400.0
     esc_action: bool | None = None  # add the Esc (pause / unpause) action; None: on in HS mode, off in SR mode
     collect_action: bool = False  # add the "collect" macro (Esc, wait for the followers, Esc)
+    # the harness collects the small score balls itself: after any step that leaves small balls following (a score
+    # ball touched) it runs the collect macro (Esc, wait until none follows, Esc) within the same step, so the
+    # policy never presses Esc (HS training without an Esc action; pausing stops the clock and the score decay)
+    auto_collect: bool = False
     esc_frames: int = 4  # frames of one Esc action: Esc down on the first, released after
     collect_max_frames: int = 1200  # longest wait of the collect macro (paused frames)
     collect_chunk: int = 8  # frames per idle block while the collect macro waits
@@ -891,7 +895,14 @@ class BallanceEnv(gym.Env):
                     s.act(tas.make_frames([self.delta], [keys]), repeat=self.cfg.action_repeat, stop=EPISODE_STOP)
                     if s.frames_done > n0:
                         self._set_held(keys)
-            if paused0 or s.tracker.flags.paused:
+            if (self.cfg.auto_collect and not s.ended and not paused0 and not s.tracker.flags.paused
+                    and s.tracker.followers() > 0 and self._esc_allowed()
+                    and not {c for _, c, _ in s.tracker.events[ev0:]} & {Ev.BallOff, Ev.LevelFinish, Ev.GameOver}):
+                n1 = s.frames_done
+                extra["auto_collect"] = self._collect()
+                self._held, self._press_q = 0, {}  # the macro ends with the arrows released (pausing shuts them down)
+                self._ep_pause_frames += s.frames_done - n1
+            elif paused0 or s.tracker.flags.paused:
                 self._ep_pause_frames += s.frames_done - n0
             if paused0 and not s.tracker.flags.paused:
                 self._invalidate_held()  # pausing shuts the key forces down

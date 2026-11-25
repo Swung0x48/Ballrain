@@ -324,7 +324,7 @@ class _Episode:
                  end_sector=int(info.get("sector") or 0), sr_ms_end=float(info.get("sr_ms") or 0.0),
                  finish=end == "LevelFinish", terms=self.terms, jumps=self.jumps,
                  s_start=self.s0, s_end=s_end, t_wall=time.time() - d.pop("t_wall_start"),
-                 end_x=x, end_y=y, end_z=z,
+                 end_x=x, end_y=y, end_z=z, points_end=info.get("points"), lives_end=info.get("lives"),
                  actions=self.actions.tolist())
         d["success_cp"] = bool(d["finish"] or self.max_sector > d["start_sector"])
         d["probes"] = sorted(self.probes_seen | {f"gate:{g}" for g in self.gates_hit})
