@@ -1161,6 +1161,7 @@ def curves_payload(runs, machines) -> dict:
 
         out[r.name] = {
             "machine": machines["train" if r.remote else "eval"], "smooth": w, "level": run_level(r)["level"],
+            "goal": run_goal(r),
             "update": [int(x) for x in d["update"].to_numpy()[sel]],
             "steps": col(d["steps"] / 1e6, 4),
             "frontier": col(d["frontier"], 0),
@@ -1206,6 +1207,101 @@ def benchmarks(level: int = 1) -> dict:
     except Exception:
         pass
     return b
+
+
+def run_goal(run: Run) -> str:
+    """"HS" for a run on an HS start record (HS<level>_...), else "SR"."""
+    return "HS" if str(run_level(run).get("record") or "").startswith("HS") else "SR"
+
+
+HS_DEFAULTS = {1: {"tas": 4740, "human_wr": 4736, "featured": 4717, "threshold": 4700}}
+
+
+def hs_benchmarks(level: int = 1) -> dict:
+    """HS thresholds of a level from benchmarks/records.json (scores): current TAS, human record, 精品线, 上榜线."""
+    level = int(level)
+    b = dict(HS_DEFAULTS.get(level) or {"tas": None, "human_wr": None, "featured": None, "threshold": None})
+    try:
+        for r in json.loads(RECORDS.read_text(encoding="utf-8")):
+            if r.get("level") != level or r.get("category") != "HS" or r.get("score") is None:
+                continue
+            k = r.get("kind")
+            if k == "tas" and r.get("is_current_record"):
+                b["tas"] = r["score"]
+            elif k == "human":
+                b["human_wr"] = r["score"]
+            elif k == "human_featured":
+                b["featured"] = r["score"]
+            elif k == "human_threshold":
+                b["threshold"] = r["score"]
+    except Exception:
+        pass
+    return b
+
+
+def hs_estimate(runs, sel: str) -> dict:
+    """Full-level HS estimate of an HS run `sel` from its recent finishes (episodes*.csv; a finish is deathless, every
+    death ends the process). A life handed over at TAS frame k finishes with the whole game's score (the TAS prefix
+    included): HS = points_end + LifeBonus x lives_end + level bonus (equal to the official readout on every traced
+    finish; the harness collects the small balls, so none are pending). Its shortfall against the TAS score is
+    extrapolated in proportion to the TAS time of the stretch the agent played: estimate = TAS HS + (HS - TAS HS) x
+    TAS total time / TAS time from k. Same binning and range rule as sr_estimate."""
+    m = mac_runs(runs)
+    names = [r.name for r in m]
+    if sel not in names:
+        return {"error": "无数据", "mode": "hs"}
+    i = names.index(sel)
+    lv = run_level(m[i])
+    if lv["record"] is None:
+        return {"error": "无数据", "level": lv["level"], "mode": "hs"}
+    use = [r for r in m[max(0, i - 1): i + 1] if run_level(r)["record"] == lv["record"]]
+    clk = tas_clock(lv["record"])
+    b = hs_benchmarks(lv["level"])
+    out: dict = {"mode": "hs", "runs_used": [r.name for r in use], "window": SR_WINDOW_UPDATES, "bins": [],
+                 "level": lv["level"], "benchmarks": b, "tas_record_ms": clk.total_ms, "end_frame": clk.end_frame,
+                 "min_n": SR_MIN_N, "min_seg_s": SR_MIN_SEG_S}
+    cols = ["update", "end", "start_frame", "points_end", "lives_end"]
+    parts = [d for d in (read_many(r.files("episodes*.csv"), usecols=cols, dedup=None) for r in use) if d is not None]
+    if not parts or b["tas"] is None:
+        out["error"] = "无数据"
+        return out
+    d = pd.concat(parts, ignore_index=True)
+    for c in ("update", "start_frame", "points_end", "lives_end"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    umax = d["update"].max()
+    d = d[(d["update"] >= umax - SR_WINDOW_UPDATES) & (d["end"] == "LevelFinish") & d["points_end"].notna()
+          & d["lives_end"].notna() & d["start_frame"].notna()].copy()
+    out["update_range"] = [int(max(0, umax - SR_WINDOW_UPDATES)), int(umax)] if not math.isnan(umax) else None
+    out["n"] = int(len(d))
+    if not len(d):
+        return out
+    d["hs"] = d["points_end"] + 200 * d["lives_end"] + 100 * lv["level"]
+    k = d["start_frame"].to_numpy(float)
+    tk = np.where(k > 0, clk.ms(np.maximum(k, 0)), 0.0)
+    seg = clk.total_ms - tk
+    good = seg > 200
+    d["est"] = np.where(good, b["tas"] + (d["hs"] - b["tas"]) * clk.total_ms / np.where(good, seg, 1), np.nan)
+    out["best"] = int(d["hs"].max())
+    keep = []
+    for a, bb in zip(clk.bins[:-1], clk.bins[1:]):
+        sel_ = d[(d["start_frame"] >= a) & (d["start_frame"] < bb) & d["est"].notna()]
+        r = sel_["est"].to_numpy()
+        mid = min((a + bb) / 2, clk.end_frame)
+        row = {"lo": a, "hi": min(bb, clk.end_frame), "n": int(len(r)),
+               "tas_seg_s": round(float(clk.total_ms - clk.ms(mid)) / 1000, 1)}
+        if len(r):
+            row["hs_median"] = int(round(float(np.median(sel_["hs"]))))
+            row["hs_max"] = int(sel_["hs"].max())
+            row["median"] = round(float(np.median(r)), 1)
+            row["p10"] = round(float(np.percentile(r, 10)), 1)
+            row["p90"] = round(float(np.percentile(r, 90)), 1)
+            if len(r) >= SR_MIN_N and row["tas_seg_s"] >= SR_MIN_SEG_S:
+                keep.append(row["median"])
+                row["in_range"] = True
+        out["bins"].append(row)
+    if keep:
+        out["estimate_hs"] = [int(round(min(keep))), int(round(max(keep)))]
+    return out
 
 
 def sr_estimate(runs, sel: str) -> dict:

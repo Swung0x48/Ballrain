@@ -282,8 +282,10 @@ function renderHighlight() {
 /* ---------------------------------------------------------------------------------- SR chart */
 function renderSR() {
   const r = (S.sr || {})[sel];
+  $("sr-title").textContent = r && r.mode === "hs" ? "整关得分估计（HS）" : "整关用时估计（SR）";
   if (!r) { $("sr-head").innerHTML = `<p class="note">尚未计算（启动后约半分钟）。</p>`; return; }
   $("sr-lv").textContent = levelName(r.level || LV());
+  if (r.mode === "hs") { renderHS(r); return; }
   const b = r.benchmarks || {};
   const extra = r.alt ? r.shortcut_extra_s : 0;
   const est = (ratio) => (ratio == null ? null : +(b.tas / 1000 * ratio + extra * ratio).toFixed(2));
@@ -363,6 +365,80 @@ function renderSR() {
   $("sr-note").innerHTML = `<details><summary>怎么算的</summary>${levelName(r.level || LV())}。比率 = 智能体从接手帧 k 跑到终点的用时 ÷ TAS 同一段的用时（TAS 在第 k 帧的计时取 TAS 记录自己逐帧的 SR 计时，整段 ${sec(r.tas_record_ms)}）。` +
     `整关估计 = ${(b.tas / 1000).toFixed(3)} s × 比率${r.alt ? ` + ${esc(r.alt_name || "替代路线")}约 ${r.shortcut_extra_s} s × 比率` : ""}；范围取局数 ≥ ${r.min_n} 且 TAS 剩余段 ≥ ${r.min_seg_s} s 的分箱的中位比率最小值到最大值（柱状图中亮色的柱子，竖线为 p10–p90）。` +
     `这是外推：只统计无死亡的通关局，前段还没练到的部分按后段的比率估计，近终点分箱的段很短、噪声大，无头后端与原版游戏也略有差别；最终以从头开始的原版评估为准。</details>`;
+}
+
+/* the HS counterpart of renderSR: whole-level score estimates per hand-over bin */
+function renderHS(r) {
+  const b = r.benchmarks || {};
+  const bins = r.bins || [];
+  const pts = (v) => (v == null ? "—" : `${Math.round(v)} 分`);
+  let h = "";
+  if (r.estimate_hs) {
+    h += `<div class="big"><span class="gt" data-h="30">${r.estimate_hs[0]} - ${r.estimate_hs[1]} 分</span>
+      <span class="note" style="margin:0">训练中最高 ${pts(r.best)}（含 TAS 接手前的部分）</span></div>`;
+  } else {
+    h += `<p class="note">样本不足，暂无整关估计。</p>`;
+  }
+  h += `<div class="bench"><span>TAS <b>${pts(b.tas)}</b></span><span>人类纪录 <b>${pts(b.human_wr)}</b></span><span>精品线 <b>${pts(b.featured)}</b></span><span>上榜线 <b>${pts(b.threshold)}</b></span></div>`;
+  h += `<div class="note" style="margin:0">样本 ${num(r.n)} 局通关（${esc((r.runs_used || []).join(" + "))}，近 ${r.window} 次更新；死球直接结束这一局，所以通关局都无死亡）</div>`;
+  $("sr-head").innerHTML = h;
+  $("sr-head").querySelectorAll(".gt").forEach((el) => gameText(el, el.textContent, 30));
+  const cats = bins.map((x) => `${x.lo}–${x.hi}`);
+  const vals = bins.flatMap((x) => (x.in_range ? [x.p10, x.p90, x.median] : [x.median])).filter((v) => v != null);
+  const lo = Math.min(b.threshold || 4700, ...vals) - 20, hi = Math.max(b.tas || 4740, ...vals) + 10;
+  if (window.echarts) {
+    const ch = chart("c-sr");
+    const benchLine = (v, name, color, pos) => ({ yAxis: v, name, lineStyle: { color, type: "dashed", width: 1.4 }, label: { formatter: `${name} ${v}`, color, position: pos, fontSize: 11, textBorderColor: "#000", textBorderWidth: 2 } });
+    ch.setOption({
+      animation: false, textStyle: { color: INK },
+      grid: { left: 52, right: 16, top: 16, bottom: 58 },
+      tooltip: {
+        trigger: "axis", axisPointer: { type: "shadow" }, backgroundColor: "rgba(20,14,6,.95)", borderColor: BRASS, textStyle: { color: INK },
+        formatter: (ps) => {
+          const x = bins[ps[0].dataIndex];
+          if (!x) return "";
+          return `<b>开局帧 ${x.lo} – ${x.hi}</b><br>TAS 剩余段约 ${x.tas_seg_s} s · ${x.n} 局` +
+            (x.median != null ? `<br>通关得分中位 ${pts(x.hs_median)}，最高 ${pts(x.hs_max)}<br>整关估计中位 ${pts(x.median)} · p10 ${pts(x.p10)} · p90 ${pts(x.p90)}` : "") +
+            (x.in_range ? "<br><span style='color:#ffcf5a'>计入估计范围</span>" : "<br><span style='color:#a9a089'>样本少或剩余段太短，不计入范围</span>");
+        },
+      },
+      xAxis: { type: "category", data: cats, axisLabel: { color: MUTED, rotate: 35, fontSize: 10.5 }, axisLine: { lineStyle: { color: BRASS } }, name: "开局帧（TAS）", nameLocation: "middle", nameGap: 44, nameTextStyle: { color: MUTED } },
+      yAxis: { type: "value", min: Math.floor(lo), max: Math.ceil(hi), name: "整关估计（分）", nameTextStyle: { color: MUTED }, axisLabel: { color: MUTED }, splitLine: { lineStyle: { color: "rgba(255,220,150,.08)" } } },
+      series: [
+        {
+          type: "bar", name: "整关估计中位", barMaxWidth: 34,
+          data: bins.map((x) => ({ value: x.median, itemStyle: { color: x.in_range ? "#d79b32" : "rgba(184,137,58,.35)", borderColor: "#2b1a0a" } })),
+          markLine: { symbol: "none", silent: true, data: [benchLine(b.tas, "TAS", "#7ed69a", "insideEndTop"), benchLine(b.human_wr, "人类纪录", "#5aa9e6", "insideStartTop"), benchLine(b.featured, "精品线", "#b58cf0", "insideMiddleTop"), benchLine(b.threshold, "上榜线", "#ff7a66", "insideStartBottom")] },
+          markArea: r.estimate_hs ? { silent: true, itemStyle: { color: "rgba(255,207,90,.10)" }, data: [[{ yAxis: r.estimate_hs[0] }, { yAxis: r.estimate_hs[1] }]] } : undefined,
+        },
+        {
+          type: "custom", name: "p10–p90", silent: true, clip: true,
+          renderItem: (params, api) => {
+            const x = bins[params.dataIndex];
+            if (!x || x.p10 == null) return null;
+            const a = api.coord([params.dataIndex, x.p10]), c = api.coord([params.dataIndex, x.p90]);
+            const st = { stroke: "#f3e3b5", lineWidth: 1.3 };
+            return { type: "group", children: [
+              { type: "line", shape: { x1: a[0], y1: a[1], x2: c[0], y2: c[1] }, style: st },
+              { type: "line", shape: { x1: a[0] - 5, y1: a[1], x2: a[0] + 5, y2: a[1] }, style: st },
+              { type: "line", shape: { x1: c[0] - 5, y1: c[1], x2: c[0] + 5, y2: c[1] }, style: st }] };
+          },
+          data: bins.map((x, i) => i),
+        },
+      ],
+    }, true);
+  }
+  let t = `<table><thead><tr><th>开局帧</th><th>TAS 剩余段</th><th>局数</th><th>通关得分中位</th><th>最高</th><th>整关估计中位</th><th>p10</th><th>p90</th></tr></thead><tbody>`;
+  for (const x of bins) {
+    t += `<tr class="${x.in_range ? "" : "dim"}"><td>${x.lo} – ${x.hi}</td><td>${x.tas_seg_s} s</td><td>${x.n}</td><td>${pts(x.hs_median)}</td><td>${pts(x.hs_max)}</td><td>${pts(x.median)}</td><td>${pts(x.p10)}</td><td>${pts(x.p90)}</td></tr>`;
+  }
+  $("sr-table").innerHTML = t + "</tbody></table>";
+  const k0 = (S.k0 || []).filter((x) => x.run === sel);
+  $("k0").innerHTML = k0.length ? "" : `<p class="note" style="margin:0">这个 run 还没有从头开始的原版评估。</p>`;
+  $("sr-note").innerHTML = `<details><summary>怎么算的</summary>${levelName(r.level || LV())}。智能体从 TAS 第 k 帧接手，通关时的得分是整局的分（接手前 TAS 那一段吃到的分也算在内），` +
+    `等于结束时的分数 + 命数 × 200 + 关卡奖励（与官方结算读数逐局核对一致）。它比 TAS（${pts(b.tas)}）少的分按 TAS 时间比例外推到整关：` +
+    `整关估计 = TAS 得分 + （这一局得分 − TAS 得分）× TAS 整关用时 ÷ TAS 从第 k 帧到终点的用时（整关 ${sec(r.tas_record_ms)}）。` +
+    `范围取局数 ≥ ${r.min_n} 且 TAS 剩余段 ≥ ${r.min_seg_s} s 的分箱的中位估计最小值到最大值。这是外推：漏一个分数球就少 220 分，靠后的分箱很难反映前段的表现；最终以从出生点开始的评估为准。</details>`;
 }
 
 /* --------------------------------------------------------------------------------- the maps */
@@ -708,7 +784,8 @@ async function renderCurves(force, full) {
   if (!C0) return;
   const id = "c-curves", ch = chart(id), box = $("t-curves");
   // runs of the selected run's level only: the frontier is a frame of that level's TAS record
-  const C = Object.fromEntries(Object.entries(C0).filter(([, d]) => (d.level || 1) === lv));
+  const g0 = (C0[sel] || {}).goal || "SR";  // HS and SR runs train for different goals: one set of curves at a time
+  const C = Object.fromEntries(Object.entries(C0).filter(([, d]) => (d.level || 1) === lv && (d.goal || "SR") === g0));
   const runs = Object.keys(C);
   if (!box.dataset.wired) {
     box.innerHTML = `<button type="button" class="tbtn${curveMode.log ? " on" : ""}" data-c="log">横轴对数</button>
@@ -773,7 +850,8 @@ async function renderCurves(force, full) {
 function zoomCurves(mode) {
   const C0 = P.curves && P.curves.data, ch = charts["c-curves"];
   if (!C0 || !ch) return;
-  const C = Object.fromEntries(Object.entries(C0).filter(([, d]) => (d.level || 1) === LV()));
+  const g0 = (C0[sel] || {}).goal || "SR";
+  const C = Object.fromEntries(Object.entries(C0).filter(([, d]) => (d.level || 1) === LV() && (d.goal || "SR") === g0));
   if (mode === "all") { ch.dispatchAction({ type: "dataZoom", start: 0, end: 100 }); return; }
   const d = C[sel];
   if (!d) return;

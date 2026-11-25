@@ -434,7 +434,8 @@ class Dashboard:
             self._section("traces", errors, traces)
 
             def sr():
-                summary["sr"] = {r.name: D.sr_estimate(runs, r.name) for r in mac}
+                summary["sr"] = {r.name: (D.hs_estimate if D.run_goal(r) == "HS" else D.sr_estimate)(runs, r.name)
+                                 for r in mac}
                 summary["k0"] = D.k0_evals()
             self._section("sr", errors, sr)
             summary["data"] = vers
