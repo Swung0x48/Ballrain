@@ -342,6 +342,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--demo-coef-floor", type=float, default=0.0, help="weight after --demo-decay-updates")
     p.add_argument("--demo-decay-updates", type=int, default=0,
                    help="linear decay of the imitation weight to the floor over this many updates of the process (0 = constant)")
+    p.add_argument("--sil-coef", type=float, default=0.0,
+                   help="self-imitation (ballrain.train.sil): the PPO loss gets + coef x the policy's own better-than-"
+                        "expected actions (batch rows with advantage above --sil-adv-min std, kept while their return "
+                        "still beats the value head), weighted by clamp((R - V) / adv_std, 0, --sil-wmax); 0 = off")
+    p.add_argument("--sil-capacity", type=int, default=65536)
+    p.add_argument("--sil-adv-min", type=float, default=2.0, help="advantage (batch std) a row needs to enter the buffer")
+    p.add_argument("--sil-keep-min", type=float, default=0.1, help="(R - V) / adv_std a buffer row needs to stay")
+    p.add_argument("--sil-horizon-s", type=float, default=8.0,
+                   help="a candidate row enters the buffer only after its life went on this many game seconds without "
+                        "ending (or finished the level within them); a death, stall or cut-off first drops it")
+    p.add_argument("--sil-batch", type=int, default=256)
+    p.add_argument("--sil-vcoef", type=float, default=0.01)
+    p.add_argument("--sil-wmax", type=float, default=5.0)
     p.add_argument("--teacher", default="", help="checkpoint of a frozen teacher policy: the PPO loss gets + coef x "
                    "KL(teacher || policy) on batch states whose route s (path_progress x line length) is >= --teacher-s-min")
     p.add_argument("--teacher-allow-context-append", action="store_true",
@@ -1052,6 +1065,15 @@ def main(argv=None) -> int:
         log.msg(f"imitation: {len(demo['act'])} demonstrated states from {a.demo} (ranges {z['ranges']}), coef "
                 f"{a.demo_coef} -> {a.demo_coef_floor} over {a.demo_decay_updates} updates")
 
+    sil, last_sil = None, {}
+    if a.sil_coef > 0:
+        from ballrain.train.sil import SILBuffer, value_fn as sil_value_fn
+        sil_h = int(round(a.sil_horizon_s * 1000.0 / (env_cfg.delta_ms * a.action_repeat)))
+        sil = SILBuffer(a.sil_capacity, a.sil_adv_min, a.sil_keep_min, horizon=sil_h)
+        log.msg(f"self-imitation: coef {a.sil_coef}, buffer {a.sil_capacity} rows (advantage > {a.sil_adv_min} std in, "
+                f"kept while (R - V) / std > {a.sil_keep_min}; confirmed after {a.sil_horizon_s} s = {sil_h} steps of the "
+                f"same life without a death / stall / cut-off), {a.sil_batch} rows per minibatch, w <= {a.sil_wmax}")
+
     def demo_coef_now() -> float:
         if not a.demo_decay_updates:
             return a.demo_coef
@@ -1343,6 +1365,19 @@ def main(argv=None) -> int:
                 batch = {"obs": obs_n, "actions": np.concatenate([c["actions"] for c in chunks]),
                          "logp": np.concatenate(logps).astype(np.float32), "adv": np.concatenate(advs),
                          "ret": np.concatenate(rets)}
+                skw, sstats = {}, {}
+                if sil is not None and updates_this_process >= a.value_warmup:
+                    adv_std = float(batch["adv"].std())
+                    sstats["sil_dropped"] = sil.refresh(sil_value_fn(model, a.device),
+                                                        normalize(sil.raw, rms.state_dict()) if len(sil) else None, adv_std)
+                    sstats["sil_added"] = sil.offer(chunks, raw, batch["actions"], batch["ret"], batch["adv"], adv_std)
+                    sstats["sil_confirmed"], sstats["sil_discarded"] = sil.confirmed, sil.discarded
+                    sstats["sil_pending"] = sum(len(v["rows"]) for v in sil.pending.values())
+                    if len(sil):
+                        skw = {"sil_obs": normalize(sil.raw, rms.state_dict()), "sil_act": sil.act, "sil_ret": sil.ret,
+                               "sil_coef": a.sil_coef, "sil_scale": adv_std, "sil_batch": a.sil_batch,
+                               "sil_vcoef": a.sil_vcoef, "sil_wmax": a.sil_wmax}
+                    sstats["sil_size"] = len(sil)
                 wstats = watch_entropy(batch["obs"], raw) if watch is not None else {}
                 model.train()
                 tl, tm, tc = teacher_terms(raw) if teacher is not None else (None, None, 0.0)
@@ -1359,9 +1394,15 @@ def main(argv=None) -> int:
                                          a.target_kl, teacher_logp=tl, teacher_mask=tm, teacher_coef=tc,
                                          value_only=updates_this_process < a.value_warmup,
                                          **({"demo_obs": normalize(demo["raw"], rms.state_dict()), "demo_act": demo["act"],
-                                             "demo_coef": demo_coef_now()} if demo is not None else {}), **akw)
+                                             "demo_coef": demo_coef_now()} if demo is not None else {}), **akw, **skw)
                 if demo is not None and ustats is not None:
                     ustats["demo_coef"] = demo_coef_now()
+                if ustats is not None:  # TensorBoard only (a new updates.csv column would start updates.<i>.csv)
+                    sstats.update({k: ustats.pop(k) for k in [k for k in ustats if k.startswith("sil_")]})
+                    for k, v in sstats.items():
+                        if isinstance(v, (int, float)) and np.isfinite(v):
+                            log.tb.add_scalar(f"sil/{k.removeprefix('sil_')}", v, counters["steps"])
+                    last_sil = sstats
                 updates_this_process += 1
                 if anchor is not None:
                     astats["ppo_s"] = time.perf_counter() - tu_ppo
@@ -1535,6 +1576,8 @@ def main(argv=None) -> int:
                         f"kl {ustats.get('approx_kl', float('nan')):.4f} ev {ustats.get('explained_var', float('nan')):.2f} "
                         f"upd {row['update_s']}s reset {row['reset_frac']} rsp_skip {n_skip}"
                         + (f" demo_acc {ustats['demo_acc']:.2f}" if "demo_acc" in ustats else "")
+                        + (f" sil {last_sil.get('sil_size', 0)} +{last_sil.get('sil_added', 0)} w {last_sil.get('sil_w', float('nan')):.2f}"
+                           if sil is not None and last_sil else "")
                         + (f" nonfinite_skipped {row['nonfinite_skipped']}" if row["nonfinite_skipped"] else ""))
                 log.flush()
                 win_eps, win_runs = [], []

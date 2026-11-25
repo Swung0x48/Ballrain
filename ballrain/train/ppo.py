@@ -181,7 +181,9 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
                ent_coef: float, max_grad_norm: float, device="cpu", gen=None, target_kl: float | None = None,
                teacher_logp=None, teacher_mask=None, teacher_coef: float = 0.0,
                anchor_logp=None, anchor_weight=None, anchor_coef: float = 0.0, value_only: bool = False,
-               demo_obs=None, demo_act=None, demo_coef: float = 0.0, demo_batch: int = 256) -> dict:
+               demo_obs=None, demo_act=None, demo_coef: float = 0.0, demo_batch: int = 256,
+               sil_obs=None, sil_act=None, sil_ret=None, sil_coef: float = 0.0, sil_scale: float = 1.0,
+               sil_batch: int = 256, sil_vcoef: float = 0.01, sil_wmax: float = 5.0) -> dict:
     """teacher_logp (n, n_act) log-probabilities of a frozen teacher policy on the batch states, teacher_mask (n,) bool:
     the loss gets + teacher_coef * KL(teacher || policy) averaged over the masked states of each minibatch (e.g. keep the
     back half of a level near a faster earlier policy while the front changes); stats teacher_kl / teacher_n.
@@ -224,6 +226,15 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
         d_obs = torch.as_tensor(demo_obs, dtype=torch.float32, device=device)
         d_act = torch.as_tensor(demo_act, dtype=torch.long, device=device)
         stats["demo_ce"], stats["demo_acc"] = [], []
+    # self-imitation (ballrain.train.sil, train_m2 --sil-coef): the policy's own better-than-expected actions, weighted
+    # by clamp((R - V(s)) / sil_scale, 0, sil_wmax) with V(s) detached, plus a one-sided value term
+    use_sil = (sil_obs is not None and sil_act is not None and sil_ret is not None and sil_coef > 0 and not value_only
+               and len(sil_act) > 0 and sil_scale > 0)
+    if use_sil:
+        s_obs = torch.as_tensor(sil_obs, dtype=torch.float32, device=device)
+        s_act = torch.as_tensor(sil_act, dtype=torch.long, device=device)
+        s_ret = torch.as_tensor(sil_ret, dtype=torch.float32, device=device)
+        stats["sil_pg"], stats["sil_w"], stats["sil_pos"] = [], [], []
     snap = {k: v.detach().clone() for k, v in model.state_dict().items()}  # restored when the update turns non-finite
     opt_snap = copy.deepcopy(opt.state_dict())
     stop, nonfinite, ep = False, None, 0
@@ -264,6 +275,18 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
                 loss = loss + demo_coef * ce
                 stats["demo_ce"].append(ce.item())
                 stats["demo_acc"].append(float((dl.argmax(-1) == d_act[di]).float().mean()))
+            if use_sil:
+                si = torch.randint(0, len(s_act), (min(sil_batch, len(s_act)),), generator=gen).to(device)
+                sl, sv = model(s_obs[si])
+                gap = s_ret[si] - sv
+                w = (gap.detach() / sil_scale).clamp(0.0, sil_wmax)
+                s_logp = torch.log_softmax(sl, -1).gather(-1, s_act[si, None]).squeeze(-1)
+                s_pg = -(w * s_logp).mean()
+                s_vl = 0.5 * (gap.clamp(min=0.0) ** 2).mean() / (sil_scale ** 2)
+                loss = loss + sil_coef * (s_pg + sil_vcoef * s_vl)
+                stats["sil_pg"].append(s_pg.item())
+                stats["sil_w"].append(w.mean().item())
+                stats["sil_pos"].append(float((w > 0).float().mean()))
             if use_anchor and not value_only:
                 wa = a_w[idx]
                 ma = wa > 0
@@ -313,6 +336,8 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
     if use_teacher:
         out["teacher_n"] = float(t_mask.sum().item())
         out["teacher_coef"] = float(teacher_coef)
+    if use_sil:
+        out["sil_n"] = float(len(s_act))
     if use_anchor:
         out["anchor_n"] = float((a_w > 0).sum().item())
         out["anchor_coef"] = float(anchor_coef)
