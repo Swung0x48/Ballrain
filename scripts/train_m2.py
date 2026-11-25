@@ -331,6 +331,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rail-gate", default="",
                    help='JSON {"s": route arc length, "below": TAS frame}: truncate (bootstrapped, end gate_truncate) a 灏忚妭-1 '
                         'life not started at or after "below" once it reaches route s (WorkerSpec.rail_gate)')
+    p.add_argument("--demo", default="",
+                   help="demonstration set (scripts/build_demo.py: states of a TAS record with its actions): the PPO loss "
+                        "gets + coef x cross-entropy of the policy against the demonstrated actions (imitation beside RL)")
+    p.add_argument("--demo-coef", type=float, default=0.0, help="weight of the imitation term at the start of the process")
+    p.add_argument("--demo-coef-floor", type=float, default=0.0, help="weight after --demo-decay-updates")
+    p.add_argument("--demo-decay-updates", type=int, default=0,
+                   help="linear decay of the imitation weight to the floor over this many updates of the process (0 = constant)")
     p.add_argument("--teacher", default="", help="checkpoint of a frozen teacher policy: the PPO loss gets + coef x "
                    "KL(teacher || policy) on batch states whose route s (path_progress x line length) is >= --teacher-s-min")
     p.add_argument("--teacher-allow-context-append", action="store_true",
@@ -1017,6 +1024,27 @@ def main(argv=None) -> int:
                     + (f"; teacher s >= {s_min:g}" if s_min is not None else ""))
         return frozenset({"branch_sha256"})
 
+    demo = None
+    if a.demo:
+        z = np.load(a.demo)
+        if z["obs"].shape[1] != n_obs:
+            raise SystemExit(f"--demo {a.demo}: {z['obs'].shape[1]} observation entries, the run has {n_obs}")
+        from ballrain.features import make_layout
+        dfc = json.loads(str(z["features"]))
+        from dataclasses import fields as dc_fields
+        known = {f.name for f in dc_fields(type(env_cfg.features))}
+        if make_layout(type(env_cfg.features)(**{k: v for k, v in dfc.items() if k in known})) != make_layout(env_cfg.features):
+            raise SystemExit(f"--demo {a.demo}: built with another observation layout")
+        demo = {"raw": z["obs"].astype(np.float32), "act": z["act"].astype(np.int64)}
+        log.msg(f"imitation: {len(demo['act'])} demonstrated states from {a.demo} (ranges {z['ranges']}), coef "
+                f"{a.demo_coef} -> {a.demo_coef_floor} over {a.demo_decay_updates} updates")
+
+    def demo_coef_now() -> float:
+        if not a.demo_decay_updates:
+            return a.demo_coef
+        f = min(1.0, updates_this_process / a.demo_decay_updates)
+        return a.demo_coef + (a.demo_coef_floor - a.demo_coef) * f
+
     teacher = None
     if a.teacher:
         from ballrain.path import ReferencePath, asset_path, resolve_path_dir
@@ -1316,7 +1344,11 @@ def main(argv=None) -> int:
                 ustats = nf_guard.update(u_next, chunks, {"values": np.concatenate(vals)}, model, opt, batch, a.epochs,
                                          a.minibatch, a.clip, a.vf_coef, a.ent_coef, a.max_grad_norm, a.device, gen,
                                          a.target_kl, teacher_logp=tl, teacher_mask=tm, teacher_coef=tc,
-                                         value_only=updates_this_process < a.value_warmup, **akw)
+                                         value_only=updates_this_process < a.value_warmup,
+                                         **({"demo_obs": normalize(demo["raw"], rms.state_dict()), "demo_act": demo["act"],
+                                             "demo_coef": demo_coef_now()} if demo is not None else {}), **akw)
+                if demo is not None and ustats is not None:
+                    ustats["demo_coef"] = demo_coef_now()
                 updates_this_process += 1
                 if anchor is not None:
                     astats["ppo_s"] = time.perf_counter() - tu_ppo
@@ -1489,6 +1521,7 @@ def main(argv=None) -> int:
                         f"sr_min {row['sr_ms_min']} ent {ustats.get('entropy', float('nan')):.3f} "
                         f"kl {ustats.get('approx_kl', float('nan')):.4f} ev {ustats.get('explained_var', float('nan')):.2f} "
                         f"upd {row['update_s']}s reset {row['reset_frac']} rsp_skip {n_skip}"
+                        + (f" demo_acc {ustats['demo_acc']:.2f}" if "demo_acc" in ustats else "")
                         + (f" nonfinite_skipped {row['nonfinite_skipped']}" if row["nonfinite_skipped"] else ""))
                 log.flush()
                 win_eps, win_runs = [], []

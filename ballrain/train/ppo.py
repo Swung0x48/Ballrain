@@ -180,7 +180,8 @@ def vtrace(chunk: dict, logp_cur, v_cur, v_last: float, gamma: float, lam: float
 def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int, clip: float, vf_coef: float,
                ent_coef: float, max_grad_norm: float, device="cpu", gen=None, target_kl: float | None = None,
                teacher_logp=None, teacher_mask=None, teacher_coef: float = 0.0,
-               anchor_logp=None, anchor_weight=None, anchor_coef: float = 0.0, value_only: bool = False) -> dict:
+               anchor_logp=None, anchor_weight=None, anchor_coef: float = 0.0, value_only: bool = False,
+               demo_obs=None, demo_act=None, demo_coef: float = 0.0, demo_batch: int = 256) -> dict:
     """teacher_logp (n, n_act) log-probabilities of a frozen teacher policy on the batch states, teacher_mask (n,) bool:
     the loss gets + teacher_coef * KL(teacher || policy) averaged over the masked states of each minibatch (e.g. keep the
     back half of a level near a faster earlier policy while the front changes); stats teacher_kl / teacher_n.
@@ -216,6 +217,13 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
         use_anchor = bool((a_w > 0).any())
         if use_anchor:
             stats["anchor_kl"] = []
+    # imitation term (train_m2 --demo): + demo_coef * cross-entropy of the policy against a demonstration's actions on
+    # its states (normalised observations), a random demo_batch of them per minibatch, beside the PPO loss
+    use_demo = demo_obs is not None and demo_act is not None and demo_coef > 0 and not value_only and len(demo_act) > 0
+    if use_demo:
+        d_obs = torch.as_tensor(demo_obs, dtype=torch.float32, device=device)
+        d_act = torch.as_tensor(demo_act, dtype=torch.long, device=device)
+        stats["demo_ce"], stats["demo_acc"] = [], []
     snap = {k: v.detach().clone() for k, v in model.state_dict().items()}  # restored when the update turns non-finite
     opt_snap = copy.deepcopy(opt.state_dict())
     stop, nonfinite, ep = False, None, 0
@@ -249,6 +257,13 @@ def ppo_update(model: ActorCritic, opt, batch: dict, epochs: int, minibatch: int
                     kl_t = (lt.exp() * (lt - logp_all[m])).sum(-1).mean()
                     loss = loss + teacher_coef * kl_t
                     stats["teacher_kl"].append(kl_t.item())
+            if use_demo:
+                di = torch.randint(0, len(d_act), (min(demo_batch, len(d_act)),), generator=gen).to(device)
+                dl, _ = model(d_obs[di])
+                ce = nn.functional.cross_entropy(dl, d_act[di])
+                loss = loss + demo_coef * ce
+                stats["demo_ce"].append(ce.item())
+                stats["demo_acc"].append(float((dl.argmax(-1) == d_act[di]).float().mean()))
             if use_anchor and not value_only:
                 wa = a_w[idx]
                 ma = wa > 0
