@@ -109,6 +109,7 @@ def main(argv=None) -> int:
     ap.add_argument("--backend", default="headless")
     ap.add_argument("--headless", default=None, help="HeadlessConfig fields as JSON")
     ap.add_argument("--copy", default="hl-91")
+    ap.add_argument("--fps", type=float, default=None, help="env frame rate (default: the checkpoint's)")
     a = ap.parse_args(argv)
     import torch
     import eval_m2
@@ -122,6 +123,8 @@ def main(argv=None) -> int:
                                    headless=json.loads(a.headless) if a.headless else None)
     cfg.copy = a.copy
     cfg.trace = False
+    if a.fps:
+        cfg.delta_ms = float(np.float32(1000.0 / a.fps))
     env = BallanceEnv(cfg)
     parts = []
     try:
@@ -136,7 +139,7 @@ def main(argv=None) -> int:
     np.savez_compressed(a.out, obs=res["obs"].astype(np.float32), act=res["act"].astype(np.int64),
                         frame=res["frame"].astype(np.int64), sector=res["sector"].astype(np.int64),
                         ball=res["ball"].astype(np.int64), features=np.array(feats), record=np.array(cfg.start_record),
-                        ranges=np.array(a.ranges))
+                        ranges=np.array(a.ranges), delta_ms=np.float32(cfg.delta_ms))
     print(f"{a.out}: {len(res['act'])} samples, n_obs {res['obs'].shape[1] if len(res['obs']) else 0}")
     return 0
 

@@ -246,6 +246,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--torch-threads", type=int, default=4)
     p.add_argument("--device", default="cpu")
     p.add_argument("--action-repeat", type=int, default=4)
+    p.add_argument("--fps", type=float, default=None,
+                   help="game frames per second the env injects (delta_ms = f32(1000 / fps)); default: the resumed or "
+                        "--init-from checkpoint's, else 132. 264 = the HS01 TAS's own rate (its keys reproduce the record "
+                        "at action_repeat 2 there, not at 132 fps)")
     p.add_argument("--hs-block", action="store_true", help="keep the HS feature block (off for SR)")
     p.add_argument("--value-warmup", type=int, default=0,
                    help="the first N updates of this process train the value head only (the policy is frozen): after a reward change, e.g. --init-from an SR policy for HS")
@@ -523,7 +527,12 @@ def make_env_config(a, out_root: Path, ck=None, init=None):
     if getattr(a, "pool_ingest", False) and any(len(e) == 3 and isinstance(e[2], dict) and e[2].get("branch_move")
                                                for e in rest_starts or ()):
         raise RouteError("moving branch starts are Python-only; disable --pool-ingest")
+    if getattr(a, "fps", None):
+        delta_ms = float(np.float32(1000.0 / a.fps))
+    else:  # keep the frame rate the checkpoint was trained at
+        delta_ms = float(((ck or init or {}).get("env_config") or {}).get("delta_ms") or EnvConfig.delta_ms)
     return EnvConfig(branch_assets=bundle, level=a.level, mode="sr", action_repeat=a.action_repeat, out_root=str(out_root),
+                     delta_ms=delta_ms,
                      start_record=start_record(a),
                      backend=a.backend, headless=hl,
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
@@ -1035,6 +1044,10 @@ def main(argv=None) -> int:
         known = {f.name for f in dc_fields(type(env_cfg.features))}
         if make_layout(type(env_cfg.features)(**{k: v for k, v in dfc.items() if k in known})) != make_layout(env_cfg.features):
             raise SystemExit(f"--demo {a.demo}: built with another observation layout")
+        # a demo built at another frame rate labels the states with actions that do something else here
+        d_ms = float(z["delta_ms"]) if "delta_ms" in z.files else float(np.float32(1000 / 132))
+        if abs(d_ms - env_cfg.delta_ms) > 1e-4:
+            raise SystemExit(f"--demo {a.demo}: built at delta_ms {d_ms:.4f}, the run steps {env_cfg.delta_ms:.4f}")
         demo = {"raw": z["obs"].astype(np.float32), "act": z["act"].astype(np.int64)}
         log.msg(f"imitation: {len(demo['act'])} demonstrated states from {a.demo} (ranges {z['ranges']}), coef "
                 f"{a.demo_coef} -> {a.demo_coef_floor} over {a.demo_decay_updates} updates")
