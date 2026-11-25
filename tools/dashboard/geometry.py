@@ -24,7 +24,8 @@ if str(ROOT) not in sys.path:
 LEVEL_RECORDS = {1: "SR01_1_14_457_264", 2: "SR02_1_28_992_264"}
 RECORD = LEVEL_RECORDS[1]
 DATASET = ROOT / "runtime" / "datasets" / "tas-v1"
-RECORD_RE = re.compile(r"^SR(\d\d)_\d+_\d\d_\d{3}_\d{3}$")
+# SR records SR<level>_<m>_<ss>_<mmm>[_<fps>], HS records HS<level>_<score>_<m>_<ss>_<mmm>: group 1 is the level
+RECORD_RE = re.compile(r"^(?:SR(?=\d\d_\d+_\d\d_\d{3}_\d{3}$)|HS(?=\d\d_\d+_\d+_\d\d_\d{3}$))(\d\d)_")
 GEOM_VERSION = 2
 LINE_VERSION = 1
 START_BACK = 1500  # ballrain.curriculum.CurriculumConfig.start_back: the first frontier, before any log line

@@ -32,7 +32,8 @@ REFPATHS = ROOT / "benchmarks" / "refpaths"
 RECORDS = ROOT / "benchmarks" / "records.json"
 # default start record per level: mirrors scripts/train_m2.py RECORDS (checked by tests/test_dashboard_levels.py)
 LEVEL_RECORDS = {1: "SR01_1_14_457_264", 2: "SR02_1_28_992_264"}
-RECORD_RE = re.compile(r"^SR(\d\d)_\d+_\d\d_\d{3}_\d{3}$")
+# SR records SR<level>_<m>_<ss>_<mmm>[_<fps>], HS records HS<level>_<score>_<m>_<ss>_<mmm>: group 1 is the level
+RECORD_RE = re.compile(r"^(?:SR(?=\d\d_\d+_\d\d_\d{3}_\d{3}$)|HS(?=\d\d_\d+_\d+_\d\d_\d{3}$))(\d\d)_")
 
 SHORTCUT_EXTRA_S = 3.0  # level 1 (鬼躲石变) when a run does not record its split_extra
 SR_WINDOW_UPDATES = 1500
@@ -155,7 +156,7 @@ class Run:
 
     @property
     def num(self):
-        return int(self.name[1:])
+        return int(re.match(r"r(\d+)", self.name).group(1))
 
     def files(self, pattern):
         return sorted(glob.glob(str(self.path / pattern)))
@@ -167,7 +168,7 @@ def discover_runs() -> list[Run]:
         if not base.is_dir():
             continue
         for p in base.iterdir():
-            if p.is_dir() and re.fullmatch(r"r\d+", p.name):
+            if p.is_dir() and re.fullmatch(r"r\d+(?:-[a-z0-9]+)?", p.name):  # r10, r10-hs
                 runs[p.name] = Run(p.name, p, remote)  # a Mac run wins over a same-named PC dir
     return sorted(runs.values(), key=lambda r: r.num)
 

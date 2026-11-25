@@ -489,6 +489,8 @@ class Dashboard:
             compute = None
         res = {"now": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "now_ts": int(time.time()), "tz": D.tz_label(), "milestone": "M3",
                "runs": [r.name for r in mac], "default_run": D.default_run(runs), "status": st, "gen": gen,
+               "goals": {r.name: ("HS 高分" if str(D.run_level(r).get("record") or "").startswith("HS") else "SR 竞速")
+                         for r in mac},
                "interval_s": self.interval, "min_refresh_s": self.min_refresh, "machines": self.machines,
                "tensorboard_url": self.tensorboard_url, "data": summ.get("data") or {},
                "sr": summ.get("sr") or {}, "k0": summ.get("k0") or [],

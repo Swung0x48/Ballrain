@@ -158,6 +158,7 @@ function renderHeader() {
   document.querySelectorAll(".rn").forEach((e) => (e.textContent = sel));
   document.querySelectorAll(".lvn").forEach((e) => (e.textContent = levelName(LV())));
   $("milestone").textContent = S.milestone || "M2";
+  $("goal").textContent = (S.goals || {})[sel] || "SR 竞速";
   const tb = $("tb");
   if (S.tensorboard_url) { tb.href = S.tensorboard_url; tb.classList.remove("off"); tb.title = ""; tb.querySelector("span").textContent = "TensorBoard"; }
   else { tb.removeAttribute("href"); tb.classList.add("off"); tb.querySelector("span").textContent = "TensorBoard 暂未开放"; }
