@@ -533,7 +533,8 @@ async function renderFrontier(force, full) {
 function trajTooltip(d) {
   const o = OUT[d.end] || OUT.stopped;
   return `<b>${esc(d.run)}</b> · <span style="color:${o.c}">${o.n}</span><br>开始 ${d.ts != null ? lt(d.ts) : d.t}（${TZ}）<br>接手帧 ${d.k}，结束帧 ${d.end_frame}` +
-    (d.sr ? `<br>SR ${(d.sr / 1000).toFixed(3)} s` : "") + `<br>死亡 ${d.deaths.length} 次 · ${esc(d.backend)}` +
+    (((S.goals || {})[d.run] || "").startsWith("HS") ? (d.hs != null ? `<br>HS ${d.hs} 分` : "")
+      : (d.sr ? `<br>SR ${(d.sr / 1000).toFixed(3)} s` : "")) + `<br>死亡 ${d.deaths.length} 次 · ${esc(d.backend)}` +
     (d._rc ? `<br>路线：<span style="color:${d._rc.color}">${esc(d._rc.label)}</span>（${d.route_src === "recorded" ? "开局记录的分支" : "按轨迹位置判断"}）` : "");
 }
 

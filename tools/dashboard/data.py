@@ -168,7 +168,9 @@ def discover_runs() -> list[Run]:
         if not base.is_dir():
             continue
         for p in base.iterdir():
-            if p.is_dir() and re.fullmatch(r"r\d+(?:-[a-z0-9]+)?", p.name):  # r10, r10-hs
+            # training runs: r<N>, and on the Mac also r<N>-<tag> (r10-hs); on this PC r<N>-<tag> are mirror links
+            # (r9-mac), evaluations (r7-sim2real) and A/B dirs, not runs
+            if p.is_dir() and re.fullmatch(r"r\d+(?:-[a-z0-9]+)?" if remote else r"r\d+", p.name):
                 runs[p.name] = Run(p.name, p, remote)  # a Mac run wins over a same-named PC dir
     return sorted(runs.values(), key=lambda r: r.num)
 
@@ -1379,7 +1381,7 @@ class Traces:
             pin = (d.get("feature_config") or {}).get("branch_sha256")
             bid = str((d.get("start_state") or {}).get("branch_id") or "")
             info = {"key": j, "id": f"{h:08x}", "run": run.name, "end": OUTCOME.get(d.get("end_reason"), "stopped"),
-                    "sr": d.get("sr_ms"), "t": float(d.get("started_at") or 0), "h": h / 2 ** 32,
+                    "sr": d.get("sr_ms"), "hs": d.get("hs"), "t": float(d.get("started_at") or 0), "h": h / 2 ** 32,
                     "backend": BACKEND_LABEL.get(str(d.get("backend")), "其他"), "record": rec,
                     "pin": str(pin) if isinstance(pin, str) and pin else None,
                     "branch_id": bid if ROUTE_ID_RE.match(bid) else None}
@@ -1476,7 +1478,7 @@ def traj_payload(info, tr, R=None, memo: dict | None = None) -> dict:
     return {**route, 
         "id": info["id"], "run": info["run"], "end": info["end"], "backend": info["backend"],
         "t": dt.datetime.fromtimestamp(info["t"]).strftime("%m-%d %H:%M") if info["t"] else None,
-        "ts": round(info["t"]), "sr": info["sr"], "k": tr["k"], "end_frame": tr["end_frame"],
+        "ts": round(info["t"]), "sr": info["sr"], "hs": info.get("hs"), "k": tr["k"], "end_frame": tr["end_frame"],
         "start": [round(tr["start"][0], 1), round(tr["start"][1], 1)],
         "deaths": [[round(x, 1), round(z, 1), f] for x, z, f in tr["deaths"]],
         "segs": [[[round(float(p[0]), 1), round(float(p[1]), 1)] for p in s] for s in segs],
