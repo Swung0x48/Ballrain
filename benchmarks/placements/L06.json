@@ -1,0 +1,635 @@
+{
+"level": 6,
+"source": "placements in the level file (Level_06.NMO), read by the Ballistics map export",
+"pickup_radius": {
+"point": 3.0,
+"life": 4.5
+},
+"pickup_radius_basis": "measured in the original records (Ballistics docs/mechanisms.md): ball centre to placement distance",
+"items": [
+{
+"name": "P_Extra_Point_01",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 1,
+"position": [
+49.04,
+7.557,
+27.829
+]
+},
+{
+"name": "P_Extra_Point_02",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 1,
+"position": [
+33.108,
+30.436,
+62.26
+]
+},
+{
+"name": "P_Modul_18_01",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 1,
+"position": [
+5.694,
+12.162,
+57.453
+]
+},
+{
+"name": "P_Trafo_Paper_01",
+"type": "P_Trafo_Paper",
+"kind": "trafo",
+"label": "纸球变球器",
+"sector": 1,
+"position": [
+15.247,
+1.653,
+91.707
+]
+},
+{
+"name": "P_Trafo_Wood_04",
+"type": "P_Trafo_Wood",
+"kind": "trafo",
+"label": "木球变球器",
+"sector": 1,
+"position": [
+-44.374,
+12.595,
+62.454
+]
+},
+{
+"name": "P_Extra_Life_01",
+"type": "P_Extra_Life",
+"kind": "life",
+"label": "生命球",
+"sector": 2,
+"position": [
+-41.655,
+16.581,
+-289.838
+]
+},
+{
+"name": "P_Extra_Point_03",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 2,
+"position": [
+-41.887,
+36.517,
+-513.396
+]
+},
+{
+"name": "P_Extra_Point_04",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 2,
+"position": [
+-41.718,
+5.5,
+-212.738
+]
+},
+{
+"name": "P_Extra_Point_13",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 2,
+"position": [
+-41.641,
+26.702,
+-390.079
+]
+},
+{
+"name": "P_Modul_18_02",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 2,
+"position": [
+-41.648,
+23.266,
+-464.811
+]
+},
+{
+"name": "P_Modul_18_03",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 2,
+"position": [
+-41.608,
+13.262,
+-414.819
+]
+},
+{
+"name": "P_Modul_18_04",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 2,
+"position": [
+-41.608,
+2.156,
+-364.778
+]
+},
+{
+"name": "P_Modul_18_05",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 2,
+"position": [
+-41.646,
+22.22,
+-559.417
+]
+},
+{
+"name": "P_Modul_25_01",
+"type": "P_Modul_25",
+"kind": "mechanism",
+"label": "推板",
+"sector": 2,
+"position": [
+-41.611,
+22.651,
+-645.604
+]
+},
+{
+"name": "P_Trafo_Paper_03",
+"type": "P_Trafo_Paper",
+"kind": "trafo",
+"label": "纸球变球器",
+"sector": 2,
+"position": [
+-24.074,
+15.202,
+-99.171
+]
+},
+{
+"name": "P_Trafo_Wood_01",
+"type": "P_Trafo_Wood",
+"kind": "trafo",
+"label": "木球变球器",
+"sector": 2,
+"position": [
+-41.641,
+34.058,
+-445.715
+]
+},
+{
+"name": "P_Extra_Life_03",
+"type": "P_Extra_Life",
+"kind": "life",
+"label": "生命球",
+"sector": 3,
+"position": [
+156.703,
+22.337,
+-672.187
+]
+},
+{
+"name": "P_Extra_Point_05",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 3,
+"position": [
+156.584,
+8.346,
+-665.133
+]
+},
+{
+"name": "P_Extra_Point_06",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 3,
+"position": [
+198.889,
+10.369,
+-705.365
+]
+},
+{
+"name": "P_Extra_Point_11",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 3,
+"position": [
+156.586,
+8.346,
+-643.569
+]
+},
+{
+"name": "P_Modul_18_06",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 3,
+"position": [
+156.58,
+-8.546,
+-654.713
+]
+},
+{
+"name": "P_Modul_18_07",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 3,
+"position": [
+107.527,
+-1.515,
+-667.306
+]
+},
+{
+"name": "P_Modul_18_08",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 3,
+"position": [
+204.16,
+-14.565,
+-672.087
+]
+},
+{
+"name": "P_Modul_18_09",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 3,
+"position": [
+198.109,
+-9.341,
+-672.096
+]
+},
+{
+"name": "P_Modul_18_10",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 3,
+"position": [
+252.5,
+-14.556,
+-673.174
+]
+},
+{
+"name": "P_Modul_18_11",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 3,
+"position": [
+246.462,
+-9.332,
+-673.183
+]
+},
+{
+"name": "P_Modul_18_12",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 3,
+"position": [
+226.614,
+-14.556,
+-656.284
+]
+},
+{
+"name": "P_Modul_18_13",
+"type": "P_Modul_18",
+"kind": "mechanism",
+"label": "风扇",
+"sector": 3,
+"position": [
+226.605,
+-9.332,
+-650.246
+]
+},
+{
+"name": "P_Trafo_Paper_04",
+"type": "P_Trafo_Paper",
+"kind": "trafo",
+"label": "纸球变球器",
+"sector": 3,
+"position": [
+102.52,
+-1.076,
+-654.661
+]
+},
+{
+"name": "P_Trafo_Wood_05",
+"type": "P_Trafo_Wood",
+"kind": "trafo",
+"label": "木球变球器",
+"sector": 3,
+"position": [
+63.238,
+15.086,
+-687.335
+]
+},
+{
+"name": "P_Ball_Stone_01",
+"type": "P_Ball_Stone",
+"kind": "ball",
+"label": "石道具球",
+"sector": 4,
+"position": [
+398.65,
+8.574,
+-714.339
+]
+},
+{
+"name": "P_Box_04",
+"type": "P_Box",
+"kind": "mechanism",
+"label": "箱子",
+"sector": 4,
+"position": [
+409.107,
+9.452,
+-714.808
+]
+},
+{
+"name": "P_Box_05",
+"type": "P_Box",
+"kind": "mechanism",
+"label": "箱子",
+"sector": 4,
+"position": [
+403.425,
+9.928,
+-714.453
+]
+},
+{
+"name": "P_Box_06",
+"type": "P_Box",
+"kind": "mechanism",
+"label": "箱子",
+"sector": 4,
+"position": [
+402.663,
+15.265,
+-714.905
+]
+},
+{
+"name": "P_Box_07",
+"type": "P_Box",
+"kind": "mechanism",
+"label": "箱子",
+"sector": 4,
+"position": [
+408.307,
+15.732,
+-714.897
+]
+},
+{
+"name": "P_Extra_Point_08",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 4,
+"position": [
+376.15,
+8.815,
+-921.662
+]
+},
+{
+"name": "P_Extra_Point_09",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 4,
+"position": [
+391.15,
+8.815,
+-921.662
+]
+},
+{
+"name": "P_Trafo_Paper_02",
+"type": "P_Trafo_Paper",
+"kind": "trafo",
+"label": "纸球变球器",
+"sector": 4,
+"position": [
+377.873,
+2.403,
+-730.225
+]
+},
+{
+"name": "P_Trafo_Paper_06",
+"type": "P_Trafo_Paper",
+"kind": "trafo",
+"label": "纸球变球器",
+"sector": 4,
+"position": [
+396.501,
+2.495,
+-795.919
+]
+},
+{
+"name": "P_Trafo_Stone_01",
+"type": "P_Trafo_Stone",
+"kind": "trafo",
+"label": "石球变球器",
+"sector": 4,
+"position": [
+383.65,
+6.41,
+-926.662
+]
+},
+{
+"name": "P_Trafo_Wood_02",
+"type": "P_Trafo_Wood",
+"kind": "trafo",
+"label": "木球变球器",
+"sector": 4,
+"position": [
+361.15,
+6.41,
+-714.339
+]
+},
+{
+"name": "P_Trafo_Wood_06",
+"type": "P_Trafo_Wood",
+"kind": "trafo",
+"label": "木球变球器",
+"sector": 4,
+"position": [
+390.011,
+2.161,
+-877.601
+]
+},
+{
+"name": "P_Trafo_Wood_07",
+"type": "P_Trafo_Wood",
+"kind": "trafo",
+"label": "木球变球器",
+"sector": 4,
+"position": [
+390.419,
+2.319,
+-779.08
+]
+},
+{
+"name": "P_Trafo_Wood_08",
+"type": "P_Trafo_Wood",
+"kind": "trafo",
+"label": "木球变球器",
+"sector": 4,
+"position": [
+389.652,
+2.406,
+-730.221
+]
+},
+{
+"name": "P_Extra_Point_07",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 5,
+"position": [
+520.445,
+-32.713,
+-434.677
+]
+},
+{
+"name": "P_Extra_Point_10",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 5,
+"position": [
+507.065,
+-23.834,
+-600.554
+]
+},
+{
+"name": "P_Extra_Point_12",
+"type": "P_Extra_Point",
+"kind": "point",
+"label": "分数球",
+"sector": 5,
+"position": [
+509.285,
+-32.733,
+-467.965
+]
+},
+{
+"name": "P_Modul_29_01",
+"type": "P_Modul_29",
+"kind": "mechanism",
+"label": "软木桥",
+"sector": 5,
+"position": [
+506.594,
+-11.716,
+-600.736
+]
+},
+{
+"name": "P_Modul_29_02",
+"type": "P_Modul_29",
+"kind": "mechanism",
+"label": "软木桥",
+"sector": 5,
+"position": [
+507.231,
+-6.716,
+-601.374
+]
+},
+{
+"name": "P_Trafo_Stone_03",
+"type": "P_Trafo_Stone",
+"kind": "trafo",
+"label": "石球变球器",
+"sector": 5,
+"position": [
+507.231,
+-6.446,
+-590.408
+]
+},
+{
+"name": "P_Trafo_Wood_03",
+"type": "P_Trafo_Wood",
+"kind": "trafo",
+"label": "木球变球器",
+"sector": 5,
+"position": [
+411.262,
+4.088,
+-618.866
+]
+},
+{
+"name": "P_Trafo_Wood_09",
+"type": "P_Trafo_Wood",
+"kind": "trafo",
+"label": "木球变球器",
+"sector": 5,
+"position": [
+515.242,
+-35.135,
+-346.803
+]
+}
+]
+}

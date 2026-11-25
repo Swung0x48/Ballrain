@@ -331,12 +331,13 @@ class Dashboard:
             # payloads of levels no run trains any more are dropped from the listing
             # (and the level-1 names of the single-level version)
             for k in list(vers):
-                m = re.match(r"^(?:geometry|frontier|history)(?:_l(\d+))?$", k)
+                m = re.match(r"^(?:geometry|frontier|history|placements)(?:_l(\d+))?$", k)
                 if m and (m.group(1) is None or int(m.group(1)) not in levels):
                     del vers[k]
 
             for lv, (L, _) in levels.items():
                 put(f"geometry_l{lv}", L.record, lambda L=L: L.outlines)
+                put(f"placements_l{lv}", D._sig(D.placements_path(lv)), lambda lv=lv: D.placements(lv))
 
             def frontier():
                 for lv, (L, cur_run) in levels.items():

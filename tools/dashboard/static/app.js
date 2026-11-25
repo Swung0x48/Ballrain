@@ -367,6 +367,23 @@ function renderSR() {
 
 /* --------------------------------------------------------------------------------- the maps */
 const geoReady = {};  // level -> registered as map "L<level>"
+const PLC = {};  // level -> placed objects [x, z, kind, label, sector] (payload placements_l<level>)
+const PLC_STYLE = {
+  point: { n: "分数球", sym: "circle", size: 9, c: "#ffd34d" },
+  life: { n: "生命球", sym: "circle", size: 10, c: "#ff7ab8" },
+  trafo: { n: "变球器", sym: "diamond", size: 11, c: "#5ec8ff" },
+  mechanism: { n: "机关", sym: "rect", size: 9, c: "#b98cff" },
+  ball: { n: "道具球", sym: "circle", size: 6, c: "#9aa3b2" },
+};
+function placementSeries(lv) {
+  const items = (PLC[lv] || {}).items || [];
+  return Object.entries(PLC_STYLE).map(([k, s]) => ({
+    type: "scatter", name: s.n, coordinateSystem: "geo", z: 5, symbol: s.sym, symbolSize: s.size,
+    itemStyle: { color: s.c, borderColor: "#111", borderWidth: 1 },
+    data: items.filter((it) => it[2] === k).map((it) => ({ value: [it[0], it[1]], label: it[3], sector: it[4] })),
+    tooltip: { formatter: (p) => `${p.data.label}${p.data.sector ? `（第 ${p.data.sector} 小节）` : ""}` },
+  })).filter((s) => s.data.length);
+}
 async function ensureGeo(lv) {
   if (geoReady[lv]) return true;
   const g = await getPayload(`geometry_l${lv}`);
@@ -374,6 +391,7 @@ async function ensureGeo(lv) {
   const ring = (r) => { const p = []; for (let i = 0; i < r.length; i += 2) p.push([r[i], r[i + 1]]); p.push(p[0]); return [p]; };
   const fc = { type: "FeatureCollection", features: ["walk", "steep", "rail"].map((k) => ({ type: "Feature", properties: { name: k }, geometry: { type: "MultiPolygon", coordinates: (g[k] || []).map(ring) } })) };
   echarts.registerMap("L" + lv, fc);
+  if (!PLC[lv]) PLC[lv] = (await getPayload(`placements_l${lv}`)) || { items: [] };
   geoReady[lv] = true;
   return true;
 }
@@ -488,6 +506,7 @@ async function renderFrontier(force, full) {
   const covered = R && R.covered ? R.covered : [F.covered];
   const series = [
     ...tasSeries(F, R),
+    ...placementSeries(lv),
     { type: "lines", name: "已覆盖段", coordinateSystem: "geo", polyline: true, silent: true, z: 3, data: covered.map((c) => ({ coords: c })), lineStyle: { color: "#7ed69a", width: 3.2, opacity: R ? 0.55 : 0.9 } },
     { type: "scatter", name: "TAS 帧", coordinateSystem: "geo", z: 4, symbolSize: 5, itemStyle: { color: "rgba(233,237,247,.55)" },
       data: F.tas_pts.map((p) => ({ value: [p[0], p[1]], frame: p[2] })), tooltip: { formatter: (p) => `TAS 第 ${p.data.frame} 帧` } },
@@ -615,7 +634,7 @@ async function renderAttempts(force, full) {
   wireRouteControls(box, st, (f) => renderAttempts(true, f));
   const trs = A.traj.filter((d) => st.outcomes[d.end] && (!R || !st.hide[d.route]));
   const groups = byRoute ? RC.filter((c) => !st.hide[c.key]).map((c) => [c.label, c.color]) : Object.entries(OUT).filter(([k]) => st.outcomes[k]).map(([k, o]) => [o.n, o.c]);
-  const series = [...tasSeries(F, R),
+  const series = [...tasSeries(F, R), ...placementSeries(lv),
     ...(byRoute ? trajSeries(trs, (d) => (d._rc || {}).color || ROUTE_C.shared, (d) => (d._rc || {}).label, groups)
       : trajSeries(trs, (d) => (OUT[d.end] || OUT.stopped).c, (d) => (OUT[d.end] || OUT.stopped).n, groups)), pickedSeries(st)];
   if (ch._run !== sel) { st.picked = null; $("p-attempts").textContent = "点击轨迹查看详情"; series[series.length - 1] = pickedSeries(st); }
@@ -666,7 +685,7 @@ async function renderHistory(force, full) {
     c.onchange = () => { box.dataset.shown = ""; renderHistory(true); };
   });
   const trs = pool.filter((d) => st.outcomes[d.end] && d.ts >= lo - 1 && d.ts <= hi + 1 && (!R || !st.hide[d.route]));
-  const series = [...tasSeries(F, R),
+  const series = [...tasSeries(F, R), ...placementSeries(lv),
     ...(byRoute ? trajSeries(trs, (d) => (d._rc || {}).color || ROUTE_C.shared, (d) => (d._rc || {}).label, RC.filter((c) => !st.hide[c.key]).map((c) => [c.label, c.color]))
       : trajSeries(trs, (d) => plasma((d.ts - tmin) / span), (d) => d.run, H.runs.map((r) => [r, runColor(r)]))), pickedSeries(st)];
   apply(ch, {

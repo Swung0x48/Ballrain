@@ -254,6 +254,24 @@ def run_uses_alt(run: Run) -> bool:
     return p.is_file() and p.resolve() != (REFPATHS / p.name).resolve()
 
 
+PLACEMENTS = ROOT / "benchmarks" / "placements"
+
+
+def placements_path(level: int) -> Path:
+    return PLACEMENTS / f"L{int(level):02d}.json"
+
+
+def placements(level: int) -> dict:
+    """The level's placed objects for the maps (benchmarks/placements/L<nn>.json, from the level file): mechanisms,
+    transformers, prop balls, score balls and life balls as [x, z, kind, label, sector]."""
+    try:
+        doc = json.loads(placements_path(level).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"items": []}
+    return {"items": [[round(float(it["position"][0]), 2), round(float(it["position"][2]), 2), it["kind"], it["label"],
+                       it.get("sector")] for it in doc.get("items", [])]}
+
+
 def alt_name(level: int) -> str:
     return "鬼躲石变" if int(level) == 1 else "替代路线"
 
