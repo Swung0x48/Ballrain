@@ -142,6 +142,10 @@ def _display(fx, vec, tracker, finfo=None) -> dict:
     return d
 
 
+# runs that end because their driver stopped them (no BallOff / LevelFinish) replay to the end of their frames
+# instead of failing; for diagnostic recordings only (the highlight job keeps it off)
+ALLOW_TRUNCATED = False
+
 def env_replay(run, row: dict, meta: dict, frames: np.ndarray, k: int, out: Path, *, post_s: float, fps: float,
                launcher_cls, log=print) -> tuple[dict, dict]:
     """The capture replay through the training env. Returns (res for highlight.verify, panel data)."""
@@ -234,6 +238,9 @@ def env_replay(run, row: dict, meta: dict, frames: np.ndarray, k: int, out: Path
         while True:
             f = int(env.session.frames_done)
             if f >= len(frames):
+                if ALLOW_TRUNCATED:  # a run its driver stopped (an eval's stall stop): the video ends with its frames
+                    end = "truncated"
+                    break
                 raise RuntimeError(f"the run's frames end at {len(frames)} but the episode goes on")
             keys2 = int(frames["keys"][f + 1]) if f + 1 < len(frames) else int(frames["keys"][f])
             cam = env.session.tracker.obs.cams["cams"][0]["matrix"]
