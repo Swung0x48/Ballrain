@@ -886,12 +886,14 @@ const MODEL_GROUPS = {
   bodies: ["活动机关", "附近会动的物体"],
   game: ["游戏状态", "生命、分数、小节、计时"],
   contacts: ["多接触点", "按方向分的 4 个接触点（右、下、左、其他）；左右两侧最近的轨；支撑法向与轨道接触数"],
+  pickups: ["分数球与生命球", "本小节最近两颗还没吃的分数球 / 生命球的方向和距离；本小节和全关还剩几颗"],
   other: ["其他", ""],
 };
 const MODEL_NOTE = {
   f6: "基础输入：球的状态、周围地形、路线、活动机关和游戏状态。",
   f7: "在基础输入后加了可达性：8 个方向各能走多远、腾空能落在哪。",
   f8: "在可达性后加了多接触点（49 列）：骑双轨时左右两根轨都能看到。从上一个 run 的模型扩容而来，新列权重从零开始。",
+  pickups: "HS 训练：在多接触点后加了分数球与生命球（14 列），模型能看到本小节还没吃的球在哪。从第 1 关 SR 里程碑 r7 的模型逐步扩容而来（先加可达性与多接触点，再加这一块），新列权重都从零开始。",
 };
 function renderModel() {
   const m = (S.status[sel] || {}).model;
@@ -917,7 +919,7 @@ function renderModel() {
       <div class="mcol"><div class="marr">▼</div><div class="mnode val"><b>价值网络（独立）</b><span>${m.n_obs} → ${hid}，${esc(act)}</span></div>
         <div class="marr">▼</div><div class="mnode val"><b>状态价值</b><span>1 个数，只在训练时用</span></div></div>
     </div>
-    <p class="note">PPO 训练，约 ${(m.params / 1e4).toFixed(1)} 万个参数。${esc(MODEL_NOTE[m.features] || "")}</p>`;
+    <p class="note">PPO 训练，约 ${(m.params / 1e4).toFixed(1)} 万个参数。${esc(m.pickups ? MODEL_NOTE.pickups : (MODEL_NOTE[m.features] || ""))}</p>`;
 }
 
 load();

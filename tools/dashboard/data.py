@@ -524,6 +524,7 @@ _MODEL_GROUPS = (
     ("game", ("lives", "points", "sr_s", "sector", "transforming", "ball_nav", "depth_margin", "followers",
               "follower_sources", "follower_near", "paused", "since_checkpoint")),
     ("contacts", ("contacts", "contact_agg", "rails_lr")),
+    ("pickups", ("pickups", "pickups_left")),
 )
 _MODEL_MEMO: dict = {}
 _CK_MEMO: dict = {}  # run name -> (checkpoint key, slim checkpoint)
@@ -588,7 +589,7 @@ def model_info(run: Run) -> dict | None:
             "hidden": [int(x) for x in str(a.get("hidden", "256,256")).split(",") if x.strip()],
             "activation": str(a.get("activation", "tanh")), "heads": str(a.get("actor_heads") or "single"),
             "action_repeat": int(a.get("action_repeat") or 1), "features": str(f.get("version") or ""),
-            "groups": groups, "params": params, "init_from": bool(a.get("init_from"))}
+            "groups": groups, "params": params, "init_from": bool(a.get("init_from")), "pickups": bool(f.get("pickups"))}
     _MODEL_MEMO[run.name] = (key, info)
     return info
 
