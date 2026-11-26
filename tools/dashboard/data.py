@@ -47,6 +47,15 @@ MIN_STEP = 1.0  # world units between kept trajectory points
 BACKEND_LABEL = {"headless": "x87-soft headless", "retail": "2002 retail", "headless2002": "2002 headless"}
 
 
+def run_backend_label(meta: dict) -> str:
+    """Label of the engine a run directory's .json ran on: the 2002-physics headless build writes backend "headless"
+    like x87-soft, and only its mod_version says "phys2002" (the runner hosts' traced lives)."""
+    b = str(meta.get("backend"))
+    if b == "headless" and "phys2002" in str(meta.get("mod_version") or ""):
+        return BACKEND_LABEL["headless2002"]
+    return BACKEND_LABEL.get(b, "其他")
+
+
 BEST_NEAR_FRONTIER = 500  # TAS frames after the frontier still counted as "near" for the best-time tile
 
 
@@ -1494,7 +1503,7 @@ class Traces:
                 continue
             s = _sig(p)
             hit = self.meta.get(j)
-            if hit and hit[0] == s and hit[1].get("record") == rec:
+            if hit and hit[0] == s and hit[1].get("record") == rec and hit[1].get("bv") == 2:
                 out.append(hit[1])
                 continue
             try:
@@ -1507,7 +1516,7 @@ class Traces:
             bid = str((d.get("start_state") or {}).get("branch_id") or "")
             info = {"key": j, "id": f"{h:08x}", "run": run.name, "end": OUTCOME.get(d.get("end_reason"), "stopped"),
                     "sr": d.get("sr_ms"), "hs": d.get("hs"), "t": float(d.get("started_at") or 0), "h": h / 2 ** 32,
-                    "backend": BACKEND_LABEL.get(str(d.get("backend")), "其他"), "record": rec,
+                    "backend": run_backend_label(d), "record": rec, "bv": 2,
                     "pin": str(pin) if isinstance(pin, str) and pin else None,
                     "branch_id": bid if ROUTE_ID_RE.match(bid) else None}
             self.meta[j] = (s, info)
