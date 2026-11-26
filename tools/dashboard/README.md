@@ -18,7 +18,9 @@ uv run python tools/dashboard/server.py --host 127.0.0.1 --tensorboard-url /tens
 | `--no-game-assets` | 关 | 不提供游戏贴图 / 菜单字体，页面退回纯色（公开部署时若不想分发游戏素材就打开） |
 | `--show-shortcut-line` | 关 | 在课程地图上画鬼躲石变参考线（这条线取自人类录像，公开时保持关闭） |
 
-工作方式：后台线程每 10 分钟读一次训练输出，把地图 / 曲线 / SR 估计算成 JSON（gzip）写到 `runtime/dashboard/`（不提交）；
+工作方式：服务进程启动一个生成子进程（同一脚本加 `--generator`，服务进程退出时它也退出），子进程每 10 分钟读一次训练输出，
+把地图 / 曲线 / SR 估计算成 JSON（gzip）写到 `runtime/dashboard/`（不提交）；服务进程只读它的结果，所以一轮重算再久，
+页面请求也不用等；`/api/status` 最多 20 秒重算一次，过期时先返回上一份、后台算新的，重启后先返回上一个进程留下的那份；
 页面每 60 秒拉一次 `/api/status`，数据版本变了才重新下载对应 JSON，全部图表在浏览器里用 ECharts 绘制（缩放、悬停、图例开关、点击高亮）。
 每个 run 的关卡与 TAS 记录取自它的 `config.json`（`level` / `record`，r8 之前的 run 没有这两项，按第 1 关），
 页面上选中的 run 决定地图、TAS 轨迹、盘点、SR 计时与基准线（TAS / 人类纪录 / 精品线 / 上榜线，来自 `benchmarks/records.json`）显示哪一关；

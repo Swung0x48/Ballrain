@@ -3,9 +3,12 @@
     uv run python tools/dashboard/server.py [--host 0.0.0.0] [--port 8088] [--tensorboard-url URL]
 
 Serves static/index.html, /api/status (small JSON, polled by the page every 60 s) and
-/api/data/<name>.json (map / curve payloads, gzip). A background thread recomputes the payloads every
---interval seconds (default 10 min; the page's "立即刷新" asks for an earlier pass, rate-limited) into
-runtime/dashboard/ (untracked). Each run's level and TAS record come from its config (level 1 before r8); the maps
+/api/data/<name>.json (map / curve payloads, gzip). A generator child process (this script with --generator, started
+and watched by the server) recomputes the payloads every --interval seconds (default 10 min; the page's "立即刷新" asks
+for an earlier pass, rate-limited) into runtime/dashboard/ (untracked); the server only reads its results
+(summary_last.json, generator_state.json), so a pass of several minutes never holds the server's interpreter and the
+page's requests answer at once. The child exits when the server goes away (its stdin closes).
+Each run's level and TAS record come from its config (level 1 before r8); the maps
 of a level (geometry_l<N>, frontier_l<N>, history_l<N>) are built from that level's TAS record, once, and cached. The process lowers its
 own CPU priority, only reads the training outputs, and never starts or touches the game or the trainer.
 See tools/dashboard/README.md for what the page publishes and what it leaves out.
@@ -30,6 +33,7 @@ import time  # noqa: E402
 import traceback  # noqa: E402
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer  # noqa: E402
 from pathlib import Path  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -39,10 +43,16 @@ import data as D  # noqa: E402
 import report as R  # noqa: E402
 
 ROOT = D.ROOT
+if str(ROOT) not in sys.path:  # ballrain.features for the model panel (data.model_info)
+    sys.path.append(str(ROOT))
 OUT = ROOT / "runtime" / "dashboard"
 CACHE = OUT / "cache"
 ASSETS = OUT / "assets"
 STATIC = HERE / "static"
+STATE = "generator_state.json"  # in OUT: the generator child's state (pass running / done, map frontier, level sizes)
+SCRIPT = "tools/dashboard/server.py"  # the child's command line names the script as the server's does (ops match it)
+RESPAWN_S = 60  # a generator child that exited is started again after this long
+STATUS_SNAPSHOT = "status_last.json"  # in OUT: the last /api/status answer, served by a restarted server at once
 STATUS_TTL_S = 20
 ATTEMPTS_N = 80
 HISTORY_N = 150
@@ -221,8 +231,27 @@ def write_json(name: str, obj) -> int:
     return int(p.stat().st_mtime * 1000)
 
 
+def write_text_atomic(p: Path, text: str):
+    """Writes p through a temporary file; retries the replace for a moment (on Windows it fails while the server
+    process has the file open for reading)."""
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    for i in range(20):
+        try:
+            os.replace(tmp, p)
+            return
+        except PermissionError:
+            if i == 19:
+                raise
+            time.sleep(0.05)
+
+
 class Dashboard:
-    def __init__(self, a):
+    """role "server": answers the page, keeps a generator child running and reads its results; role "generator" (the
+    child): computes the payloads. argv: the server's own arguments, passed on to the child."""
+
+    def __init__(self, a, role: str = "server", argv=None):
+        self.role, self.argv = role, list(argv or [])
         self.interval, self.min_refresh = a.interval, a.min_refresh
         self.machines = {"train": a.train_machine, "eval": a.eval_machine}
         # host label -> generic machine name for the data-source tile (never sent to the page as a mapping)
@@ -232,8 +261,9 @@ class Dashboard:
         self.game_assets = not a.no_game_assets
         self.lock = threading.Lock()
         self.wake = threading.Event()
-        self.levels: dict = {}  # TAS record -> geometry.Level (built in the generation thread only)
-        self.traces = D.Traces(CACHE / "traces.pkl")
+        self.levels: dict = {}  # TAS record -> geometry.Level (built in the generator only)
+        self.level_dims: dict = {}  # TAS record -> [n, first] of its Level (what the status needs of it)
+        self.traces = D.Traces(CACHE / "traces.pkl") if role == "generator" else None
         self.route_memo: dict = {}  # (traced life, bundle pin) -> route class
         self.sigs: dict = {}
         self.summary: dict = {}
@@ -246,24 +276,162 @@ class Dashboard:
         self.gen = {"running": False, "last_start": 0.0, "generated_at": self.summary.get("generated_at"),
                     "generated_ts": self.summary.get("generated_ts"), "seconds": None, "errors": {}}
         self._status = (0.0, None)
+        self._status_lock = threading.Lock()  # one status computation at a time; the others get the last answer
         self.assets = []
         self.serif_v = None  # version of the self-served title font (serif_font.py), None = not built
+        self.child = None  # the generator child (server role)
+        self._child_lock = threading.Lock()
+        self._state_sig = None
+        self.stop = threading.Event()
+        if role == "server":
+            self._read_state(initial=True)
+            self._load_status_snapshot()
 
-    # --------------------------------------------------------------------------- generation
+    # ------------------------------------------------------------------ server: the generator child
 
-    def loop(self):
+    def start(self):
+        """Server role: the generator child and its watcher, the assets / title font, and a first status computation
+        (so the first page request after a restart finds it ready)."""
+        threading.Thread(target=self.supervise, name="generator", daemon=True).start()
+        threading.Thread(target=self.side_jobs, name="assets", daemon=True).start()
+        threading.Thread(target=self.status, name="status-warm", daemon=True).start()
+
+    def side_jobs(self):
         try:
             self.assets = A.prepare(ASSETS, log=log) if self.game_assets else []
         except Exception:
             log("assets failed:\n" + traceback.format_exc())
-        while True:
+        while not self.stop.is_set():
             self.serif_font()
+            self.stop.wait(self.interval)
+
+    def generator_cmd(self) -> list[str]:
+        return [sys.executable, SCRIPT, "--generator", *[x for x in self.argv if x != "--generator"]]
+
+    def _spawn(self):
+        cmd = self.generator_cmd()
+        self.child = subprocess.Popen(cmd, cwd=str(ROOT), stdin=subprocess.PIPE)
+        log(f"generator started (pid {self.child.pid})")
+
+    def supervise(self):
+        """Keeps exactly one generator child: a new one only after the last one has exited, RESPAWN_S later."""
+        next_start = 0.0
+        while not self.stop.is_set():
+            ch = self.child
+            if ch is not None and ch.poll() is not None:
+                log(f"generator exited with code {ch.returncode}; starting a new one in {RESPAWN_S}s")
+                with self.lock:
+                    self.gen.update(running=False, errors={"generator": "exited"})
+                    self._expire_status()
+                self.child = None
+                next_start = time.time() + RESPAWN_S
+            if self.child is None and time.time() >= next_start:
+                try:
+                    self._spawn()
+                except Exception:
+                    log("generator start failed:\n" + traceback.format_exc())
+                    next_start = time.time() + RESPAWN_S
+            self._read_state()
+            self.stop.wait(1.0)
+        self.close()
+
+    def close(self):
+        """Closes the child's stdin: the child exits (also what happens when the server process ends)."""
+        ch = self.child
+        if ch is not None and ch.stdin is not None:
+            try:
+                ch.stdin.close()
+            except OSError:
+                pass
+
+    def _wake(self):
+        """Asks for a generation pass now (or right after the running one)."""
+        if self.role == "generator":
+            self.wake.set()
+            return
+        ch = self.child
+        if ch is None or ch.stdin is None:
+            return
+        with self._child_lock:
+            try:
+                ch.stdin.write(b"wake\n")
+                ch.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+    def _expire_status(self):
+        self._status = (0.0, self._status[1])
+
+    def _read_state(self, initial: bool = False):
+        """Takes the child's state file when it changed: pass running / done, map frontier, Mac clock offset, level
+        sizes; after a finished pass also the new summary_last.json. At start (initial) only the lasting parts of the
+        previous child's state (its pass state is that of a process that is gone)."""
+        p = OUT / STATE
+        sig = D._sig(p)
+        if sig is None or sig == self._state_sig:
+            return
+        try:
+            st = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return  # being replaced: next time
+        self._state_sig = sig
+        if not isinstance(st, dict):
+            return
+        with self.lock:
+            if isinstance(st.get("level_dims"), dict):
+                self.level_dims.update(st["level_dims"])
+            if isinstance(st.get("map_frontier"), list) and len(st["map_frontier"]) == 2:
+                self.map_frontier = tuple(st["map_frontier"])
+            if isinstance(st.get("off"), (int, float)):
+                self.off = float(st["off"])
+            g = st.get("gen")
+            if initial or not isinstance(g, dict):
+                return
+            done = g.get("generated_ts") is not None and g.get("generated_ts") != self.gen.get("generated_ts")
+            self.gen.update({k: g.get(k) for k in ("running", "last_start", "generated_at", "generated_ts", "seconds")})
+            self.gen["errors"] = g.get("errors") if isinstance(g.get("errors"), dict) else {}
+        if done:
+            try:
+                summ = json.loads((OUT / "summary_last.json").read_text(encoding="utf-8"))
+                with self.lock:
+                    self.summary = summ
+            except (OSError, ValueError):
+                log("summary reload failed:\n" + traceback.format_exc())
+        self._expire_status()
+
+    # ---------------------------------------------------------------------- generator (child role)
+
+    def run_generator(self):
+        """Generator role: a pass every --interval, or at once on a "wake" line from the server; exits when its stdin
+        closes (the server is gone)."""
+        threading.Thread(target=self._watch_parent, name="parent", daemon=True).start()
+        while True:
             try:
                 self.generate()
             except Exception:
                 log("generation failed:\n" + traceback.format_exc())
             self.wake.wait(self.interval)
             self.wake.clear()
+
+    def _watch_parent(self):
+        try:
+            for line in sys.stdin.buffer:
+                if line.strip() == b"wake":
+                    self.wake.set()
+        except Exception:
+            pass
+        log("generator: server gone, exiting")
+        os._exit(0)
+
+    def _write_state(self):
+        try:
+            OUT.mkdir(parents=True, exist_ok=True)
+            with self.lock:
+                st = {"pid": os.getpid(), "gen": dict(self.gen), "map_frontier": getattr(self, "map_frontier", None),
+                      "off": getattr(self, "off", None), "level_dims": dict(self.level_dims)}
+            write_text_atomic(OUT / STATE, json.dumps(st, ensure_ascii=False, default=str))
+        except Exception:
+            log("generator state failed:\n" + traceback.format_exc())
 
     def serif_font(self):
         """Keeps the title-font subset in line with the page's text (serif_font.py; built in a child process so the
@@ -288,9 +456,11 @@ class Dashboard:
             wait = self.min_refresh - (time.time() - self.gen["last_start"])
             if wait > 0:
                 return False, f"刚刚算过，{int(wait)} 秒后可再刷新"
-            self._status = (0.0, None)
-            self.wake.set()
-            return True, "已开始重新计算"
+            self._expire_status()
+            # until the child reports the pass: no second request (the rate limit counts from now)
+            self.gen["last_start"] = time.time()
+        self._wake()
+        return True, "已开始重新计算"
 
     def _section(self, name, errors, fn):
         try:
@@ -299,20 +469,24 @@ class Dashboard:
             errors[name] = type(e).__name__  # details stay in the server log only
             log(f"section {name} failed:\n" + traceback.format_exc())
 
-    def level_of(self, run, build: bool = False):
-        """The run's Level (its TAS record); build=False (request threads): only one that is already loaded."""
+    def level_of(self, run):
+        """What the status needs of the run's Level (its TAS record): the loaded Level in the generator, its sizes
+        (n, first; reported by the generator) in the server; None while not known yet."""
         rec = D.run_level(run)["record"]
         if rec is None:
             return None
-        if rec not in self.levels and build:
-            from geometry import Level
-            self.levels[rec] = Level(CACHE, log=log, record=rec)
-        return self.levels.get(rec)
+        if rec in self.levels:
+            return self.levels[rec]
+        d = self.level_dims.get(rec)
+        if isinstance(d, list) and len(d) == 2:
+            return SimpleNamespace(n=int(d[0]), first=int(d[1]))
+        return None
 
     def generate(self):
         with self.lock:
             self.gen["running"] = True
             self.gen["last_start"] = time.time()
+        self._write_state()
         t0 = time.time()
         errors: dict = {}
         OUT.mkdir(parents=True, exist_ok=True)
@@ -354,6 +528,9 @@ class Dashboard:
                     errors[f"level{lv}"] = type(e).__name__
                     log(f"level {lv} failed:\n" + traceback.format_exc())
             summary["levels"] = sorted(levels)
+            with self.lock:
+                self.level_dims.update({L.record: [int(L.n), int(L.first)] for L in self.levels.values()})
+            self._write_state()
             # payloads of levels no run trains any more are dropped from the listing
             # (and the level-1 names of the single-level version)
             for k in list(vers):
@@ -479,19 +656,59 @@ class Dashboard:
                                 seconds=secs, errors=errors)
                 self._status = (0.0, None)
             try:
-                tmp = OUT / "summary_last.tmp"
-                tmp.write_text(json.dumps(summary, ensure_ascii=False, default=str), encoding="utf-8")
-                os.replace(tmp, OUT / "summary_last.json")
+                write_text_atomic(OUT / "summary_last.json", json.dumps(summary, ensure_ascii=False, default=str))
             except Exception:
                 log("summary snapshot failed:\n" + traceback.format_exc())
+            self._write_state()  # after the summary: the server reloads it when it sees the finished pass
             log(f"generated in {secs}s" + (f", errors: {list(errors)}" if errors else ""))
 
     # ------------------------------------------------------------------------------- status
 
     def status(self) -> dict:
+        """Cached for STATUS_TTL_S; an expired answer is still served at once while one background thread computes the
+        next (a cold computation after a start, or a training CSV parsed anew, takes seconds). Only when there is no
+        answer at all (no snapshot from the last process either) do the requests wait, for one computation."""
         ts, cached = self._status
         if cached is not None and time.time() - ts < STATUS_TTL_S:
             return cached
+        if cached is None:
+            with self._status_lock:
+                if self._status[1] is None:
+                    self._refresh_status()
+            if self._status[1] is None:
+                raise RuntimeError("status not available")  # logged by _refresh_status; the page gets a 500
+            return self._status[1]
+        if self._status_lock.acquire(blocking=False):
+            def bg():
+                try:
+                    self._refresh_status()
+                finally:
+                    self._status_lock.release()
+            threading.Thread(target=bg, name="status", daemon=True).start()
+        return cached
+
+    def _refresh_status(self):
+        """Computes the status (caller holds _status_lock) and keeps a snapshot for the next server process."""
+        try:
+            res = self._compute_status()
+        except Exception:
+            log("status failed:\n" + traceback.format_exc())
+            return
+        self._status = (time.time(), res)
+        try:
+            write_text_atomic(OUT / STATUS_SNAPSHOT, json.dumps(res, ensure_ascii=False, default=str))
+        except Exception:
+            log("status snapshot failed:\n" + traceback.format_exc())
+
+    def _load_status_snapshot(self):
+        try:
+            res = json.loads((OUT / STATUS_SNAPSHOT).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(res, dict) and isinstance(res.get("status"), dict):
+            self._status = (0.0, res)  # expired: served until the first computation replaces it
+
+    def _compute_status(self) -> dict:
         runs = D.discover_runs()
         mac = D.mac_runs(runs)
         off = getattr(self, "off", None)
@@ -513,10 +730,13 @@ class Dashboard:
         live = (st.get(sel_run) or {}).get("frontier")
         built = getattr(self, "map_frontier", None)
         if live is not None and built is not None and built[0] == sel_run and int(live) != built[1]:
+            wake = False
             with self.lock:
                 if not self.gen["running"] and getattr(self, "_woken_for", None) != int(live):
                     self._woken_for = int(live)
-                    self.wake.set()
+                    wake = True
+            if wake:
+                self._wake()
         try:
             compute = D.discarded_steps(runs, D.default_run(runs))
         except Exception:
@@ -531,7 +751,6 @@ class Dashboard:
                "traced_counts": summ.get("traced_counts") or {}, "assets": self.assets, "compute": compute,
                "levels": summ.get("levels") or [],
                "reports": R.public(R.load()), "highlight": highlight_public()}
-        self._status = (time.time(), res)
         return res
 
 
@@ -685,17 +904,29 @@ def main(argv=None):
                     help="do not serve the game textures / menu font (the page falls back to plain colours)")
     ap.add_argument("--show-shortcut-line", action="store_true",
                     help="draw the shortcut-1 reference line (derived from a human recording; off by default)")
+    ap.add_argument("--generator", action="store_true", help=argparse.SUPPRESS)  # the child the server starts
+    argv = list(sys.argv[1:] if argv is None else argv)
     a = ap.parse_args(argv)
     lower_priority()
-    dash = Dashboard(a)
+    if a.generator:
+        Dashboard(a, role="generator").run_generator()
+        return
+    dash = Dashboard(a, argv=argv)
+    try:  # loading torch's libraries holds the interpreter for seconds: before serving, not in the first status
+        import torch  # noqa: F401
+    except ImportError:
+        pass
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(dash))
     srv.daemon_threads = True
-    threading.Thread(target=dash.loop, name="regen", daemon=True).start()
+    dash.start()
     log(f"dashboard listening on port {a.port}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        dash.stop.set()
+        dash.close()
 
 
 if __name__ == "__main__":
