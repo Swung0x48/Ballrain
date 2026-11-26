@@ -2,8 +2,9 @@
 
 After the GAE of each batch, the rows whose advantage is above `adv_min` batch standard deviations (an action followed
 by more return than the value head predicted: e.g. a life that flies over the stone transformer where nearly all fail)
-become candidates. A candidate enters the buffer of (raw observation, action, return) only once its own life has gone
-on for `horizon` more steps without ending, or ended with LevelFinish within them (offer(): the worker's later rows and
+become candidates. A candidate enters the buffer of (raw observation, action, return) only once its own life has
+reached the next checkpoint (a later sector in the observation, sector_col; the default of train_m2) or finished the
+level, or (without sector_col) gone on for `horizon` more steps without ending (offer(): the worker's later rows and
 chunks are followed, per worker); a life that dies, stalls or is cut off within the horizon takes its pending
 candidates with it. The lambda-return only sees a short way ahead, so without this a life that flies past the
 transformer and falls two seconds later would look good at the jump (user, 2026-11-25: learn only real successes). Before every update the buffer is re-scored with the current
@@ -25,9 +26,13 @@ import torch
 
 class SILBuffer:
     def __init__(self, capacity: int = 65536, adv_min: float = 2.0, keep_min: float = 0.1, horizon: int = 0,
-                 max_pending: int = 20000):
+                 max_pending: int = 20000, sector_col: int | None = None):
         self.capacity, self.adv_min, self.keep_min = int(capacity), float(adv_min), float(keep_min)
         self.horizon, self.max_pending = int(horizon), int(max_pending)
+        # sector_col: column of the raw observation that holds the sector (FeatureConfig layout "sector"). When set, a
+        # candidate is confirmed only when a later row of its life shows a higher sector (the life reached the next
+        # checkpoint) or the life finishes the level; `horizon` is then not used (user, 2026-11-25)
+        self.sector_col = None if sector_col is None else int(sector_col)
         self.pending: dict = {}  # worker key -> {"n": rows seen, "rows": [[due, raw, act, ret, score], ...]}
         self.confirmed = self.discarded = 0  # candidates that survived their horizon / died with their life
         self.raw = None  # (n, n_obs) float32
@@ -87,9 +92,10 @@ class SILBuffer:
             rows = st["rows"]
             for t in range(T):
                 st["n"] += 1
+                i = off + t
                 if t in cand:
-                    i = off + t
-                    rows.append([st["n"] + self.horizon, raw[i], act[i], ret[i], adv[i] / adv_std])
+                    key_t = float(raw[i, self.sector_col]) if self.sector_col is not None else st["n"] + self.horizon
+                    rows.append([key_t, raw[i], act[i], ret[i], adv[i] / adv_std])
                 if t in end_at:  # the life ends at this row: its candidates are confirmed or dropped together
                     if rows:
                         if end_at[t] == "LevelFinish":
@@ -99,8 +105,13 @@ class SILBuffer:
                         rows.clear()
                     continue
                 k = 0
-                while k < len(rows) and rows[k][0] <= st["n"]:
-                    k += 1
+                if self.sector_col is not None:  # confirmed once the life is in a later sector than the candidate
+                    sec = float(raw[i, self.sector_col])
+                    while k < len(rows) and rows[k][0] < sec - 1e-6:
+                        k += 1
+                else:
+                    while k < len(rows) and rows[k][0] <= st["n"]:
+                        k += 1
                 if k:
                     self._commit(rows[:k])
                     del rows[:k]

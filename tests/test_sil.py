@@ -128,3 +128,36 @@ def test_workers_are_followed_separately():
     assert len(b) == 0 and b.discarded == 0  # worker 1's stall does not touch worker 0's candidate
     _offer(b, [_chunk(5, wid=0)])
     assert len(b) == 1
+
+
+def _chunk_sec(secs, wid=0, ends=(), adv_rows=()):
+    c, adv = _chunk(len(secs), wid, ends, adv_rows)
+    return c, adv, np.asarray(secs, np.float32)
+
+
+def _offer_sec(b, parts):
+    chunks = [c for c, _, _ in parts]
+    adv = np.concatenate([a for _, a, _ in parts])
+    sec = np.concatenate([s for _, _, s in parts])
+    n = len(adv)
+    raw = np.stack([np.arange(n, dtype=np.float32), sec], 1)
+    return b.offer(chunks, raw, np.arange(n), np.ones(n, np.float32), adv, 1.0)
+
+
+def test_checkpoint_confirms_when_the_life_reaches_the_next_sector():
+    b = SILBuffer(capacity=100, adv_min=2.0, sector_col=1)
+    assert _offer_sec(b, [_chunk_sec([0.25] * 40, adv_rows=(3,))]) == 0  # long life, still in its sector
+    assert _offer_sec(b, [_chunk_sec([0.25, 0.25, 0.5, 0.5])]) == 1  # next checkpoint reached
+    assert b.raw[0, 0] == 3.0
+
+
+def test_checkpoint_drops_a_candidate_whose_life_ends_in_its_sector():
+    b = SILBuffer(capacity=100, adv_min=2.0, sector_col=1)
+    _offer_sec(b, [_chunk_sec([0.25] * 300, ends=((299, "BallOff"),), adv_rows=(1,))])
+    _offer_sec(b, [_chunk_sec([0.5] * 10)])  # the next life's sector does not count
+    assert len(b) == 0 and b.discarded == 1
+
+
+def test_checkpoint_level_finish_confirms():
+    b = SILBuffer(capacity=100, adv_min=2.0, sector_col=1)
+    assert _offer_sec(b, [_chunk_sec([1.0] * 6, ends=((5, "LevelFinish"),), adv_rows=(2,))]) == 1

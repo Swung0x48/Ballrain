@@ -349,6 +349,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sil-capacity", type=int, default=65536)
     p.add_argument("--sil-adv-min", type=float, default=2.0, help="advantage (batch std) a row needs to enter the buffer")
     p.add_argument("--sil-keep-min", type=float, default=0.1, help="(R - V) / adv_std a buffer row needs to stay")
+    p.add_argument("--sil-confirm", choices=("checkpoint", "horizon"), default="checkpoint",
+                   help="when a candidate row enters the buffer: its life reaches the next checkpoint (or finishes the "
+                        "level) / its life goes on --sil-horizon-s without ending; a life that ends first drops it")
     p.add_argument("--sil-horizon-s", type=float, default=8.0,
                    help="a candidate row enters the buffer only after its life went on this many game seconds without "
                         "ending (or finished the level within them); a death, stall or cut-off first drops it")
@@ -1069,10 +1072,23 @@ def main(argv=None) -> int:
     if a.sil_coef > 0:
         from ballrain.train.sil import SILBuffer, value_fn as sil_value_fn
         sil_h = int(round(a.sil_horizon_s * 1000.0 / (env_cfg.delta_ms * a.action_repeat)))
-        sil = SILBuffer(a.sil_capacity, a.sil_adv_min, a.sil_keep_min, horizon=sil_h)
+        sil_col = None
+        if a.sil_confirm == "checkpoint":
+            from ballrain.features import make_layout
+            o = 0
+            for name, size in make_layout(env_cfg.features):
+                if name == "sector":
+                    sil_col = o
+                    break
+                o += size
+            if sil_col is None:
+                raise SystemExit("--sil-confirm checkpoint: the observation has no sector entry")
+        sil = SILBuffer(a.sil_capacity, a.sil_adv_min, a.sil_keep_min, horizon=sil_h, sector_col=sil_col)
         log.msg(f"self-imitation: coef {a.sil_coef}, buffer {a.sil_capacity} rows (advantage > {a.sil_adv_min} std in, "
-                f"kept while (R - V) / std > {a.sil_keep_min}; confirmed after {a.sil_horizon_s} s = {sil_h} steps of the "
-                f"same life without a death / stall / cut-off), {a.sil_batch} rows per minibatch, w <= {a.sil_wmax}")
+                f"kept while (R - V) / std > {a.sil_keep_min}; confirmed when "
+                + (f"the same life reaches the next checkpoint or finishes (sector column {sil_col})" if sil_col is not None
+                   else f"the same life goes on {a.sil_horizon_s} s = {sil_h} steps without a death / stall / cut-off")
+                + f"), {a.sil_batch} rows per minibatch, w <= {a.sil_wmax}")
 
     def demo_coef_now() -> float:
         if not a.demo_decay_updates:
