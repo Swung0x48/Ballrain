@@ -33,6 +33,26 @@ def teacher_key(key, teachers: dict):
     return "default" if "default" in teachers else None
 
 
+def s_ranges(teachers: dict) -> list[tuple[float, float, str]]:
+    """Teacher keys of the form "s:LO-HI" (arc s along the run's reference line) -> [(lo, hi, key)]."""
+    out = []
+    for k in teachers:
+        if k.startswith("s:"):
+            lo, hi = (float(x) for x in k[2:].split("-"))
+            out.append((lo, hi, k))
+    return out
+
+
+def pick_teacher(sector, s, teachers: dict, ranges=None):
+    """The teacher of a state: an "s:LO-HI" key whose range holds its route s (when s is known), else its sector's key,
+    else "default", else None."""
+    if s is not None and s == s:  # not NaN
+        for lo, hi, k in (ranges if ranges is not None else s_ranges(teachers)):
+            if lo <= s < hi:
+                return k
+    return teacher_key(sector, teachers)
+
+
 def parse_ranges(spec: str) -> list[tuple[int, int, float]]:
     """"4000-5800:2,936-25300" -> [(4000, 5800, 2.0), (936, 25300, 1.0)] (hand-over frame ranges with weights)."""
     out = []

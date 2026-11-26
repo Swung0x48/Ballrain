@@ -26,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from common import load_actor, parse_teachers, teacher_key
+from common import load_actor, parse_teachers, pick_teacher, s_ranges, teacher_key
 
 
 def main(argv=None) -> int:
@@ -60,6 +60,7 @@ def main(argv=None) -> int:
         if (ck["n_obs"], ck["n_act"]) != (base["n_obs"], base["n_act"]):
             raise SystemExit(f"teacher {k}: observation / action layout differs from the student's")
     raw, key, life = [], [], []
+    srs = s_ranges(teachers)
     off = 0
     D = Path(a.data)
     for r in a.rounds:
@@ -69,7 +70,11 @@ def main(argv=None) -> int:
         for f in files:
             z = np.load(f)
             raw.append(z["raw"])
-            keys = [teacher_key(s, teachers) for s in z["sector"]] if a.label_by == "sector" else [teacher_key(r, teachers)] * len(z["raw"])
+            if a.label_by == "sector":
+                ss = z["s"] if "s" in z.files else [None] * len(z["raw"])
+                keys = [pick_teacher(sc, (float(sv) if sv is not None else None), teachers, srs) for sc, sv in zip(z["sector"], ss)]
+            else:
+                keys = [teacher_key(r, teachers)] * len(z["raw"])
             key += keys
             life.append(z["life"] + off)
             off = int(life[-1].max()) + 1

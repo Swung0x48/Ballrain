@@ -23,13 +23,13 @@ from pathlib import Path
 
 import numpy as np
 
-from common import load_actor, make_env, parse_ranges, parse_teachers, teacher_key
+from common import load_actor, make_env, parse_ranges, parse_teachers, pick_teacher, s_ranges
 
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--behaviour", default="", help="checkpoint that plays every step (else the --teacher composite)")
-    p.add_argument("--teacher", action="append", default=[], help="KEY=CKPT, KEY a sector number or 'default'")
+    p.add_argument("--teacher", action="append", default=[], help="KEY=CKPT, KEY a sector number, 's:LO-HI' (route arc s range, wins over sectors) or 'default'")
     p.add_argument("--ranges", required=True, help="hand-over frame ranges LO-HI[:weight],...")
     p.add_argument("--n", type=int, required=True, help="lives")
     p.add_argument("--copy", required=True, help="spare headless copy label, e.g. hl-81 (one per process)")
@@ -59,7 +59,8 @@ def main(argv=None) -> int:
     ranges = parse_ranges(a.ranges)
     w = np.array([r[2] for r in ranges])
     rng = np.random.default_rng(a.seed)
-    obs_all, sec_all, life_all, lives = [], [], [], []
+    obs_all, sec_all, life_all, s_all, lives = [], [], [], [], []
+    sr = s_ranges(teachers)
     try:
         for i in range(a.n):
             gen = torch.Generator().manual_seed(a.seed * 1000 + i)
@@ -73,8 +74,10 @@ def main(argv=None) -> int:
             for t in range(a.cap):
                 obs_all.append(np.asarray(obs, np.float32))
                 sec_all.append(sec)
+                s_now0 = env.reward.s
+                s_all.append(float(s_now0) if s_now0 is not None else float("nan"))
                 life_all.append(i)
-                key = "behaviour" if a.behaviour else teacher_key(sec, teachers)
+                key = "behaviour" if a.behaviour else pick_teacher(sec, s_all[-1], teachers, sr)
                 if key is None:
                     raise SystemExit(f"no teacher for sector {sec} (add --teacher default=CKPT)")
                 ck, m = pols[key]
@@ -105,7 +108,7 @@ def main(argv=None) -> int:
     finally:
         env.close()
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(a.out, raw=np.asarray(obs_all, np.float32), sector=np.asarray(sec_all, np.int8),
+    np.savez_compressed(a.out, raw=np.asarray(obs_all, np.float32), sector=np.asarray(sec_all, np.int8), s=np.asarray(s_all, np.float32),
                         life=np.asarray(life_all, np.int32))
     n = len(lives)
     print(json.dumps({"behaviour": Path(a.behaviour).name if a.behaviour else {k: Path(v).name for k, v in teachers.items()},
