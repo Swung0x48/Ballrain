@@ -735,7 +735,9 @@ class Worker:
         stall_max = int(1000 * sp.stall_max_s / sp.env.delta_ms)
         while not self.stop:
             T = sp.chunk
-            buf = {"obs": np.zeros((T, n_obs), np.float32), "raw": np.zeros((T, n_obs), np.float32),
+            # "obs" (the normalised rows) is not sent: the learner normalises "raw" with its own statistics and only
+            # checks the key (2026-11-26: half the bytes of a chunk, for the runner hosts' links)
+            buf = {"obs": None, "raw": np.zeros((T, n_obs), np.float32),
                    "actions": np.zeros(T, np.int64), "logp": np.zeros(T, np.float32), "values": np.zeros(T, np.float32),
                    "rewards": np.zeros(T, np.float32), "terminated": np.zeros(T, bool), "truncated": np.zeros(T, bool),
                    "trunc_values": np.zeros(T, np.float32)}
@@ -837,7 +839,7 @@ class Worker:
                             ep.ret += pen
                             ep.terms["stall_penalty"] = ep.terms.get("stall_penalty", 0.0) + pen
                             term, trunc = True, False
-                buf["obs"][t], buf["raw"][t] = x, obs
+                buf["raw"][t] = obs
                 if sp.start_tags:
                     self._tag_row(buf, t, ep, past_cp)
                 buf["actions"][t], buf["logp"][t], buf["values"][t] = a, logp, v
