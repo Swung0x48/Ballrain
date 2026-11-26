@@ -378,18 +378,13 @@ def n_actions(c: dict) -> int:
 # ---------------------------------------------------------------------------------- clocks
 
 def mac_offset_hours(runs) -> float:
-    """Mac log wall clock minus PC local clock, rounded to 30 min (log strings are Mac local time)."""
+    """Mac log wall clock minus PC local clock, rounded to 30 min (log strings are Mac local time).
+
+    First from the learner's train.log (written only on the Mac): its last line's clock against the mirrored file's
+    modification time. Only then from traced lives, whose file names carry the clock of the machine that played them:
+    runner lives copied into the mirror (2026-11-26) carry the runner's clock, so the newest file can be one of
+    those and give 0 (the page then showed Mac times 12 h off)."""
     for r in reversed(mac_runs(runs)):
-        for j in reversed(r.files("episodes-traced/*/*/*.json")[-20:]):
-            m = re.search(r"-(\d{8}-\d{6})-", Path(j).name)
-            try:
-                started = json.loads(Path(j).read_text(encoding="utf-8")).get("started_at")
-            except Exception:
-                continue
-            if m and started:
-                mac = dt.datetime.strptime(m.group(1), "%Y%m%d-%H%M%S")
-                pc = dt.datetime.fromtimestamp(float(started))
-                return round((mac - pc).total_seconds() / 1800) * 0.5
         lp = r.path / "train.log"
         s = _sig(lp)
         if s:
@@ -401,6 +396,20 @@ def mac_offset_hours(runs) -> float:
             if last:
                 mac = dt.datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
                 pc = dt.datetime.fromtimestamp(s[1] / 1e9)
+                return round((mac - pc).total_seconds() / 1800) * 0.5
+    for r in reversed(mac_runs(runs)):
+        for j in reversed(r.files("episodes-traced/*/*/*.json")[-20:]):
+            m = re.search(r"-(\d{8}-\d{6})-", Path(j).name)
+            try:
+                d = json.loads(Path(j).read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            started = d.get("started_at")
+            if "phys2002" in str(d.get("mod_version") or ""):  # a runner's life (2002 headless build), not the Mac's
+                continue
+            if m and started:
+                mac = dt.datetime.strptime(m.group(1), "%Y%m%d-%H%M%S")
+                pc = dt.datetime.fromtimestamp(float(started))
                 return round((mac - pc).total_seconds() / 1800) * 0.5
     return DEFAULT_MAC_OFFSET_H
 
