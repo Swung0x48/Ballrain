@@ -5,9 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Ballrain 训练进度</title>
 <link rel="icon" href="/assets/ball.png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@700;900&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<style>
+/* title font: a subset of Noto Serif SC served by the page server itself (tools/dashboard/serif_font.py) */
+@font-face { font-family: "Ballrain Serif"; src: url("/font/serif-700.woff?v=__SERIF_V__") format("woff"); font-weight: 700; font-display: swap; }
+@font-face { font-family: "Ballrain Serif"; src: url("/font/serif-900.woff?v=__SERIF_V__") format("woff"); font-weight: 900; font-display: swap; }
+</style>
 <link rel="stylesheet" href="/static/style.css">
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
 </head>

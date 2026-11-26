@@ -23,6 +23,7 @@ import gzip  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
 import re  # noqa: E402
+import subprocess  # noqa: E402
 import sys  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
@@ -239,6 +240,7 @@ class Dashboard:
         self.gen = {"running": False, "last_start": 0.0, "generated_at": None, "seconds": None, "errors": {}}
         self._status = (0.0, None)
         self.assets = []
+        self.serif_v = None  # version of the self-served title font (serif_font.py), None = not built
 
     # --------------------------------------------------------------------------- generation
 
@@ -248,12 +250,29 @@ class Dashboard:
         except Exception:
             log("assets failed:\n" + traceback.format_exc())
         while True:
+            self.serif_font()
             try:
                 self.generate()
             except Exception:
                 log("generation failed:\n" + traceback.format_exc())
             self.wake.wait(self.interval)
             self.wake.clear()
+
+    def serif_font(self):
+        """Keeps the title-font subset in line with the page's text (serif_font.py; built in a child process so the
+        server's threads never wait for it)."""
+        import serif_font as SF
+        srcs = [STATIC / "index.html", STATIC / "app.js", OUT / "reports.json"]
+        try:
+            ver, done = SF.version(OUT / "fonts", srcs)
+            if ver and not done:
+                r = subprocess.run([sys.executable, str(Path(SF.__file__)), str(OUT / "fonts"), *map(str, srcs)],
+                                   capture_output=True, text=True, timeout=900)
+                ver = r.stdout.strip() or None
+                log(f"title font subset {ver}" + ("" if r.returncode == 0 else f" failed: {r.stderr[-400:]}"))
+            self.serif_v = ver
+        except Exception:
+            log("title font failed:\n" + traceback.format_exc())
 
     def request_refresh(self):
         with self.lock:
@@ -504,6 +523,8 @@ class Dashboard:
 
 
 DATA_RE = re.compile(r"^/api/data/([a-z0-9_]+)\.json$")
+GZ_MEMO: dict = {}  # static .js / .css path -> ((size, mtime), gzip bytes)
+FONT_RE = re.compile(r"^/font/serif-(700|900)\.woff$")
 FILE_RE = re.compile(r"^/(static|assets)/([a-z0-9_]+\.(?:js|css|png|jpg|json))$")
 MEDIA_RE = re.compile(r"^/media/(highlight(?:-overlay)?(?:-\d{9,12})?\.mp4)$")
 
@@ -523,6 +544,7 @@ def make_handler(dash: Dashboard, media: MediaCache | None = None):
             self.send_header("Content-Type", ctype)
             if gz:
                 self.send_header("Content-Encoding", "gzip")
+                self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -570,6 +592,7 @@ def make_handler(dash: Dashboard, media: MediaCache | None = None):
                 return self._media(m.group(1))
             if u.path in ("/", "/index.html"):
                 html = (STATIC / "index.html").read_text(encoding="utf-8")
+                html = html.replace("__SERIF_V__", dash.serif_v or "0")
                 for f in ("app.js", "style.css"):  # cache-busting: bump on every change of the file
                     html = html.replace(f"/static/{f}\"", f"/static/{f}?v={int((STATIC / f).stat().st_mtime)}\"")
                 return self._send(200, html.encode("utf-8"), CTYPES[".html"], "no-cache")
@@ -588,6 +611,12 @@ def make_handler(dash: Dashboard, media: MediaCache | None = None):
                     if "gzip" in (self.headers.get("Accept-Encoding") or ""):
                         return self._send(200, body, CTYPES[".json"], cache, gz=True)
                     return self._send(200, gzip.decompress(body), CTYPES[".json"], cache)
+            m = FONT_RE.match(u.path)
+            if m and dash.serif_v:
+                p = OUT / "fonts" / f"serif-{m.group(1)}.woff"
+                if p.is_file():
+                    cache = "public, max-age=604800" if "v=" in (u.query or "") else "no-cache"
+                    return self._send(200, p.read_bytes(), "font/woff", cache)
             m = FILE_RE.match(u.path)
             if m:
                 base = STATIC if m.group(1) == "static" else ASSETS
@@ -595,6 +624,15 @@ def make_handler(dash: Dashboard, media: MediaCache | None = None):
                 p = base / m.group(2)
                 if allowed and p.is_file():
                     cache = "no-cache"  # assets are regenerated when their version changes: always revalidate
+                    if m.group(1) == "static" and "v=" in (u.query or ""):
+                        cache = "public, max-age=604800"  # versioned by the page (?v=mtime)
+                    if p.suffix in (".js", ".css") and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+                        st = p.stat()
+                        hit = GZ_MEMO.get(p)
+                        if not hit or hit[0] != (st.st_size, st.st_mtime_ns):
+                            hit = ((st.st_size, st.st_mtime_ns), gzip.compress(p.read_bytes(), 6))
+                            GZ_MEMO[p] = hit
+                        return self._send(200, hit[1], CTYPES[p.suffix], cache, gz=True)
                     return self._send(200, p.read_bytes(), CTYPES[p.suffix], cache)
             self._send(404, "未找到".encode("utf-8"), "text/plain; charset=utf-8")
 
