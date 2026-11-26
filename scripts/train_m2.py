@@ -400,6 +400,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="rows of a life in a mastered family that are anchored: life = all of them (also after it reached "
                         "later checkpoints); first-cp = only those before it reached its next checkpoint (the stretch "
                         "its success measures; with --success finish both are the whole life)")
+    p.add_argument("--anchor-only", default="",
+                   help="comma-separated family keys (e.g. rehearse:4000-4450): only these families are anchored when "
+                        "mastered; the others are still counted (anchor.csv) but never pulled. Empty: every family")
     p.add_argument("--anchor-ratchet", action="store_true",
                    help="automatic teachers: a family whose last --anchor-window lives were all played by policies newer "
                         "than its snapshot, at >= the rate it had then, moves to a newer snapshot (follows improvements)")
@@ -1153,6 +1156,8 @@ def main(argv=None) -> int:
         def anchor_key(tag):
             return AN.family_key(tag, band_frames=band_frames, base_frame=base_frame, kinds=kinds)
 
+        anchor_only = {k.strip() for k in a.anchor_only.split(",") if k.strip()}
+
         anchor = AN.MasteredAnchor(window=a.anchor_window, min_lives=a.anchor_min_lives, threshold=a.anchor_threshold,
                                    grace=a.anchor_grace, drop_scale=a.anchor_drop_scale,
                                    max_teachers=a.anchor_max_teachers, explicit=bool(a.anchor_teacher),
@@ -1194,6 +1199,7 @@ def main(argv=None) -> int:
                 f"frames), mastered at >= {a.anchor_threshold:g} over {a.anchor_min_lives} of the last "
                 f"{a.anchor_window} lives, grace {a.anchor_grace} lives, teacher "
                 + (a.anchor_teacher if a.anchor_teacher else f"per-family snapshots (<= {a.anchor_max_teachers})")
+                + (f", only {','.join(sorted(anchor_only))}" if anchor_only else "")
                 + (f"; resumed: {sm['families']} families, {sm['mastered']} mastered, {sm['teachers']} snapshots"
                    if ck is not None and ck.get("anchor") else ""))
     elif ck is not None and ck.get("anchor"):
@@ -1218,6 +1224,8 @@ def main(argv=None) -> int:
         for what, who, detail in anchor.drain_events():
             log.msg(f"anchor: {what} {who} ({detail})")
         anchored = anchor.anchored()
+        if anchor_only:
+            anchored = {k: v for k, v in anchored.items() if k in anchor_only}
         keys = AN.row_families(chunks, anchor_key, past_cp_counts=a.anchor_rows == "life" or a.success == "finish")
         w, groups = AN.row_weights(keys, anchored, anchor.weight, a.anchor_min_rows)
         st = {**anchor.summary(), "batch_families": len(groups), "rows": int(sum(len(g) for g in groups.values())),
