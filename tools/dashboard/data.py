@@ -101,8 +101,19 @@ def _sig(p: Path):
 _CSV_MEMO: dict = {}
 
 
+_HEAD_BYTES = 4096
+
+
+def _head(p: Path, n: int) -> bytes:
+    with open(p, "rb") as f:
+        return f.read(min(n, _HEAD_BYTES))
+
+
 def read_csv(p: Path, usecols=None) -> pd.DataFrame | None:
-    """Tolerant CSV read, memoised on (size, mtime)."""
+    """Tolerant CSV read, memoised on (size, mtime). The training CSVs only grow (the pulls rewrite them with the same
+    beginning and more rows): when a file got longer and still starts with the same bytes, only the rows after the
+    last complete line read before are parsed and appended. A full parse of a large episodes file holds the
+    interpreter for many seconds, and every request of the page server waited behind it."""
     s = _sig(p)
     if s is None:
         return None
@@ -111,13 +122,30 @@ def read_csv(p: Path, usecols=None) -> pd.DataFrame | None:
     if hit and hit[0] == s:
         return hit[1]
     try:
+        if hit and len(hit) > 2 and s[0] > hit[2] and _head(p, hit[2]) == hit[3]:
+            off, cols = hit[2], hit[4]
+            with open(p, "rb") as f:
+                f.seek(off)
+                tail = f.read(s[0] - off)
+            cut = tail.rfind(b"\n") + 1
+            if cut == 0:  # no complete new line yet
+                _CSV_MEMO[key] = (s, *hit[1:])
+                return hit[1]
+            new = pd.read_csv(io.BytesIO(tail[:cut]), header=None, names=cols, usecols=list(hit[1].columns),
+                              on_bad_lines="skip", low_memory=False)
+            d = pd.concat([hit[1], new], ignore_index=True) if len(new) else hit[1]
+            _CSV_MEMO[key] = (s, d, off + cut, hit[3], cols)
+            return d
+        cols = list(pd.read_csv(p, nrows=0).columns)
         if usecols:
-            cols = pd.read_csv(p, nrows=0).columns
             usecols = [c for c in usecols if c in cols]
-        d = pd.read_csv(p, usecols=usecols, on_bad_lines="skip", low_memory=False)
+        with open(p, "rb") as f:
+            raw = f.read(s[0])
+        cut = raw.rfind(b"\n") + 1
+        d = pd.read_csv(io.BytesIO(raw[:cut] if cut else raw), usecols=usecols, on_bad_lines="skip", low_memory=False)
     except Exception:
         return hit[1] if hit else None
-    _CSV_MEMO[key] = (s, d)
+    _CSV_MEMO[key] = (s, d, cut if cut else len(raw), raw[:_HEAD_BYTES], cols)
     return d
 
 
