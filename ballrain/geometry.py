@@ -11,7 +11,18 @@ All functions use float64.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
+
+try:  # the per-step vertical rays (features: height grid, edge fan) run through a compiled kernel when numba is there
+    if os.environ.get("BALLRAIN_NO_NUMBA") or os.environ.get("BALLRAIN_RAY_PY"):
+        raise ImportError("disabled")
+    import numba
+    HAVE_NUMBA = True
+except ImportError:  # pragma: no cover - depends on the environment
+    numba = None
+    HAVE_NUMBA = False
 
 UP_WALKABLE = 0.5  # |n_y| above this: walkable face
 WELD = 1e-3
@@ -157,6 +168,55 @@ class Grid2D:
         return np.where(ok, c[:, 0] * nz + c[:, 1], -1)
 
 
+def _ray_down_grid(P, ox, oz, cell, nx, nz, start, items, A, B, C, eps):
+    """TriangleSet.ray_down over the grid, one point at a time: the same arithmetic as ray_down_pairs (same operation
+    order, float64), and the same choice: the highest hit, among equal heights the last in cell order."""
+    M = P.shape[0]
+    y = np.full(M, np.nan)
+    tri = np.full(M, -1, np.int64)
+    for i in range(M):
+        x = P[i, 0]
+        z = P[i, 2]
+        cx = int(np.floor((x - ox) / cell))
+        cz = int(np.floor((z - oz) / cell))
+        if cx < 0 or cx >= nx or cz < 0 or cz >= nz:
+            continue
+        c = cx * nz + cz
+        best = 0.0
+        bt = -1
+        for j in range(start[c], start[c + 1]):
+            t = items[j]
+            x0 = A[t, 0]
+            z0 = A[t, 2]
+            e1x = B[t, 0] - x0
+            e1z = B[t, 2] - z0
+            e2x = C[t, 0] - x0
+            e2z = C[t, 2] - z0
+            det = e1x * e2z - e2x * e1z
+            if not abs(det) > eps:
+                continue
+            px = x - x0
+            pz = z - z0
+            u = (px * e2z - e2x * pz) / det
+            v = (e1x * pz - px * e1z) / det
+            if not (u >= -1e-9 and v >= -1e-9 and u + v <= 1 + 1e-9):
+                continue
+            hy = A[t, 1] + u * (B[t, 1] - A[t, 1]) + v * (C[t, 1] - A[t, 1])
+            if not (hy <= P[i, 1] + 1e-9):
+                continue
+            if bt < 0 or hy >= best:
+                best = hy
+                bt = t
+        if bt >= 0:
+            y[i] = best
+            tri[i] = bt
+    return y, tri
+
+
+if HAVE_NUMBA:
+    _ray_down_grid = numba.njit(cache=True, nogil=True)(_ray_down_grid)
+
+
 class TriangleSet:
     """World-space triangles with owner entity ids and optional grid."""
 
@@ -223,6 +283,10 @@ class TriangleSet:
         tri = np.full(M, -1, np.int64)
         if len(self.A) == 0 or M == 0:
             return y, tri
+        if HAVE_NUMBA and owner_mask is None and self.grid is not None:
+            g = self.grid
+            return _ray_down_grid(P, float(g.origin[0]), float(g.origin[1]), g.cell, int(g.shape[0]), int(g.shape[1]),
+                                  g.start.astype(np.int64), g.items.astype(np.int64), self.A, self.B, self.C, 1e-9)
         if self.grid is None:
             pi = np.repeat(np.arange(M), len(self.A))
             ti = np.tile(np.arange(len(self.A)), M)
