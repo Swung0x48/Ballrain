@@ -115,6 +115,7 @@ def _run_worker(tmp_path, fake_record, p, start_back, n_chunks=4):
     ctrl_q, data_q = queue.Queue(), queue.Queue()
     w = Worker(spec, ctrl_q, data_q)
     w.model.act = lambda x, gen=None: (3, np.float32(-2.2), np.float32(0.0))  # left: off the road, a death per life
+    w.np_policy = None  # use the stubbed torch-side act
     w.model.value = lambda x: np.float32(0.0)
     n = w.env.observation_space.shape[0]
     ctrl_q.put({"version": 0, "model": {k: v.detach().numpy() for k, v in w.model.state_dict().items()},

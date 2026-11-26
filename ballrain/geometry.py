@@ -154,11 +154,27 @@ class Grid2D:
         return (ix * nz + iz).ravel()
 
     def query_box(self, xz_lo, xz_hi) -> np.ndarray:
+        if HAVE_NUMBA:
+            lo = np.asarray(xz_lo, np.float64)
+            hi = np.asarray(xz_hi, np.float64)
+            return _query_box_grid(float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1]), float(self.origin[0]),
+                                   float(self.origin[1]), self.cell, int(self.shape[0]), int(self.shape[1]),
+                                   self._start64(), self._items64())
         cells = self.cells_of(xz_lo, xz_hi)
         if len(cells) == 0:
             return np.zeros(0, np.int64)
         parts = [self.items[self.start[c]:self.start[c + 1]] for c in cells]
         return np.unique(np.concatenate(parts)) if parts else np.zeros(0, np.int64)
+
+    def _start64(self):
+        if getattr(self, "_s64", None) is None:
+            self._s64 = np.ascontiguousarray(self.start, np.int64)
+        return self._s64
+
+    def _items64(self):
+        if getattr(self, "_i64", None) is None:
+            self._i64 = np.ascontiguousarray(self.items, np.int64)
+        return self._i64
 
     def point_cells(self, xz) -> np.ndarray:
         """Cell id per point, -1 outside the grid."""
@@ -166,6 +182,38 @@ class Grid2D:
         nx, nz = self.shape
         ok = (c[:, 0] >= 0) & (c[:, 0] < nx) & (c[:, 1] >= 0) & (c[:, 1] < nz)
         return np.where(ok, c[:, 0] * nz + c[:, 1], -1)
+
+
+def _query_box_grid(lx, lz, hx, hz, ox, oz, cell, nx, nz, start, items):
+    """Grid2D.query_box: the sorted distinct items of the cells overlapping [lo, hi] (same cell arithmetic)."""
+    c0x = max(int(np.floor((lx - ox) / cell)), 0)
+    c0z = max(int(np.floor((lz - oz) / cell)), 0)
+    c1x = min(int(np.floor((hx - ox) / cell)), nx - 1)
+    c1z = min(int(np.floor((hz - oz) / cell)), nz - 1)
+    if c1x < c0x or c1z < c0z:
+        return np.zeros(0, np.int64)
+    n = 0
+    for ix in range(c0x, c1x + 1):
+        for iz in range(c0z, c1z + 1):
+            c = ix * nz + iz
+            n += start[c + 1] - start[c]
+    if n == 0:
+        return np.zeros(0, np.int64)
+    out = np.empty(n, np.int64)
+    k = 0
+    for ix in range(c0x, c1x + 1):
+        for iz in range(c0z, c1z + 1):
+            c = ix * nz + iz
+            for j in range(start[c], start[c + 1]):
+                out[k] = items[j]
+                k += 1
+    out.sort()
+    m = 1
+    for j in range(1, n):
+        if out[j] != out[m - 1]:
+            out[m] = out[j]
+            m += 1
+    return out[:m].copy()
 
 
 def _ray_down_grid(P, ox, oz, cell, nx, nz, start, items, A, B, C, eps):
@@ -215,6 +263,7 @@ def _ray_down_grid(P, ox, oz, cell, nx, nz, start, items, A, B, C, eps):
 
 if HAVE_NUMBA:
     _ray_down_grid = numba.njit(cache=True, nogil=True)(_ray_down_grid)
+    _query_box_grid = numba.njit(cache=True, nogil=True)(_query_box_grid)
 
 
 class TriangleSet:

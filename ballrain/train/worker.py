@@ -366,6 +366,11 @@ class Worker:
         self.model = ActorCritic(self.env.observation_space.shape[0], self.env.action_space.n, spec.hidden,
                                  spec.activation, spec.actor_heads)
         self.model.eval()
+        # the per-step policy in numpy (ppo.NumpyPolicy; BALLRAIN_TORCH_POLICY=1 keeps torch), refreshed with the weights
+        import os as _os
+        from .ppo import NumpyPolicy
+        self.np_policy = None if _os.environ.get("BALLRAIN_TORCH_POLICY") else NumpyPolicy(self.model)
+        self._act_rng = np.random.default_rng(spec.seed + 7919)
         self.version = -1
         self.rms = None
         self.stop = False
@@ -660,6 +665,8 @@ class Worker:
             return
         if "model" in msg:
             self.model.load_state_dict({k: self.torch.as_tensor(v) for k, v in msg["model"].items()})
+            if self.np_policy is not None:
+                self.np_policy.refresh(self.model)
             self.version = int(msg["version"])
         if "rms" in msg:
             self.rms = msg["rms"]
@@ -742,7 +749,10 @@ class Worker:
             t = 0
             while t < T:
                 x = normalize(obs, self.rms)
-                a, logp, v = self.model.act(x, gen=self.gen)
+                if self.np_policy is not None:
+                    a, logp, v = self.np_policy.act(x, self._act_rng)
+                else:
+                    a, logp, v = self.model.act(x, gen=self.gen)
                 a = int(a)
                 f0 = self.env.session.frames_done if self.env.session is not None else 0
                 s_before = self.env.reward.s
@@ -834,7 +844,7 @@ class Worker:
                 buf["rewards"][t], buf["terminated"][t] = r, term
                 buf["truncated"][t] = trunc and not term
                 if trunc and not term:
-                    buf["trunc_values"][t] = self.model.value(normalize(obs2, self.rms))
+                    buf["trunc_values"][t] = (self.np_policy or self.model).value(normalize(obs2, self.rms))
                 t += 1
                 if term or trunc:
                     skip = self._skip_respawn(end, info2)
@@ -848,7 +858,7 @@ class Worker:
                     self._split_start(ep, info)
                 else:
                     obs, info = obs2, info2
-            buf["last_value"] = self.model.value(normalize(obs, self.rms))
+            buf["last_value"] = (self.np_policy or self.model).value(normalize(obs, self.rms))
             buf.update(wid=sp.wid, copy=sp.copy, version=version, episodes=episodes, runs=self.pending_runs,
                        backend=getattr(sp.env, "backend", "retail"),
                        errors=self.errors, t_chunk=time.perf_counter() - t0, t_reset=t_reset, frames=frames)

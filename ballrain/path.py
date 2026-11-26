@@ -259,8 +259,9 @@ class ReferencePath:
         return glob
 
     def point_at(self, s: float) -> np.ndarray:
-        s = float(np.clip(s, 0, self.length))
-        i = int(np.clip(np.searchsorted(self.cum, s, side="right") - 1, 0, len(self.seg) - 1))
+        s = float(s)
+        s = 0.0 if s < 0 else (float(self.length) if s > self.length else s)  # np.clip without the call (nan stays nan)
+        i = min(max(int(np.searchsorted(self.cum, s, side="right")) - 1, 0), len(self.seg) - 1)
         t = (s - self.cum[i]) / self.seg_len[i] if self.seg_len[i] > 0 else 0.0
         return self.P[i] + self.seg[i] * t
 

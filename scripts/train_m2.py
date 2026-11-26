@@ -751,7 +751,21 @@ def main(argv=None) -> int:
                 raise SystemExit(f"Player.exe already running in {n}")
 
     ctx = mp.get_context("spawn")
-    data_q = ctx.Queue()
+    data_q = ctx.Queue()  # local worker processes -> learner
+    # The main loop reads in_q only: the local workers' chunks are moved over from data_q by a thread, and the remote
+    # hub puts its chunks straight into in_q (before 2026-11-26 the hub put them into data_q, which pickled each
+    # received chunk again in the feeder thread and unpickled it once more in the main loop).
+    in_q: queue.Queue = queue.Queue()
+
+    def _forward_local():
+        while True:
+            try:
+                in_q.put(data_q.get())
+            except (EOFError, OSError, ValueError):
+                return
+
+    import threading as _threading
+    _threading.Thread(target=_forward_local, daemon=True, name="local-forward").start()
     ctrl_qs, procs, specs = [], [], []
 
     def spec_for(i, restart=0):
@@ -841,7 +855,7 @@ def main(argv=None) -> int:
             # the same raw bytes the checkpoint holds ({level, line_npz, desc_json, drive_npz, sha256}); the pool's
             # learner link carries them into the exported policy state
             template["branch_assets"] = env_cfg.branch_assets
-        hub = RemoteHub(parse_addr(a.remote_listen), key, data_q, template, log=log.msg)
+        hub = RemoteHub(parse_addr(a.remote_listen), key, in_q, template, log=log.msg)
         log.msg(f"remote hub listening on {a.remote_listen} (remote backend {a.remote_backend})")
     for i in range(a.workers):
         s, q, p = start_worker(i)
@@ -1277,16 +1291,21 @@ def main(argv=None) -> int:
         log.msg(f"stack sampler: {a.profile_sample} s, every 10 ms, -> profile.json")
     try:
         first = ck is None and a.init_from is None
+        drop_hist: dict = {}  # "local|remote:lag" -> dropped chunks since the last log line
+        wait_hist: list = []  # seconds blocked waiting for data per batch, since the last log line
         while counters["steps"] < a.total_steps and not stop:
             chunks = []
             n = 0
             tc = time.perf_counter()
+            t_wait = 0.0  # time blocked in data_q.get this batch (data arriving slower than the learner takes it)
             while n < a.batch_steps:
                 if (run_dir / "STOP").is_file():
                     stop = True
                     break
                 try:
-                    m = data_q.get(timeout=30)
+                    tw0 = time.perf_counter()
+                    m = in_q.get(timeout=30)
+                    t_wait += time.perf_counter() - tw0
                 except queue.Empty:
                     dead = [i for i, p in enumerate(procs) if not p.is_alive()]
                     if dead:
@@ -1349,6 +1368,9 @@ def main(argv=None) -> int:
                     counters["dropped_chunks"] += 1
                     continue
                 if counters["update"] - m["version"] > (a.max_stale_remote if m.get("remote") else a.max_stale):
+                    # by source and lag (versions behind), for the log line: are drops a backlog or late arrivals?
+                    dk = f"{'remote' if m.get('remote') else 'local'}:{min(counters['update'] - m['version'], 9)}"
+                    drop_hist[dk] = drop_hist.get(dk, 0) + 1
                     counters["dropped_chunks"] += 1
                     counters[f"dropped_{be}"] = counters.get(f"dropped_{be}", 0) + 1
                     counters[f"dropped_steps_{be}"] = counters.get(f"dropped_steps_{be}", 0) + len(m["rewards"])
@@ -1358,6 +1380,7 @@ def main(argv=None) -> int:
             if stop or not chunks:
                 break
             collect_times.append(time.perf_counter() - tc)
+            wait_hist.append(t_wait)
             raw = np.concatenate([c["raw"] for c in chunks])
             # Non-finite guard (ballrain.train.nonfinite): a batch with a non-finite value, or an update whose loss /
             # gradient turns non-finite, is skipped: model, optimiser and observation statistics stay as before it. It
@@ -1601,7 +1624,13 @@ def main(argv=None) -> int:
                         + (f" demo_acc {ustats['demo_acc']:.2f}" if "demo_acc" in ustats else "")
                         + (f" sil {last_sil.get('sil_size', 0)} +{last_sil.get('sil_added', 0)} w {last_sil.get('sil_w', float('nan')):.2f}"
                            if sil is not None and last_sil else "")
+                        + (f" wait {np.mean(wait_hist):.2f}s" if wait_hist else "")
+                        + (" drops " + ",".join(f"{k}={v}" for k, v in sorted(drop_hist.items())) if drop_hist else "")
                         + (f" nonfinite_skipped {row['nonfinite_skipped']}" if row["nonfinite_skipped"] else ""))
+                if wait_hist:
+                    log.tb.add_scalar("train/collect_wait_s", float(np.mean(wait_hist)), counters["steps"])
+                drop_hist.clear()
+                wait_hist.clear()
                 log.flush()
                 win_eps, win_runs = [], []
             if u % a.ckpt_every == 0:
@@ -1624,7 +1653,7 @@ def main(argv=None) -> int:
         closed = set()
         while time.time() < deadline and len(closed) < len(procs):
             try:
-                m = data_q.get(timeout=5)
+                m = in_q.get(timeout=5)
             except queue.Empty:
                 if all(not p.is_alive() for p in procs):
                     break

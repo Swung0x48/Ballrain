@@ -93,6 +93,7 @@ def test_worker_truncates_at_the_gate_and_bootstraps(tmp_path, fake_record):
     ctrl_q, data_q = queue.Queue(), queue.Queue()
     w = Worker(spec, ctrl_q, data_q)
     w.model.act = lambda x, gen=None: (1, np.float32(-2.2), np.float32(0.0))  # up: along the fake road
+    w.np_policy = None  # use the stubbed torch-side act
     w.model.value = lambda x: np.float32(0.75)
     n = w.env.observation_space.shape[0]
     ctrl_q.put({"version": 0, "model": {k: v.detach().numpy() for k, v in w.model.state_dict().items()},
@@ -131,6 +132,7 @@ def test_worker_band_starts_play_through_rehearsal_starts_gated(tmp_path, fake_r
     ctrl_q, data_q = queue.Queue(), queue.Queue()
     w = Worker(spec, ctrl_q, data_q)
     w.model.act = lambda x, gen=None: (1, np.float32(-2.2), np.float32(0.0))
+    w.np_policy = None  # use the stubbed torch-side act
     w.model.value = lambda x: np.float32(0.5)
     n = w.env.observation_space.shape[0]
     ctrl_q.put({"version": 0, "model": {k: v.detach().numpy() for k, v in w.model.state_dict().items()},

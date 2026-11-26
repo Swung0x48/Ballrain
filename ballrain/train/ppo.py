@@ -121,6 +121,59 @@ class ActorCritic(nn.Module):
         return float(self.v(torch.as_tensor(x, dtype=torch.float32)[None]).squeeze())
 
 
+class NumpyPolicy:
+    """The worker's per-step policy without torch (2026-11-26): ActorCritic's forward for one observation in numpy
+    float32 (torch's per-call overhead was ~0.4 ms of a ~3.3 ms worker step for a 330 -> 256 -> 256 network).
+    Same layers, same head choice (ball_type: the head of the largest of columns 1:4 when it is positive, else 0;
+    ties to the first, like torch.max), sampling from the softmax with the worker's numpy generator. Not bit-identical
+    to torch (float32 summation order), so the logp it reports differs from the learner's by ~1e-7 at most."""
+
+    def __init__(self, model: ActorCritic):
+        self.heads_mode = model.actor_heads
+        self.refresh(model)
+
+    def refresh(self, model: ActorCritic):
+        def lin(m):
+            return (m.weight.detach().cpu().numpy().astype(np.float32).T.copy(),
+                    m.bias.detach().cpu().numpy().astype(np.float32))
+        self.tanh = isinstance(model.pi[1], nn.Tanh)
+        self.pi_hidden = [lin(m) for m in model.pi[:-1] if isinstance(m, nn.Linear)]
+        self.pi_heads = [lin(model.pi[-1])] + ([lin(h) for h in model.extra_heads] if self.heads_mode == "ball_type" else [])
+        self.v_hidden = [lin(m) for m in model.v[:-1] if isinstance(m, nn.Linear)]
+        self.v_out = lin(model.v[-1])
+
+    def _hidden(self, x, layers):
+        for W, b in layers:
+            x = x @ W + b
+            x = np.tanh(x) if self.tanh else np.maximum(x, 0)
+        return x
+
+    def logits(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, np.float32)
+        k = 0
+        if self.heads_mode == "ball_type":
+            k = int(np.argmax(x[1:4]))
+            if not x[1 + k] > 0:
+                k = 0
+        W, b = self.pi_heads[k]
+        return self._hidden(x, self.pi_hidden) @ W + b
+
+    def value(self, x: np.ndarray) -> float:
+        W, b = self.v_out
+        return float((self._hidden(np.asarray(x, np.float32), self.v_hidden) @ W + b)[0])
+
+    def act(self, x: np.ndarray, rng: np.random.Generator):
+        """One observation (normalised): (action, logp, value) like ActorCritic.act at temperature 1."""
+        z = self.logits(x).astype(np.float64)
+        z -= z.max()
+        lse = np.log(np.exp(z).sum())
+        logp_all = z - lse
+        p = np.exp(logp_all)
+        a = int(np.searchsorted(np.cumsum(p), rng.random() * p.sum(), side="right"))
+        a = min(a, len(p) - 1)
+        return a, np.float32(logp_all[a]), np.float32(self.value(x))
+
+
 def gae(chunk: dict, gamma: float, lam: float, reward_scale: float = 1.0):
     """Advantages and returns of one chunk (arrays of length T)."""
     r = chunk["rewards"].astype(np.float64) * reward_scale

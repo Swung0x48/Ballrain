@@ -183,6 +183,7 @@ def test_reward_and_flag_parity_with_the_learner_worker(pool, kind):
     w = Worker(spec, ctrl_q, DataQ())
     it = iter(seq)
     w.model.act = lambda x, gen=None: (next(it), 0.0, 0.0)
+    w.np_policy = None  # use the stubbed torch-side act
     ctrl_q.put({"rms": {"mean": np.zeros(pool["n_obs"]), "var": np.ones(pool["n_obs"])}})
     w.run()
     buf = out[0]

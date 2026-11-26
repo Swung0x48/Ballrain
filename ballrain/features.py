@@ -315,6 +315,9 @@ def yaw_basis(matrix43) -> tuple[np.ndarray, np.ndarray]:
 
 def to_frame(v, right, fwd) -> np.ndarray:
     v = np.asarray(v, np.float64)
+    if v.shape == (3,):  # the common single vector: the same float64 operations without np.stack's overhead
+        v0, v1, v2 = v[0], v[1], v[2]
+        return np.array([v0 * right[0] + v2 * right[2], v1, v0 * fwd[0] + v2 * fwd[2]])
     return np.stack([v[..., 0] * right[0] + v[..., 2] * right[2], v[..., 1],
                      v[..., 0] * fwd[0] + v[..., 2] * fwd[2]], -1)
 

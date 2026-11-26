@@ -9,6 +9,7 @@ drive target, once with this checkout and once with the merge base with main (a 
 every chunk (observations, actions, log-probs, values, rewards, flags, bootstrap values, frames) and every episode
 record to be identical. A second check draws 20000 starts with both versions of the start draw."""
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -50,7 +51,9 @@ def record(tmp_path_factory):
 
 def _run(root: Path, record: Path, out: Path, n: int) -> dict:
     p = subprocess.run([sys.executable, str(REPO / "tests" / "worker_identity_run.py"), str(root), str(record), str(out),
-                        str(n)], capture_output=True, text=True, encoding="utf-8", timeout=900, cwd=str(root))
+                        str(n)], capture_output=True, text=True, encoding="utf-8", timeout=900, cwd=str(root),
+                       # the torch policy on both sides: the numpy one (ppo.NumpyPolicy) samples from another generator
+                       env={**os.environ, "BALLRAIN_TORCH_POLICY": "1"})
     assert p.returncode == 0, p.stderr[-3000:]
     return json.loads(p.stdout.strip().splitlines()[-1])
 

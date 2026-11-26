@@ -25,3 +25,21 @@ def test_compiled_rays_match_numpy_exactly():
     assert np.array_equal(fast[0], slow[0], equal_nan=True)
     assert np.array_equal(fast[1], slow[1])
     assert (~np.isnan(slow[0])).sum() > 1000
+
+
+def test_compiled_query_box_matches_numpy_exactly():
+    rng = np.random.default_rng(3)
+    lo = rng.uniform(-60, 60, (2000, 3))
+    hi = lo + rng.uniform(0, 8, (2000, 3))
+    g = G.Grid2D(lo, hi, 4.0)
+    keep = G.HAVE_NUMBA
+    try:
+        for _ in range(500):
+            c, w = rng.uniform(-80, 80, 2), rng.uniform(0, 15, 2)
+            fast = g.query_box(c, c + w)
+            G.HAVE_NUMBA = False
+            slow = g.query_box(c, c + w)
+            G.HAVE_NUMBA = keep
+            assert np.array_equal(fast, slow) and fast.dtype == slow.dtype
+    finally:
+        G.HAVE_NUMBA = keep
