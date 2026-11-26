@@ -405,6 +405,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--anchor-only", default="",
                    help="comma-separated family keys (e.g. rehearse:4000-4450): only these families are anchored when "
                         "mastered; the others are still counted (anchor.csv) but never pulled. Empty: every family")
+    p.add_argument("--anchor-max-s", default="",
+                   help='per-family row cutoff, e.g. "rehearse:936-1000=300,rehearse:2000-3500=300": rows of that family '
+                        "whose route s (path_progress x line length) is above the value are not anchored (weight 0), so a "
+                        "family protects only the stretch before it. Empty: every row (unchanged)")
     p.add_argument("--anchor-ratchet", action="store_true",
                    help="automatic teachers: a family whose last --anchor-window lives were all played by policies newer "
                         "than its snapshot, at >= the rate it had then, moves to a newer snapshot (follows improvements)")
@@ -1159,6 +1163,16 @@ def main(argv=None) -> int:
             return AN.family_key(tag, band_frames=band_frames, base_frame=base_frame, kinds=kinds)
 
         anchor_only = {k.strip() for k in a.anchor_only.split(",") if k.strip()}
+        anchor_max_s = AN.parse_max_s(a.anchor_max_s)
+        anchor_s_col = anchor_s_len = None
+        if anchor_max_s:
+            from ballrain.path import ReferencePath, asset_path, resolve_path_dir
+            sl_pp = obs_layout(env_cfg.features)[1].get("path_progress")
+            asset = asset_path(env_cfg.level, resolve_path_dir(env_cfg.features.path_dir)) if env_cfg.features.path_dir else None
+            if sl_pp is None or asset is None or not asset.is_file():
+                raise SystemExit("--anchor-max-s needs the path_progress feature and a reference line asset (--path-dir)")
+            anchor_s_col, anchor_s_len = sl_pp.start, ReferencePath.load(asset).length
+            log.msg(f"anchor row cutoff (route s): {anchor_max_s} (line length {anchor_s_len:.1f})")
 
         anchor = AN.MasteredAnchor(window=a.anchor_window, min_lives=a.anchor_min_lives, threshold=a.anchor_threshold,
                                    grace=a.anchor_grace, drop_scale=a.anchor_drop_scale,
@@ -1229,6 +1243,8 @@ def main(argv=None) -> int:
         if anchor_only:
             anchored = {k: v for k, v in anchored.items() if k in anchor_only}
         keys = AN.row_families(chunks, anchor_key, past_cp_counts=a.anchor_rows == "life" or a.success == "finish")
+        if anchor_max_s:
+            keys = AN.cut_rows_by_s(keys, raw[:, anchor_s_col] * anchor_s_len, anchor_max_s)
         w, groups = AN.row_weights(keys, anchored, anchor.weight, a.anchor_min_rows)
         st = {**anchor.summary(), "batch_families": len(groups), "rows": int(sum(len(g) for g in groups.values())),
               "tagged_rows": sum(k is not None for k in keys)}

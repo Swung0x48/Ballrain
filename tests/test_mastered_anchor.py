@@ -353,6 +353,26 @@ def test_row_families_maps_rows_and_excludes_untagged():
     assert keys[2] == "rest:13900-13900"
 
 
+def test_anchor_max_s_cuts_only_the_listed_families_above_their_s():
+    assert AN.parse_max_s("") == {}
+    cut = AN.parse_max_s("rehearse:936-1000=300, rehearse:2000-3500=250.5")
+    assert cut == {"rehearse:936-1000": 300.0, "rehearse:2000-3500": 250.5}
+    with pytest.raises(ValueError):
+        AN.parse_max_s("rehearse:936-1000")
+    keys = ["rehearse:936-1000", "rehearse:936-1000", "rehearse:2000-3500", "rehearse:4450-4950", None, "rehearse:936-1000"]
+    s = [120.0, 300.5, 260.0, 900.0, 50.0, 300.0]
+    out = AN.cut_rows_by_s(keys, s, cut)
+    assert out == ["rehearse:936-1000", None, None, "rehearse:4450-4950", None, "rehearse:936-1000"]  # s == cutoff kept
+    anchored = {k: 0 for k in ("rehearse:936-1000", "rehearse:2000-3500", "rehearse:4450-4950")}
+    w_off, _ = AN.row_weights(keys, anchored, min_rows=1)
+    w_cut, g = AN.row_weights(out, anchored, min_rows=1)
+    assert w_cut[1] == 0 and w_cut[2] == 0 and w_cut[0] > 0 and w_cut[3] > 0
+    assert set(g) == {"rehearse:936-1000", "rehearse:4450-4950"}
+    # off (no cutoff) = the same keys and the same weights as before
+    assert AN.cut_rows_by_s(keys, s, {}) == keys
+    np.testing.assert_array_equal(AN.row_weights(AN.cut_rows_by_s(keys, s, {}), anchored, min_rows=1)[0], w_off)
+
+
 def test_worker_tags_rows_with_their_life():
     from ballrain.train.worker import Worker
     w = object.__new__(Worker)

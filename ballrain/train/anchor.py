@@ -121,6 +121,28 @@ def row_families(chunks, key_of, past_cp_counts: bool = False) -> list:
     return out
 
 
+def parse_max_s(spec: str) -> dict:
+    """--anchor-max-s "rehearse:936-1000=300,rehearse:2000-3500=300" -> {family key: route arc s}."""
+    out = {}
+    for part in (spec or "").split(","):
+        if not part.strip():
+            continue
+        k, sep, v = part.rpartition("=")
+        if not sep or not k.strip():
+            raise ValueError(f"--anchor-max-s {part!r}: expected FAMILY=S")
+        out[k.strip()] = float(v)
+    return out
+
+
+def cut_rows_by_s(row_keys, s, max_s: dict) -> list:
+    """Row keys with None for rows of a family in max_s whose route arc s is above that family's cutoff (those rows
+    get anchor weight 0); other families and rows unchanged. s: per-row route arc s (same order as row_keys)."""
+    if not max_s:
+        return list(row_keys)
+    s = np.asarray(s, np.float64)
+    return [None if (k is not None and k in max_s and s[i] > max_s[k]) else k for i, k in enumerate(row_keys)]
+
+
 # ------------------------------------------------------------------------------------------------ mastery state
 
 class _Family:
