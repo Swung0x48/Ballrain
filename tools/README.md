@@ -51,3 +51,12 @@ are only ever started in `runtime/<copy>/Bin` through `ballrain.instances`.
   rotation-free radius; `fan_val.py <tag>` is the before/after validation (TAS doomed flags, the L2 pit,
   traced deaths and false alarms at the fans, vertical motion, latency; `FR_SRC` picks the code, `FR_EPISODES`
   freezes the episode set).
+
+## merge/
+
+Policy merge by distillation (`docs/policy-merge.md`): several checkpoints that each master a different part of a
+level are distilled into one actor, the teacher of a state chosen by its sector (or, for a capacity test, by the data
+file). `collect.py` plays a checkpoint or a composite of teachers on the headless engine from weighted record
+hand-overs and saves the raw observations (also a play test: lives that reached their next checkpoint, sectors left
+with every ball); `distill.py` fits the student (from a checkpoint's weights, or fresh at a given width) and writes a
+checkpoint `train_m2 --resume` and `scripts/eval_m2.py` read. `models/L01-r10-m2` was made this way.
