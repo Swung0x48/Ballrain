@@ -1,21 +1,36 @@
-"""Log timestamps that carry their own UTC offset ("2026-11-26 22:37:31+08:00"), so a reader on another machine
-gets the exact instant without guessing the writer's time zone. Older logs have no offset ("2026-11-26 22:37:31");
-parse() returns a naive datetime for those and the reader has to supply the writer's clock offset itself."""
+"""Log timestamps as Unix seconds ("1795705562.123"): an instant, independent of the writer's time zone. Only a
+display converts it to local time (the dashboard page does that in the viewer's browser).
+
+Older logs begin with the writer's local time ("2026-11-26 22:37:31", no zone) or, briefly on 2026-11-26, local time
+with its UTC offset ("2026-11-26 22:37:31+08:00"); to_epoch() reads all three, the first only with the writer's clock
+offset supplied by the reader."""
 from __future__ import annotations
 
 import datetime as dt
 import re
+import time
 
-TS_PATTERN = r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:[+-]\d\d:\d\d)?"
-
-
-def stamp(now: dt.datetime | None = None) -> str:
-    """The current local time with its UTC offset, to the second: "YYYY-MM-DD HH:MM:SS+hh:mm"."""
-    return (now or dt.datetime.now().astimezone()).isoformat(sep=" ", timespec="seconds")
+TS_PATTERN = r"\d{9,11}(?:\.\d+)?|\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:[+-]\d\d:\d\d)?"
+_EPOCH = re.compile(r"\d{9,11}(?:\.\d+)?")
 
 
-def parse(ts: str) -> dt.datetime:
-    """A stamp() string -> aware datetime; an old offset-free string -> naive datetime (writer's local time)."""
+def stamp(t: float | None = None) -> str:
+    """Unix seconds with milliseconds: "1795705562.123"."""
+    return f"{time.time() if t is None else t:.3f}"
+
+
+def is_epoch(ts: str) -> bool:
+    return bool(_EPOCH.fullmatch(ts))
+
+
+def to_epoch(ts: str, naive_utc_offset_h: float | None = None) -> float | None:
+    """Unix seconds of a log timestamp: an epoch stamp as is; a stamp with its UTC offset exactly; an old offset-free
+    local stamp with the writer's UTC offset in hours (None = unknown: returns None)."""
+    if is_epoch(ts):
+        return float(ts)
     if re.fullmatch(r".*[+-]\d\d:\d\d", ts):
-        return dt.datetime.fromisoformat(ts)
-    return dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        return dt.datetime.fromisoformat(ts).timestamp()
+    if naive_utc_offset_h is None:
+        return None
+    t = dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    return t.replace(tzinfo=dt.timezone(dt.timedelta(hours=naive_utc_offset_h))).timestamp()

@@ -72,8 +72,8 @@ def machine_of(backend, host, sources: dict) -> str:
         return sources["retail"]
     return "其他"
 
-# log lines begin with the writer's local time; since 2026-11-26 with its UTC offset (ballrain.clock.stamp)
-LOG_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:[+-]\d\d:\d\d)?) (.*)$")
+# log lines begin with Unix seconds (ballrain.clock.stamp, since 2026-11-26); older ones with the writer's local time
+LOG_RE = re.compile(r"^(\d{9,11}(?:\.\d+)?|\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:[+-]\d\d:\d\d)?) (.*)$")
 UPD_RE = re.compile(r"u(\d+) steps (\d+) sps (\d+) frontier (\d+) band ([\d.]+)/(\d+).*? ent ([\d.]+) kl ([\d.]+)")
 FRONTIER_RE = re.compile(r"curriculum: frontier (?:->|set \d+ ->) (\d+)")
 CURR_OK_RE = re.compile(r"^curriculum: frontier (?:->|set \d+ ->) \d+(?: \(sector \d+\))?(?: after rate [\d.]+)?"
@@ -379,28 +379,41 @@ def n_actions(c: dict) -> int:
 # ---------------------------------------------------------------------------------- clocks
 
 def mac_offset_hours(runs) -> float:
-    """Mac log wall clock minus PC local clock, rounded to 30 min (log strings are Mac local time).
+    """Mac log wall clock minus PC local clock, rounded to 30 min, for the old offset-free Mac log stamps (since
+    2026-11-26 log lines begin with Unix seconds, which need no offset).
 
-    First from the learner's train.log (written only on the Mac): its last line's clock against the mirrored file's
-    modification time. Only then from traced lives, whose file names carry the clock of the machine that played them:
-    runner lives copied into the mirror (2026-11-26) carry the runner's clock, so the newest file can be one of
-    those and give 0 (the page then showed Mac times 12 h off)."""
+    From the learner's train.log (written only on the Mac): where an old local stamp is followed by an epoch stamp
+    (the run restarted with the new code), the pair; else the last old stamp against the mirrored file's modification
+    time. Only then from traced lives, whose file names carry the clock of the machine that played them (runner lives
+    copied into the mirror carry the runner's clock and are skipped)."""
     for r in reversed(mac_runs(runs)):
         lp = r.path / "train.log"
         s = _sig(lp)
-        if s:
-            last = None
-            for line in log_lines(r)[-50:]:
-                m = LOG_RE.match(line)
-                if m:
-                    last = m.group(1)
-            if last:
-                mac = parse_log_ts(last)
-                if mac.tzinfo is not None:  # the stamp carries the Mac's offset: exact, no file times involved
-                    pc_off = dt.datetime.now().astimezone().utcoffset() or dt.timedelta(0)
-                    return round((mac.utcoffset() - pc_off).total_seconds() / 1800) * 0.5
-                pc = dt.datetime.fromtimestamp(s[1] / 1e9)
-                return round((mac - pc).total_seconds() / 1800) * 0.5
+        if not s:
+            continue
+        lines = log_lines(r)
+        prev = None
+        for line in lines:
+            m = LOG_RE.match(line)
+            if not m:
+                continue
+            ts = m.group(1)
+            if clock_is_epoch(ts):
+                if prev is not None:
+                    mac = dt.datetime.strptime(prev, "%Y-%m-%d %H:%M:%S")
+                    pc = dt.datetime.fromtimestamp(float(ts))
+                    return round((mac - pc).total_seconds() / 1800) * 0.5
+            elif not re.fullmatch(r".*[+-]\d\d:\d\d", ts):
+                prev = ts
+        last = None
+        for line in lines[-50:]:
+            m = LOG_RE.match(line)
+            if m:
+                last = m.group(1)
+        if last and not clock_is_epoch(last) and not re.fullmatch(r".*[+-]\d\d:\d\d", last):
+            mac = dt.datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+            pc = dt.datetime.fromtimestamp(s[1] / 1e9)
+            return round((mac - pc).total_seconds() / 1800) * 0.5
     for r in reversed(mac_runs(runs)):
         for j in reversed(r.files("episodes-traced/*/*/*.json")[-20:]):
             m = re.search(r"-(\d{8}-\d{6})-", Path(j).name)
@@ -434,16 +447,23 @@ def log_lines(run: Run) -> list[str]:
     return lines
 
 
+def clock_is_epoch(ts: str) -> bool:
+    return bool(re.fullmatch(r"\d{9,11}(?:\.\d+)?", ts))
+
+
 def parse_log_ts(ts: str) -> dt.datetime:
-    """A log time: aware when it carries its UTC offset (exact), else naive (the writer's local clock)."""
+    """A log time: aware for Unix seconds (since 2026-11-26) or a stamp with its UTC offset, else naive (the writer's
+    local clock, older logs)."""
+    if clock_is_epoch(ts):
+        return dt.datetime.fromtimestamp(float(ts), dt.timezone.utc)
     if re.fullmatch(r".*[+-]\d\d:\d\d", ts):
         return dt.datetime.fromisoformat(ts)
     return dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
 
 
 def to_pc(ts: str, run: Run, off_h: float) -> dt.datetime:
-    """A log time as naive PC-local time: exact for a stamp with its UTC offset; an old offset-free Mac stamp is
-    shifted by the measured Mac clock offset off_h."""
+    """A log time as naive PC-local time: exact for Unix seconds or a stamp with its UTC offset; an old offset-free
+    Mac stamp is shifted by the measured Mac clock offset off_h."""
     t = parse_log_ts(ts)
     if t.tzinfo is not None:
         return t.astimezone().replace(tzinfo=None)
