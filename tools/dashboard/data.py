@@ -72,7 +72,8 @@ def machine_of(backend, host, sources: dict) -> str:
         return sources["retail"]
     return "其他"
 
-LOG_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)$")
+# log lines begin with the writer's local time; since 2026-11-26 with its UTC offset (ballrain.clock.stamp)
+LOG_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d(?:[+-]\d\d:\d\d)?) (.*)$")
 UPD_RE = re.compile(r"u(\d+) steps (\d+) sps (\d+) frontier (\d+) band ([\d.]+)/(\d+).*? ent ([\d.]+) kl ([\d.]+)")
 FRONTIER_RE = re.compile(r"curriculum: frontier (?:->|set \d+ ->) (\d+)")
 CURR_OK_RE = re.compile(r"^curriculum: frontier (?:->|set \d+ ->) \d+(?: \(sector \d+\))?(?: after rate [\d.]+)?"
@@ -394,7 +395,10 @@ def mac_offset_hours(runs) -> float:
                 if m:
                     last = m.group(1)
             if last:
-                mac = dt.datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+                mac = parse_log_ts(last)
+                if mac.tzinfo is not None:  # the stamp carries the Mac's offset: exact, no file times involved
+                    pc_off = dt.datetime.now().astimezone().utcoffset() or dt.timedelta(0)
+                    return round((mac.utcoffset() - pc_off).total_seconds() / 1800) * 0.5
                 pc = dt.datetime.fromtimestamp(s[1] / 1e9)
                 return round((mac - pc).total_seconds() / 1800) * 0.5
     for r in reversed(mac_runs(runs)):
@@ -430,8 +434,19 @@ def log_lines(run: Run) -> list[str]:
     return lines
 
 
+def parse_log_ts(ts: str) -> dt.datetime:
+    """A log time: aware when it carries its UTC offset (exact), else naive (the writer's local clock)."""
+    if re.fullmatch(r".*[+-]\d\d:\d\d", ts):
+        return dt.datetime.fromisoformat(ts)
+    return dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+
+
 def to_pc(ts: str, run: Run, off_h: float) -> dt.datetime:
-    t = dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    """A log time as naive PC-local time: exact for a stamp with its UTC offset; an old offset-free Mac stamp is
+    shifted by the measured Mac clock offset off_h."""
+    t = parse_log_ts(ts)
+    if t.tzinfo is not None:
+        return t.astimezone().replace(tzinfo=None)
     return t - dt.timedelta(hours=off_h) if run.remote else t
 
 

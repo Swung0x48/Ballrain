@@ -28,6 +28,8 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts"))
 
+from ballrain import clock  # noqa: E402
+
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -50,7 +52,7 @@ def main(argv=None) -> int:
     retail = (rest[rest.index("--backend") + 1] if "--backend" in rest else "retail") == "retail"
 
     def log(msg):
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+        line = f"{clock.stamp()} {msg}"
         print(line, flush=True)
         logf.write(line + "\n")
         logf.flush()

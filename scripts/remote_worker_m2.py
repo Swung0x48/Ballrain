@@ -26,6 +26,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts"))
 
+from ballrain import clock  # noqa: E402
 
 LOCAL_OVERRIDE_FIELDS = ("skip_respawn_from_sector",)
 
@@ -101,7 +102,7 @@ def main(argv=None) -> int:
     logf = open(out / "remote.log", "a", encoding="utf-8")
 
     def log(s):
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {s}"
+        line = f"{clock.stamp()} {s}"
         print(line, flush=True)
         logf.write(line + "\n")
         logf.flush()

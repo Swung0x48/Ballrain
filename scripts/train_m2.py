@@ -38,6 +38,8 @@ sys.path.insert(0, str(REPO))
 
 import numpy as np  # noqa: E402
 
+from ballrain import clock  # noqa: E402
+
 RECORD = "SR01_1_14_457_264"
 RECORDS = {1: RECORD, 2: "SR02_1_28_992_264"}  # default start record per level (--record overrides)
 TERMS = ("progress", "time", "finish", "death", "death_refund", "shaping", "checkpoint", "stall_penalty", "gate_bonus", "split_bonus",
@@ -455,7 +457,7 @@ class Logger:
         self.log.flush()
 
     def msg(self, s: str):
-        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {s}"
+        line = f"{clock.stamp()} {s}"
         print(line, flush=True)
         self.log.write(line + "\n")
         self.log.flush()
@@ -1291,7 +1293,7 @@ def main(argv=None) -> int:
             log.msg(msg)
             broadcast()
         with open(run_dir / "ALERT_auto_rollback.txt", "a", encoding="utf-8") as fh:
-            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+            fh.write(clock.stamp() + " " + msg + "\n")
 
     if a.profile_sample > 0:
         from ballrain.train.stack_sampler import StackSampler

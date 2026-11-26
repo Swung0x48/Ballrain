@@ -237,7 +237,14 @@ class Dashboard:
         self.route_memo: dict = {}  # (traced life, bundle pin) -> route class
         self.sigs: dict = {}
         self.summary: dict = {}
-        self.gen = {"running": False, "last_start": 0.0, "generated_at": None, "seconds": None, "errors": {}}
+        # the last generation's summary (data versions, SR / HS estimates, counts): a restarted server shows the
+        # previous maps and curves at once (their files are still in runtime/dashboard) while it rebuilds them
+        try:
+            self.summary = json.loads((OUT / "summary_last.json").read_text(encoding="utf-8"))
+        except Exception:
+            self.summary = {}
+        self.gen = {"running": False, "last_start": 0.0, "generated_at": self.summary.get("generated_at"),
+                    "generated_ts": self.summary.get("generated_ts"), "seconds": None, "errors": {}}
         self._status = (0.0, None)
         self.assets = []
         self.serif_v = None  # version of the self-served title font (serif_font.py), None = not built
@@ -471,6 +478,12 @@ class Dashboard:
                 self.gen.update(running=False, generated_at=summary["generated_at"], generated_ts=summary["generated_ts"],
                                 seconds=secs, errors=errors)
                 self._status = (0.0, None)
+            try:
+                tmp = OUT / "summary_last.tmp"
+                tmp.write_text(json.dumps(summary, ensure_ascii=False, default=str), encoding="utf-8")
+                os.replace(tmp, OUT / "summary_last.json")
+            except Exception:
+                log("summary snapshot failed:\n" + traceback.format_exc())
             log(f"generated in {secs}s" + (f", errors: {list(errors)}" if errors else ""))
 
     # ------------------------------------------------------------------------------- status

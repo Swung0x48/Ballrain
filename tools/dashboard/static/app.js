@@ -199,7 +199,7 @@ function renderStatus() {
     (det[k] ? `<div class="sub">${esc(det[k].join(" + "))}</div>` : "")).join("") : "—";
   $("tiles").innerHTML = [
     tile("run", sel, [levelName(levelOf(sel)), s.machine ? `训练机：${s.machine}` : ""].filter(Boolean).join(" · "), true),
-    tile(`最后记录（${TZ}）`, lt(s.last_log_ts, s.last_log || "—"), s.last_log_age_min != null ? `${num(s.last_log_age_min, 0)} 分钟前；开始于 ${lt(s.started_ts, s.started || "—")}` : "", true),
+    tile(`最后记录（${TZ}）`, lt(s.last_log_ts, s.last_log || "—"), (s.last_log_ts != null || s.last_log_age_min != null) ? `${num(s.last_log_ts != null ? Math.max(0, (Date.now() / 1000 - s.last_log_ts) / 60) : s.last_log_age_min, 0)} 分钟前；开始于 ${lt(s.started_ts, s.started || "—")}` : "", true),
     tile("更新次数", num(s.update), "", true),
     tile("训练步数", s.steps != null ? (s.steps / 1e6).toFixed(2) + " M" : "—", "", true),
     tile("每秒步数", num(s.steps_per_s), `近 20 次 ${num(s.steps_per_s_avg20)}`, true),
