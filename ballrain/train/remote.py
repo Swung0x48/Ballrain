@@ -300,6 +300,7 @@ class RemoteBridge:
                     self._restart_all = True
                 if self.template is None:
                     self.template, self.wid_base, self.template_id = m["template"], m["wid_base"], m.get("template_id")
+                self._t_rx = time.time()
                 self.conn = c
                 self.log(f"bridge: connected to {self.addr} (session {self.session}, wid base {m['wid_base']})")
                 return True
@@ -368,6 +369,7 @@ class RemoteBridge:
             except (EOFError, OSError, ConnectionError):
                 self._lost(c)
                 continue
+            self._t_rx = time.time()
             if m.get("type") == "params":
                 self._last_params = m["msg"]
                 self.counts["params"] += 1
@@ -375,6 +377,18 @@ class RemoteBridge:
                     continue
                 for q in self.ctrl_qs:
                     q.put(m["msg"])
+
+    def _watchdog(self, timeout_s: float = 120.0):
+        """A half-open connection (the learner's side gone, e.g. over Wi-Fi) is never noticed by a sender: the
+        learner broadcasts parameters after every update (seconds apart), so nothing received for timeout_s means the
+        link is dead; closing it here also frees a send blocked on the full socket. (2026-11-26: a laptop runner sent
+        into a dead link for ~50 min.)"""
+        while not self.stop:
+            time.sleep(10)
+            c = self.conn
+            if c is not None and time.time() - getattr(self, "_t_rx", time.time()) > timeout_s:
+                self.log(f"bridge: nothing from the learner for {timeout_s:.0f} s: reconnecting")
+                self._lost(c)
 
     def _lost(self, c):
         if self.conn is c:
@@ -461,6 +475,7 @@ class RemoteBridge:
         else:
             self.start_workers(ctx, data_q)
         threading.Thread(target=self._recv_loop, daemon=True, name="bridge-recv").start()
+        threading.Thread(target=self._watchdog, daemon=True, name="bridge-watchdog").start()
         restarts = [0] * len(self.copies)
         t_beat = 0.0
         while not self.stop and not should_stop():
