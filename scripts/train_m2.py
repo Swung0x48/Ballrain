@@ -342,6 +342,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--demo-coef-floor", type=float, default=0.0, help="weight after --demo-decay-updates")
     p.add_argument("--demo-decay-updates", type=int, default=0,
                    help="linear decay of the imitation weight to the floor over this many updates of the process (0 = constant)")
+    p.add_argument("--profile-sample", type=float, default=0.0,
+                   help="sample every thread's Python stack every 10 ms for this many seconds after the start and write "
+                        "the counts to <run>/profile.json (ballrain.train.stack_sampler; 0 = off)")
     p.add_argument("--sil-coef", type=float, default=0.0,
                    help="self-imitation (ballrain.train.sil): the PPO loss gets + coef x the policy's own better-than-"
                         "expected actions (batch rows with advantage above --sil-adv-min std, kept while their return "
@@ -1268,6 +1271,10 @@ def main(argv=None) -> int:
         with open(run_dir / "ALERT_auto_rollback.txt", "a", encoding="utf-8") as fh:
             fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
 
+    if a.profile_sample > 0:
+        from ballrain.train.stack_sampler import StackSampler
+        StackSampler(run_dir / "profile.json", duration=a.profile_sample).start()
+        log.msg(f"stack sampler: {a.profile_sample} s, every 10 ms, -> profile.json")
     try:
         first = ck is None and a.init_from is None
         while counters["steps"] < a.total_steps and not stop:
