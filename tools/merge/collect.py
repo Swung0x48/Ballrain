@@ -42,6 +42,8 @@ def main(argv=None) -> int:
     p.add_argument("--hl-bin", default="", help="headless binary (default BALLRAIN_HL_BIN)")
     p.add_argument("--hl-root", default="", help="game root (default BALLRAIN_HL_ROOT)")
     p.add_argument("--ball-order", default="retail")
+    p.add_argument("--counter-rand", default="", help="JSON like train_m2 --counter-rand: per life, overwrite the lives counter with a drawn value and offset sr_s / points (what the policy sees and what is saved, as the training workers do)")
+    p.add_argument("--counter-p", type=float, default=1.0, help="share of the lives with randomised counters")
     a = p.parse_args(argv)
     import torch
     from ballrain.train.ppo import normalize
@@ -60,6 +62,8 @@ def main(argv=None) -> int:
     w = np.array([r[2] for r in ranges])
     rng = np.random.default_rng(a.seed)
     obs_all, sec_all, life_all, s_all, lives = [], [], [], [], []
+    cr_cfg = json.loads(a.counter_rand) if a.counter_rand else {}
+    slices = env.fx.slices() if cr_cfg else {}
     sr = s_ranges(teachers)
     try:
         for i in range(a.n):
@@ -68,11 +72,28 @@ def main(argv=None) -> int:
             env.cfg.start_frame = int(rng.integers(lo, hi))
             obs, info = env.reset(options={"new_process": True})
             sec = sec0 = int(info.get("sector") or 1)
+            cr = {}
+            if cr_cfg and rng.random() < a.counter_p:
+                if "lives" in cr_cfg and "lives" in slices:
+                    vals = [float(v) for v in cr_cfg["lives"]["values"]]
+                    cr[slices["lives"]] = ("set", vals[int(rng.choice(len(vals), p=cr_cfg["lives"].get("p")))])
+                for k in ("sr_s", "points"):
+                    if k in cr_cfg and k in slices:
+                        cr[slices[k]] = ("add", float(rng.uniform(float(cr_cfg[k][0]), float(cr_cfg[k][1]))))
+
+            def crx(o):
+                if not cr:
+                    return np.asarray(o, np.float32)
+                o = np.array(o, np.float32, copy=True)
+                for sl, (op, v) in cr.items():
+                    o[sl] = v if op == "set" else o[sl] + v
+                return o
             clean, fin, reached = [], False, False
             mark_s, mark_t = None, 0
             t = 0
             for t in range(a.cap):
-                obs_all.append(np.asarray(obs, np.float32))
+                ob = crx(obs)
+                obs_all.append(ob)
                 sec_all.append(sec)
                 s_now0 = env.reward.s
                 s_all.append(float(s_now0) if s_now0 is not None else float("nan"))
@@ -81,7 +102,7 @@ def main(argv=None) -> int:
                 if key is None:
                     raise SystemExit(f"no teacher for sector {sec} (add --teacher default=CKPT)")
                 ck, m = pols[key]
-                act, _, _ = m.act(normalize(obs, ck["rms"]), gen=gen)
+                act, _, _ = m.act(normalize(ob, ck["rms"]), gen=gen)
                 obs, r, term, trunc, info = env.step(int(act))
                 if any(e[1] == "LevelFinish" for e in info.get("events") or []):
                     fin = True
@@ -103,7 +124,7 @@ def main(argv=None) -> int:
                         mark_s, mark_t = s_now, t
                     elif t - mark_t > stuck_steps:
                         break
-            lives.append({"frame": int(env.cfg.start_frame), "sector0": sec0, "sector": sec, "steps": t + 1,
+            lives.append({"frame": int(env.cfg.start_frame), "counters": "randomised" if cr else "true", "sector0": sec0, "sector": sec, "steps": t + 1,
                           "clean": clean, "finished": fin, "next_cp": reached or fin})
     finally:
         env.close()
