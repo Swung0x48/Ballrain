@@ -346,6 +346,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "TAS starts in [lo, hi] reach the next checkpoint at < low in consecutive bins of policy versions")
     p.add_argument("--frontier-floor", type=int, default=0,
                    help="the curriculum frontier never moves below this TAS frame (0 = no floor)")
+    p.add_argument("--perturb-starts", default="",
+                   help='JSON {"frames": [lo, hi], "steps": [a, b], "p": p}: a TAS start handed over at a record frame in '
+                        "[lo, hi] is, with probability p, followed by a + random(b - a) uniformly random actions before the "
+                        "policy takes over (real engine states beside the TAS line; WorkerSpec.perturb_starts). Off when empty")
     p.add_argument("--rail-gate", default="",
                    help='JSON {"s": route arc length, "below": TAS frame}: truncate (bootstrapped, end gate_truncate) a 灏忚妭-1 '
                         'life not started at or after "below" once it reaches route s (WorkerSpec.rail_gate)')
@@ -815,6 +819,7 @@ def main(argv=None) -> int:
                           wall_push_rate=a.wall_push_rate, wall_min_rise=a.wall_min_rise,
                           wall_max_progress=a.wall_max_progress, wall_push_everywhere=a.wall_push_everywhere,
                           zone_stall_exempt=a.zone_stall_exempt, rail_gate=json.loads(a.rail_gate) if a.rail_gate else {},
+                          perturb_starts=json.loads(a.perturb_starts) if a.perturb_starts else {},
                           respawn_level_starts=a.respawn_level_starts,
                           counter_rand=json.loads(a.counter_rand) if a.counter_rand else {},
                           launcher_factory=FakeLauncher if a.fake else None,
@@ -870,6 +875,7 @@ def main(argv=None) -> int:
                                "wall_min_rise": a.wall_min_rise, "wall_max_progress": a.wall_max_progress,
                                "wall_push_everywhere": a.wall_push_everywhere, "zone_stall_exempt": a.zone_stall_exempt,
                                "rail_gate": json.loads(a.rail_gate) if a.rail_gate else {},
+                               "perturb_starts": json.loads(a.perturb_starts) if a.perturb_starts else {},
                                "respawn_level_starts": a.respawn_level_starts,
                                "counter_rand": json.loads(a.counter_rand) if a.counter_rand else {}}}
         if a.actor_heads != "single":

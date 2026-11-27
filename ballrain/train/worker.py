@@ -138,6 +138,14 @@ class WorkerSpec:
     # --skip-respawn-from-sector; L2 r8: the 2002-physics SimTool crashes on the 盘点-4 paper-ball respawn, see
     # runtime/m2-train/r8-prep/simtool-2002-respawn-crash.md); getattr-read
     skip_respawn_from_sector: int = 0
+    # perturb_starts (off when empty): {"frames": [lo, hi], "steps": [a, b], "p": p}. A TAS start (kind "tas") handed
+    # over at a record frame in [lo, hi] is, with probability p, followed by a prefix of n uniformly random actions (n in
+    # [a, b] agent steps, drawn from the worker's own rng) played before the policy takes over: the life starts wherever
+    # that real engine state lands (beside / off the TAS line, other speed and heading), not at an edited state. The
+    # prefix steps are not part of the life (no rows, rewards discarded); the life records its TAS frame and the prefix
+    # actions (episode perturb_frame / perturb_actions) so it replays exactly. A prefix that ends the life (death,
+    # truncation) is dropped and a new start is drawn. Read with getattr: an older pickled WorkerSpec has no such field
+    perturb_starts: dict = field(default_factory=dict)
     # counter randomisation (off when empty): in a game process not started from level load (TAS / at-rest starts and
     # their respawns) every life draws one set of counter-feature values and the observations of that life carry them
     # instead of the true ones: {"lives": {"values": [...], "p": [...]} (replaced), "sr_s": [lo, hi], "points": [lo, hi]
@@ -237,6 +245,10 @@ class _Episode:
                   "cap_frames": cap_frames, "t_wall_start": time.time(),
                   # headless: the contact order of this process (e.g. "retail:<seed>"); None on retail
                   "ball_order": getattr(getattr(getattr(env, "session", None), "handle", None), "ball_order", None)}
+        pt = st.get("perturb")
+        if pt:  # WorkerSpec.perturb_starts: the TAS frame and the random prefix this life started after
+            self.d["perturb_frame"] = int(pt["frame"])
+            self.d["perturb_actions"] = "".join(str(int(x)) for x in pt["actions"])
         self.ret = 0.0
         self.steps = 0
         self.max_sector = self.d["start_sector"]
@@ -356,6 +368,7 @@ class Worker:
         self._trace_rng = np.random.default_rng(spec.seed + 99991)
         self._respawn_rng = np.random.default_rng(spec.seed + 104729)
         self._counter_rng = np.random.default_rng(spec.seed + 130363)
+        self._perturb_rng = np.random.default_rng(spec.seed + 155921)
         self._cr: dict | None = None  # feature slice -> ("set" | "add", value) of the current life (counter_rand)
         self.env = None
         self.fx_info = {}
@@ -638,6 +651,32 @@ class Worker:
                 o[s_] = v if op == "set" else o[s_] + v
         return o
 
+    def _perturb_prefix(self, info):
+        """WorkerSpec.perturb_starts: None (no prefix: off, not a TAS start, outside the frame range, or not drawn),
+        False (the prefix ended the life), else (obs, info) after the prefix, info["start"] carrying the TAS frame and
+        the prefix actions ("perturb")."""
+        ps = getattr(self.spec, "perturb_starts", None) or {}
+        st = info.get("start") or {}
+        if not ps or st.get("kind") != "tas":
+            return None
+        k = int(st.get("frame") or 0)
+        lo, hi = (int(v) for v in ps["frames"])
+        if not lo <= k <= hi or self._perturb_rng.random() >= float(ps.get("p", 1.0)):
+            return None
+        a, b = (int(v) for v in ps["steps"])
+        n_act = int(self.env.action_space.n)
+        acts = [int(x) for x in self._perturb_rng.integers(0, n_act, size=int(self._perturb_rng.integers(a, b + 1)))]
+        obs, info2 = None, info
+        for x in acts:
+            obs, _r, term, trunc, info2 = self.env.step(x)
+            if term or trunc:
+                return False
+        if obs is None:
+            return None
+        info2 = dict(info2)
+        info2["start"] = {**st, "perturb": {"frame": k, "actions": acts}}
+        return obs, info2
+
     def _reset(self, new_process: bool = False):
         """new_process: end the current game process (e.g. a skipped early respawn) and start a new curriculum start."""
         fails = 0
@@ -647,6 +686,13 @@ class Worker:
             try:
                 self._cr = None  # the reset observation is computed with the true counters, then the new life's set
                 obs, info = self.env.reset(options={"new_process": True} if new_process else None)
+                pert = self._perturb_prefix(info)
+                if pert is False:  # the prefix ended the life: draw a new start
+                    new_process = True
+                    self._collect_runs()
+                    continue
+                if pert is not None:
+                    obs, info = pert
                 self._cr = self._counter_draw()
                 obs = self._counter_apply(obs)
                 self._collect_runs()
