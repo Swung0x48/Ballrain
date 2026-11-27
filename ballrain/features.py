@@ -143,6 +143,11 @@ class FeatureConfig:
     # (weight h^2 / (h^2 + spin_vel_fade^2), where the direction of travel is undefined). Needs no reference line.
     spin: bool = False
     spin_vel_fade: float = 1.0
+    # the orientation block, after the spin blocks (a policy grows with zero input weights): the ball's body x and y axes
+    # (the first two columns of R(q_next)) in the directional features' frame, 6 entries in [-1, 1]. A continuous
+    # rotation representation (unlike the quaternion, no q / -q sign flip). Matters for a ball whose collision shape is
+    # not a sphere (the paper ball); a sphere's dynamics do not depend on it.
+    orient: bool = False
 
     def to_dict(self):
         d = asdict(self)
@@ -154,6 +159,8 @@ class FeatureConfig:
             del d["pickups"], d["pickup_scale"]
         if not self.spin:
             del d["spin"], d["spin_vel_fade"]
+        if not self.orient:
+            del d["orient"]
         return d
 
 
@@ -332,6 +339,13 @@ def spin_world(ball) -> np.ndarray:
     return G.quat_matrix(ball["q_next"]) @ w_body
 
 
+def orientation_6d(ball, right, fwd) -> np.ndarray:
+    """FeatureConfig.orient: the ball's body x and y axes (columns 0 and 1 of R(q_next), geometry.quat_matrix) in the
+    directional features' frame (to_frame), concatenated (6 entries)."""
+    R = G.quat_matrix(ball["q_next"])
+    return np.concatenate([to_frame(R[:, 0], right, fwd), to_frame(R[:, 1], right, fwd)])
+
+
 def spin_vector(ball, right, fwd) -> np.ndarray:
     """FeatureConfig.spin "spin" (before scaling): the world angular velocity in the directional features' frame."""
     return to_frame(spin_world(ball), right, fwd)
@@ -409,6 +423,8 @@ def make_layout(c: FeatureConfig) -> list:
         L += [("pickups", PICKUP_SLOTS * 6), ("pickups_left", 2)]
     if c.spin:  # after everything else, so a policy without them grows with zero input weights
         L += [("spin", 3), ("spin_vel", 3)]
+    if c.orient:  # after everything else
+        L.append(("orient", 6))
     return L
 
 
@@ -574,6 +590,8 @@ class FeatureExtractor:
                 w_world = spin_world(ball)
                 F["spin"][:] = to_frame(w_world, right, fwd) / c.angvel_scale
                 F["spin_vel"][:] = spin_along_velocity(w_world, vel, c.spin_vel_fade) / c.angvel_scale
+            if c.orient:
+                F["orient"][:] = orientation_6d(ball, right, fwd)
             if c.absolute_position:
                 F["pos_world"][:] = pos / c.pos_scale
             radius = float(ball["extra_radius"]) or 2.0

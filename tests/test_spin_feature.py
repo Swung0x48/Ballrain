@@ -5,7 +5,7 @@ from dataclasses import asdict
 import numpy as np
 import torch
 
-from ballrain.features import FeatureConfig, make_layout, spin_along_velocity, spin_vector, to_frame
+from ballrain.features import FeatureConfig, make_layout, orientation_6d, spin_along_velocity, spin_vector, to_frame
 from ballrain.train.grow import check_prefix, load_grown
 from ballrain.train.ppo import ActorCritic, RunningMeanStd, normalize
 
@@ -101,3 +101,21 @@ def test_spin_along_velocity_roll_side_yaw_and_the_fade():
     assert np.abs(small).max() < 1e-5  # continuous through rest
     big = spin_along_velocity(w, [100.0, 0, 0], fade=1.0)
     np.testing.assert_allclose(big, spin_along_velocity(w, [100.0, 0, 0], fade=0.0), rtol=2e-4)
+
+
+def test_orient_block_layout_and_values():
+    a, b = FeatureConfig(**R10, spin=True), FeatureConfig(**R10, spin=True, orient=True)
+    la, lb = make_layout(a), make_layout(b)
+    assert lb[:len(la)] == la and lb[len(la):] == [("orient", 6)]
+    assert "orient" not in a.to_dict() and b.to_dict()["orient"] is True
+    check_prefix(asdict(a), asdict(b), _n(a), _n(b))
+    world = (np.array([1.0, 0, 0]), np.array([0, 0, 1.0]))
+    np.testing.assert_allclose(orientation_6d({"q_next": (0, 0, 0, 1.0)}, *world), [1, 0, 0, 0, 1, 0], atol=1e-12)
+    # 90 degrees about the world y axis: body x -> world -z, body y stays world y
+    np.testing.assert_allclose(orientation_6d({"q_next": _quat([0, 1, 0], np.pi / 2)}, *world), [0, 0, -1, 0, 1, 0],
+                               atol=1e-9)
+    # q and -q are the same rotation: identical entries (no sign flip, unlike the raw quaternion)
+    q = np.array(_quat([1, 2, 3], 1.1))
+    np.testing.assert_allclose(orientation_6d({"q_next": q}, *world), orientation_6d({"q_next": -q}, *world), atol=1e-12)
+    o = orientation_6d({"q_next": q}, *world)
+    assert abs(np.linalg.norm(o[:3]) - 1) < 1e-9 and abs(np.linalg.norm(o[3:]) - 1) < 1e-9 and abs(o[:3] @ o[3:]) < 1e-9
