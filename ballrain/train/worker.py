@@ -106,6 +106,9 @@ class WorkerSpec:
     # the step's reward gets -penalty (default 1.5, term "zone_penalty") and the life goes on; the zone re-arms once the
     # ball has left it (outside the box or zone_rearm above y_below). Counted per episode (zone_entries)
     zones: dict = field(default_factory=dict)
+    # A contact zone instead of a box: {"rail_touches": n, "s": [lo, hi], "penalty": p}: the ball touches at least n rails
+    # (the contact block's n_rail_touch, needs FeatureConfig.contacts; a double rail is two rail contacts) while the
+    # route s is in [lo, hi]. Once per life (no re-arm: contacts flicker while the ball rolls in a double rail)
     zone_rearm: float = 1.0
     # unclimbable-wall push (off when wall_push_rate = 0): while the ball touches a wall (mindist gap <= wall_gap, contact
     # normal |n_y| <= wall_max_ny) whose top is more than wall_min_rise above the ball's lowest point (user: a wall higher
@@ -399,6 +402,7 @@ class Worker:
         def compute(tracker):
             o, fi = orig(tracker)
             self.fx_info = fi
+            self._fx_raw = o
             return self._counter_apply(o), fi
         self.env.fx.compute = compute
         st = self.env.starts
@@ -431,6 +435,21 @@ class Worker:
         m = st.sector == sector
         return int(st.valid[m][0]) if m.any() else None
 
+    def _contact_zone(self, z: dict) -> bool:
+        """Contact zone (WorkerSpec.zones with "rail_touches"): the latest observation's rail-touch count reaches
+        z["rail_touches"] while the route s is inside z["s"]."""
+        s = self.env.reward.s
+        lo, hi = z["s"]
+        o = getattr(self, "_fx_raw", None)
+        if s is None or not (lo <= s <= hi) or o is None:
+            return False
+        sl = getattr(self, "_agg_slice", None)
+        if sl is None:
+            from ballrain.features import layout_slices, CONTACT_AGG_FIELDS
+            ag = layout_slices(self.env.fx.cfg)["contact_agg"]
+            sl = self._agg_slice = ag.start + CONTACT_AGG_FIELDS.index("n_rail_touch")
+        return int(round(float(o[sl]) * 2)) >= int(z["rail_touches"])  # n_rail_touch = min(count, 2) / 2
+
     def _zone_wall(self, ep, a: int, s_before, frames: int) -> float:
         """Penalty zones and the unclimbable-wall push for the step just taken (WorkerSpec.zones / wall_push_rate);
         returns the reward to add (<= 0) and books the terms on the episode."""
@@ -442,6 +461,14 @@ class Worker:
         out = 0.0
         wp_here = bool(getattr(sp, "wall_push_everywhere", False))  # getattr: a WorkerSpec pickled by older code
         for name, z in sp.zones.items():
+            if "rail_touches" in z:
+                if not ep.zone_in.get(name) and self._contact_zone(z):
+                    pen = -float(z.get("penalty", 1.5))
+                    out += pen
+                    ep.terms["zone_penalty"] = ep.terms.get("zone_penalty", 0.0) + pen
+                    ep.zone_counts[name] = ep.zone_counts.get(name, 0) + 1
+                    ep.zone_in[name] = True  # once per life
+                continue
             inside = in_zone(pos, z)
             if inside and z.get("wall_push"):
                 wp_here = True
