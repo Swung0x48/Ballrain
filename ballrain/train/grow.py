@@ -50,7 +50,7 @@ def grow_model_state(sd: dict, n_old: int, n_new: int) -> dict:
         w = sd[k]
         if w.shape[1] != n_old:
             raise GrowError(f"{k} has {w.shape[1]} inputs, the checkpoint says n_obs {n_old}")
-        sd[k] = torch.cat([w, torch.zeros(w.shape[0], n_new - n_old, dtype=w.dtype)], 1)
+        sd[k] = torch.cat([w, torch.zeros(w.shape[0], n_new - n_old, dtype=w.dtype, device=w.device)], 1)
     return sd
 
 
@@ -65,7 +65,7 @@ def _seed_columns(v: torch.Tensor, n_new: int) -> torch.Tensor:
     n_old = v.shape[1]
     row = v.mean(1, keepdim=True)
     row = torch.where(row > 0, row, v.mean())
-    return torch.cat([v, row.expand(v.shape[0], n_new - n_old).to(v.dtype)], 1)
+    return torch.cat([v, row.expand(v.shape[0], n_new - n_old).to(device=v.device, dtype=v.dtype)], 1)
 
 
 def grow_optimizer_state(opt_sd: dict, model, n_old: int, n_new: int) -> dict:
@@ -90,7 +90,7 @@ def grow_optimizer_state(opt_sd: dict, model, n_old: int, n_new: int) -> dict:
                     if k in ("exp_avg_sq", "max_exp_avg_sq"):
                         s[k] = _seed_columns(v, n_new)
                     else:
-                        s[k] = torch.cat([v, torch.zeros(v.shape[0], n_new - n_old, dtype=v.dtype)], 1)
+                        s[k] = torch.cat([v, torch.zeros(v.shape[0], n_new - n_old, dtype=v.dtype, device=v.device)], 1)
         state[pid] = s
     return {"state": state, "param_groups": groups}
 
