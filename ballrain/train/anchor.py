@@ -386,8 +386,15 @@ def teacher_layout_error(mine: dict, theirs: dict, t_obs: int, n_obs: int, t_act
     tv, mv = theirs.get("reach_version"), mine.get("reach_version")
     if tv and isinstance(mv, str) and mv.startswith(f"{tv}-mech1-"):
         appended.add("reach_version")
+    # a key only one side carries is compared with its FeatureConfig default: checkpoints saved before an opt-in
+    # field existed (spin, orient, ...) omit it, while a run's asdict() carries it at its off value
+    from dataclasses import MISSING, fields
+    from ballrain.features import FeatureConfig
+    dflt = {f.name: f.default for f in fields(FeatureConfig) if f.default is not MISSING}
+    mine_n = {k: mine.get(k, dflt.get(k)) for k in set(mine) | set(theirs)}
+    theirs_n = {k: theirs.get(k, dflt.get(k)) for k in set(mine) | set(theirs)}
     # ignore: keys the caller has validated itself (an append-only branch repin: --teacher-allow-context-append)
-    diff = sorted(k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k) and k not in appended | set(ignore))
+    diff = sorted(k for k in mine_n if mine_n[k] != theirs_n[k] and k not in appended | set(ignore))
     if (t_obs != n_obs and not appended) or int(t_act) != n_act or diff:
         return f"observations differ (n_obs {t_obs} vs {n_obs}, features {diff})"
     if appended:

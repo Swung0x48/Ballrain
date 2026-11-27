@@ -408,6 +408,12 @@ def test_teacher_layout_rules_match_the_teacher_option():
     assert "observations differ" in E(asdict(f8), asdict(f8), n["f8"], n["f8"], 8, 9)
     other = FeatureConfig(far_waypoints=(20.0,))
     assert "far_waypoints" in E(asdict(plain), asdict(other), layout_size(other), n["plain"], 9, 9)
+    # a teacher saved before the opt-in spin / orient fields existed omits them; the run carries them off
+    old = {k: v for k, v in asdict(f8).items() if k not in ("spin", "spin_vel_fade", "orient")}
+    assert E(asdict(f8), old, n["f8"], n["f8"], 9, 9) is None
+    on = FeatureConfig(reach=True, version=CONTACT_FEATURE_VERSION, spin=True)
+    on.reach_version = mech.reach_version
+    assert "spin" in E(asdict(on), old, n["f8"], n["f8"], 9, 9)  # a run with spin on still refuses it
     src = (REPO / "scripts" / "train_m2.py").read_text(encoding="utf-8")
     assert src.count("teacher_layout_error(") == 3  # --teacher, --anchor-teacher, stored snapshots on resume
 
