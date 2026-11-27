@@ -659,6 +659,8 @@ def main(argv=None) -> int:
     (run_dir / ("config.json" if not a.resume else f"config.resume-{time.strftime('%Y%m%d-%H%M%S')}.json")).write_text(
         json.dumps(saved_args(a), indent=1), encoding="utf-8")
     log = Logger(run_dir, a.resume)
+    if a.perturb_starts:  # the perturbed starts' record (WorkerSpec.perturb_starts) in episodes.csv; off: columns unchanged
+        log.cols["episodes"] = EP_COLS + ["perturb_frame", "perturb_actions"]
     log.tb.add_text("config", "    " + json.dumps(saved_args(a), indent=1).replace("\n", "\n    "),
                     global_step=int(ck["counters"]["steps"]) if ck is not None else 0)
     torch.set_num_threads(a.torch_threads)

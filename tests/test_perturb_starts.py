@@ -96,3 +96,5 @@ def test_train_m2_option_reaches_spec_and_remote_template():
     src = (train_m2.REPO / "scripts" / "train_m2.py").read_text(encoding="utf-8")
     assert src.count("perturb_starts=json.loads(a.perturb_starts) if a.perturb_starts else {}") == 1  # local workers
     assert '"perturb_starts": json.loads(a.perturb_starts) if a.perturb_starts else {}' in src  # remote template
+    assert "perturb_frame" not in train_m2.EP_COLS  # off: episodes.csv columns unchanged
+    assert 'log.cols["episodes"] = EP_COLS + ["perturb_frame", "perturb_actions"]' in src
