@@ -72,6 +72,18 @@ class RewardConfig:
     s3_lane_rate: float = 0.0  # per metre per second, excess distance over the 0.25 m deadband
     s3_paper_cost: float = 0.0  # one-time cost for taking the approach transformer
 
+    # Optional route-adherence ("lane") term, SR mode, off at lane_weight 0. Inside the route-s window lane_s [lo, hi]
+    # it pays lane_weight * closeness * (s - s_max) when the projection passes the life's maximum s so far (s_max,
+    # from the life's start s), then s_max = s: at most once per metre of route per life, never per second, so it is
+    # neither a time nor a speed term and rolling back and forth earns nothing. closeness = max(0, 1 - d / lane_width),
+    # d the 3D distance from the ball centre to the route line: to the projection point (ballrain.path), the nearest
+    # point of the line, so the offset is already perpendicular to it (the projection's tangent is horizontal and
+    # would misjudge a climbing stretch such as the L1 spiral, so it is not used). Not paid on a branch line or on a re-acquired projection (jump: s_max
+    # only moves). Held without floor support and forfeited at BallOff like the progress term (hold_unsupported).
+    lane_weight: float = 0.0
+    lane_s: tuple = ()  # (lo, hi) route s; required when lane_weight > 0
+    lane_width: float = 0.5  # metres
+
     def to_dict(self):
         return asdict(self)
 
@@ -85,7 +97,23 @@ class Reward:
             raise ValueError(f"unknown reward mode {self.cfg.mode!r}")
         if any(not isfinite(x) or x < 0 for x in (self.cfg.s3_lane_rate, self.cfg.s3_paper_cost)):
             raise ValueError("sector-3 costs must be finite and nonnegative")
+        c = self.cfg
+        if not isfinite(c.lane_weight) or c.lane_weight < 0:
+            raise ValueError("lane_weight must be finite and >= 0")
+        if c.lane_weight:
+            if c.mode != "sr":
+                raise ValueError("the lane term is SR mode only")
+            if not (isfinite(c.lane_width) and c.lane_width > 0):
+                raise ValueError("lane_width must be finite and > 0")
+            if (len(c.lane_s) != 2 or not all(isfinite(float(v)) for v in c.lane_s)
+                    or not 0 <= float(c.lane_s[0]) < float(c.lane_s[1])):
+                raise ValueError(f"lane_s must be [lo, hi] with 0 <= lo < hi, got {c.lane_s!r}")
         self.reset_state()
+
+    def check_lane_window(self, route_length: float):
+        """The lane window must lie inside the route (called by the env once the reference path is known)."""
+        if self.cfg.lane_weight and float(self.cfg.lane_s[1]) > route_length:
+            raise ValueError(f"lane_s {list(self.cfg.lane_s)} exceeds the route length {route_length:.1f}")
 
     def reset_state(self):
         self.s = None
@@ -101,6 +129,8 @@ class Reward:
         self.total = 0.0
         self.terms: dict = {}
         self.s3_paper_paid = False
+        self.lane_s_max = None  # the life's maximum route s (lane term)
+        self.lane_held = 0.0  # lane pay earned without floor support, not paid yet
 
     def _pk_phi(self, d) -> float:
         c = self.cfg
@@ -113,6 +143,7 @@ class Reward:
         self.reset_state()
         self.pk_phi = self._pk_phi(pickup_dist)
         self.s = s
+        self.lane_s_max = s
         self.sr = tracker.sr_ms or 0.0
         self.score = tracker.hs_partial()
         self.checkpoints = tracker.checkpoints
@@ -170,9 +201,38 @@ class Reward:
             return {"s3_paper": -c.s3_paper_cost}
         return {}
 
+    def _lane_term(self, s, features, rebase, died, finished, supported) -> dict:
+        c = self.cfg
+        pay = 0.0
+        if s is not None:
+            lo, hi = float(c.lane_s[0]), float(c.lane_s[1])
+            s_max = self.lane_s_max
+            if s_max is None or rebase:
+                self.lane_s_max = s if s_max is None else max(s_max, s)
+            elif s > s_max:
+                gained = min(s, hi) - max(s_max, lo)
+                route = (features or {}).get("path") or {}
+                pos = (features or {}).get("pos")
+                if (gained > 0 and pos is not None and route.get("point") is not None
+                        and not (route.get("branch") or route.get("branch_id"))):
+                    d = sum((float(pos[i]) - float(route["point"][i])) ** 2 for i in range(3)) ** 0.5
+                    closeness = max(0.0, 1.0 - d / c.lane_width)
+                    pay = c.lane_weight * closeness * gained
+                self.lane_s_max = s
+        if c.hold_unsupported:
+            self.lane_held += pay
+            pay = 0.0
+            if died:  # forfeited
+                self.lane_held = 0.0
+            elif finished or supported is None or supported:
+                pay, self.lane_held = self.lane_held, 0.0
+        elif died:
+            pay = 0.0
+        return {"lane": pay}
+
     def step(self, tracker: GameTracker, s: float | None, died: bool, finished: bool, terminal: bool,
              rebase: bool = False, supported: bool | None = None, s3_features: dict | None = None,
-             pickup_dist=None) -> tuple[float, dict]:
+             pickup_dist=None, lane_features: dict | None = None) -> tuple[float, dict]:
         """s: arc length of the ball's projection (None when unknown). rebase: the projection was re-acquired
         this step (ballrain.path, jump=True): paid like any step when pay_jumps (default), otherwise no progress
         reward for it and s only moves the reference.
@@ -218,6 +278,8 @@ class Reward:
                 phi1 = 0.0 if terminal else self._pk_phi(pickup_dist)
                 terms["pickup_shaping"] = c.gamma * phi1 - self.pk_phi
                 self.pk_phi = phi1
+            if c.lane_weight:
+                terms.update(self._lane_term(s, lane_features, rebase, died, finished, supported))
         else:
             score = tracker.hs_partial()
             terms["score"] = c.score_scale * (score - self.score)

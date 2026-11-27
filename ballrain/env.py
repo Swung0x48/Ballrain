@@ -875,6 +875,8 @@ class BallanceEnv(gym.Env):
             self.fx.reference_path(s.tracker)
             self.fx.branch.restore(self._start["branch_id"], self._start["phase"], self._start["branch_s"])
         obs, finfo = self.fx.compute(s.tracker)
+        if self.reward.cfg.lane_weight and self.fx.path is not None:
+            self.reward.check_lane_window(self.fx.path.length)
         self.reward.begin(s.tracker, self._arc(finfo), pickup_dist=self._pickup_dist())
         info = self._info(finfo, [])
         return obs, info
@@ -973,7 +975,8 @@ class BallanceEnv(gym.Env):
         r, terms = self.reward.step(s.tracker, self._arc(finfo), died, finished, terminated,
                                     rebase=bool(p and p.get("jump")), supported=finfo.get("supported", False),
                                     pickup_dist=self._pickup_dist(),
-                                    s3_features=finfo if self.cfg.level == 2 else None)
+                                    s3_features=finfo if self.cfg.level == 2 else None,
+                                    lane_features=finfo if self.reward.cfg.lane_weight else None)
         if cam_bad:  # no credit for the episode: its return becomes -death_penalty
             pen = -self.reward.total - self.reward.cfg.death_penalty
             terms = dict(terms, camera_off_quarter=pen)

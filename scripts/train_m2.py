@@ -661,6 +661,8 @@ def main(argv=None) -> int:
     log = Logger(run_dir, a.resume)
     if a.perturb_starts:  # the perturbed starts' record (WorkerSpec.perturb_starts) in episodes.csv; off: columns unchanged
         log.cols["episodes"] = EP_COLS + ["perturb_frame", "perturb_actions"]
+    if json.loads(a.reward).get("lane_weight"):  # the opt-in lane term (RewardConfig.lane_weight); off: columns unchanged
+        log.cols["episodes"] = log.cols["episodes"] + ["r_lane"]
     log.tb.add_text("config", "    " + json.dumps(saved_args(a), indent=1).replace("\n", "\n    "),
                     global_step=int(ck["counters"]["steps"]) if ck is not None else 0)
     torch.set_num_threads(a.torch_threads)
@@ -927,6 +929,7 @@ def main(argv=None) -> int:
             e["speed"] = (e["s_end"] - e["s_start"]) / e["agent_s"]
         for k in TERMS:
             e[f"r_{k}"] = e["terms"].get(k, 0.0)
+        e["r_lane"] = e["terms"].get("lane", 0.0)  # written only when the lane term is on (log.cols)
         counters["episodes"] += 1
         win_eps.append(e)
         log.row("episodes", e)
