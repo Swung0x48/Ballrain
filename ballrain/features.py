@@ -133,12 +133,16 @@ class FeatureConfig:
     # in the sector / 5 and in the level / 15. Needs benchmarks/placements/L<nn>.json for the level.
     pickups: bool = False
     pickup_scale: float = 20.0
-    # the spin block, after every other entry (a policy grows with zero input weights): the ball's angular velocity in
-    # the frame of the directional features (world with camera "world", else the camera yaw frame) / angvel_scale.
-    # The "angvel" entries are the same vector in the ball's own body frame (IVP rot_speed + rot_speed_change), which
-    # turns with the ball, so they give the spin rate but not its direction relative to the motion; here it is rotated
-    # to the world by the ball's quaternion q_next (geometry.quat_matrix, column-vector, x y z w). Needs no reference line.
+    # the spin blocks, after every other entry (a policy grows with zero input weights). The "angvel" entries are the
+    # ball's angular velocity in its own body frame (IVP rot_speed + rot_speed_change), which turns with the ball, so they
+    # give the spin rate but not its direction relative to the motion. Here it is rotated to the world by the ball's
+    # quaternion q_next (geometry.quat_matrix, column-vector, x y z w): "spin" = that vector in the frame of the
+    # directional features (world with camera "world", else the camera yaw frame) / angvel_scale; "spin_vel" = the same
+    # vector split along the ball's own horizontal velocity (roll: + = rolling forward, - = backspin; side: about the
+    # direction of travel; yaw: about the vertical) / angvel_scale, faded smoothly to 0 as the horizontal speed goes to 0
+    # (weight h^2 / (h^2 + spin_vel_fade^2), where the direction of travel is undefined). Needs no reference line.
     spin: bool = False
+    spin_vel_fade: float = 1.0
 
     def to_dict(self):
         d = asdict(self)
@@ -149,7 +153,7 @@ class FeatureConfig:
         if not self.pickups:  # preserve serialized configurations when off
             del d["pickups"], d["pickup_scale"]
         if not self.spin:
-            del d["spin"]
+            del d["spin"], d["spin_vel_fade"]
         return d
 
 
@@ -321,12 +325,32 @@ def yaw_basis(matrix43) -> tuple[np.ndarray, np.ndarray]:
     return r, f
 
 
-def spin_vector(ball, right, fwd) -> np.ndarray:
-    """FeatureConfig.spin (before scaling): the ball's angular velocity, IVP rot_speed + rot_speed_change in its body
-    frame, rotated to the world by its quaternion q_next (geometry.quat_matrix: column-vector, x y z w) and then to the
-    directional features' frame (to_frame)."""
+def spin_world(ball) -> np.ndarray:
+    """The ball's angular velocity in the world: IVP rot_speed + rot_speed_change (body frame) rotated by its quaternion
+    q_next (geometry.quat_matrix: column-vector, x y z w)."""
     w_body = np.asarray(ball["rot_speed"], np.float64) + np.asarray(ball["rot_speed_change"], np.float64)
-    return to_frame(G.quat_matrix(ball["q_next"]) @ w_body, right, fwd)
+    return G.quat_matrix(ball["q_next"]) @ w_body
+
+
+def spin_vector(ball, right, fwd) -> np.ndarray:
+    """FeatureConfig.spin "spin" (before scaling): the world angular velocity in the directional features' frame."""
+    return to_frame(spin_world(ball), right, fwd)
+
+
+def spin_along_velocity(w, vel, fade: float = 1.0) -> np.ndarray:
+    """FeatureConfig.spin "spin_vel" (before scaling): world angular velocity w split along the horizontal velocity:
+    (roll, side, yaw) with roll = w . (up x f) (+ when rolling forward: w = (up x v) / r for a rolling ball), side =
+    w . f, yaw = w_y, f the unit horizontal velocity; all times h^2 / (h^2 + fade^2), h the horizontal speed (0 at rest,
+    where f is undefined, and continuous through it)."""
+    w = np.asarray(w, np.float64)
+    vx, vz = float(vel[0]), float(vel[2])
+    h2 = vx * vx + vz * vz
+    if h2 <= 0.0:
+        return np.zeros(3)
+    h = math.sqrt(h2)
+    fx, fz = vx / h, vz / h  # f = (fx, 0, fz); up x f = (fz, 0, -fx)
+    g = h2 / (h2 + fade * fade)
+    return g * np.array([w[0] * fz - w[2] * fx, w[0] * fx + w[2] * fz, w[1]])
 
 
 def to_frame(v, right, fwd) -> np.ndarray:
@@ -383,8 +407,8 @@ def make_layout(c: FeatureConfig) -> list:
               ("rails_lr", 2 * len(RAIL_SIDE_FIELDS))]
     if c.pickups:  # after everything else, so an f8 policy grows with zero input weights
         L += [("pickups", PICKUP_SLOTS * 6), ("pickups_left", 2)]
-    if c.spin:  # after everything else, so a policy without it grows with zero input weights
-        L.append(("spin", 3))
+    if c.spin:  # after everything else, so a policy without them grows with zero input weights
+        L += [("spin", 3), ("spin_vel", 3)]
     return L
 
 
@@ -547,7 +571,9 @@ class FeatureExtractor:
             F["speed"][0] = np.linalg.norm(vel) / c.vel_scale
             F["angvel"][:] = (np.asarray(ball["rot_speed"]) + np.asarray(ball["rot_speed_change"])) / c.angvel_scale
             if c.spin:
-                F["spin"][:] = spin_vector(ball, right, fwd) / c.angvel_scale
+                w_world = spin_world(ball)
+                F["spin"][:] = to_frame(w_world, right, fwd) / c.angvel_scale
+                F["spin_vel"][:] = spin_along_velocity(w_world, vel, c.spin_vel_fade) / c.angvel_scale
             if c.absolute_position:
                 F["pos_world"][:] = pos / c.pos_scale
             radius = float(ball["extra_radius"]) or 2.0
