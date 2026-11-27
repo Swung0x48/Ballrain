@@ -47,6 +47,25 @@ def test_gate_rule():
     assert WorkerSpec(wid=0, copy="x", env=None, seed=0).rail_gate == {}
 
 
+def test_gate_sector_key():
+    g = {"s": 1760.0, "below": 99999, "sector": 3}
+    w = _w(g)
+    assert w._gate_hit(_ep("tas", 16400, start_sector=3), 1760.0, {"sector": 3})
+    assert not w._gate_hit(_ep("tas", 16400, start_sector=3), 1759.9, {"sector": 3})
+    assert w._gate_hit(_ep("tas", 17500, start_sector=3), 1765.0, {"sector": 4})  # past the checkpoint: still gated
+    assert w._gate_hit(_ep("respawn", 14800, start_sector=3), 1770.0, {"sector": 3})
+    assert not w._gate_hit(_ep("tas", 2100, start_sector=1), 1800.0, {"sector": 1})  # other 小节
+    assert not w._gate_hit(_ep("tas", 19000, start_sector=4), 1800.0, {"sector": 4})
+    assert not w._gate_hit(_ep("tas", 16400, start_sector=3), None, {"sector": 3})
+    assert not _w({"s": 1760.0, "below": 17000, "sector": 3})._gate_hit(_ep("tas", 17000, start_sector=3), 1800.0,
+                                                                        {"sector": 3})  # below still applies
+    # without the key: 小节 1 only, and only while still in 小节 1 (unchanged)
+    w = _w({"s": 1760.0, "below": 99999})
+    assert not w._gate_hit(_ep("tas", 16400, start_sector=3), 1800.0, {"sector": 3})
+    assert w._gate_hit(_ep("tas", 2100), 1800.0, {"sector": 1})
+    assert not w._gate_hit(_ep("tas", 2100), 1800.0, {"sector": 2})
+
+
 def test_gate_follows_the_frontier():
     g = {"s": 277.0, "below": 4000, "follow_frontier": True}
     w = _w(g, frontier=3900)  # unpinned: the band starts at 3900

@@ -494,9 +494,15 @@ class Worker:
 
     def _gate_hit(self, ep, s, info) -> bool:
         """WorkerSpec.rail_gate: this 小节-1 life (not started at or after TAS frame gate["below"]) has reached the gate's
-        route arc length."""
+        route arc length. With a "sector" key the gate applies to lives started in that 小节 instead, and holds whatever
+        小节 they have reached since (a stretch specialist's lives stop past its stretch, checkpoint included)."""
         g = getattr(self.spec, "rail_gate", None) or {}
-        if not g or s is None or int(ep.d.get("start_sector") or 0) != 1 or int(info.get("sector") or 1) > 1:
+        if not g or s is None:
+            return False
+        if "sector" in g:
+            if int(ep.d.get("start_sector") or 0) != int(g["sector"]):
+                return False
+        elif int(ep.d.get("start_sector") or 0) != 1 or int(info.get("sector") or 1) > 1:
             return False
         below = int(g.get("below", 4000))
         if g.get("follow_frontier"):  # starts in the curriculum's range [frontier, end] always play through
