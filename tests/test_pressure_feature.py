@@ -108,9 +108,16 @@ def test_block_values_slots_normals_squash_and_support_force():
     # no friction contact (airborne / impact): the section is there with n = 0, the block is all zero
     slots, agg, _ = _block(cfg, [])
     assert not slots.any() and not agg.any()
-    # a contact without a valid lt normal (an engine that cannot read it): refused, never a block without directions
-    with pytest.raises(RuntimeError, match="lt_valid"):
-        _block(cfg, [(777, 10.0, (0, 0, 0), (0, 0, 0), 0)])
+    # a contact without an engine normal (lt_valid 0): no slot, no part in the direction; its force counts in the
+    # total and the contact in the count (nothing substituted)
+    slots, agg, info = _block(cfg, [(777, 10.0, (0, 0, 0), (0, 0, 0), 0)])
+    assert not slots.any()
+    np.testing.assert_allclose(agg, [0.5, 0, 0, 0, 0.25], atol=1e-6)
+    assert info["pressure_no_normal"] == [(10.0, 777)]
+    slots, agg, _ = _block(cfg, [(501, 30.0, (1.0, 10.0, 0), (-2.0, 0, 0)), (777, 10.0, (0, 0, 0), (0, -1, 0), 0)])
+    np.testing.assert_allclose(slots[0], [1, 30 / 40, -1, 0, 0, -1, 1], atol=1e-6)
+    assert not slots[1].any()
+    np.testing.assert_allclose(agg, [40 / 50, -30 / 40, 0, 0, 0.5], atol=1e-6)  # direction from the rail only
 
 
 def test_block_refuses_an_engine_without_the_section():

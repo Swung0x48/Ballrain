@@ -351,6 +351,9 @@ hello 串带 `phys2002 e72e4afcfa5c33a7`。`train_m2.py --backend headless --hl-
 - **构建**：源码树是 `runtime/hl-win/clean/respawnfix/src` 的副本加新的 agent 源（`runtime/hl-win/clean/pressure`），输出放新目录 `runtime/hl-win/bin-x86p2002f-pressure/`；
   正在用的 `bin-x86p2002f-respawnfix` 不动。`headless/src/ballrain_agent.cpp` 同时补进了 respawnfix 构建里已有、仓库里缺的一段（旧的 Physicalize 三参数布局迁移到 2002 BB 的四参数布局）。
 - **特征**：`FeatureConfig.pressure`（docs/observations.md）。原生志愿者客户端还没有这一块（后续单独做）。
+- **没有法向的接触**：训练中 2002 宿主偶尔给出 `lt_valid` 0 的摩擦接触（本机 5 个 worker 约 25 分钟 14 次，对方是 A01–A04 的地面和 A03_Rail_01；
+  runner 上约每分钟 30 次）。原样回放其中一条出错的生命没有重现；用策略从出生点和螺旋起跑、两种物理各约 5 万个接触里也没碰到。原因没查实
+  （猜测是引擎还没解算过的新接触点）。特征不再因此中止：这种接触不占槽、不参与合力方向，支持力计入总量，接触计入接触数。不用别的来源替代。
 - **其余字段 2002 对 x87-soft**（同一核对，7060 帧）：TIME、BALL（除 core_flags 原始位域）、CAMS、FRIC、FRCP、MIND（除 ledge 地址和 plane 的 w：xyz 逐位相同）、
   SCOR（除 Energy 第 4 列：参数格的指针）逐位相同；BODY 的项集合与按距离的顺序相同，只有导出顺序不同（6171 帧起），特征按距离排序，不受影响；
   GLCT 组计数不同（§5 已列为 x87-soft 给不出）。这些不同的字段训练特征都不用；当前训练配置的完整观测（342 项）在 940–3700 帧两边逐位相同。

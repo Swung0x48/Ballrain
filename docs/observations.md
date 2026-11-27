@@ -187,7 +187,7 @@ SR01 全程平均 5.8 → 1.4 ms，HS01 6.7 → 1.5 ms（每 4 帧取 1 帧，`t
 | rails_lr | 2 × 6 | 仅 f8：球左、右两侧最近的钢轨面点，每侧 (存在, 接近度, 相对球心的三维偏移 / 6, 偏移在路线右侧轴上的分量 / 6) |
 | spin、spin_vel | 3 + 3 | 可选（`FeatureConfig.spin`，`train_m2 --spin`，默认关）：球的角速度从体坐标转到方向特征的坐标系 / angvel_scale；以及沿球自身水平速度分解的（滚动、侧旋、自转），水平速度趋于 0 时平滑淡出 |
 | orient | 6 | 可选（`FeatureConfig.orient`，`--orient`）：球体 x、y 轴（R(q_next) 的前两列）在方向特征坐标系里的分量，连续的姿态表示（q 与 −q 相同） |
-| pressure、pressure_agg | 2 × 7 + 5 | 可选（`FeatureConfig.pressure`，`--pressure`，只有带 FRCP 段的无头构建能用，缺段直接报错）：引擎的摩擦接触，按支持力从大到小取 2 个，每个 (存在, 支持力 p/(p+38), 引擎接触法向（FRIC lt_normal，转成朝向球心）3、法向在路线右侧轴上的分量, 对方是钢轨)；汇总 (总支持力 压缩, 合力 Σp·n 的方向 × 压缩后的大小 3, 接触数 / 4)。全部来自引擎，不由运动反推。见 docs/headless.md §13.4 |
+| pressure、pressure_agg | 2 × 7 + 5 | 可选（`FeatureConfig.pressure`，`--pressure`，只有带 FRCP 段的无头构建能用，缺段直接报错）：引擎的摩擦接触，按支持力从大到小取 2 个，每个 (存在, 支持力 p/(p+38), 引擎接触法向（FRIC lt_normal，转成朝向球心）3、法向在路线右侧轴上的分量, 对方是钢轨)；汇总 (总支持力 压缩, 合力 Σp·n 的方向 × 压缩后的大小 3, 接触数 / 4)。全部来自引擎，不由运动反推；没有引擎法向的接触（`lt_valid` 0，少见）只计入总支持力和接触数。见 docs/headless.md §13.4 |
 
 `FeatureConfig` 的全部字段（网格大小、射线扇方向数、缩放、是否含运动体……）都会写进每个 run 的元数据。
 **f6**（`FEATURE_VERSION = "f6"`）：可选的前瞻块 `far_waypoints`、`ref_speed`，默认关闭，此时布局与 f5 完全相同。原因（r3，第 3 小节）：球以约 21 单位/秒接近 s 1375–1395 的腾空缺口，

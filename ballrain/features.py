@@ -47,7 +47,7 @@ RAIL_SIDE_FIELDS = ("present", "proximity", "off_x", "off_y", "off_z", "off_lat"
 # FeatureConfig.pressure: the PRESSURE_SLOTS friction contacts with the largest pressure (FRCP), each (present, squashed
 # pressure, contact normal in the directional frame (3, oriented towards the ball centre), normal along the route's
 # right axis, partner is a rail); aggregate (squashed total pressure, support-force direction x squashed magnitude (3),
-# friction contacts / 4)
+# friction contacts / 4). A contact without an engine normal (lt_valid 0) only counts in the total and the contact count
 PRESSURE_SLOTS = 2
 PRESSURE_SLOT_FIELDS = ("present", "pressure", "n_x", "n_y", "n_z", "n_lat", "rail")
 PRESSURE_AGG_FIELDS = ("total", "force_x", "force_y", "force_z", "n_contacts")
@@ -809,9 +809,10 @@ class FeatureExtractor:
     def _pressure(self, tracker, F, info, pos, right, fwd):
         """FeatureConfig.pressure: per friction contact the engine's normal force (FRCP pressure) and the engine's
         contact normal (FRIC lt_normal, IVP_Impact_Solver_Long_Term of the contact; oriented here towards the ball
-        centre). A missing FRCP section, or a contact without a valid lt normal (an engine that cannot read it), is an
-        error: the block never runs on partial engine data. Both the 2002 host and the x87-soft headless physics send
-        them (docs/headless.md, FRCP)."""
+        centre). A missing FRCP section is an error (the engine does not export the force). A friction contact without
+        an engine normal (FRIC lt_valid 0: rare, e.g. a contact point the engine has not solved yet) takes no slot and
+        no part in the force direction; its force counts in the total and the contact in n_contacts (so n_contacts
+        above the filled slots shows it). Nothing is substituted: every value is the engine's (docs/headless.md, FRCP)."""
         obs = tracker.obs
         frcp, fric = obs.frcp, obs.fric
         if frcp is None:
@@ -823,19 +824,19 @@ class FeatureExtractor:
         lat = info["lateral_axis"] if "lateral_axis" in info else self._lateral_axis(info, right)
         out = F["pressure"].reshape(PRESSURE_SLOTS, len(PRESSURE_SLOT_FIELDS))
         agg = F["pressure_agg"]
-        items = []
+        items, no_normal = [], []
         for it, fc in zip(frcp, fric):
             p = max(float(it["pressure"]), 0.0)
             n = np.asarray(fc["lt_normal"], np.float64)
             h = float(np.linalg.norm(n))
             if not fc["lt_valid"] or h < 1e-6:
-                raise RuntimeError(f"FeatureConfig.pressure: friction contact with partner {int(fc['partner'])} has no "
-                                   "engine contact normal (FRIC lt_valid 0): this engine build does not export it")
+                no_normal.append((p, int(fc["partner"])))
+                continue
             n = n / h
             if float(n @ (pos - np.asarray(fc["lt_point"], np.float64))) < 0:  # towards the ball centre
                 n = -n
             items.append((p, n, float(lvl.in_group(int(it["partner"]), G_RAILS))))
-        info["pressure_contacts"] = items
+        info["pressure_contacts"], info["pressure_no_normal"] = items, no_normal
         items.sort(key=lambda e: -e[0])
         sq = lambda v: v / (v + c.pressure_scale)
         for i, (p, n, rail) in enumerate(items[:PRESSURE_SLOTS]):
@@ -844,10 +845,11 @@ class FeatureExtractor:
         if items:
             f = np.sum([p * n for p, n, _ in items], axis=0)
             m = float(np.linalg.norm(f))
-            agg[0] = sq(sum(p for p, _, _ in items))
             if m > 1e-9:
                 agg[1:4] = to_frame(f / m, right, fwd) * sq(m)
-            agg[4] = min(len(items), 4) / 4
+        if items or no_normal:
+            agg[0] = sq(sum(p for p, _, _ in items) + sum(p for p, _ in no_normal))
+            agg[4] = min(len(items) + len(no_normal), 4) / 4
 
     def _lateral_axis(self, info, right) -> np.ndarray:
         """Horizontal unit vector to the right of the route (the reference line's tangent at the ball, as vel_path);
