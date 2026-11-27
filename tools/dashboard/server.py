@@ -907,8 +907,10 @@ def main(argv=None):
     ap.add_argument("--generator", action="store_true", help=argparse.SUPPRESS)  # the child the server starts
     argv = list(sys.argv[1:] if argv is None else argv)
     a = ap.parse_args(argv)
-    lower_priority()
     if a.generator:
+        # only the generator runs below normal priority: the server is light, and below normal it starved for
+        # minutes at start (importing torch) while the runners and a training kept every core busy
+        lower_priority()
         Dashboard(a, role="generator").run_generator()
         return
     dash = Dashboard(a, argv=argv)

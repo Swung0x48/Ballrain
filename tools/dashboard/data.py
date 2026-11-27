@@ -1547,7 +1547,7 @@ class Traces:
                 continue
             s = _sig(p)
             hit = self.meta.get(j)
-            if hit and hit[0] == s and hit[1].get("record") == rec and hit[1].get("bv") == 2:
+            if hit and hit[0] == s and hit[1].get("record") == rec and hit[1].get("bv") == 3:
                 out.append(hit[1])
                 continue
             try:
@@ -1557,10 +1557,15 @@ class Traces:
             h = zlib.crc32(p.stem.encode())
             # the route bundle the life ran with and the branch member a rest start was placed on (server-side only)
             pin = (d.get("feature_config") or {}).get("branch_sha256")
-            bid = str((d.get("start_state") or {}).get("branch_id") or "")
+            st = d.get("start_state") or {}
+            bid = str(st.get("branch_id") or "")
+            # a TAS hand-over replays its own record up to the hand-over: compare against that record (a 4741
+            # prefix compared with the 4740 run record diverged at frame ~1046 and showed as a policy-played level start)
+            srec = st.get("record") if st.get("kind") == "tas" else None
+            trec = srec if isinstance(srec, str) and srec != rec and tas_trace(srec).exists() else rec
             info = {"key": j, "id": f"{h:08x}", "run": run.name, "end": OUTCOME.get(d.get("end_reason"), "stopped"),
                     "sr": d.get("sr_ms"), "hs": d.get("hs"), "t": float(d.get("started_at") or 0), "h": h / 2 ** 32,
-                    "backend": run_backend_label(d), "record": rec, "bv": 2,
+                    "backend": run_backend_label(d), "record": rec, "trace_record": trec, "bv": 3,
                     "pin": str(pin) if isinstance(pin, str) and pin else None,
                     "branch_id": bid if ROUTE_ID_RE.match(bid) else None}
             self.meta[j] = (s, info)
@@ -1572,7 +1577,7 @@ class Traces:
         j = info["key"]
         tp = Path(j).with_name("trace.txt")
         s = _sig(tp)
-        rec = info.get("record")
+        rec = info.get("trace_record") or info.get("record")
         if rec is None:
             return None
         hit = self.parsed.get(j)
