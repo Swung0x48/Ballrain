@@ -133,6 +133,12 @@ class FeatureConfig:
     # in the sector / 5 and in the level / 15. Needs benchmarks/placements/L<nn>.json for the level.
     pickups: bool = False
     pickup_scale: float = 20.0
+    # the spin block, after every other entry (a policy grows with zero input weights): the ball's angular velocity in
+    # the frame of the directional features (world with camera "world", else the camera yaw frame) / angvel_scale.
+    # The "angvel" entries are the same vector in the ball's own body frame (IVP rot_speed + rot_speed_change), which
+    # turns with the ball, so they give the spin rate but not its direction relative to the motion; here it is rotated
+    # to the world by the ball's quaternion q_next (geometry.quat_matrix, column-vector, x y z w). Needs no reference line.
+    spin: bool = False
 
     def to_dict(self):
         d = asdict(self)
@@ -142,6 +148,8 @@ class FeatureConfig:
             del d["branch_sha256"]
         if not self.pickups:  # preserve serialized configurations when off
             del d["pickups"], d["pickup_scale"]
+        if not self.spin:
+            del d["spin"]
         return d
 
 
@@ -313,6 +321,14 @@ def yaw_basis(matrix43) -> tuple[np.ndarray, np.ndarray]:
     return r, f
 
 
+def spin_vector(ball, right, fwd) -> np.ndarray:
+    """FeatureConfig.spin (before scaling): the ball's angular velocity, IVP rot_speed + rot_speed_change in its body
+    frame, rotated to the world by its quaternion q_next (geometry.quat_matrix: column-vector, x y z w) and then to the
+    directional features' frame (to_frame)."""
+    w_body = np.asarray(ball["rot_speed"], np.float64) + np.asarray(ball["rot_speed_change"], np.float64)
+    return to_frame(G.quat_matrix(ball["q_next"]) @ w_body, right, fwd)
+
+
 def to_frame(v, right, fwd) -> np.ndarray:
     v = np.asarray(v, np.float64)
     if v.shape == (3,):  # the common single vector: the same float64 operations without np.stack's overhead
@@ -367,6 +383,8 @@ def make_layout(c: FeatureConfig) -> list:
               ("rails_lr", 2 * len(RAIL_SIDE_FIELDS))]
     if c.pickups:  # after everything else, so an f8 policy grows with zero input weights
         L += [("pickups", PICKUP_SLOTS * 6), ("pickups_left", 2)]
+    if c.spin:  # after everything else, so a policy without it grows with zero input weights
+        L.append(("spin", 3))
     return L
 
 
@@ -528,6 +546,8 @@ class FeatureExtractor:
             F["vel_cam"][:] = to_frame(vel, right, fwd) / c.vel_scale
             F["speed"][0] = np.linalg.norm(vel) / c.vel_scale
             F["angvel"][:] = (np.asarray(ball["rot_speed"]) + np.asarray(ball["rot_speed_change"])) / c.angvel_scale
+            if c.spin:
+                F["spin"][:] = spin_vector(ball, right, fwd) / c.angvel_scale
             if c.absolute_position:
                 F["pos_world"][:] = pos / c.pos_scale
             radius = float(ball["extra_radius"]) or 2.0

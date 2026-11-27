@@ -258,6 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pickups", action="store_true",
                    help="the pickup block (FeatureConfig.pickups: nearest score / life balls still present in the sector, "
                         "after every other entry; a checkpoint without it is grown with zero input weights)")
+    p.add_argument("--spin", action="store_true",
+                   help="the spin block (FeatureConfig.spin: the ball's angular velocity rotated from its body frame to "
+                        "the directional features' frame, 3 entries, after every other entry; a checkpoint without it "
+                        "is grown with zero input weights). Sticky like --pickups")
     p.add_argument("--pickups-success", action="store_true",
                    help="for the failure-weighted starts a finish that left a score / life ball behind is a failure")
     p.add_argument("--auto-collect", action="store_true",
@@ -531,7 +535,7 @@ def make_env_config(a, out_root: Path, ck=None, init=None):
                        far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=path_dir,
                        branch_sha256=pin, path_sha256=main_sha, reach=bool(getattr(a, "reach", False)),
                        version=CONTACT_FEATURE_VERSION if getattr(a, "contacts", False) else FEATURE_VERSION,
-                       pickups=bool(getattr(a, "pickups", False)))
+                       pickups=bool(getattr(a, "pickups", False)), spin=bool(getattr(a, "spin", False)))
     from ballrain.reach_features import is_mechanism_version, reach_version
     old_reach = old.get("reach_version")
     saved_mechanisms = is_mechanism_version(old_reach)
@@ -622,6 +626,7 @@ def main(argv=None) -> int:
         a.contacts = bool(a.contacts or saved.get("contacts"))  # likewise for the f8 contact blocks
         a.auto_collect = bool(a.auto_collect or saved.get("auto_collect"))  # the harness keeps collecting on resume
         a.pickups = bool(a.pickups or saved.get("pickups"))  # on stays on (the observation never shrinks)
+        a.spin = bool(a.spin or saved.get("spin"))  # likewise for the spin block
         from ballrain.reach_features import is_mechanism_version
         a.reach_mechanisms = a.reach_mechanisms or is_mechanism_version(saved.get("reach_version"))
     else:
