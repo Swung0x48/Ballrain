@@ -28,11 +28,14 @@ FIELDS = ["version", "camera", "pos_scale", "vel_scale", "angvel_scale", "absolu
           "path_lateral_scale", "path_back", "path_ahead", "path_margin", "path_reacquire", "waypoints",
           "waypoint_spacing", "far_waypoints", "ref_speed_at", "bodies", "body_radius", "dynamic_geometry", "counters",
           "hs_block", "follower_sources", "checkpoint_frames_scale", "clip", "reach", "reach_version", "branch_sha256", "pickups", "pickup_scale"]
+# opt-in blocks added later: to_dict leaves them out while off, so the serialized configuration above is unchanged
+OPT_IN = ["spin", "spin_vel_fade", "orient", "pressure", "pressure_scale"]
 N_F8 = FX.CONTACT_SLOTS * len(FX.CONTACT_SLOT_FIELDS) + len(FX.CONTACT_AGG_FIELDS) + 2 * len(FX.RAIL_SIDE_FIELDS)
 
 
 def test_f6_f7_unchanged_and_f8_appends_after_the_reach_block():
-    assert [f.name for f in fields(FX.FeatureConfig)] == FIELDS
+    assert [f.name for f in fields(FX.FeatureConfig)] == FIELDS + OPT_IN
+    assert not set(FX.FeatureConfig(**R8, reach=True, version="f8").to_dict()) & set(OPT_IN)  # off: not serialized
     assert FX.layout_size(FX.FeatureConfig()) == 204
     f7, f8 = FX.FeatureConfig(**R8, reach=True), FX.FeatureConfig(**R8, reach=True, version="f8")
     assert FX.layout_size(f7) == 267 and f7.version == "f7" and not f7.contacts  # the r8 run
@@ -47,7 +50,7 @@ def test_f6_f7_unchanged_and_f8_appends_after_the_reach_block():
     assert FX.FeatureConfig(**asdict(f8)).version == "f8" and FX.FeatureConfig(**asdict(f7)).version == "f7"
     assert FX.FeatureConfig(**dict(asdict(f7), reach=False)).version == "f6"
     assert FX.FeatureConfig().to_dict() == {k: v for k, v in asdict(FX.FeatureConfig()).items()
-                                            if k not in ("branch_dir", "branch_sha256", "pickups", "pickup_scale")}
+                                            if k not in ("branch_dir", "branch_sha256", "pickups", "pickup_scale", *OPT_IN)}
 
 
 class _OldCode(pickle.Unpickler):

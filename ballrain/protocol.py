@@ -14,7 +14,7 @@ is silent, and the C++ side must match them (they are also listed in docs/observ
   A3  Section header: u32 tag, u16 sec_version, u16 sec_flags, u32 payload_len (12 bytes).
       payload_len is the unpadded payload length; the next section starts at align4(payload_len).
       Readers accept trailing payload bytes (fields are only ever appended) and skip unknown tags.
-  A4  Per-frame list sections (FRIC, MIND, BODY, ARRS, EVTS, WTCH, PHYS) start with u16 n, items follow
+  A4  Per-frame list sections (FRIC, FRCP, MIND, BODY, ARRS, EVTS, WTCH, PHYS) start with u16 n, items follow
       directly. TRAC starts with u32 n (a block can cover more than 65535 frames). PHYS items are u32
       physicalize-record sequence numbers.
   A5  CK world matrices "12 x f32" are rows 0..3 of the 4x4 VxMatrix, columns 0..2 (row 3 = position);
@@ -165,6 +165,10 @@ FRIC_DT = np.dtype([
     ("partner", "<u4"), ("self_status", "u1"), ("partner_status", "u1"), ("cp_status", "u1"), ("pad", "u1"),
     ("gap", "<f4"), ("friction", "<f4"), ("lt_normal", "<f4", 3), ("lt_point", "<f8", 3), ("lt_valid", "u1"),
 ])
+# FRCP (headless contact-pressure builds, optional): one item per FRIC item, same order: the partner's ckid and the
+# contact point's now_friction_pressure (IVP_Contact_Point_Fast; the contact's normal and point are FRIC lt_*). Missing
+# section = an engine that does not export it (BallrainIO, older headless builds): Observation.frcp stays None.
+FRCP_DT = np.dtype([("partner", "<u4"), ("pressure", "<f4")])
 MIND_DT = np.dtype([
     ("partner", "<u4"), ("self_status", "u1"), ("partner_status", "u1"), ("pad", "<u2"),
     ("gap", "<f4"), ("plane", "<f4", 4), ("sum_extra_radius", "<f4"), ("ledge", "<u4"),
@@ -206,14 +210,14 @@ ARRS_ITEM_HDR = struct.Struct("<IHHBB")  # array ckid, row, col, col type, len
 
 for _dt, _size in ((TIME_DT, 57), (FRIC_DT, 53), (MIND_DT, 112), (BODY_DT, 180), (CAMS_DT, 264),
                    (GLCT_DT, 30), (EVT_DT, 8), (WTCH_DT, 17), (TRAC_DT, 52), (TIME_EXT_DT, 12), (SCOR_DT, 56),
-                   (SREN_DT, 80), (SCOR_EXT_DT, 4), (SREN_EXT_DT, 8)):
+                   (SREN_DT, 80), (SCOR_EXT_DT, 4), (SREN_EXT_DT, 8), (FRCP_DT, 8)):
     assert _dt.itemsize == _size, (_dt, _dt.itemsize)
 assert BALL_DT.itemsize == 4 + 2 + 48 + 24 + 32 + 32 + 8 + 60 + 8 + 8 + 4
 
 FRAME_ACT_DT = np.dtype([("delta", "<f4"), ("keys", "<u4")])  # == ballrain.tas.FRAME_DTYPE
 
 LIST_SECTIONS = {  # tag -> (count format, item dtype)
-    "FRIC": ("<H", FRIC_DT), "MIND": ("<H", MIND_DT), "BODY": ("<H", BODY_DT),
+    "FRIC": ("<H", FRIC_DT), "FRCP": ("<H", FRCP_DT), "MIND": ("<H", MIND_DT), "BODY": ("<H", BODY_DT),
     "EVTS": ("<H", EVT_DT), "WTCH": ("<H", WTCH_DT), "TRAC": ("<I", TRAC_DT),
 }
 FIXED_SECTIONS = {"TIME": TIME_DT, "BALL": BALL_DT, "CAMS": CAMS_DT, "GLCT": GLCT_DT, "SCOR": SCOR_DT, "SREN": SREN_DT,
@@ -317,6 +321,7 @@ class Observation:
     time: np.void | None = None
     ball: np.void | None = None
     fric: np.ndarray = field(default_factory=lambda: np.zeros(0, FRIC_DT))
+    frcp: np.ndarray | None = None  # contact pressure per FRIC item (headless contact-pressure builds); None = not sent
     mind: np.ndarray = field(default_factory=lambda: np.zeros(0, MIND_DT))
     body: np.ndarray = field(default_factory=lambda: np.zeros(0, BODY_DT))
     cams: np.void | None = None

@@ -26,7 +26,7 @@
 // every field below except MIND ledge (an address), bml_hs and the CK ids is the retail one.
 //
 // What the engine cannot give (marked in the data: OBS1 flag OBS_HEADLESS, docs/headless.md):
-// FRIC lt_* (transaction memory), MIND ledge (an address), IVPO material bytes, GLCT group counters,
+// MIND ledge (an address), IVPO material bytes, GLCT group counters,
 // BALL core_flags / core_state other than the unmoveable bits / movement state, SCOR / SREN bml_hs
 // (computed as Points + Lifes x LifeBonus, BML+'s value), CK ids (allocated by this engine).
 
@@ -181,6 +181,10 @@ void PutMatrix12(Wire &w, const VxMatrix &m) {
 #ifdef BALLRAIN_PHYS2002_HOST
 // ---- 2002 DLL raw reads (BallrainIO Agent.cpp, unchanged)
 using namespace ivp2002;
+// f32 now_friction_pressure of the contact point (not in Ivp2002.h). ivp_friction.hxx IVP_Contact_Point_Fast:
+// tmp_contact_info 0x40 (CP_LT), real_friction_factor 0x44 (CP_FRICTION), integrated_destroyed_energy 0x48,
+// inv_triangle_det 0x4C, old_energy_dynamic_fr 0x50, now_friction_pressure 0x54, last_gap_len 0x58 (CP_GAP).
+constexpr ptrdiff_t CP_PRESSURE = 0x54;
 
 bool CoreUnmoveable(const u8 *core) {
     uint32_t v = 0;
@@ -328,6 +332,24 @@ void BeginMessage(Wire &w, const char magic[4], uint16_t flags, uint32_t frames)
 void EndMessage(Wire &w) {
     w.PatchU32(8, (uint32_t) w.Size());
     w.PatchU32(16, w.Sections());
+}
+
+// FRCP v1 (headless only, optional): u16 n, then n x (u32 partner ckid, f32 now_friction_pressure), the same items in
+// the same order as the FRIC section just written (the contact's normal and point are FRIC's lt_* fields). IVP keeps the
+// pressure on each friction contact point; airborne / impact frames have no friction contact (n = 0). Readers that do
+// not know the tag skip it.
+struct FrcpItem {
+    uint32_t partner = 0;
+    float pressure = 0;
+};
+void WriteFrcp(Wire &w, const FrcpItem *items, uint32_t n) {
+    w.Begin("FRCP", 1);
+    w.U16((uint16_t) n);
+    for (uint32_t i = 0; i < n; ++i) {
+        w.U32(items[i].partner);
+        w.F32(items[i].pressure);
+    }
+    w.End();
 }
 
 // ------------------------------------------------------------------------------------------- socket
@@ -1055,6 +1077,26 @@ CKBehavior *Hook(CKBehavior *script, uint16_t code) {
 CKBEHAVIORFCT g_Physicalize = nullptr;
 int PhysicalizeHook(const CKBehaviorContext &behcontext) {
     CKBehavior *beh = behcontext.Behavior;
+#ifdef BALLRAIN_PHYS2002_HOST
+    // Older Physicalize instances store [convex, ball, shift].  The 2002 BB
+    // expects [convex, ball, concave, shift].  CK2 may already have renamed
+    // the locals by prototype index; identify the old shape by type, not name.
+    if (ballrain::phys2002::loaded() && beh->GetLocalParameterCount() == 3) {
+        auto *shift = beh->GetLocalParameter(2);
+        if (shift && shift->GetGUID() == CKPGUID_VECTOR) {
+            // Keep the vector object (and any links to it). Allocate before
+            // moving it so an allocation failure leaves the old layout intact.
+            auto *count = beh->CreateLocalParameter("Concave Count", CKPGUID_INT);
+            if (!count) return CKBR_PARAMETERERROR;
+            const int zero = 0;
+            count->SetValue(&zero);
+            beh->RemoveLocalParameter(2);
+            shift->SetName("Shift Mass Center");
+            beh->AddLocalParameter(shift);
+            Log("physicalize: migrated legacy shift vector on block %u (concave count 0)", beh->GetID());
+        }
+    }
+#endif
     if (g_Agent) {
         g_Agent->ApplyBallOrder();
         g_Agent->OnPhysicalize(beh, beh->IsInputActive(0) != FALSE);
@@ -1388,6 +1430,9 @@ void Agent::WriteIvp2002(Wire &w, CK3dEntity *ball) {
     }
 
     // ---- FRIC: friction synapses of the ball -> contact points
+    // FRCP (after FRIC, same items in the same order): partner ckid + now_friction_pressure per contact point
+    FrcpItem frcp[32];
+    uint32_t frcpN = 0;
     if (!(m_ObsMask & M_FRIC)) {
         w.Begin("FRIC", 1);
         const size_t at = w.Size();
@@ -1417,6 +1462,10 @@ void Agent::WriteIvp2002(Wire &w, CK3dEntity *ball) {
             Rd(cp, CP_STATUS, cpst);
             Rd(cp, CP_GAP, gap);
             Rd(cp, CP_FRICTION, fric);
+            FrcpItem &fi = frcp[n];
+            fi.partner = CkidOf2002(pclient);
+            Rd(cp, CP_PRESSURE, fi.pressure);
+            frcpN = n + 1;
             u8 *lt = nullptr;
             const bool ltOk = Rd(cp, CP_LT, lt) && lt && SafeRead(lt + LT_NORMAL, normal, sizeof(normal)) &&
                               SafeRead(lt + LT_POINT, point, sizeof(point));
@@ -1442,6 +1491,7 @@ void Agent::WriteIvp2002(Wire &w, CK3dEntity *ball) {
         }
         w.PatchU16(at, (uint16_t) n);
         w.End();
+        WriteFrcp(w, frcp, frcpN);
     }
 
     // ---- MIND: exact synapses of the ball -> mindists
@@ -2512,10 +2562,24 @@ void Agent::BuildState(bool minimal) {
         w.End();
     }
 
-    // ---- FRIC
+    // ---- FRIC (+ FRCP: partner ckid + now_friction_pressure per item, same order)
+    FrcpItem frcp[32];
+    uint32_t frcpN = 0;
     if (!m_P2 && !(m_ObsMask & M_FRIC)) {
         w.Begin("FRIC", 1);
-        w.SetSectionFlags(SECF_APPROX);   // lt_* not available (transaction memory)
+        // lt_*: the long-term contact info (tmp_contact_info) is transaction memory, cleared after the PSI; but
+        // IVP_Contact_Point::recalc_friction_s_vals copies its contact_point_ws / surf_normal onto the point itself
+        // (last_contact_point_ws, surf_normal_ws: "cache surface normal as needed by external code"), so those are the
+        // values the 2002 host reads through lt (the point as f32 here, f64 there). lt_valid 0 until the first recalc.
+        auto contactLt = [](IVP_Contact_Point *c, float nrm[3], double pt[3]) -> bool {
+            const IVP_U_Float_Point &n = IVP_BMMO_State::cp_normal_ws(*c);
+            const IVP_U_Float_Point &q = IVP_BMMO_State::cp_contact_ws(*c);
+            for (int k = 0; k < 3; ++k) {
+                nrm[k] = n.k[k];
+                pt[k] = q.k[k];
+            }
+            return n.k[0] != 0.0f || n.k[1] != 0.0f || n.k[2] != 0.0f;
+        };
         const size_t at = w.Size();
         w.U16(0);
         uint32_t n = 0;
@@ -2531,8 +2595,16 @@ void Agent::BuildState(bool minimal) {
             w.U8(0);
             w.F32(IVP_BMMO_State::cp_gap(*cp));
             w.F32(IVP_BMMO_State::cp_friction_factor(*cp));
-            w.Zeros(12 + 24);
-            w.U8(0);
+            FrcpItem &fi = frcp[n];
+            fi.partner = ps ? CkidOf(ps->get_object()) : 0;
+            fi.pressure = IVP_BMMO_State::cp_pressure(*cp);
+            frcpN = n + 1;
+            float nrm[3] = {};
+            double pt[3] = {};
+            const bool ltOk = contactLt(cp, nrm, pt);
+            w.Raw(nrm, sizeof(nrm));
+            w.Raw(pt, sizeof(pt));
+            w.U8(ltOk ? 1 : 0);
             ++n;
             IVP_Synapse_Friction *nx = s->get_next();
             if (nx == s || nx == head)
@@ -2541,6 +2613,7 @@ void Agent::BuildState(bool minimal) {
         }
         w.PatchU16(at, (uint16_t) n);
         w.End();
+        WriteFrcp(w, frcp, frcpN);
     }
 
     // ---- MIND

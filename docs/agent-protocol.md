@@ -69,6 +69,7 @@ v1 的段如下（`f32` / `f64` 原样拷贝内存，不做换算）：
 | `TIME` | f64 env current_time、time_of_next_psi、time_of_last_psi；f32 管理器 +0xC8、+0xCC、+0xD0；f32 本帧 delta；f64 SR（mod 按 BML+ 0.3.12 规则累加的 double 和）；f32 `GetSRScore()`；u8 SR 是否在计时；u32 本条覆盖的帧数 | 每条 |
 | `BALL` | u32 ckid；u8 类型（0 木，1 纸，2 石，254 其它，255 无）；u8 是否找到 IVP 物体；CK 世界矩阵 12×f32；core：f64×3 pos_last_psi、f64×4 q_last、f64×4 q_next、f64 tpsi、f32×3 speed、f32×3 speed_change、f32×3 rot_speed、f32×3 rot_speed_change、f32×3 rotation_axis、f32 current_speed、f32 abs_omega、u32 core 位域 +0x00、u32 core +0x60；f32 extra_radius | 每条 |
 | `FRIC` | u16 n；每项：u32 对方 ckid、u8 自身 status、u8 对方 status、u8 cp_status、u8 pad、f32 last_gap_len、f32 real_friction_factor、f32×3 lt.surf_normal、f64×3 lt.contact_point_ws、u8 lt 是否有效（mod 只检查可读）| 每条 |
+| `FRCP` | 仅无头 contact-pressure 构建（可选段）：u16 n；每项：u32 对方 ckid、f32 now_friction_pressure（接触点上的法向支持力）；与同一条的 FRIC 逐项同序 | 每条 |
 | `MIND` | u16 n；每项：u32 对方 ckid、u8 自身 status、u8 对方 status、u16 pad、f32 len_numerator、f32×4 contact_plane（含 hesse）、f32 sum_extra_radius、u32 ledge 标识、u16 tri_index、i8 edge_index、u8 有几个三角形、f32×9 特征三角形（物体坐标）、f32×9 相邻三角形（仅边接触时） | 每条 |
 | `BODY` | u16 n；附近运动体（半径由配置给，默认 60）：u32 ckid、u32 core +0x60、f64×3 pos、f64×4 q、f64×4 q_core_f_object、f32×3 shift_core_f_object、f32×3 speed、f32×3 rot_speed、CK 世界矩阵 12×f32 | 每条 |
 | `CAMS` | 5 × {u32 ckid，12×f32 世界矩阵}：Cam_OrientRef、Cam_Orient、Cam_Pos、Cam_Target、InGameCam；u32 当前挂接相机的 ckid | 每条 |
@@ -262,6 +263,7 @@ mod 拒绝运行的情况：physics_RT.dll 的 sha256 不是 2002 版；共享�
 | TIME | 69 | 0 f64 env current_time，8 f64 time_of_next_psi，16 f64 time_of_last_psi，24 f32 管理器 +0xC8，28 f32 +0xCC，32 f32 +0xD0，36 f32 本帧 GetLastDeltaTime，40 f64 SR（double 和），48 f32 GetSRScore()，52 u8 SR 计时中，53 u32 本条覆盖帧数（构造状态时）；**追加**：57 f32 float32 和，61 u32 原始帧计数（含尾帧），65 u32 尾帧数 |
 | BALL | 230 | 0 u32 ckid，4 u8 类型（0 木 1 纸 2 石 254 其它 255 无），5 u8 找到 IVP 物体（见 §8.7），6 12×f32 CK 世界矩阵，54 f64×3 pos_last_psi，78 f64×4 q_last，110 f64×4 q_next，142 f64 time_of_last_psi，150 f32×3 speed，162 speed_change，174 rot_speed，186 rot_speed_change，198 rotation_axis，210 f32 current_speed，214 f32 abs_omega，218 u32 core +0x00，222 u32 core +0x60，226 f32 extra_radius |
 | FRIC | 2+53n | u16 n（≤32）；项：0 u32 对方 ckid，4 u8 自身 status，5 u8 对方 status，6 u8 cp_status，7 u8 0，8 f32 last_gap_len，12 f32 real_friction_factor，16 f32×3 lt 法向，28 f64×3 lt 接触点，52 u8 lt 可读 |
+| FRCP | 2+8n | 可选（无头 contact-pressure 构建）：u16 n（= FRIC 的 n）；项：0 u32 对方 ckid，4 f32 now_friction_pressure（2002 DLL：接触点 +0x54） |
 | MIND | 2+112n | u16 n（≤64）；项：0 u32 对方 ckid，4 u8 自身 status，5 u8 对方 status，6 u16 0，8 f32 len_numerator（间隙），12 f32×4 contact_plane（xyz 是法向；第 4 个 float 即 +0x74 不维护，是无意义的残值），28 f32 sum_extra_radius，32 u32 ledge 地址，36 u16 tri_index（无为 0xFFFF），38 i8 边号，39 u8 三角形个数（0/1/2），40 f32×9 特征三角形（物体坐标），76 f32×9 相邻三角形 |
 | BODY | 2+180n | u16 n；项：0 u32 ckid，4 u32 core +0x60，8 f64×3 pos_last_psi，32 f64×4 q_last，64 f64×4 q_core_f_object，96 f32×3 shift_core_f_object，108 f32×3 speed，120 f32×3 rot_speed，132 12×f32 CK 世界矩阵 |
 | CAMS | 264 | 5 × {u32 ckid，12×f32}（Cam_OrientRef、Cam_Orient、Cam_Pos、Cam_Target、InGameCam），u32 当前挂接相机 ckid |

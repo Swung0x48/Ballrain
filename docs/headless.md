@@ -103,7 +103,7 @@ BML+ 0.3.12 的事件钩子（`EventHook.cpp` / `ScriptHelper.cpp`）按同样�
 |---|---|
 | TIME | 全部（env 时间来自物理桥的 `get_clock_state`；管理器三个值是 `m_DeltaTime` / `m_PhysicsDeltaTime` / `m_PhysicsTimeFactor`）。**第 0 帧**的观测建在隐藏 tick 之后，env 时间等与零售不同 |
 | BALL | 全部；`core_flags` 只有 physical_unmoveable 两位（bit 2–3），`core_state` 只有 movement_state（低字节）——其余位是 2002 二进制位域，没有对应 |
-| FRIC | 对方、状态、cp_status、间隙、摩擦系数可用；`lt_normal` / `lt_point` / `lt_valid` **不可用**（零售读的是事务内存，这里填 0，`lt_valid = 0`） |
+| FRIC | 对方、状态、cp_status、间隙、摩擦系数可用；`lt_normal` / `lt_point` 从接触点上的缓存（`surf_normal_ws` / `last_contact_point_ws`）导出，与零售读的事务内存同值（§13.4；之前的构建填 0，`lt_valid = 0`） |
 | MIND | 全部，除 `ledge`（零售是地址，这里 0）；`plane[3]`（+0x74）零售也是不维护的残值，不可比 |
 | BODY | 全部（遍历全部物理化实体，跳过不可动的核，与零售遍历整个簇等价）；`core_state` 只有 movement_state。项的顺序与零售不同（Python 按距离排序） |
 | CAMS、ARRS、WTCH、EVTS、PHYS、TRAC | 全部 |
@@ -330,3 +330,27 @@ hello 串带 `phys2002 e72e4afcfa5c33a7`。`train_m2.py --backend headless --hl-
   在第 12284 帧起球的 CK 矩阵差 1 ulp，之后分开。与观测读取（K = 1000 + obs_mask 255 也一样）、球序钩子、CRT 种子都无关，所以是 agent 模式和 `--tas` 的帧方案 / 钩子差别，
   两个无头后端共有，只在这条（G1 不用的）记录上看到。原因没查。
 - HS01_4738_1_31_317 的 FRIC `lt_point` / `lt_normal`（§13.1）：对方是 `P_Modul_01_Pusher`（7 帧）和 `A03_Floor_02` / `A04_Floor_01`，没有解释。
+
+### 13.4 接触支持力：FRCP 段（`bin-x86p2002f-pressure`，2026-11-27）
+
+- **内容**：新的可选段 `FRCP`（v1）：每个摩擦接触点一项（u32 对方 ckid、f32 `now_friction_pressure`），与同一条观测的 FRIC 逐项同序。
+  2002 宿主从接触点 +0x54 读（`ivp_friction.hxx` 的 `IVP_Contact_Point_Fast`：+0x44 real_friction_factor（`CP_FRICTION`）、+0x48 integrated_destroyed_energy、
+  +0x4C inv_triangle_det、+0x50 old_energy_dynamic_fr、+0x54 now_friction_pressure、+0x58 last_gap_len（`CP_GAP`），两端与 `Ivp2002.h` 的已知偏移吻合）；
+  源码物理分支用 `IVP_BMMO_State::cp_pressure`。不认识这个标签的读取方跳过它；旧二进制不发，Python 里 `Observation.frcp` 为 None。
+- **方向**：用 FRIC 的 `lt_normal` / `lt_point`（接触的 `IVP_Impact_Solver_Long_Term`）。2002 宿主从 DLL 内存读：L1 TAS 2950–3460 帧的 517 个接触点全部
+  `lt_valid`，|n| = 1，接触点离球心正好 2.0（半径），法向与“接触点 − 球心”同向（引擎存的是指向对方的法向）。
+  x87-soft（源码物理）的 lt 是事务内存，PSI 结束就清掉，以前 FRIC 在这里全写 0（`lt_valid` 0）；但源码的 `IVP_Contact_Point::recalc_friction_s_vals`
+  把同一份 `surf_normal` / `contact_point_ws` 缓存到接触点自己的 `surf_normal_ws` / `last_contact_point_ws`（注释：供外部代码用），现在从那里导出。
+  核对（同一二进制，`BALLRAIN_HL_PHYS2002=0` 对比 2002 DLL，L1 TAS 940–8000 帧，4375 个接触）：`lt_normal`、`lt_valid` 逐位相同，`lt_point` 差 ≤ 1.5e-5
+  （这里是 f32，2002 是 f64）。打开 `FeatureConfig.pressure` 的完整观测（361 项）在 940–6000 帧逐位相同。
+  旧的 x87-soft 构建（Mac 上的 `x87s-*`）没有这段改动，lt 仍是 0、也不发 FRCP：特征遇到缺段或 `lt_valid` 0 直接报错，要用新的 agent 源重编。
+- **实测**（L1 TAS 940–5000 帧逐帧回放，4060 帧）：每帧都有 FRCP、与 FRIC 逐项相同；每帧最多 2 个摩擦接触（0 个 1416 帧，1 个 2426，2 个 218）。
+  球静止在起点地面 37.9，TAS 在直单轨上匀速 37.9–38.0 = 木球质量 1.9 × 重力 20；单轨向上拐的凹弧上 45–48。非零读数中位数 38.0（钢轨 37.9，地面 38.0）。
+- **限制**：读数为 0 的接触不少（钢轨 411 / 1232，地面 323 / 1630）。螺旋里尤其明显：3140–3460 帧有摩擦接触的 270 帧里只有 132 帧非零，相邻几帧在 0 和 24–41 之间跳，
+  球其实一直贴着钢轨。原因没查（猜测这时引擎主要用碰撞冲量推球，这个字段只在部分时刻更新）。
+- **构建**：源码树是 `runtime/hl-win/clean/respawnfix/src` 的副本加新的 agent 源（`runtime/hl-win/clean/pressure`），输出放新目录 `runtime/hl-win/bin-x86p2002f-pressure/`；
+  正在用的 `bin-x86p2002f-respawnfix` 不动。`headless/src/ballrain_agent.cpp` 同时补进了 respawnfix 构建里已有、仓库里缺的一段（旧的 Physicalize 三参数布局迁移到 2002 BB 的四参数布局）。
+- **特征**：`FeatureConfig.pressure`（docs/observations.md）。原生志愿者客户端还没有这一块（后续单独做）。
+- **其余字段 2002 对 x87-soft**（同一核对，7060 帧）：TIME、BALL（除 core_flags 原始位域）、CAMS、FRIC、FRCP、MIND（除 ledge 地址和 plane 的 w：xyz 逐位相同）、
+  SCOR（除 Energy 第 4 列：参数格的指针）逐位相同；BODY 的项集合与按距离的顺序相同，只有导出顺序不同（6171 帧起），特征按距离排序，不受影响；
+  GLCT 组计数不同（§5 已列为 x87-soft 给不出）。这些不同的字段训练特征都不用；当前训练配置的完整观测（342 项）在 940–3700 帧两边逐位相同。

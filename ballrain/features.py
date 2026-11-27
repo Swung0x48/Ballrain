@@ -44,6 +44,13 @@ CONTACT_SIDE_LAT = 0.4  # a normal with more than this along the route's right a
 CONTACT_TOUCH_GAP = 0.1  # touching for the aggregates (touching entries are 0.01-0.04; the next facets 0.05+)
 CONTACT_AGG_FIELDS = ("support_n_x", "support_n_y", "support_n_z", "n_touch", "n_rail_touch")
 RAIL_SIDE_FIELDS = ("present", "proximity", "off_x", "off_y", "off_z", "off_lat")
+# FeatureConfig.pressure: the PRESSURE_SLOTS friction contacts with the largest pressure (FRCP), each (present, squashed
+# pressure, contact normal in the directional frame (3, oriented towards the ball centre), normal along the route's
+# right axis, partner is a rail); aggregate (squashed total pressure, support-force direction x squashed magnitude (3),
+# friction contacts / 4)
+PRESSURE_SLOTS = 2
+PRESSURE_SLOT_FIELDS = ("present", "pressure", "n_x", "n_y", "n_z", "n_lat", "rail")
+PRESSURE_AGG_FIELDS = ("total", "force_x", "force_y", "force_z", "n_contacts")
 
 
 @dataclass
@@ -148,6 +155,15 @@ class FeatureConfig:
     # rotation representation (unlike the quaternion, no q / -q sign flip). Matters for a ball whose collision shape is
     # not a sphere (the paper ball); a sphere's dynamics do not depend on it.
     orient: bool = False
+    # the contact-pressure block, after the orientation block (a policy grows with zero input weights): the ball's
+    # friction contacts as the physics engine keeps them (headless contact-pressure builds only; the feature refuses
+    # observations without the FRCP section): per contact the normal force IVP holds on the point
+    # (now_friction_pressure, FRCP) and the engine's contact normal (FRIC lt_normal), plus their sum as one support
+    # force. Zero without a friction contact (airborne, impact frames). pressure_scale: the force that maps to 0.5
+    # (p / (p + scale)); 38 = the wood ball's weight (mass 1.9 x gravity 20), measured: median 38.0 over the L1 TAS
+    # contacts, 37.9 at rest on the start floor.
+    pressure: bool = False
+    pressure_scale: float = 38.0
 
     def to_dict(self):
         d = asdict(self)
@@ -161,6 +177,8 @@ class FeatureConfig:
             del d["spin"], d["spin_vel_fade"]
         if not self.orient:
             del d["orient"]
+        if not self.pressure:
+            del d["pressure"], d["pressure_scale"]
         return d
 
 
@@ -425,6 +443,8 @@ def make_layout(c: FeatureConfig) -> list:
         L += [("spin", 3), ("spin_vel", 3)]
     if c.orient:  # after everything else
         L.append(("orient", 6))
+    if c.pressure:  # after everything else
+        L += [("pressure", PRESSURE_SLOTS * len(PRESSURE_SLOT_FIELDS)), ("pressure_agg", len(PRESSURE_AGG_FIELDS))]
     return L
 
 
@@ -596,6 +616,8 @@ class FeatureExtractor:
                 F["pos_world"][:] = pos / c.pos_scale
             radius = float(ball["extra_radius"]) or 2.0
             self._contacts(tracker, F, info, pos, vel, radius, right, fwd)
+            if c.pressure:
+                self._pressure(tracker, F, info, pos, right, fwd)
             info["supported"] = "support_point" in info  # floor-facing contact within SUPPORT_GAP (SR reward hold)
             self._terrain(tracker, F, info, pos, radius, right, fwd)
             if path is not None and (self.branch is None or valid):
@@ -783,6 +805,49 @@ class FeatureExtractor:
                 F["rail_dir"][:] = (dv[0] / h, dv[2] / h)
         else:
             F["rail_dist"][0] = 1.0
+
+    def _pressure(self, tracker, F, info, pos, right, fwd):
+        """FeatureConfig.pressure: per friction contact the engine's normal force (FRCP pressure) and the engine's
+        contact normal (FRIC lt_normal, IVP_Impact_Solver_Long_Term of the contact; oriented here towards the ball
+        centre). A missing FRCP section, or a contact without a valid lt normal (an engine that cannot read it), is an
+        error: the block never runs on partial engine data. Both the 2002 host and the x87-soft headless physics send
+        them (docs/headless.md, FRCP)."""
+        obs = tracker.obs
+        frcp, fric = obs.frcp, obs.fric
+        if frcp is None:
+            raise RuntimeError("FeatureConfig.pressure needs the FRCP section (a headless contact-pressure build; "
+                               "BallrainIO and older headless builds do not send it)")
+        if len(frcp) != len(fric):
+            raise RuntimeError(f"FRCP has {len(frcp)} items, FRIC {len(fric)}: they must match item by item")
+        c, lvl = self.cfg, tracker.level
+        lat = info["lateral_axis"] if "lateral_axis" in info else self._lateral_axis(info, right)
+        out = F["pressure"].reshape(PRESSURE_SLOTS, len(PRESSURE_SLOT_FIELDS))
+        agg = F["pressure_agg"]
+        items = []
+        for it, fc in zip(frcp, fric):
+            p = max(float(it["pressure"]), 0.0)
+            n = np.asarray(fc["lt_normal"], np.float64)
+            h = float(np.linalg.norm(n))
+            if not fc["lt_valid"] or h < 1e-6:
+                raise RuntimeError(f"FeatureConfig.pressure: friction contact with partner {int(fc['partner'])} has no "
+                                   "engine contact normal (FRIC lt_valid 0): this engine build does not export it")
+            n = n / h
+            if float(n @ (pos - np.asarray(fc["lt_point"], np.float64))) < 0:  # towards the ball centre
+                n = -n
+            items.append((p, n, float(lvl.in_group(int(it["partner"]), G_RAILS))))
+        info["pressure_contacts"] = items
+        items.sort(key=lambda e: -e[0])
+        sq = lambda v: v / (v + c.pressure_scale)
+        for i, (p, n, rail) in enumerate(items[:PRESSURE_SLOTS]):
+            nf = to_frame(n, right, fwd)
+            out[i] = (1.0, sq(p), nf[0], nf[1], nf[2], float(n @ lat), rail)
+        if items:
+            f = np.sum([p * n for p, n, _ in items], axis=0)
+            m = float(np.linalg.norm(f))
+            agg[0] = sq(sum(p for p, _, _ in items))
+            if m > 1e-9:
+                agg[1:4] = to_frame(f / m, right, fwd) * sq(m)
+            agg[4] = min(len(items), 4) / 4
 
     def _lateral_axis(self, info, right) -> np.ndarray:
         """Horizontal unit vector to the right of the route (the reference line's tangent at the ball, as vel_path);

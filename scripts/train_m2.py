@@ -266,6 +266,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the orientation block (FeatureConfig.orient: the ball's body x and y axes in the directional "
                         "features' frame, 6 entries, after every other entry; a checkpoint without it is grown with zero "
                         "input weights). Sticky like --spin")
+    p.add_argument("--pressure", action="store_true",
+                   help="the contact-pressure block (FeatureConfig.pressure: the friction contacts' normal force and "
+                        "normal from the engine, 19 entries, after every other entry; a checkpoint without it is grown "
+                        "with zero input weights). Needs a headless build that sends the FRCP section; sticky like --spin")
     p.add_argument("--pickups-success", action="store_true",
                    help="for the failure-weighted starts a finish that left a score / life ball behind is a failure")
     p.add_argument("--auto-collect", action="store_true",
@@ -539,7 +543,8 @@ def make_env_config(a, out_root: Path, ck=None, init=None):
                        far_waypoints=fl(a.far_waypoints), ref_speed_at=fl(a.ref_speed_at), path_dir=path_dir,
                        branch_sha256=pin, path_sha256=main_sha, reach=bool(getattr(a, "reach", False)),
                        version=CONTACT_FEATURE_VERSION if getattr(a, "contacts", False) else FEATURE_VERSION,
-                       pickups=bool(getattr(a, "pickups", False)), spin=bool(getattr(a, "spin", False)), orient=bool(getattr(a, "orient", False)))
+                       pickups=bool(getattr(a, "pickups", False)), spin=bool(getattr(a, "spin", False)), orient=bool(getattr(a, "orient", False)),
+                       pressure=bool(getattr(a, "pressure", False)))
     from ballrain.reach_features import is_mechanism_version, reach_version
     old_reach = old.get("reach_version")
     saved_mechanisms = is_mechanism_version(old_reach)
@@ -632,6 +637,7 @@ def main(argv=None) -> int:
         a.pickups = bool(a.pickups or saved.get("pickups"))  # on stays on (the observation never shrinks)
         a.spin = bool(a.spin or saved.get("spin"))  # likewise for the spin block
         a.orient = bool(a.orient or saved.get("orient"))  # and the orientation block
+        a.pressure = bool(a.pressure or saved.get("pressure"))  # and the contact-pressure block
         from ballrain.reach_features import is_mechanism_version
         a.reach_mechanisms = a.reach_mechanisms or is_mechanism_version(saved.get("reach_version"))
     else:
