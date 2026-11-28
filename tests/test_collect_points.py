@@ -37,5 +37,6 @@ def test_l1_record_points():
     st = TasStarts(str(REC), camera_tol=None)
     assert CP.pause_frames(st) == [8921, 14821, 18243]
     pts = CP.points(st, ReferencePath.load(asset_path(1, resolve_path_dir("benchmarks/refpaths-hs"))))
-    assert [p[0] for p in pts] == [1, 2, 3]
+    assert [p[0] for p in pts] == [1, 2, 3, 4]
     assert 780 < pts[0][1] < 792 and 1365 < pts[1][1] < 1373 and 1715 < pts[2][1] < 1743
+    assert 2380 < pts[3][1] < 2397  # before boarding the spaceship (the record does not pause in the last sector)

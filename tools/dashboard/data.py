@@ -250,6 +250,18 @@ def record_ok(record, level: int | None = None) -> bool:
     return (DATASET / str(record) / "starts.npz").is_file()
 
 
+def run_pickup_weight(run: Run) -> float:
+    """RewardConfig.pickup_weight of the run's newest start (config.resume-*.json, else config.json; 0 when unknown)."""
+    files = sorted(run.path.glob("config.resume-*.json")) or [run.path / "config.json"]
+    try:
+        c = json.loads(files[-1].read_text(encoding="utf-8"))
+        r = c.get("reward")
+        r = json.loads(r) if isinstance(r, str) else (r or {})
+        return float(r.get("pickup_weight") or 0.0)
+    except Exception:
+        return 0.0
+
+
 def run_level(run: Run) -> dict:
     """{"level", "record"} of a run from its config (args --level / --record; runs before r8 have neither: level 1).
     The config is mirrored from the training machine, so the record must be a dataset record of that level."""
@@ -1324,8 +1336,9 @@ def hs_benchmarks(level: int = 1) -> dict:
 def hs_estimate(runs, sel: str) -> dict:
     """Full-level HS estimate of an HS run `sel` from its recent finishes (episodes*.csv; a finish is deathless, every
     death ends the process). A life handed over at TAS frame k finishes with the whole game's score (the TAS prefix
-    included): HS = points_end + LifeBonus x lives_end + level bonus (equal to the official readout on every traced
-    finish; the harness collects the small balls, so none are pending). Its shortfall against the TAS score is
+    included): HS = points_end + LifeBonus x lives_end + level bonus + 20 x the small balls still following at the
+    finish (the game tallies them into the official score; the episode row has them as r_pickup_followers_finish =
+    pickup_weight x 20 x pending, pickup_weight from the run's newest config). Its shortfall against the TAS score is
     extrapolated in proportion to the TAS time of the stretch the agent played: estimate = TAS HS + (HS - TAS HS) x
     TAS total time / TAS time from k. Same binning and range rule as sr_estimate."""
     m = mac_runs(runs)
@@ -1342,8 +1355,16 @@ def hs_estimate(runs, sel: str) -> dict:
     out: dict = {"mode": "hs", "runs_used": [r.name for r in use], "window": SR_WINDOW_UPDATES, "bins": [],
                  "level": lv["level"], "benchmarks": b, "tas_record_ms": clk.total_ms, "end_frame": clk.end_frame,
                  "min_n": SR_MIN_N, "min_seg_s": SR_MIN_SEG_S}
-    cols = ["update", "end", "start_frame", "points_end", "lives_end"]
-    parts = [d for d in (read_many(r.files("episodes*.csv"), usecols=cols, dedup=None) for r in use) if d is not None]
+    cols = ["update", "end", "start_frame", "points_end", "lives_end", "r_pickup_followers_finish"]
+    parts = []
+    for r in use:
+        d_ = read_many(r.files("episodes*.csv"), usecols=cols, dedup=None)
+        if d_ is not None:
+            d_ = d_.copy()
+            pw = run_pickup_weight(r)
+            rf = pd.to_numeric(d_["r_pickup_followers_finish"], errors="coerce") if "r_pickup_followers_finish" in d_ else 0.0
+            d_["follow_pts"] = (rf / pw if pw else 0.0) if not isinstance(rf, float) else 0.0  # = 20 x pending followers
+            parts.append(d_)
     if not parts or b["tas"] is None:
         out["error"] = "无数据"
         return out
@@ -1357,7 +1378,7 @@ def hs_estimate(runs, sel: str) -> dict:
     out["n"] = int(len(d))
     if not len(d):
         return out
-    d["hs"] = d["points_end"] + 200 * d["lives_end"] + 100 * lv["level"]
+    d["hs"] = d["points_end"] + 200 * d["lives_end"] + 100 * lv["level"] + d["follow_pts"].fillna(0.0)
     k = d["start_frame"].to_numpy(float)
     tk = np.where(k > 0, clk.ms(np.maximum(k, 0)), 0.0)
     seg = clk.total_ms - tk
