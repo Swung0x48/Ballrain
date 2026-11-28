@@ -95,6 +95,11 @@ class EnvConfig:
     # the arrows would; without it those frames run with no key, a push lost at every collect. Never on paused frames
     # (arrows act on the pause menu). The macro ends with the arrows held (pressed again after the unpause)
     collect_hold_arrows: bool = False
+    # collect_points (None: auto-collect whenever a small ball follows, as before): [[sector, route s], ...] where the
+    # auto-collect macro may run, once per sector per life: in that sector, from that route s on (the last known arc
+    # length), when small balls follow. The sector's other steps do not pause. Built from the start record's own
+    # pauses (scripts/train_m2.py --collect-at tas-pauses: a player / the TAS pauses once before each checkpoint)
+    collect_points: list | None = None
     collect_chunk: int = 8  # frames per idle block while the collect macro waits
     mask_keys_while_paused: bool = True
     pause_keys: int = 0  # keys injected instead of the action's keys while paused
@@ -886,6 +891,7 @@ class BallanceEnv(gym.Env):
         s = self.session
         self.recorder.begin_life(s.frames_done)
         self._ep_steps = self._ep_frames = self._ep_pause_frames = 0
+        self._collected_sectors = set()  # collect_points: sectors whose collect ran in this life
         self._ep_start = s.frames_done
         self.fx.reset_episode()  # path projection state: re-acquired at every episode start
         if self._start.get("branch_id"):
@@ -898,6 +904,18 @@ class BallanceEnv(gym.Env):
         self.reward.begin(s.tracker, self._arc(finfo), pickup_dist=self._pickup_dist())
         info = self._info(finfo, [])
         return obs, info
+
+    def _collect_point_reached(self) -> bool:
+        """collect_points: True when this life has not collected in the current sector yet and the last known route arc
+        length is at or past the sector's collect point (no point for the sector: never); without collect_points always."""
+        pts = self.cfg.collect_points
+        if pts is None:
+            return True
+        sec = int(self.session.tracker.sector)
+        if sec in getattr(self, "_collected_sectors", ()):
+            return False
+        arc = self.reward.s
+        return arc is not None and any(int(p[0]) == sec and float(arc) >= float(p[1]) for p in pts)
 
     def _apply_own_camera(self, obs) -> None:
         if self._own_cam is not None:
@@ -956,11 +974,13 @@ class BallanceEnv(gym.Env):
                     if s.frames_done > n0:
                         self._set_held(keys)
             if (self.cfg.auto_collect and not s.ended and not paused0 and not s.tracker.flags.paused
-                    and s.tracker.followers() > 0 and self._esc_allowed()
+                    and s.tracker.followers() > 0 and self._esc_allowed() and self._collect_point_reached()
                     and not {c for _, c, _ in s.tracker.events[ev0:]} & {Ev.BallOff, Ev.LevelFinish, Ev.GameOver}):
                 n1 = s.frames_done
                 hold = (self._held & ARROW_MASK) if self.cfg.collect_hold_arrows else 0
                 extra["auto_collect"] = self._collect(hold)
+                if self.cfg.collect_points is not None:
+                    self._collected_sectors.add(int(s.tracker.sector))
                 self._held, self._press_q = 0, {}  # the macro ends with the arrows released (pausing shuts them down)
                 if hold and extra["auto_collect"].get("unpause") == "unpaused":
                     self._set_held(hold)  # pressed again after the unpause toggle: held, with the current camera

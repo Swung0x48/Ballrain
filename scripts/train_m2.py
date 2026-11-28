@@ -302,6 +302,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--collect-hold-arrows", action="store_true",
                    help="auto-collect macro keeps the held arrows on the simulated frames of its Esc actions "
                         "(EnvConfig.collect_hold_arrows: no push lost at a collect; on stays on across resumes)")
+    p.add_argument("--collect-at", choices=("each", "tas-pauses"), default="each",
+                   help="where the auto-collect macro may run: each = whenever small balls follow (as before); tas-pauses = "
+                        "once per sector at the start record's own pauses (EnvConfig.collect_points, "
+                        "ballrain.collect_points; the L1 TAS pauses once before each checkpoint); tas-pauses stays on "
+                        "across resumes")
     p.add_argument("--teacher-camera", choices=("tas", "own"), default="tas",
                    help="with --own-camera: the camera the --teacher reads (tas: the TAS camera at the row's route s, for "
                         "teachers trained on hand-overs after a TAS camera turn; own: the rows as they are)")
@@ -525,6 +530,21 @@ def obs_layout(fc):
     return layout_size(fc), layout_slices(fc)
 
 
+def collect_points_for(a, *, level, path_dir):
+    """--collect-at tas-pauses: [[sector, route s], ...] from the start record's pauses; None for "each"."""
+    if getattr(a, "collect_at", "each") != "tas-pauses":
+        return None
+    from ballrain import collect_points as CP
+    from ballrain.curriculum import TasStarts
+    from ballrain.path import ReferencePath, asset_path, resolve_path_dir
+    pts = CP.points(TasStarts(start_record(a), camera_tol=None),
+                    ReferencePath.load(asset_path(level, resolve_path_dir(path_dir))))
+    if not pts:
+        raise SystemExit("--collect-at tas-pauses: the start record has no pause after its first controllable frame")
+    print(f"collect points (sector, route s): {pts}", flush=True)
+    return pts
+
+
 def make_env_config(a, out_root: Path, ck=None, init=None):
     """ck: the checkpoint resumed from (--resume); init: the one a new run starts from (--init-from), whose route
     branch bundle the new run keeps unless --branch-dir names one (it must match that checkpoint's pin)."""
@@ -605,6 +625,7 @@ def make_env_config(a, out_root: Path, ck=None, init=None):
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
                      own_camera=bool(getattr(a, "own_camera", False)),
                      collect_hold_arrows=bool(getattr(a, "collect_hold_arrows", False)),
+                     collect_points=collect_points_for(a, level=a.level, path_dir=path_dir),
                      auto_collect=a.auto_collect,
                      per_life=not a.no_respawn,
                      rest_starts=rest_starts,
@@ -667,7 +688,9 @@ def main(argv=None) -> int:
         a.orient = bool(a.orient or saved.get("orient"))  # and the orientation block
         a.pressure = bool(a.pressure or saved.get("pressure"))  # and the contact-pressure block
         a.own_camera = bool(a.own_camera or saved.get("own_camera"))
-        a.collect_hold_arrows = bool(a.collect_hold_arrows or saved.get("collect_hold_arrows"))  # the camera inputs never go back to the TAS camera
+        a.collect_hold_arrows = bool(a.collect_hold_arrows or saved.get("collect_hold_arrows"))
+        if saved.get("collect_at") == "tas-pauses":
+            a.collect_at = "tas-pauses"  # the camera inputs never go back to the TAS camera
         from ballrain.reach_features import is_mechanism_version
         a.reach_mechanisms = a.reach_mechanisms or is_mechanism_version(saved.get("reach_version"))
     else:

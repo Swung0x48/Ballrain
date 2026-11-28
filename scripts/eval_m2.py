@@ -50,6 +50,7 @@ def build_env_config(ck: dict, out_root: str, start_frame: int, max_frames: int,
                      max_process_frames=max_frames, trace=True, world_actions=e.get("world_actions", False),
                      own_camera=bool(e.get("own_camera", False)),
                      collect_hold_arrows=bool(e.get("collect_hold_arrows", False)),
+                     collect_points=e.get("collect_points"),
                      delta_ms=float(e.get("delta_ms") or EnvConfig.delta_ms),  # the frame rate the policy was trained at
                      repress_stale_keys=e.get("repress_stale_keys"), auto_collect=e.get("auto_collect", False),
                      backend=backend or e.get("backend", "retail"),
