@@ -299,6 +299,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "row's route s (--teacher-camera, per extra teacher its \"camera\" key: \"tas\" or \"own\"); an "
                         "explicit anchor teacher reads, per family, the TAS camera at the family's first start frame "
                         "(what it saw when the family was mastered); demo rows get the own camera")
+    p.add_argument("--collect-hold-arrows", action="store_true",
+                   help="auto-collect macro keeps the held arrows on the simulated frames of its Esc actions "
+                        "(EnvConfig.collect_hold_arrows: no push lost at a collect; on stays on across resumes)")
     p.add_argument("--teacher-camera", choices=("tas", "own"), default="tas",
                    help="with --own-camera: the camera the --teacher reads (tas: the TAS camera at the row's route s, for "
                         "teachers trained on hand-overs after a TAS camera turn; own: the rows as they are)")
@@ -601,6 +604,7 @@ def make_env_config(a, out_root: Path, ck=None, init=None):
                      backend=a.backend, headless=hl,
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
                      own_camera=bool(getattr(a, "own_camera", False)),
+                     collect_hold_arrows=bool(getattr(a, "collect_hold_arrows", False)),
                      auto_collect=a.auto_collect,
                      per_life=not a.no_respawn,
                      rest_starts=rest_starts,
@@ -662,7 +666,8 @@ def main(argv=None) -> int:
         a.spin = bool(a.spin or saved.get("spin"))  # likewise for the spin block
         a.orient = bool(a.orient or saved.get("orient"))  # and the orientation block
         a.pressure = bool(a.pressure or saved.get("pressure"))  # and the contact-pressure block
-        a.own_camera = bool(a.own_camera or saved.get("own_camera"))  # the camera inputs never go back to the TAS camera
+        a.own_camera = bool(a.own_camera or saved.get("own_camera"))
+        a.collect_hold_arrows = bool(a.collect_hold_arrows or saved.get("collect_hold_arrows"))  # the camera inputs never go back to the TAS camera
         from ballrain.reach_features import is_mechanism_version
         a.reach_mechanisms = a.reach_mechanisms or is_mechanism_version(saved.get("reach_version"))
     else:

@@ -89,6 +89,12 @@ class EnvConfig:
     auto_collect: bool = False
     esc_frames: int = 4  # frames of one Esc action: Esc down on the first, released after
     collect_max_frames: int = 1200  # longest wait of the collect macro (paused frames)
+    # collect_hold_arrows (off: the macro as before, bit-identical): the auto-collect macro keeps the arrow keys of the
+    # step before it on the frames of its two Esc actions that the game still simulates (the pause Esc's frames before
+    # the toggle, the unpause Esc's frames after it; the toggle lands two frames after the press), as a player holding
+    # the arrows would; without it those frames run with no key, a push lost at every collect. Never on paused frames
+    # (arrows act on the pause menu). The macro ends with the arrows held (pressed again after the unpause)
+    collect_hold_arrows: bool = False
     collect_chunk: int = 8  # frames per idle block while the collect macro waits
     mask_keys_while_paused: bool = True
     pause_keys: int = 0  # keys injected instead of the action's keys while paused
@@ -953,8 +959,11 @@ class BallanceEnv(gym.Env):
                     and s.tracker.followers() > 0 and self._esc_allowed()
                     and not {c for _, c, _ in s.tracker.events[ev0:]} & {Ev.BallOff, Ev.LevelFinish, Ev.GameOver}):
                 n1 = s.frames_done
-                extra["auto_collect"] = self._collect()
+                hold = (self._held & ARROW_MASK) if self.cfg.collect_hold_arrows else 0
+                extra["auto_collect"] = self._collect(hold)
                 self._held, self._press_q = 0, {}  # the macro ends with the arrows released (pausing shuts them down)
+                if hold and extra["auto_collect"].get("unpause") == "unpaused":
+                    self._set_held(hold)  # pressed again after the unpause toggle: held, with the current camera
                 self._ep_pause_frames += s.frames_done - n1
             elif paused0 or s.tracker.flags.paused:
                 self._ep_pause_frames += s.frames_done - n0
@@ -1115,19 +1124,25 @@ class BallanceEnv(gym.Env):
             return True
         return f.ball_nav and not f.ball_off and not f.finished and not t.transforming
 
-    def _esc(self) -> str:
+    def _esc(self, hold: int = 0) -> str:
         """One Esc press (down one frame, then released), esc_frames frames, stopping on episode events.
-        Returns "paused" / "unpaused" / "no_toggle" from the PauseLevel / UnpauseLevel events."""
+        Returns "paused" / "unpaused" / "no_toggle" from the PauseLevel / UnpauseLevel events.
+        hold: arrow keys held on the frames the game still simulates (the toggle lands two frames after the press): the
+        frames before the toggle when this Esc pauses, the frames after it when it unpauses."""
         s = self.session
         was = s.tracker.flags.paused
         n = self.cfg.esc_frames
-        s.act(tas.make_frames([self.delta] * n, [tas.KEY_ESC] + [0] * (n - 1)), repeat=1, stop=EPISODE_STOP)
+        keys = [tas.KEY_ESC] + [0] * (n - 1)
+        if hold:
+            keys = keys[:2] + [int(hold)] * (n - 2) if was else [k | int(hold) for k in keys[:2]] + keys[2:]
+        s.act(tas.make_frames([self.delta] * n, keys), repeat=1, stop=EPISODE_STOP)
         now = s.tracker.flags.paused
         return "no_toggle" if now == was else ("paused" if now else "unpaused")
 
-    def _collect(self) -> dict:
+    def _collect(self, hold: int = 0) -> dict:
         """Collect macro: Esc, idle frames until no small ball is following (or collect_max_frames), Esc.
-        A no-op block (keys 0) when nothing is following, the game is paused or Esc is not allowed."""
+        A no-op block (keys 0) when nothing is following, the game is paused or Esc is not allowed.
+        hold: arrow keys held on the simulated frames of both Esc actions (collect_hold_arrows)."""
         s = self.session
         t = s.tracker
         out = {"followers_before": t.followers(), "waited": 0}
@@ -1135,7 +1150,7 @@ class BallanceEnv(gym.Env):
             s.act(self._idle(), repeat=self.cfg.action_repeat, stop=EPISODE_STOP)
             out["result"] = "noop"
             return out
-        out["pause"] = self._esc()
+        out["pause"] = self._esc(hold)
         if t.flags.paused:
             while not s.ended and t.followers() > 0 and out["waited"] < self.cfg.collect_max_frames:
                 n0 = s.frames_done
@@ -1146,7 +1161,7 @@ class BallanceEnv(gym.Env):
                 if s.frames_done == n0:
                     break
             if not s.ended and t.flags.paused:
-                out["unpause"] = self._esc()
+                out["unpause"] = self._esc(hold)
         out["followers_after"] = t.followers()
         out["result"] = "done"
         return out
