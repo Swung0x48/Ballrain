@@ -114,7 +114,9 @@ class WorkerSpec:
     zones: dict = field(default_factory=dict)
     # A contact zone instead of a box: {"rail_touches": n, "s": [lo, hi], "penalty": p}: the ball touches at least n rails
     # (the contact block's n_rail_touch, needs FeatureConfig.contacts; a double rail is two rail contacts) while the
-    # route s is in [lo, hi]. Once per life (no re-arm: contacts flicker while the ball rolls in a double rail)
+    # route s is in [lo, hi]. Once per life (no re-arm: contacts flicker while the ball rolls in a double rail).
+    # "terminal": true on a zone (box or contact): entering it also ends the life there as a failure (terminal, no
+    # bootstrap, end "zone_terminal"); the penalty still applies. Without the key the life goes on (unchanged)
     zone_rearm: float = 1.0
     # unclimbable-wall push (off when wall_push_rate = 0): while the ball touches a wall (mindist gap <= wall_gap, contact
     # normal |n_y| <= wall_max_ny) whose top is more than wall_min_rise above the ball's lowest point (user: a wall higher
@@ -288,6 +290,7 @@ class _Episode:
         self.seg = None  # (agent IGT ms at the segment start, TAS IGT ms at the segment start)
         self.zone_in: dict = {}  # penalty zone name -> the ball is inside (not re-armed yet)
         self.zone_counts: dict = {}  # penalty zone name -> entries this episode
+        self.zone_terminal = None  # name of a "terminal" zone that fired (the life ends this step)
 
     def step(self, a, r, info, finfo):
         self.ret += r
@@ -474,6 +477,8 @@ class Worker:
                     ep.terms["zone_penalty"] = ep.terms.get("zone_penalty", 0.0) + pen
                     ep.zone_counts[name] = ep.zone_counts.get(name, 0) + 1
                     ep.zone_in[name] = True  # once per life
+                    if z.get("terminal"):
+                        ep.zone_terminal = name
                 continue
             inside = in_zone(pos, z)
             if inside and z.get("wall_push"):
@@ -484,6 +489,8 @@ class Worker:
                 ep.terms["zone_penalty"] = ep.terms.get("zone_penalty", 0.0) + pen
                 ep.zone_counts[name] = ep.zone_counts.get(name, 0) + 1
                 ep.zone_in[name] = True
+                if z.get("terminal"):
+                    ep.zone_terminal = name
             elif ep.zone_in.get(name) and not in_zone(pos, z, sp.zone_rearm):
                 ep.zone_in[name] = False
         if sp.wall_push_rate and wp_here and len(o.mind) and "mind_normals" in self.fx_info:
@@ -891,6 +898,9 @@ class Worker:
                     if sh:
                         r += sh
                         ep.ret += sh
+                zone_failed = getattr(ep, "zone_terminal", None) is not None and not term
+                if zone_failed:  # a "terminal" zone fired: the life ends here as a failure
+                    term, trunc = True, False
                 slow_failed = False
                 if (sp.split_k or getattr(sp, "slow_fail", None)) and (int(info2.get("sector") or 0) > ep.max_sector_seen
                                                                        or info2.get("episode_end") == "LevelFinish"):
@@ -923,6 +933,8 @@ class Worker:
                 end = info2.get("episode_end") if (term or trunc) else None
                 if slow_failed:
                     end = "slow_fail"
+                if zone_failed:
+                    end = "zone_terminal"
                 if "branch" in info2 and ep.d.get("cap_branch") != info2["branch"]:
                     ep.d["cap_frames"] = self._cap_frames(info2)
                     ep.d["cap_branch"] = info2["branch"]

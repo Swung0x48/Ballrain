@@ -57,3 +57,24 @@ def test_box_zones_unchanged_beside_a_contact_zone():
     _at(w, 100.0, 2)  # outside the contact window
     assert w._zone_wall(ep, 0, 99.0, 2) == -1.5
     assert ep.zone_counts == {"pit": 1}
+
+
+def test_terminal_key_marks_the_life():
+    """"terminal": true: the zone that fires names itself on the episode (the worker ends the life that step);
+    without the key nothing is marked (the life goes on as before)."""
+    w, ep = _worker(ZONE), _ep()
+    _at(w, 212.0, 2)
+    w._zone_wall(ep, 0, 211.0, 2)
+    assert getattr(ep, "zone_terminal", None) is None
+    w = _worker({"double_rail": {**ZONE["double_rail"], "terminal": True}})
+    ep = _ep()
+    _at(w, 210.0, 1)
+    w._zone_wall(ep, 0, 209.0, 2)
+    assert getattr(ep, "zone_terminal", None) is None  # not fired yet
+    _at(w, 212.0, 2)
+    assert w._zone_wall(ep, 0, 211.0, 2) == -5.0  # the penalty still applies
+    assert ep.zone_terminal == "double_rail"
+    box = {"pit": {"box": [-1.0, 1.0, -1.0, 1.0], "y_below": 1.0, "penalty": 1.5, "terminal": True}}
+    w, ep = _worker(box), _ep()
+    _at(w, 100.0, 0)
+    assert w._zone_wall(ep, 0, 99.0, 2) == -1.5 and ep.zone_terminal == "pit"
