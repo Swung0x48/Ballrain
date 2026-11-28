@@ -1,5 +1,6 @@
 """python -m ballrain.segsearch search --a 18653 --b 23300 --out runtime/segsearch/s4 [options]
 python -m ballrain.segsearch plot runtime/segsearch/s4/result.json --title "..."   (top + side view)
+python -m ballrain.segsearch rollouts runtime/segsearch/s4 --title "..."   (every rollout tried, by how it ended)
 
 Search runs the TAS reference A -> B on the headless engine, then the staged beam search (ballrain.segsearch.search),
 then the cold verification of the best lines; everything lands in OUT (result.json, search.log, plots)."""
@@ -33,6 +34,9 @@ def main(argv=None) -> int:
     for k in ("dv", "dheading", "dpos", "dy"):
         s.add_argument("--end-" + k, type=float, default=getattr(e, k))
     s.add_argument("--ball-order", default="ckid")
+    w = sub.add_parser("rollouts", help="plot every rollout a search tried (OUT/rollouts.npz) by how it ended")
+    w.add_argument("dir")
+    w.add_argument("--title", default="")
     q = sub.add_parser("plot")
     q.add_argument("result")
     q.add_argument("--title", default="")
@@ -49,6 +53,9 @@ def main(argv=None) -> int:
         eng = default_engine()
         eng.ball_order = a.ball_order
         run_search(cfg, Path(a.dataset), Path(a.out), eng)
+    elif a.cmd == "rollouts":
+        from .plot import plot_rollouts
+        print(plot_rollouts(Path(a.dir), a.title))
     else:
         from .plot import plot_result
         print(plot_result(Path(a.result), a.title, Path(a.out) if a.out else None))

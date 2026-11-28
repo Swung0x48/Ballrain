@@ -142,3 +142,11 @@ def test_select_survivors_first():
     c = node(15, pos=(9, 0, 0))
     assert [n.time for n in select([a, b, c], 2, k_surv=1, ahead=2)] == [20, 10]
     assert [n.time for n in select([a, b, c], 2)] == [10, 15]
+
+
+def test_rollout_categories():
+    from ballrain.segsearch.plot import category
+    assert category("fell", -1) == "fell" and category("ball_off", -1) == "fell"
+    assert category("last_gate", -1) == "reached" and category("stuck", -1) == "stuck"
+    assert category("behind", -1) == "behind" and category("keys_end", -1) == "behind"
+    assert category("last_gate", 7) == "pickup"  # a missed pickup wins over how the rollout ended

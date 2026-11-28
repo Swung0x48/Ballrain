@@ -11,10 +11,13 @@ TAS 更快的走法、快多少”，找到的线还可以当训练示范。
 ```powershell
 python -m ballrain.segsearch search --a 18653 --b 23300 --out runtime/segsearch/s4-cp4-slope --workers 7 --seed 1
 python -m ballrain.segsearch plot runtime/segsearch/s4-cp4-slope/result.json --title "小节4 盘点 → 坡顶"
+python -m ballrain.segsearch rollouts runtime/segsearch/s4-cp4-slope --title "小节4 盘点 → 坡顶"
 ```
 
 输出（都在 `--out` 下，`runtime/` 不进 git）：`result.json`（门、TAS 参考、统计、验证过的线：A→B 的按键 run 列表、帧数、
-SR 毫秒、和 TAS 的差、终点检查、整条位置）、`search.log`、`view.png`（全关俯视 + 这一段俯视 + 沿 TAS 线的侧视）。
+SR 毫秒、和 TAS 的差、终点检查、整条位置）、`search.log`、`view.png`（全关俯视 + 这一段俯视 + 沿 TAS 线的侧视）、`rollouts.npz`（试过的每条 rollout 自己新走的
+部分：位置、帧、父分支、怎么结束、按键来源、因少吃球被丢的门）和 `rollouts` 子命令画的 `rollouts.png`（按结局分面板的
+俯视 + 高度随时间）。
 `result.json` 只存 A→B 这一段的按键和数据集 framelog 的 sha256，不存 TAS 前缀。
 
 默认数据集是 `runtime/datasets/tas-v1/HS01_4740_1_30_344`（`run/framelog.bin` = 纪录实际执行的帧）。引擎：

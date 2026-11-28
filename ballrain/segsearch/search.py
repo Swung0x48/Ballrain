@@ -93,6 +93,7 @@ class Search:
         self.start_s = 0.0
         self.n_rollouts = 0
         self.ends: dict[str, int] = {}
+        self._kind = "plain"
         self.dropped: dict[int, list] = {}  # gate -> [branches dropped for a missed pickup, earliest such crossing]
 
     # -------------------------------------------------------------------------------------------- reference (TAS)
@@ -141,12 +142,15 @@ class Search:
             cont = np.r_[cont, np.full(n - len(cont), cont[-1] if len(cont) else 0, np.uint32)]
         u = self.rng.random()
         if plain or u < c.p_plain:
+            self._kind = "plain"
             return cont.copy()
         if u < c.p_plain + c.p_random:
+            self._kind = "random_holds"
             w = min(c.window, len(cont))
             out = cont.copy()
             out[:w] = random_holds(w, self.rng, bias=int(cont[0]) & 15 or None)
             return out
+        self._kind = "edits"
         return mutate(cont, self.rng, c.window, 1 + self.rng.poisson(c.mean_edits))
 
     def node_keys(self, node: Node | None) -> np.ndarray:
@@ -159,8 +163,9 @@ class Search:
         rid = self.next_rid
         self.next_rid += 1
         start_gate = 0 if node is None else node.gate + 1
-        self.rollouts[rid] = {"parent": node, "keys": None}
-        return dict(rid=rid, base=self.node_keys(node), cont=self.continuation(node, plain), delta=self.delta, block=c.block,
+        cont = self.continuation(node, plain)
+        self.rollouts[rid] = {"parent": node, "keys": None, "kind": self._kind}
+        return dict(rid=rid, base=self.node_keys(node), cont=cont, delta=self.delta, block=c.block,
                     gates=self.gates, start_gate=start_gate, best=dict(self.best), slack=c.slack,
                     max_gap=2.5 * c.gate_every + 200, y_floor=self.y_floor)
 
@@ -170,7 +175,8 @@ class Search:
         rid = r["rid"]
         meta = self.rollouts[rid]
         parent: Node | None = meta["parent"]
-        meta.update(keys=r["keys"], t=r["t"], pos=r["pos"], end=r["end"])
+        meta.update(keys=r["keys"], t=r["t"], pos=r["pos"], end=r["end"], base_len=r["base_len"], dropped=-1,
+                    crossed=sorted(r["cross"]))
         self.engine_s += r["wall"]
         self.start_s += r["wall_start"]
         self.n_rollouts += 1
@@ -192,6 +198,7 @@ class Search:
                 d = self.dropped.setdefault(g, [0, None])
                 d[0] += 1
                 d[1] = min(d[1] if d[1] is not None else 1e18, float(tc))
+                meta["dropped"] = g
                 break
             nd = Node(rid, end, g, float(tc), r["pos"][j].copy(), r["vel"][j].copy(), counts, type=int(r["type"][j]))
             self.archive.setdefault(g, []).append(nd)
@@ -241,6 +248,27 @@ class Search:
                              f"{self.n_rollouts} rollouts, {self.engine_s:.0f} engine-s, {time.perf_counter() - t0:.0f} s")
             self.wall = time.perf_counter() - t0
             return self.finish(pool)
+
+    def save_rollouts(self, path: Path) -> None:
+        """Every rollout's own samples (frames after A >= its base length) with its parent rollout, how it ended, its
+        kind of keys (plain / random_holds / edits), the gates it crossed and the gate where a missed pickup dropped it
+        (-1: none). Concatenated: pos[off[i]:off[i+1]] belongs to rollout rid[i]."""
+        rids = sorted(k for k, m in self.rollouts.items() if m.get("t") is not None)
+        pos, t, off = [], [], [0]
+        for k in rids:
+            m = self.rollouts[k]
+            sel = m["t"] >= m["base_len"]
+            pos.append(m["pos"][sel].astype(np.float32))
+            t.append(m["t"][sel].astype(np.int32))
+            off.append(off[-1] + int(sel.sum()))
+        par = [self.rollouts[k]["parent"].rollout if self.rollouts[k]["parent"] is not None else -1 for k in rids]
+        np.savez_compressed(path, rid=np.asarray(rids, np.int32), parent=np.asarray(par, np.int32),
+                            off=np.asarray(off, np.int64), pos=np.concatenate(pos) if pos else np.zeros((0, 3), np.float32),
+                            t=np.concatenate(t) if t else np.zeros(0, np.int32),
+                            end=np.asarray([self.rollouts[k]["end"] for k in rids]),
+                            kind=np.asarray([self.rollouts[k]["kind"] for k in rids]),
+                            dropped=np.asarray([self.rollouts[k]["dropped"] for k in rids], np.int32),
+                            last_gate=np.asarray([max(self.rollouts[k]["crossed"], default=-1) for k in rids], np.int32))
 
     def chain(self, node: Node):
         """(times, positions) the search observed along a branch: each rollout's own samples, parents first."""
@@ -320,6 +348,7 @@ def run_search(cfg: SearchConfig, dataset: Path, out: Path, eng: EngineSpec | No
 
     s = Search(cfg, frames, out, eng, log)
     fin = s.run()
+    s.save_rollouts(out / "rollouts.npz")
     eng = s.eng
     res = {
         "a": cfg.a, "b": cfg.b, "dataset": Path(dataset).name,
