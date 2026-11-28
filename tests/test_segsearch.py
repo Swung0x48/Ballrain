@@ -171,3 +171,44 @@ def test_single_edits_enumeration():
     assert list(k["shift r0/r1 +2"]) == [1] * 7 + [9] + [0] * 4
     assert list(k["shift r0/r1 -4"]) == [1] + [9] * 7 + [0] * 4
     assert list(k["rotate r1 180"][5:8]) == [6] * 3  # up+right -> down+left
+
+
+@pytest.mark.skipif(not _engine_ready()[0], reason="engine test: set BALLRAIN_SEG_ENGINE_TEST=1 (needs the headless binary + TAS dataset)")
+def test_engine_snapshot_save_load_identical(tmp_path):
+    """ProcessSnapshot: save at TAS frame 1500, run 400 frames of random holds, load, run them again: every raw
+    observation byte-identical; a second load after other keys gives the same again."""
+    from ballrain import tas
+    from ballrain.client import SessionConfig
+    from ballrain.headless import HeadlessLauncher
+    from ballrain.segsearch.engine import keys_to_frames
+    from ballrain.segsearch.snapsession import SnapSession
+    _, eng, ds = _engine_ready()
+    frames = tas.load_raw(ds)
+    tas.save_raw(tmp_path / "prefix.bin", frames[:1500])
+    raw = []
+    s = SnapSession(SessionConfig(1, tmp_path / "run", copy="hl-47", prefix=tmp_path / "prefix.bin", events_txt=False,
+                                  hello_timeout_s=90, obs_timeout_s=90),
+                    HeadlessLauncher(binary=eng.binary, root=eng.root, socket="tcp", log=False, ball_order=eng.ball_order))
+    s.raw_hook = raw.append
+    try:
+        s.start()
+        fr = keys_to_frames(random_holds(400, np.random.default_rng(7)), float(frames["delta"][1500]))
+        other = keys_to_frames(random_holds(300, np.random.default_rng(8)), float(frames["delta"][1500]))
+
+        def run(f):
+            raw.clear()
+            for k in range(0, len(f), 4):
+                s.act(f[k:k + 4])
+            return list(raw)
+        img = s.save()
+        a = run(fr)
+        s.load(img)
+        b = run(fr)
+        s.load(img)
+        run(other)
+        s.load(img)
+        c = run(fr)
+        assert a == b == c and len(a) == 100
+        assert s.frames_done == 1900
+    finally:
+        s.close(kill=True)
