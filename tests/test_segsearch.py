@@ -212,3 +212,21 @@ def test_engine_snapshot_save_load_identical(tmp_path):
         assert s.frames_done == 1900
     finally:
         s.close(kill=True)
+
+
+def test_mpc_route_and_cem():
+    from ballrain.segsearch.mpc import Route, initial_probs, refit, sample
+    pts = np.stack([np.arange(100.0), np.zeros(100), np.zeros(100)], axis=1)
+    r = Route(pts)
+    s, d = r.project([40.2, 1.0, 0], hint=35)
+    assert s == 40 and d == pytest.approx(np.hypot(0.2, 1.0))
+    assert list(r.progress_track([[1, 0, 0], [0.5, 0, 0], [3, 0, 0]])) == [1, 1, 3]  # never goes back
+    base = np.array([1] * 8 + [0] * 4, np.uint32)
+    P = initial_probs(base, 2, 0.55)
+    assert P.shape == (6, 9) and np.allclose(P.sum(axis=1), 1)
+    assert P[0, COMBOS.index(1)] == pytest.approx(0.55) and P[0, COMBOS.index(9)] == pytest.approx(0.12)
+    assert P[5, 0] == pytest.approx(0.55 / (0.55 + 8 / 9)) or P[5, 0] > 0.3
+    k = sample(P, np.random.default_rng(0), 50)
+    assert k.shape == (50, 12) and (k[:, ::2] == k[:, 1::2]).all()
+    Q = refit(P, [base] * 5, 2, alpha=1.0)
+    assert Q[0, COMBOS.index(1)] > 0.9 and np.allclose(Q.sum(axis=1), 1)

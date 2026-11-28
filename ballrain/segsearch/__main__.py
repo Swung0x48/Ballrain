@@ -46,6 +46,19 @@ def main(argv=None) -> int:
     sc.add_argument("--radius", type=float, default=6.0)
     sc.add_argument("--max-shift", type=int, default=24)
     sc.add_argument("--verify-top", type=int, default=3)
+    mp_ = sub.add_parser("mpc", help="receding-horizon CEM search with rollback (ballrain.segsearch.mpc)")
+    mp_.add_argument("--a", type=int, required=True)
+    mp_.add_argument("--b", type=int, required=True)
+    mp_.add_argument("--dataset", default=str(DATASET))
+    mp_.add_argument("--out", required=True)
+    from .mpc import MPCConfig
+    dm = MPCConfig(0, 0)
+    for k in ("window", "commit", "lookahead", "pop", "iters", "elites", "block", "workers", "seed", "max_backtrack"):
+        mp_.add_argument("--" + k.replace("_", "-"), type=int, default=getattr(dm, k))
+    for k in ("p_base", "alpha", "fall_cost", "off_route", "corridor_cost", "radius", "margin"):
+        mp_.add_argument("--" + k.replace("_", "-"), type=float, default=getattr(dm, k))
+    mp_.add_argument("--oracle", default="", help="dataset whose keys are committed (score diagnostics)")
+    mp_.add_argument("--null", action="store_true", help="commit the TAS keys every window (must reproduce the TAS)")
     w = sub.add_parser("rollouts", help="plot every rollout a search tried (OUT/rollouts.npz) by how it ended")
     w.add_argument("dir")
     w.add_argument("--title", default="")
@@ -71,6 +84,13 @@ def main(argv=None) -> int:
         from .scan import run_scan
         run_scan(SearchConfig(a.a, a.b, gate_every=a.gate_every, radius=a.radius, workers=a.workers,
                               verify_top=a.verify_top), Path(a.dataset), Path(a.out), max_shift=a.max_shift)
+    elif a.cmd == "mpc":
+        if a.workers > 7:
+            raise SystemExit("at most 7 workers (hl-40..hl-46; hl-47 is the reference / verify copy)")
+        from .mpc import MPCConfig, run_mpc
+        run_mpc(MPCConfig(a.a, a.b, **{k: getattr(a, k) for k in (
+            "window", "commit", "lookahead", "pop", "iters", "elites", "block", "workers", "seed", "max_backtrack",
+            "p_base", "alpha", "fall_cost", "off_route", "corridor_cost", "radius", "margin", "null", "oracle")}), Path(a.dataset), Path(a.out))
     elif a.cmd == "rollouts":
         from .plot import plot_rollouts
         print(plot_rollouts(Path(a.dir), a.title))
