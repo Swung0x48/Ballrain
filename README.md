@@ -43,6 +43,7 @@
 | `dataset.py` | TAS 数据集构建 |
 | `fakegame.py` | 模拟 mod（同一套传输和线格式），用于测试和离线开发 |
 | `headless.py` | 无头后端的启动器（`EnvConfig(backend="headless")`），见 `docs/headless.md` |
+| `segsearch/` | 段搜索（“自动 TAS”）：TAS 两个门之间在 headless 引擎上搜比 TAS 快的按键，冷启动验证（`python -m ballrain.segsearch`，见 `docs/segsearch.md`） |
 
 ## 环境准备
 
