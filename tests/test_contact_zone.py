@@ -78,3 +78,26 @@ def test_terminal_key_marks_the_life():
     w, ep = _worker(box), _ep()
     _at(w, 100.0, 0)
     assert w._zone_wall(ep, 0, 99.0, 2) == -1.5 and ep.zone_terminal == "pit"
+
+
+def test_min_steps_needs_consecutive_contact():
+    """"min_steps": n: only n consecutive steps with the rail-touch count reached fire the zone (a short brush of the
+    other rail while hopping between rails does not); the count resets on a step without it. Without the key the
+    first such step fires (test_two_rail_touches_in_window_once_per_life)."""
+    w = _worker({"double_rail": {**ZONE["double_rail"], "min_steps": 3, "terminal": True}})
+    ep = _ep()
+    seq = [2, 2, 1, 2, 2, 1, 2, 2]  # two brushes of 2 steps: never 3 in a row
+    for i, n in enumerate(seq):
+        _at(w, 210.0 + i, n)
+        assert w._zone_wall(ep, 0, 209.0 + i, 2) == 0.0
+    assert getattr(ep, "zone_terminal", None) is None and ep.zone_counts == {}
+    _at(w, 220.0, 2)
+    assert w._zone_wall(ep, 0, 219.0, 2) == -5.0  # the third step in a row
+    assert ep.zone_terminal == "double_rail" and ep.zone_counts == {"double_rail": 1}
+    ep2 = _ep()  # a new life starts counting from zero
+    _at(w, 221.0, 2)
+    assert w._zone_wall(ep2, 0, 220.0, 2) == 0.0
+    _at(w, 250.0, 2)  # outside the window: the count resets
+    w._zone_wall(ep2, 0, 249.0, 2)
+    _at(w, 222.0, 2)
+    assert w._zone_wall(ep2, 0, 221.0, 2) == 0.0

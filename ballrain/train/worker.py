@@ -116,7 +116,9 @@ class WorkerSpec:
     # (the contact block's n_rail_touch, needs FeatureConfig.contacts; a double rail is two rail contacts) while the
     # route s is in [lo, hi]. Once per life (no re-arm: contacts flicker while the ball rolls in a double rail).
     # "terminal": true on a zone (box or contact): entering it also ends the life there as a failure (terminal, no
-    # bootstrap, end "zone_terminal"); the penalty still applies. Without the key the life goes on (unchanged)
+    # bootstrap, end "zone_terminal"); the penalty still applies. Without the key the life goes on (unchanged).
+    # "min_steps": n on a contact zone: it fires only after n consecutive steps with the rail-touch count reached (the
+    # count resets on a step without it), so a brush of another rail while hopping between rails does not fire
     zone_rearm: float = 1.0
     # unclimbable-wall push (off when wall_push_rate = 0): while the ball touches a wall (mindist gap <= wall_gap, contact
     # normal |n_y| <= wall_max_ny) whose top is more than wall_min_rise above the ball's lowest point (user: a wall higher
@@ -471,7 +473,17 @@ class Worker:
         wp_here = bool(getattr(sp, "wall_push_everywhere", False))  # getattr: a WorkerSpec pickled by older code
         for name, z in sp.zones.items():
             if "rail_touches" in z:
-                if not ep.zone_in.get(name) and self._contact_zone(z):
+                if ep.zone_in.get(name):
+                    continue
+                hit = self._contact_zone(z)
+                need = int(z.get("min_steps", 1) or 1)
+                if need > 1:  # only n consecutive steps in contact fire (a brush while changing rails does not)
+                    runs = getattr(ep, "zone_run", None)
+                    if runs is None:
+                        runs = ep.zone_run = {}
+                    runs[name] = runs.get(name, 0) + 1 if hit else 0
+                    hit = runs[name] >= need
+                if hit:
                     pen = -float(z.get("penalty", 1.5))
                     out += pen
                     ep.terms["zone_penalty"] = ep.terms.get("zone_penalty", 0.0) + pen
