@@ -273,6 +273,17 @@ touch repo/runtime/m2-train/r3/STOP    # 停止（learner 自己的停止文件�
 `train_m2.py --backend headless` 的 `--hl-bin` / `--hl-root` / `--hl-socket` 对应 `EnvConfig.headless` 的 `binary` / `root` / `socket`
 （缺省时取 `BALLRAIN_HL_BIN` / `BALLRAIN_HL_ROOT` / `BALLRAIN_HL_SOCKET`，`train_mac.sh` 会设好前两个），实例名 `hl-<offset+i>`。
 
+### 11.1 Linux x86-64（2026-11-28，WSL2 上的 Arch，gcc 16.2.1，带 FRCP 的 agent 源）
+
+- **构建**：`build_mac.sh` 不用改（`JOBS` 缺省时用 `nproc`），输入是 `mk_src.sh` 的 src.tar（产品提交 `ba5ba279`）+ 0002 + 仓库里的 `headless/src`，
+  SDL3 用 PC 上 Windows 构建用的同一棵源码树；配置 16 s、编译 192 s（12 线程），不需要 googletest / yaml-cpp。
+  这棵树就是 `bin-x86p2002f-pressure` 的源码树去掉只在 Windows x86 上用的 0003（逐文件比较过，只差生成文件和符号链接）。
+- **门禁**：HS01_4740_1_30_344 用 `replay_stub` 回放 0–8001 帧，`trace.txt` 与 PC 的 `bin-x86p2002f-pressure`（2002 DLL）以及同一二进制的源码物理
+  （`BALLRAIN_HL_PHYS2002=0`）逐字节相同（只差 CRLF），球序 `ckid` / `retail:12` / `retail:0` 都一样；`build_demo.py` 在 6900–8200 帧
+  用 349 维的 pressure 模型建的示范集（649 条，含 FRCP 特征）与 PC 上建的 obs / act / frame / sector / ball 逐位相同。
+- **Python**：CPU 版 torch（PyTorch 的 cpu 索引）+ numpy / gymnasium / tensorboard / pillow / numba 装进独立 venv 即可跑 `train_m2.py --backend headless --device cpu`
+  （AF_UNIX socket）；9 个 worker + 3 个 torch 线程约 1400 步/秒。
+
 ## 12. 没有做 / 限制
 
 - 在真实引擎上没跑过：`BALLRAIN_PREFIX_EVENTS`（fakegame 测过）、动作 flags bit2 重写关卡消息、非前缀的 `n_frames = 0`、ResetLevel / ExitLevel 结束。
