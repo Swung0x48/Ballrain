@@ -1200,7 +1200,7 @@ def main(argv=None) -> int:
         extras = json.loads(a.teacher_extra) if a.teacher_extra else []
         teacher["extra"] = []
         for e in extras:
-            eck = torch.load(e["ckpt"], weights_only=False)
+            eck = torch.load(e["ckpt"], weights_only=False, map_location="cpu")
             e_obs = int(eck["n_obs"])
             err = teacher_layout_error(asdict(env_cfg)["features"], eck["env_config"]["features"], e_obs, n_obs,
                                        int(eck["n_act"]), n_act, branch_append_ignore(eck, "--teacher-extra"))
