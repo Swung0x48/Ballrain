@@ -1,12 +1,14 @@
 """python -m ballrain.segsearch search --a 18653 --b 23300 --out runtime/segsearch/s4 [options]
 python -m ballrain.segsearch plot runtime/segsearch/s4/result.json --title "..."   (top + side view)
 python -m ballrain.segsearch rollouts runtime/segsearch/s4 --title "..."   (every rollout tried, by how it ended)
+python -m ballrain.segsearch scan --a 18653 --b 23300 --out runtime/segsearch/s4-scan   (every single edit of the TAS keys)
 
 Search runs the TAS reference A -> B on the headless engine, then the staged beam search (ballrain.segsearch.search),
 then the cold verification of the best lines; everything lands in OUT (result.json, search.log, plots)."""
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from .core import EndCheck
@@ -34,6 +36,16 @@ def main(argv=None) -> int:
     for k in ("dv", "dheading", "dpos", "dy"):
         s.add_argument("--end-" + k, type=float, default=getattr(e, k))
     s.add_argument("--ball-order", default="ckid")
+    sc = sub.add_parser("scan", help="run every single edit of the TAS keys between A and B (ballrain.segsearch.scan)")
+    sc.add_argument("--a", type=int, required=True)
+    sc.add_argument("--b", type=int, required=True)
+    sc.add_argument("--dataset", default=str(DATASET))
+    sc.add_argument("--out", required=True)
+    sc.add_argument("--workers", type=int, default=7)
+    sc.add_argument("--gate-every", type=int, default=264)
+    sc.add_argument("--radius", type=float, default=6.0)
+    sc.add_argument("--max-shift", type=int, default=24)
+    sc.add_argument("--verify-top", type=int, default=3)
     w = sub.add_parser("rollouts", help="plot every rollout a search tried (OUT/rollouts.npz) by how it ended")
     w.add_argument("dir")
     w.add_argument("--title", default="")
@@ -53,9 +65,18 @@ def main(argv=None) -> int:
         eng = default_engine()
         eng.ball_order = a.ball_order
         run_search(cfg, Path(a.dataset), Path(a.out), eng)
+    elif a.cmd == "scan":
+        if a.workers > 8:
+            raise SystemExit("at most 8 workers (copies hl-40..hl-47)")
+        from .scan import run_scan
+        run_scan(SearchConfig(a.a, a.b, gate_every=a.gate_every, radius=a.radius, workers=a.workers,
+                              verify_top=a.verify_top), Path(a.dataset), Path(a.out), max_shift=a.max_shift)
     elif a.cmd == "rollouts":
         from .plot import plot_rollouts
         print(plot_rollouts(Path(a.dir), a.title))
+        if (Path(a.dir) / "result.json").is_file() and "scan" in json.loads((Path(a.dir) / "result.json").read_text(encoding="utf-8")):
+            from .plot import plot_scan
+            print(plot_scan(Path(a.dir), a.title))
     else:
         from .plot import plot_result
         print(plot_result(Path(a.result), a.title, Path(a.out) if a.out else None))

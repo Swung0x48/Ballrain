@@ -150,3 +150,24 @@ def test_rollout_categories():
     assert category("last_gate", -1) == "reached" and category("stuck", -1) == "stuck"
     assert category("behind", -1) == "behind" and category("keys_end", -1) == "behind"
     assert category("last_gate", 7) == "pickup"  # a missed pickup wins over how the rollout ended
+
+
+def test_single_edits_enumeration():
+    from ballrain.segsearch.scan import apply_edit, single_edits
+    keys = np.array([1] * 5 + [9] * 3 + [0] * 4, np.uint32)  # runs: up x5, up+right x3, none x4
+    ed = single_edits(keys, max_shift=24)
+    names = [e[0] for e in ed]
+    # boundary 0/1 at frame 5: d in -4..+2 (both runs keep a frame); boundary 1/2 at frame 8: d in -2..+3
+    assert sum(n.startswith("shift r0/r1") for n in names) == 4 + 2
+    assert sum(n.startswith("shift r1/r2") for n in names) == 2 + 3
+    assert sum(n.startswith("rotate r0") for n in names) == 5 and "release r0" in names
+    assert sum(n.startswith("press r2") for n in names) == 8  # a no-arrow run: each direction
+    for name, start, seg in ed:
+        out = apply_edit(keys, start, seg)
+        assert len(out) == len(keys)
+        diff = np.flatnonzero(out != keys)
+        assert len(diff) and diff[0] == start and diff[-1] < start + len(seg)  # first changed frame = start
+    k = dict((n, apply_edit(keys, s, g)) for n, s, g in ed)
+    assert list(k["shift r0/r1 +2"]) == [1] * 7 + [9] + [0] * 4
+    assert list(k["shift r0/r1 -4"]) == [1] + [9] * 7 + [0] * 4
+    assert list(k["rotate r1 180"][5:8]) == [6] * 3  # up+right -> down+left

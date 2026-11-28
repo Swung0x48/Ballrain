@@ -200,3 +200,67 @@ def plot_rollouts(out_dir: Path, title: str = "", out: Path | None = None) -> Pa
     fig.savefig(out, dpi=80)
     plt.close(fig)
     return out
+
+
+def plot_scan(out_dir: Path, title: str = "", out: Path | None = None) -> Path:
+    """Single-edit scan (result.json "scan"): every edit at its first changed frame; top: arrival at B vs the TAS for
+    the edits that reached B with the TAS's pickups (green = end check passed, orange = failed); bottom: how the others
+    ended, by edit kind."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+    out_dir = Path(out_dir)
+    res = json.loads((out_dir / "result.json").read_text(encoding="utf-8"))
+    rows = res["scan"]["rows"]
+    kinds = ("shift", "rotate", "release", "press")
+    ends = {"reached_ok": ("到 B，终点合格", "#18b84a"), "reached_bad": ("到 B，终点不合格", "#ff9f1a"),
+            "pickup": ("少吃球", "#7a2bd1"), "fell": ("掉下去", "#e8333a"), "slow": ("太慢 / 卡住", "#9a9a9a")}
+
+    def outcome(r):
+        if r["dropped_pickup_gate"] >= 0:
+            return "pickup"
+        if "B_vs_tas_frames" in r:
+            return "reached_bad" if r["end_check"] else "reached_ok"
+        if r["end"] in ("fell", "ball_off", "game_over"):
+            return "fell"
+        return "slow"
+
+    fig, (ax, bx) = plt.subplots(2, 1, figsize=(17, 11), gridspec_kw={"height_ratios": [1, 0.8]})
+    for key in ("reached_bad", "reached_ok"):
+        pts = [(r["frame"], r["B_vs_tas_frames"]) for r in rows if outcome(r) == key]
+        if pts:
+            p = np.asarray(pts, float)
+            ax.plot(p[:, 0], p[:, 1], "o", ms=3.5, color=ends[key][1], alpha=0.8, label=f"{ends[key][0]}（{len(pts)}）")
+    ax.axhline(0, color="#1f3fff", lw=1.5, label="TAS")
+    ax.set_ylabel("到 B 比 TAS 晚（帧，负 = 更早）")
+    ax.set_xlabel("这处改动的第一帧（TAS 帧号）")
+    ax.grid(alpha=0.3)
+    ax.legend(loc="upper right")
+    ax.set_title("到了 B 的改动：到 B 的时间差")
+    yk = {k: i for i, k in enumerate(kinds)}
+    for key, (label, col) in ends.items():
+        pts = [(r["frame"], yk[r["edit"].split()[0]]) for r in rows if outcome(r) == key]
+        if pts:
+            p = np.asarray(pts, float)
+            jitter = (np.random.default_rng(0).random(len(p)) - 0.5) * 0.5
+            bx.plot(p[:, 0], p[:, 1] + jitter, "|", ms=9, mew=1.2, color=col, alpha=0.7, label=f"{label}（{len(pts)}）")
+    bx.set_yticks(range(len(kinds)))
+    bx.set_yticklabels(["挪边界", "转方向", "松键", "按方向（原来没按）"])
+    bx.set_xlabel("这处改动的第一帧（TAS 帧号）")
+    bx.grid(alpha=0.3, axis="x")
+    bx.legend(loc="upper right", ncol=5, fontsize=10)
+    bx.set_xlim(ax.get_xlim())
+    bx.set_title("全部改动按种类和结局")
+    st = res["stats"]
+    valid = [r["B_vs_tas_frames"] for r in rows if outcome(r) == "reached_ok"]
+    best = min(valid) if valid else None
+    fig.suptitle(f"{title or ('TAS 帧 %d → %d' % (res['a'], res['b']))}：TAS 按键的全部 {len(rows)} 处单点改动（其余按键照 TAS，"
+                 f"开环）\n最好的合格改动 {('%+.1f 帧' % best) if best is not None else '没有'}（搜索时 4 帧采样插值）；"
+                 f"{st['engine_s']:.0f} 引擎秒（headless，球序 {res['engine']['ball_order']}）", fontsize=13)
+    fig.tight_layout()
+    out = out or out_dir / "scan.png"
+    fig.savefig(out, dpi=90)
+    plt.close(fig)
+    return out

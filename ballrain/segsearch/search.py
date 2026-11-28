@@ -182,7 +182,10 @@ class Search:
         self.n_rollouts += 1
         self.ends[r["end"]] = self.ends.get(r["end"], 0) + 1
         ev = [e for e in r["events"] if e[0] > r["base_len"]]
-        base_counts = parent.counts if parent is not None else {k: 0 for k in self.ref_end["counts"]}
+        if meta.get("base_counts") is not None:  # a branch whose base is plain TAS keys (single-edit scan)
+            base_counts = meta["base_counts"]
+        else:
+            base_counts = parent.counts if parent is not None else {k: 0 for k in self.ref_end["counts"]}
         n = 0
         made = []
         for g, tc in sorted(r["cross"].items()):
@@ -215,15 +218,19 @@ class Search:
         return n
 
     # -------------------------------------------------------------------------------------------- main loop
-    def run(self):
-        c = self.cfg
+    def pool(self):
+        """The worker pool: one process per copy label (hl-40..), each starting its own engine processes."""
         self.out.mkdir(parents=True, exist_ok=True)
         ctx = mp.get_context("spawn")
         labels = ctx.Manager().Queue()
-        for lab in COPIES[:c.workers]:
+        for lab in COPIES[:self.cfg.workers]:
             labels.put(lab)
+        return ctx.Pool(self.cfg.workers, initializer=_init, initargs=(labels, self.eng, str(self.out), self.prefix))
+
+    def run(self):
+        c = self.cfg
         t0 = time.perf_counter()
-        with ctx.Pool(c.workers, initializer=_init, initargs=(labels, self.eng, str(self.out), self.prefix)) as pool:
+        with self.pool() as pool:
             self.reference(pool)
             last = len(self.gates) - 1
             for rnd in range(c.rounds):
@@ -333,24 +340,21 @@ class Search:
         return res
 
 
-def run_search(cfg: SearchConfig, dataset: Path, out: Path, eng: EngineSpec | None = None) -> dict:
-    """Search A -> B of a tas-v1 dataset (run/framelog.bin = the record's executed frames); writes out/result.json."""
-    frames = tas.load_raw(Path(dataset) / "run" / "framelog.bin")
-    out = Path(out)
-    out.mkdir(parents=True, exist_ok=True)
-    logf = open(out / "search.log", "a", encoding="utf-8")
+def logger(path: Path):
+    """(log function, file) appending time-stamped lines to `path` and printing them."""
+    f = open(path, "a", encoding="utf-8")
 
     def log(msg):
         line = time.strftime("%H:%M:%S ") + msg
         print(line, flush=True)
-        logf.write(line + "\n")
-        logf.flush()
+        f.write(line + "\n")
+        f.flush()
+    return log, f
 
-    s = Search(cfg, frames, out, eng, log)
-    fin = s.run()
-    s.save_rollouts(out / "rollouts.npz")
+
+def result_dict(s: Search, cfg: SearchConfig, dataset: Path, fin: dict) -> dict:
     eng = s.eng
-    res = {
+    return {
         "a": cfg.a, "b": cfg.b, "dataset": Path(dataset).name,
         "framelog_sha256": sha256(Path(dataset) / "run" / "framelog.bin"),
         "engine": {"binary": Path(eng.binary).parent.name + "/" + Path(eng.binary).name, "ball_order": eng.ball_order,
@@ -366,6 +370,18 @@ def run_search(cfg: SearchConfig, dataset: Path, out: Path, eng: EngineSpec | No
         "results": fin["results"],
         "candidates_at_B": fin["candidates"],  # earliest branches at B as the search saw them (4-frame samples), before verification
     }
+
+
+def run_search(cfg: SearchConfig, dataset: Path, out: Path, eng: EngineSpec | None = None) -> dict:
+    """Search A -> B of a tas-v1 dataset (run/framelog.bin = the record's executed frames); writes out/result.json."""
+    frames = tas.load_raw(Path(dataset) / "run" / "framelog.bin")
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    log, logf = logger(out / "search.log")
+    s = Search(cfg, frames, out, eng, log)
+    fin = s.run()
+    s.save_rollouts(out / "rollouts.npz")
+    res = result_dict(s, cfg, dataset, fin)
     (out / "result.json").write_text(json.dumps(res, indent=1, default=float), encoding="utf-8")
     for r in fin["results"]:
         log(f"result ({r['kind']}): {r.get('delta_ms', float('nan')):+.1f} ms vs TAS, deterministic {r['deterministic']}, "
