@@ -393,6 +393,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--teacher-decay-updates", type=int, default=0)
     p.add_argument("--teacher-s-min", type=float, default=331.4,
                    help="route arc length from which the teacher term applies (L1 refpaths-alt: 331.4 = TAS frame 4460)")
+    p.add_argument("--teacher-extra", default="",
+                   help='JSON list [{"ckpt": PATH, "s_min": S, "s_max": S}, ...]: more --teacher policies, each on its own '
+                        "route s window with the same coefficient (needs --teacher); inside a window the extra teacher's "
+                        "log-probabilities replace the main one's (later entries win). Empty = unchanged")
     p.add_argument("--teacher-s-max", type=float, default=None,
                    help="route arc length up to which the teacher term applies (default: no upper bound, unchanged)")
     p.add_argument("--anchor-mastered", action="store_true",
@@ -1191,6 +1195,29 @@ def main(argv=None) -> int:
                 + (f" -> {a.teacher_coef_floor} over {a.teacher_decay_updates} updates" if a.teacher_decay_updates else "")
                 + f" on route s >= {a.teacher_s_min:g}"
                 + (f" and <= {a.teacher_s_max:g}" if a.teacher_s_max is not None else "") + f" (line length {length:.1f})")
+        # --teacher-extra: more frozen teachers, each on its own route s window, same coefficient; on a batch state
+        # inside an extra window the extra teacher's log-probabilities replace the main one's (later entries win)
+        extras = json.loads(a.teacher_extra) if a.teacher_extra else []
+        teacher["extra"] = []
+        for e in extras:
+            eck = torch.load(e["ckpt"], weights_only=False)
+            e_obs = int(eck["n_obs"])
+            err = teacher_layout_error(asdict(env_cfg)["features"], eck["env_config"]["features"], e_obs, n_obs,
+                                       int(eck["n_act"]), n_act, branch_append_ignore(eck, "--teacher-extra"))
+            if err:
+                raise SystemExit(f"--teacher-extra {e['ckpt']}: {err}")
+            lo, hi = float(e["s_min"]), float(e["s_max"])
+            if not 0 <= lo < hi <= length:
+                raise SystemExit(f"--teacher-extra {e['ckpt']}: s window {lo}-{hi} not within the line ({length:.1f})")
+            ea = eck["args"]
+            emodel = ActorCritic(e_obs, n_act, tuple(int(x) for x in ea["hidden"].split(",")), ea["activation"],
+                                 ea.get("actor_heads", "single")).to(a.device)
+            emodel.load_state_dict(eck["model"])
+            emodel.eval()
+            teacher["extra"].append({"model": emodel, "rms": eck["rms"], "lo": lo / length, "hi": hi / length,
+                                     "n_obs": e_obs})
+            log.msg(f"teacher-extra {e['ckpt']} (update {eck.get('counters', {}).get('update')}): same KL coef on "
+                    f"route s {lo:g}-{hi:g}")
 
     anchor, anchor_teachers, AN = None, {}, None
     if a.anchor_mastered:
@@ -1310,6 +1337,14 @@ def main(argv=None) -> int:
         mask = raw[:, teacher["col"]] >= teacher["lo"]
         if teacher.get("hi") is not None:
             mask &= raw[:, teacher["col"]] <= teacher["hi"]
+        for e in teacher.get("extra") or ():
+            m = (raw[:, teacher["col"]] >= e["lo"]) & (raw[:, teacher["col"]] <= e["hi"])
+            if m.any():
+                with torch.no_grad():
+                    xe = torch.as_tensor(normalize(raw[m, :e["n_obs"]], e["rms"]), device=a.device)
+                    le, _ = e["model"](xe)
+                    lt[m] = torch.log_softmax(le, -1).cpu().numpy()
+                mask = mask | m
         coef = a.teacher_coef
         if a.teacher_decay_updates and a.teacher_coef_floor is not None:
             f = min(1.0, (counters["update"] - teacher["u0"]) / a.teacher_decay_updates)

@@ -69,3 +69,10 @@ def test_options():
                         "--teacher-decay-updates", "5000"])
     assert a.teacher == "t.pt" and a.teacher_coef_floor == 0.05 and a.teacher_decay_updates == 5000
     assert "u_teacher_kl" in train_m2.UPDATE_COLS and "u_teacher_coef" in train_m2.UPDATE_COLS
+
+
+def test_teacher_extra_option():
+    import train_m2
+    assert train_m2.parse(["--run", "x"]).teacher_extra == ""
+    j = '[{"ckpt": "a.pt", "s_min": 1500, "s_max": 1795}]'
+    assert train_m2.parse(["--run", "x", "--teacher", "t.pt", "--teacher-extra", j]).teacher_extra == j
