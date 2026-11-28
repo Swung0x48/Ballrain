@@ -85,6 +85,7 @@ class Image:
     nbytes: int = 0
     seconds: float = 0.0
     extra: dict = field(default_factory=dict)  # caller state (python side) kept with the image
+    guards: list = field(default_factory=list)  # (base, size, protect) of committed guard pages (stack ends) at the save
 
 
 class ProcessSnapshot:
@@ -207,10 +208,12 @@ class ProcessSnapshot:
             self._suspend(hs)
             try:
                 ctx = {t: self._context(h) for t, h in hs.items()}
-                regs, allocs, nb = [], set(), 0
+                regs, allocs, guards, nb = [], set(), [], 0
                 for base, size, state, prot, typ, ab in self.regions():
                     if state == MEM_COMMIT and typ == MEM_PRIVATE:
                         allocs.add(ab)
+                        if prot & PAGE_GUARD:
+                            guards.append((base, size, prot))
                     if self._saved_kind(state, prot, typ):
                         regs.append((base, size, prot, typ, ab, self._read(base, size)))
                         nb += size
@@ -218,7 +221,7 @@ class ProcessSnapshot:
                 self._resume(hs)
         finally:
             self._close(hs)
-        return Image(regs, allocs, ctx, nb, time.perf_counter() - t0)
+        return Image(regs, allocs, ctx, nb, time.perf_counter() - t0, guards=guards)
 
     def load(self, img: Image) -> dict:
         """Write the image back. Refuses (SnapshotError, process left as it was) when the thread set or any thread's
@@ -256,15 +259,31 @@ class ProcessSnapshot:
                         _check(k32.VirtualFreeEx(self.hproc, ctypes.c_void_p(ab), 0, MEM_RELEASE), f"release {ab:#x}")
                         released.add(ab)
                 stats["released"] = len(released)
-                covered = [(r[0], r[0] + r[1]) for r in img.regions]
+                # committed private pages (guard pages included) the save had neither as data nor as a guard: decommit.
+                # A stack that grew since the save loses the pages below its saved guard page, and the guard page
+                # itself comes back below (else the next deep call would fault in a hole with no guard page)
+                covered = sorted([(r[0], r[0] + r[1]) for r in img.regions] + [(g[0], g[0] + g[1]) for g in img.guards])
+                los = [c_[0] for c_ in covered]
+                import bisect
+
+                def is_covered(p):
+                    i = bisect.bisect_right(los, p) - 1
+                    return i >= 0 and covered[i][0] <= p < covered[i][1]
                 for base, size, state, prot, typ, ab in self.regions():
-                    if state == MEM_COMMIT and typ == MEM_PRIVATE and prot & WRITABLE and not prot & PAGE_GUARD:
-                        if not any(lo <= base and base + size <= hi for lo, hi in covered):
-                            # partly covered regions are split by page below
-                            for p in range(base, base + size, 0x1000):
-                                if not any(lo <= p < hi for lo, hi in covered):
-                                    k32.VirtualFreeEx(self.hproc, ctypes.c_void_p(p), 0x1000, MEM_DECOMMIT)
-                                    stats["decommitted"] += 1
+                    if state == MEM_COMMIT and typ == MEM_PRIVATE and (prot & WRITABLE or prot & PAGE_GUARD):
+                        for p in range(base, base + size, 0x1000):
+                            if not is_covered(p):
+                                k32.VirtualFreeEx(self.hproc, ctypes.c_void_p(p), 0x1000, MEM_DECOMMIT)
+                                stats["decommitted"] += 1
+                for gbase, gsize, gprot in img.guards:
+                    mbi = MBI()
+                    k32.VirtualQueryEx(self.hproc, ctypes.c_void_p(gbase), ctypes.byref(mbi), ctypes.sizeof(mbi))
+                    if int(mbi.State) != MEM_COMMIT:
+                        _check(k32.VirtualAllocEx(self.hproc, ctypes.c_void_p(gbase), gsize, MEM_COMMIT, gprot), f"guard {gbase:#x}")
+                    elif int(mbi.Protect) != gprot:
+                        old = wt.DWORD()
+                        _check(k32.VirtualProtectEx(self.hproc, ctypes.c_void_p(gbase), gsize, gprot, ctypes.byref(old)), f"guard {gbase:#x}")
+                    stats["guards"] = stats.get("guards", 0) + 1
                 for base, size, prot, typ, ab, data in img.regions:
                     mbi = MBI()
                     k32.VirtualQueryEx(self.hproc, ctypes.c_void_p(base), ctypes.byref(mbi), ctypes.sizeof(mbi))
