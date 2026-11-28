@@ -106,6 +106,8 @@ class Search:
                                                                        self.prefix, task["base"], cont, delta=self.delta,
                                                                        block=1, record_sr=True)
         self.ref = r
+        if c.a + int(r["t"][-1]) < c.b:
+            raise RuntimeError(f"the TAS reference ends ({r['end']}) at frame {c.a + int(r['t'][-1])}, before B = {c.b}")
         self.gates = make_gates(c.a + r["t"], r["pos"], r["vel"], c.a, c.b, c.gate_every, c.radius)
         cr = crossings(self.gates, 0, r["t"], r["pos"])
         if len(cr) != len(self.gates):
