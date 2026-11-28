@@ -96,6 +96,12 @@ class WorkerSpec:
     # extra reference time for segments that cross a section the reference line routes differently from the TAS:
     # [[lo_frame, hi_frame, seconds], ...]: a segment that starts before TAS frame lo and ends at or after hi gets +seconds
     split_extra: list = field(default_factory=list)
+    # slow split = failure (off when empty): {"lag_s": X, "penalty": P (optional), "min_ref_s": M (optional)}. At a
+    # checkpoint / LevelFinish, a split (the same stretch as the split bonus: from the life's hand-over or its previous
+    # checkpoint, so inherited lag never counts) with t_agent - t_ref > X ends the life as a failure: reward P (default:
+    # a death's, -(death_penalty + death_refund x sector progress paid)), term "slow_fail", end "slow_fail", the game
+    # process ends like a terminal stall. Splits with t_ref < M (default 0) are not judged. getattr-read
+    slow_fail: dict = field(default_factory=dict)
     # early respawns: after a BallOff whose respawn sector the start record enters before the curriculum frontier (TAS
     # cross frame < frontier: a stretch the curriculum has not reached), the respawn life is played with this probability;
     # otherwise the game process ends and the next episode is a new curriculum start (episode record respawn_skipped).
@@ -557,8 +563,8 @@ class Worker:
         return float(s) >= float(g["s"])
 
     def _split_start(self, ep, info):
-        """Segment start of a new life for the split bonus."""
-        if not self.spec.split_k or self.env.starts is None:
+        """Segment start of a new life for the split bonus (and the slow-split failure)."""
+        if not (self.spec.split_k or getattr(self.spec, "slow_fail", None)) or self.env.starts is None:
             return
         if "ref_elapsed_ms" in info:
             ep.seg = (ep.d["start_sr_ms"], info["ref_elapsed_ms"], None)
@@ -581,7 +587,10 @@ class Worker:
         ep.seg = None if ref is None else (agent, ref, k0)
 
     def _split_bonus(self, ep, info, finished: bool) -> float:
-        if ep.seg is None or not self.spec.split_k:
+        """Split bonus of the stretch that ends here (0 with split_k 0); also leaves the stretch's lag t_agent - t_ref
+        in ep.split_lag and its t_ref in ep.split_ref (None when no split was measured) for _slow_fail."""
+        ep.split_lag = ep.split_ref = None
+        if ep.seg is None or not (self.spec.split_k or getattr(self.spec, "slow_fail", None)):
             return 0.0
         sec = 0 if finished else int(info.get("sector") or 0)
         end_ref = info["ref_elapsed_ms"] if "ref_elapsed_ms" in info else self._tas_cross(sec)
@@ -595,10 +604,25 @@ class Worker:
             if ep.seg[2] is not None and end_frame is not None and ep.seg[2] < lo and end_frame >= hi:
                 t_ref += float(extra)
         k = self.spec.split_k
-        b = float(np.clip(k * (t_ref - t_agent) / max(t_ref, self.spec.split_min_ref_s), -k, k))
+        b = float(np.clip(k * (t_ref - t_agent) / max(t_ref, self.spec.split_min_ref_s), -k, k)) if k else 0.0
         ep.splits.append((sec if sec else 99, t_agent, t_ref, b))
         ep.seg = (float(sr), end_ref, end_frame)
+        ep.split_lag, ep.split_ref = t_agent - t_ref, t_ref
         return b
+
+    def _slow_fail(self, ep) -> float | None:
+        """WorkerSpec.slow_fail: the failure reward (< 0) when the split just measured (_split_bonus) lost more than
+        lag_s against the start record, else None. Default reward: a death's (no stall compensation)."""
+        sf = getattr(self.spec, "slow_fail", None) or {}
+        lag, ref = getattr(ep, "split_lag", None), getattr(ep, "split_ref", None)
+        if not sf or lag is None or ref is None or ref < float(sf.get("min_ref_s", 0.0)):
+            return None
+        if lag <= float(sf["lag_s"]):
+            return None
+        if "penalty" in sf:
+            return -abs(float(sf["penalty"]))
+        rc = self.env.reward.cfg
+        return -(rc.death_penalty + rc.death_refund * max(self.env.reward.sector_paid, 0.0))
 
     def _cap_frames(self, info) -> int | None:
         if "ref_remaining_ms" in info:
@@ -867,13 +891,21 @@ class Worker:
                     if sh:
                         r += sh
                         ep.ret += sh
-                if sp.split_k and (int(info2.get("sector") or 0) > ep.max_sector_seen
-                                   or info2.get("episode_end") == "LevelFinish"):
+                slow_failed = False
+                if (sp.split_k or getattr(sp, "slow_fail", None)) and (int(info2.get("sector") or 0) > ep.max_sector_seen
+                                                                       or info2.get("episode_end") == "LevelFinish"):
                     sb = self._split_bonus(ep, info2, info2.get("episode_end") == "LevelFinish")
                     if sb:
                         r += sb
                         ep.ret += sb
                         ep.terms["split_bonus"] = ep.terms.get("split_bonus", 0.0) + sb
+                    sf = self._slow_fail(ep)
+                    if sf is not None:  # too slow over this split: a failure like a death (the life ends here)
+                        r += sf
+                        ep.ret += sf
+                        ep.terms["slow_fail"] = ep.terms.get("slow_fail", 0.0) + sf
+                        slow_failed = True
+                        term, trunc = True, False
                 ep.max_sector_seen = max(ep.max_sector_seen, int(info2.get("sector") or 0))
                 if (sp.route_probes or sp.gates) and self.env.session is not None:
                     o = self.env.session.tracker.obs
@@ -889,6 +921,8 @@ class Worker:
                                 ep.ret += gb
                                 ep.terms["gate_bonus"] = ep.terms.get("gate_bonus", 0.0) + gb
                 end = info2.get("episode_end") if (term or trunc) else None
+                if slow_failed:
+                    end = "slow_fail"
                 if "branch" in info2 and ep.d.get("cap_branch") != info2["branch"]:
                     ep.d["cap_frames"] = self._cap_frames(info2)
                     ep.d["cap_branch"] = info2["branch"]

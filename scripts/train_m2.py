@@ -188,6 +188,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--split-k", type=float, default=0.0, help="split bonus scale (0 = off; WorkerSpec.split_k)")
     p.add_argument("--split-min-ref-s", type=float, default=5.0)
     p.add_argument("--split-extra", default="", help="JSON [[lo_frame, hi_frame, seconds], ...] (WorkerSpec.split_extra)")
+    p.add_argument("--slow-fail", default="",
+                   help='JSON {"lag_s": X, "penalty": P, "min_ref_s": M} (WorkerSpec.slow_fail): a split that lost more than X s '
+                        'against the start record (from the hand-over or previous checkpoint) ends the life as a failure '
+                        '(default reward: the death penalty; end "slow_fail", column r_slow_fail). Empty: off')
     p.add_argument("--exclude-starts", default="", help="record frame ranges lo-hi never used as starts")
     p.add_argument("--branch-update", action="store_true", help="explicitly replace the checkpoint branch pin")
     p.add_argument("--branch-dir", help="paired ball-type diversion assets (main line unchanged)")
@@ -665,6 +669,8 @@ def main(argv=None) -> int:
         log.cols["episodes"] = EP_COLS + ["perturb_frame", "perturb_actions"]
     if json.loads(a.reward).get("lane_weight"):  # the opt-in lane term (RewardConfig.lane_weight); off: columns unchanged
         log.cols["episodes"] = log.cols["episodes"] + ["r_lane"]
+    if a.slow_fail:  # the opt-in slow-split failure (WorkerSpec.slow_fail); off: columns unchanged
+        log.cols["episodes"] = log.cols["episodes"] + ["r_slow_fail"]
     log.tb.add_text("config", "    " + json.dumps(saved_args(a), indent=1).replace("\n", "\n    "),
                     global_step=int(ck["counters"]["steps"]) if ck is not None else 0)
     torch.set_num_threads(a.torch_threads)
@@ -821,6 +827,7 @@ def main(argv=None) -> int:
                           trace_sample=a.trace_sample, route_probes=json.loads(a.route_probes) if a.route_probes else {},
                           gates=json.loads(a.gates) if a.gates else {}, split_k=a.split_k,
                           split_min_ref_s=a.split_min_ref_s, split_extra=json.loads(a.split_extra) if a.split_extra else [],
+                          slow_fail=json.loads(a.slow_fail) if a.slow_fail else {},
                           p_early_respawn=a.p_early_respawn, zones=json.loads(a.zones) if a.zones else {},
                           wall_push_rate=a.wall_push_rate, wall_min_rise=a.wall_min_rise,
                           wall_max_progress=a.wall_max_progress, wall_push_everywhere=a.wall_push_everywhere,
@@ -886,6 +893,8 @@ def main(argv=None) -> int:
                                "counter_rand": json.loads(a.counter_rand) if a.counter_rand else {}}}
         if a.actor_heads != "single":
             template["worker"]["actor_heads"] = a.actor_heads
+        if a.slow_fail:  # (only then: the template, and its id, stay as before with it off)
+            template["worker"]["slow_fail"] = json.loads(a.slow_fail)
         if a.anchor_mastered:  # (only then: the template, and its id, stay as before with the anchor off)
             template["worker"]["start_tags"] = True
         if getattr(env_cfg, "branch_assets", None):
@@ -932,6 +941,7 @@ def main(argv=None) -> int:
         for k in TERMS:
             e[f"r_{k}"] = e["terms"].get(k, 0.0)
         e["r_lane"] = e["terms"].get("lane", 0.0)  # written only when the lane term is on (log.cols)
+        e["r_slow_fail"] = e["terms"].get("slow_fail", 0.0)  # written only with --slow-fail (log.cols)
         counters["episodes"] += 1
         win_eps.append(e)
         log.row("episodes", e)
