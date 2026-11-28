@@ -105,6 +105,7 @@ class TasStarts:
         lf = int(c["levelfinish_frame"])
         self.levelfinish_frame = None if lf < 0 else lf
         self.sr_final = float(c["sr_final"])
+        self.control_frame = int(self.valid[0]) if len(self.valid) else 0  # first controllable frame (spawn), before any filter
         self.camera_dropped = 0
         self._apply_camera_filter()
 

@@ -293,6 +293,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "cannot unpickle the f8 template and refuse it")
     p.add_argument("--world-actions", action="store_true",
                    help="world-frame directional features (FeatureConfig camera=world) and world-direction actions")
+    p.add_argument("--own-camera", action="store_true",
+                   help="the agent's own (spawn) camera in the camera inputs on every life, TAS hand-overs included "
+                        "(ballrain.own_camera; on stays on across resumes). Frozen teachers read the TAS camera at the "
+                        "row's route s (--teacher-camera, per extra teacher its \"camera\" key: \"tas\" or \"own\"); an "
+                        "explicit anchor teacher reads, per family, the TAS camera at the family's first start frame "
+                        "(what it saw when the family was mastered); demo rows get the own camera")
+    p.add_argument("--teacher-camera", choices=("tas", "own"), default="tas",
+                   help="with --own-camera: the camera the --teacher reads (tas: the TAS camera at the row's route s, for "
+                        "teachers trained on hand-overs after a TAS camera turn; own: the rows as they are)")
     p.add_argument("--reward", default="{}", help="RewardConfig overrides as JSON")
     p.add_argument("--no-respawn", action="store_true",
                    help="end the game process at BallOff (EnvConfig.per_life=False): no respawn lives at the checkpoint")
@@ -591,6 +600,7 @@ def make_env_config(a, out_root: Path, ck=None, init=None):
                      start_record=start_record(a),
                      backend=a.backend, headless=hl,
                      curriculum=cu, features=fc, reward=rc, max_process_frames=200000, world_actions=a.world_actions,
+                     own_camera=bool(getattr(a, "own_camera", False)),
                      auto_collect=a.auto_collect,
                      per_life=not a.no_respawn,
                      rest_starts=rest_starts,
@@ -652,6 +662,7 @@ def main(argv=None) -> int:
         a.spin = bool(a.spin or saved.get("spin"))  # likewise for the spin block
         a.orient = bool(a.orient or saved.get("orient"))  # and the orientation block
         a.pressure = bool(a.pressure or saved.get("pressure"))  # and the contact-pressure block
+        a.own_camera = bool(a.own_camera or saved.get("own_camera"))  # the camera inputs never go back to the TAS camera
         from ballrain.reach_features import is_mechanism_version
         a.reach_mechanisms = a.reach_mechanisms or is_mechanism_version(saved.get("reach_version"))
     else:
@@ -1134,6 +1145,11 @@ def main(argv=None) -> int:
         if abs(d_ms - env_cfg.delta_ms) > 1e-4:
             raise SystemExit(f"--demo {a.demo}: built at delta_ms {d_ms:.4f}, the run steps {env_cfg.delta_ms:.4f}")
         demo = {"raw": z["obs"].astype(np.float32), "act": z["act"].astype(np.int64)}
+        if env_cfg.own_camera:  # the demonstrated states as the agent sees them: its own camera
+            from ballrain import own_camera as OC
+            from ballrain.curriculum import TasStarts
+            OC.write(demo["raw"], obs_layout(env_cfg.features)[1],
+                     OC.spawn_quarter(TasStarts(env_cfg.start_record, camera_tol=None)))
         log.msg(f"imitation: {len(demo['act'])} demonstrated states from {a.demo} (ranges {z['ranges']}), coef "
                 f"{a.demo_coef} -> {a.demo_coef_floor} over {a.demo_decay_updates} updates")
 
@@ -1214,8 +1230,10 @@ def main(argv=None) -> int:
                                  ea.get("actor_heads", "single")).to(a.device)
             emodel.load_state_dict(eck["model"])
             emodel.eval()
+            if e.get("camera", "tas") not in ("tas", "own"):
+                raise SystemExit(f"--teacher-extra {e['ckpt']}: camera {e.get('camera')!r} is not tas / own")
             teacher["extra"].append({"model": emodel, "rms": eck["rms"], "lo": lo / length, "hi": hi / length,
-                                     "n_obs": e_obs})
+                                     "n_obs": e_obs, "camera": e.get("camera", "tas")})
             log.msg(f"teacher-extra {e['ckpt']} (update {eck.get('counters', {}).get('update')}): same KL coef on "
                     f"route s {lo:g}-{hi:g}")
 
@@ -1320,18 +1338,54 @@ def main(argv=None) -> int:
               "tagged_rows": sum(k is not None for k in keys)}
         if not groups:
             return None, None, st
-        lt = AN.teacher_logp(anchor_teachers, groups, anchored, raw, n_act, a.device)
+        lt = AN.teacher_logp(anchor_teachers, groups, anchored, anchor_view(raw, groups) if cam_view is not None and anchor.explicit else raw, n_act, a.device)
         if (u + 1) % a.log_every == 0:  # per-family KL before the update (logging only: on the logged updates)
             fk = AN.family_kl(model, obs_n, lt, groups, a.device)
             st["kl_pre"] = float(np.mean(list(fk.values())))
             st["top"] = sorted(((v, k, len(groups[k])) for k, v in fk.items()), reverse=True)[:5]
         return lt, w, st
 
+    cam_view = None
+    if env_cfg.own_camera and (a.teacher or a.anchor_mastered):
+        # frozen teachers (--teacher / --teacher-extra / --anchor-teacher) were trained on TAS hand-overs with the TAS
+        # camera, not the agent's own camera: teachers by route s (--teacher-camera / "camera" "tas"), an explicit
+        # --anchor-teacher per family by its first start frame; automatic snapshots of this run read the rows as they are
+        from ballrain import own_camera as OC
+        from ballrain.curriculum import TasStarts
+        from ballrain.path import ReferencePath, asset_path, resolve_path_dir
+        _lay = obs_layout(env_cfg.features)[1]
+        _line = ReferencePath.load(asset_path(env_cfg.level, resolve_path_dir(env_cfg.features.path_dir)))
+        _st = TasStarts(env_cfg.start_record, camera_tol=None)
+        _pts = OC.turn_points(_st, _line)
+        _q = np.asarray(_st.camera_quarters())
+        log.msg("own camera: TAS camera by route s " + ", ".join(f"s>={s0:.1f}: quarter {q}" for s0, q in _pts)
+                + f"; --teacher reads {a.teacher_camera}"
+                + "".join(f", extra {Path(e['ckpt']).name} reads {e.get('camera', 'tas')}"
+                          for e in (json.loads(a.teacher_extra) if a.teacher_extra else [])))
+        def cam_view(raw):
+            return OC.view(raw, _lay, _lay["path_progress"].start, _line.length, _pts)
+
+        def anchor_view(raw, groups):
+            """Rows of each anchored family with the TAS camera at the family's first start frame ("rehearse:lo-hi",
+            "band:lo-hi"; other keys: the rows as they are): what the anchor teacher saw on those lives."""
+            out = np.array(raw, copy=True)
+            for k, idx in groups.items():
+                try:
+                    lo = int(str(k).split(":", 1)[1].split("-")[0])
+                except (IndexError, ValueError):
+                    continue
+                qk = int(_q[min(max(lo, 0), len(_q) - 1)])
+                if qk >= 0:
+                    out[idx] = OC.write(out[idx], _lay, qk)
+            return out
+
     def teacher_terms(raw):
         """Teacher log-probabilities on the batch (the teacher's own observation statistics), the route mask, the
         coefficient of this update."""
+        raw_tas = cam_view(raw) if cam_view is not None else raw
         with torch.no_grad():
-            x = torch.as_tensor(normalize(raw[:, :teacher["n_obs"]], teacher["rms"]), device=a.device)
+            r0 = raw_tas if a.teacher_camera == "tas" else raw
+            x = torch.as_tensor(normalize(r0[:, :teacher["n_obs"]], teacher["rms"]), device=a.device)
             logits, _ = teacher["model"](x)
             lt = torch.log_softmax(logits, -1).cpu().numpy()
         mask = raw[:, teacher["col"]] >= teacher["lo"]
@@ -1341,7 +1395,8 @@ def main(argv=None) -> int:
             m = (raw[:, teacher["col"]] >= e["lo"]) & (raw[:, teacher["col"]] <= e["hi"])
             if m.any():
                 with torch.no_grad():
-                    xe = torch.as_tensor(normalize(raw[m, :e["n_obs"]], e["rms"]), device=a.device)
+                    re_ = raw_tas if e.get("camera", "tas") == "tas" else raw
+                    xe = torch.as_tensor(normalize(re_[m, :e["n_obs"]], e["rms"]), device=a.device)
                     le, _ = e["model"](xe)
                     lt[m] = torch.log_softmax(le, -1).cpu().numpy()
                 mask = mask | m

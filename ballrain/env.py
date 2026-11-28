@@ -67,6 +67,10 @@ class EnvConfig:
     # of the current Cam_OrientRef basis at every step (world_to_camera_keys); with camera-relative keys a policy trained
     # under one camera orientation sees a rotated level under another (L1: the TAS turns the camera, a k = 0 run does not)
     world_actions: bool = False
+    # own_camera: write the agent's own (spawn) camera into cam_yaw_ref / cam_yaw / cam_rotating on every step, also on
+    # TAS hand-overs after a TAS camera turn (ballrain.own_camera); needs world_actions, the "world" feature frame, no
+    # camera actions and a start_record (without one the lives start at spawn and keep that camera anyway)
+    own_camera: bool = False
     # an arrow key's force takes Cam_OrientRef at its latest Create: each press, and for held keys the end of each camera
     # turn (the game re-creates them); death and pause shut all forces down (docs/observations.md 5). True (conservative):
     # a key held since before a Cam_OrientRef change, a respawn or an unpause is released for the first frame of the step
@@ -302,6 +306,13 @@ class BallanceEnv(gym.Env):
             raise ValueError("start_record and prefix are exclusive")
         self.starts = (TasStarts(c.start_record, camera_tol=c.camera_quarter_tol, camera_grace_ms=c.camera_turn_grace_ms)
                        if c.start_record else None)
+        self._own_cam = None
+        if c.own_camera:
+            if not c.world_actions or c.camera_actions or c.features.camera != "world":
+                raise ValueError("own_camera needs world_actions, no camera_actions and the 'world' feature frame")
+            if self.starts is not None:
+                from . import own_camera
+                self._own_cam = own_camera.spawn_quarter(self.starts)
         if self.starts is not None and c.exclude_starts:
             v = self.starts.valid
             keep = np.ones(len(v), bool)
@@ -875,11 +886,17 @@ class BallanceEnv(gym.Env):
             self.fx.reference_path(s.tracker)
             self.fx.branch.restore(self._start["branch_id"], self._start["phase"], self._start["branch_s"])
         obs, finfo = self.fx.compute(s.tracker)
+        self._apply_own_camera(obs)
         if self.reward.cfg.lane_weight and self.fx.path is not None:
             self.reward.check_lane_window(self.fx.path.length)
         self.reward.begin(s.tracker, self._arc(finfo), pickup_dist=self._pickup_dist())
         info = self._info(finfo, [])
         return obs, info
+
+    def _apply_own_camera(self, obs) -> None:
+        if self._own_cam is not None:
+            from . import own_camera
+            own_camera.write(obs, self.fx.slices(), self._own_cam)
 
     @staticmethod
     def _arc(finfo):
@@ -971,6 +988,7 @@ class BallanceEnv(gym.Env):
         if self.pickups:
             extra["pickups_new"] = self.pickups.update(s.tracker, self._ball_pos())
         obs, finfo = self.fx.compute(s.tracker)
+        self._apply_own_camera(obs)
         p = finfo.get("path")
         r, terms = self.reward.step(s.tracker, self._arc(finfo), died, finished, terminated,
                                     rebase=bool(p and p.get("jump")), supported=finfo.get("supported", False),
