@@ -119,6 +119,9 @@ class WorkerSpec:
     # bootstrap, end "zone_terminal"); the penalty still applies. Without the key the life goes on (unchanged).
     # "min_steps": n on a contact zone: it fires only after n consecutive steps with the rail-touch count reached (the
     # count resets on a step without it), so a brush of another rail while hopping between rails does not fire
+    # "speed_below": v on a box zone: it counts as entered only while the ball's horizontal speed (own displacement per
+    # second) is under v inside the box, for "min_steps" consecutive steps (default 1), and only in a life that was
+    # outside the box before (hand-overs inside it are not judged). With "terminal": true: braking there ends the life
     zone_rearm: float = 1.0
     # unclimbable-wall push (off when wall_push_rate = 0): while the ball touches a wall (mindist gap <= wall_gap, contact
     # normal |n_y| <= wall_max_ny) whose top is more than wall_min_rise above the ball's lowest point (user: a wall higher
@@ -291,6 +294,7 @@ class _Episode:
         self.max_sector_seen = self.d["start_sector"]
         self.seg = None  # (agent IGT ms at the segment start, TAS IGT ms at the segment start)
         self.zone_in: dict = {}  # penalty zone name -> the ball is inside (not re-armed yet)
+        self.zone_speed: dict = {}  # speed zone name -> {"seen_out", "slow" (consecutive slow steps), "prev" (ball pos)}
         self.zone_counts: dict = {}  # penalty zone name -> entries this episode
         self.zone_terminal = None  # name of a "terminal" zone that fired (the life ends this step)
 
@@ -461,6 +465,23 @@ class Worker:
             sl = self._agg_slice = ag.start + CONTACT_AGG_FIELDS.index("n_rail_touch")
         return int(round(float(o[sl]) * 2)) >= int(z["rail_touches"])  # n_rail_touch = min(count, 2) / 2
 
+    def _speed_zone(self, ep, name: str, z: dict, pos, in_box: bool, frames: int) -> bool:
+        """A box zone with "speed_below": v counts as entered only when the ball has been inside the box (below y_below)
+        with a horizontal speed under v (world units per second, from the ball's own displacement over the step) for
+        "min_steps" consecutive steps (default 1), and only in a life that was outside the box earlier (a life handed
+        over inside it is never judged). Book-keeping per life on the episode (zone_speed)."""
+        st = ep.zone_speed.setdefault(name, {"seen_out": False, "slow": 0, "prev": None})
+        prev, st["prev"] = st["prev"], pos.copy()
+        if not in_box:
+            st["seen_out"], st["slow"] = True, 0
+            return False
+        if not st["seen_out"] or prev is None or frames <= 0:
+            return False
+        dt = frames * float(self.spec.env.delta_ms) / 1000.0
+        v = float(np.hypot(pos[0] - prev[0], pos[2] - prev[2])) / dt
+        st["slow"] = st["slow"] + 1 if v < float(z["speed_below"]) else 0
+        return st["slow"] >= int(z.get("min_steps", 1))
+
     def _zone_wall(self, ep, a: int, s_before, frames: int) -> float:
         """Penalty zones and the unclimbable-wall push for the step just taken (WorkerSpec.zones / wall_push_rate);
         returns the reward to add (<= 0) and books the terms on the episode."""
@@ -493,6 +514,8 @@ class Worker:
                         ep.zone_terminal = name
                 continue
             inside = in_zone(pos, z)
+            if "speed_below" in z:  # a speed zone: fires only while the ball is too slow inside the box
+                inside = self._speed_zone(ep, name, z, pos, inside, frames)
             if inside and z.get("wall_push"):
                 wp_here = True
             if inside and not ep.zone_in.get(name):
