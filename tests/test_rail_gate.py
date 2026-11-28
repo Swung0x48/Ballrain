@@ -66,6 +66,22 @@ def test_gate_sector_key():
     assert not w._gate_hit(_ep("tas", 2100), 1800.0, {"sector": 2})
 
 
+def test_gate_sector_list():
+    """"sector" as a list: lives started in any listed 小节 are gated; the int form behaves exactly as before."""
+    lst, one = _w({"s": 1400.0, "below": 99999, "sector": [1, 2]}), _w({"s": 1400.0, "below": 99999, "sector": 2})
+    for kind, k, sec0, s, sec in (("tas", 8700, 1, 1400.0, 3), ("tas", 8700, 1, 1399.9, 3), ("tas", 12000, 2, 1400.0, 3),
+                                  ("tas", 12000, 2, 1500.0, 2), ("respawn", 9276, 2, 1450.0, 3), ("tas", 15100, 3, 1500.0, 3),
+                                  ("tas", 2100, 1, 1450.0, 1), ("tas", 12000, 2, None, 2)):
+        want_lst = s is not None and s >= 1400.0 and sec0 in (1, 2)
+        want_one = s is not None and s >= 1400.0 and sec0 == 2
+        assert lst._gate_hit(_ep(kind, k, start_sector=sec0), s, {"sector": sec}) == want_lst, (kind, k, sec0, s)
+        assert one._gate_hit(_ep(kind, k, start_sector=sec0), s, {"sector": sec}) == want_one, (kind, k, sec0, s)
+    assert _w({"s": 1400.0, "sector": (2,)})._gate_hit(_ep("tas", 3000, start_sector=2), 1400.0, {"sector": 2})  # below 4000
+    assert not _w({"s": 1400.0, "sector": [2]})._gate_hit(_ep("tas", 12000, start_sector=2), 1400.0, {"sector": 2})
+    assert _w({"s": 1400.0, "below": 99999, "sector": []})._gate_hit(_ep("tas", 12000, start_sector=2), 1400.0,
+                                                                     {"sector": 2}) is False  # empty list: nobody
+
+
 def test_gate_follows_the_frontier():
     g = {"s": 277.0, "below": 4000, "follow_frontier": True}
     w = _w(g, frontier=3900)  # unpinned: the band starts at 3900
