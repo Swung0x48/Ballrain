@@ -389,6 +389,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--teacher-decay-updates", type=int, default=0)
     p.add_argument("--teacher-s-min", type=float, default=331.4,
                    help="route arc length from which the teacher term applies (L1 refpaths-alt: 331.4 = TAS frame 4460)")
+    p.add_argument("--teacher-s-max", type=float, default=None,
+                   help="route arc length up to which the teacher term applies (default: no upper bound, unchanged)")
     p.add_argument("--anchor-mastered", action="store_true",
                    help="mastered-state anchor (ballrain.train.anchor): + coef x KL(teacher || policy) on the batch rows of "
                         "lives that started in a start family (--rest-starts entry, rehearsal range, curriculum band, respawn "
@@ -1170,11 +1172,15 @@ def main(argv=None) -> int:
         tmodel.eval()
         sl = obs_layout(env_cfg.features)[1]["path_progress"]
         length = ReferencePath.load(asset_path(env_cfg.level, resolve_path_dir(env_cfg.features.path_dir))).length
+        if a.teacher_s_max is not None and not a.teacher_s_min < a.teacher_s_max <= length:
+            raise SystemExit(f"--teacher-s-max {a.teacher_s_max}: must be above --teacher-s-min and within the line ({length:.1f})")
         teacher = {"model": tmodel, "rms": tck["rms"], "col": sl.start, "lo": a.teacher_s_min / length,
+                   "hi": None if a.teacher_s_max is None else a.teacher_s_max / length,
                    "u0": counters["update"], "n_obs": t_obs}
         log.msg(f"teacher {a.teacher} (update {tck['counters']['update']}): KL coef {a.teacher_coef}"
                 + (f" -> {a.teacher_coef_floor} over {a.teacher_decay_updates} updates" if a.teacher_decay_updates else "")
-                + f" on route s >= {a.teacher_s_min:g} (line length {length:.1f})")
+                + f" on route s >= {a.teacher_s_min:g}"
+                + (f" and <= {a.teacher_s_max:g}" if a.teacher_s_max is not None else "") + f" (line length {length:.1f})")
 
     anchor, anchor_teachers, AN = None, {}, None
     if a.anchor_mastered:
@@ -1292,6 +1298,8 @@ def main(argv=None) -> int:
             logits, _ = teacher["model"](x)
             lt = torch.log_softmax(logits, -1).cpu().numpy()
         mask = raw[:, teacher["col"]] >= teacher["lo"]
+        if teacher.get("hi") is not None:
+            mask &= raw[:, teacher["col"]] <= teacher["hi"]
         coef = a.teacher_coef
         if a.teacher_decay_updates and a.teacher_coef_floor is not None:
             f = min(1.0, (counters["update"] - teacher["u0"]) / a.teacher_decay_updates)

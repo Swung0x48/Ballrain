@@ -63,6 +63,8 @@ def test_options():
     import train_m2
     a = train_m2.parse(["--run", "x"])
     assert a.teacher == "" and a.teacher_coef == 0.1 and a.teacher_decay_updates == 0 and a.teacher_s_min == 331.4
+    assert a.teacher_s_max is None  # default: no upper route bound (the mask as before)
+    assert train_m2.parse(["--run", "x", "--teacher-s-min", "190", "--teacher-s-max", "290"]).teacher_s_max == 290.0
     a = train_m2.parse(["--run", "x", "--teacher", "t.pt", "--teacher-coef", "0.1", "--teacher-coef-floor", "0.05",
                         "--teacher-decay-updates", "5000"])
     assert a.teacher == "t.pt" and a.teacher_coef_floor == 0.05 and a.teacher_decay_updates == 5000
